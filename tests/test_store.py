@@ -4,7 +4,7 @@ from logging import getLogger
 
 import torch
 
-from monarch.actor_mesh import Actor, current_rank, endpoint
+from monarch.actor import Actor, current_rank, endpoint
 
 from torchstore import MultiProcessStore
 from torchstore.utils import spawn_actors
@@ -40,8 +40,8 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
         store = MultiProcessStore()
 
         # each actor mesh represents a group of processes.
-        actor_mesh_0 = spawn_actors(2, TestActor, "actor_mesh_0", store=store)
-        actor_mesh_1 = spawn_actors(2, TestActor, "actor_mesh_1", store=store)
+        actor_mesh_0 = await spawn_actors(2, TestActor, "actor_mesh_0", store=store)
+        actor_mesh_1 = await spawn_actors(2, TestActor, "actor_mesh_1", store=store)
 
         await actor_mesh_0.do_put.call()
         tensors = await actor_mesh_1.do_get.call()

@@ -10,7 +10,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 
-from monarch.actor_mesh import Actor, current_rank, endpoint
+from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -193,7 +193,7 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
             with tempfile.TemporaryDirectory() as tmpdir:
                 dcp_checkpoint_fn = os.path.join(tmpdir, "dcp_checkpoint.pt")
 
-                save_world = spawn_actors(
+                save_world = await spawn_actors(
                     save_world_size,
                     DCPParityTest,
                     "save_world",
@@ -204,7 +204,7 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
                 )
                 await save_world.do_put.call()
 
-                get_world = spawn_actors(
+                get_world = await spawn_actors(
                     get_world_size,
                     DCPParityTest,
                     "get_world",

@@ -6,7 +6,7 @@ from logging import getLogger
 
 import torch
 
-from monarch.actor_mesh import Actor, current_rank, endpoint
+from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor, Replicate, Shard
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
@@ -242,7 +242,7 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
             put_visible_devices = ",".join(
                 str(d) for d in range(put_world_size)
             )  # e.g. put_world_size=4, put_visible_devices="0,1,2,3"
-            put_mesh = spawn_actors(
+            put_mesh = await spawn_actors(
                 put_world_size,
                 DTensorActor,
                 "put_mesh",
@@ -259,7 +259,7 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
             get_visible_devices = ",".join(
                 str(d) for d in range(put_world_size, put_world_size + get_world_size)
             )  # e.g. put_world_size=4, get_world_size=2, get_visible_devices="4,5"
-            get_mesh = spawn_actors(
+            get_mesh = await spawn_actors(
                 get_world_size,
                 DTensorActor,
                 "get_mesh",
