@@ -23,10 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = [
-    "torch>=1.0.0",
-    "monarch",
-]
+dependencies = [] #todo: add toml
 
 [project.urls]
 "Homepage" = "https://github.com/your-username/torchstore"

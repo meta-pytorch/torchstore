@@ -7,10 +7,7 @@ setup(
     author="Meta",
     packages=find_packages(),
     python_requires=">=3.6",
-    install_requires=[
-        "torch>=1.0.0",
-        "monarch",  # Add version constraint if known
-    ],
+    install_requires=[], #TODO: add monarch/torch
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",

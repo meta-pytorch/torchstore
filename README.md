@@ -2,6 +2,10 @@
 
 A storage solution for PyTorch tensors with distributed tensor support.
 
+# Under Construction!
+
+Nothing to see here yet, but check back soon
+
 ## Installation
 
 ### Development Installation
@@ -46,10 +50,6 @@ await store.put("my_tensor", torch.randn(3, 4))
 # Retrieve a tensor
 tensor = await store.get("my_tensor")
 ```
-
-# Under Construction!
-
-Nothing to see here yet, but check back soon
 
 
 # Contributing Guidelines
