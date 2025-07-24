@@ -102,7 +102,7 @@ class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
 
     async def _do_test(self, put_mesh_shape, get_mesh_shape):
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = MultiProcessStore()
+            store = await MultiProcessStore.create_store()
 
             put_world_size = math.prod(put_mesh_shape)
             put_world = await spawn_actors(

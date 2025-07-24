@@ -235,7 +235,7 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
         original_tensor = torch.arange(8**2).reshape(
             8, 8
         )  # 8x8 square, with ([[0...7],[8...15],[...]])
-        store = MultiProcessStore()
+        store = await MultiProcessStore.create_store()
         with tempfile.TemporaryDirectory() as filesystem_store_dir:
             # each actor mesh represents a group of processes.
             # e.g., two different islands running spmd

@@ -27,14 +27,27 @@ class DTensorPack:
     def __post_init__(self):
         self.coordinates = tuple(self.coordinates)
 
-
 class MultiProcessStore:
     """This class represents the local store, which exists on every process. Remote storage
     is handled by the client.
     """
 
     def __init__(self):
-        self.client = await spawn_actors(1, _MultiProcessClient, "MultiProcessStore")
+        self._client = None
+
+    @classmethod
+    async def create_store(cls):
+        store = cls()
+        await store.spawn()
+        return store
+
+    async def spawn(self):
+        self._client = await spawn_actors(1, _MultiProcessClient, "MultiProcessStore")
+
+    @property
+    def client(self):
+        assert self._client is not None, "Client not initialized, please instantiate this class with 'create_store'"
+        return self._client
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):

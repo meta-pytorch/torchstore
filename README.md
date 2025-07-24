@@ -39,16 +39,26 @@ from torchstore import MultiProcessStore
 
 ```python
 import torch
+import asyncio
 from torchstore import MultiProcessStore
 
-# Create a store instance
-store = MultiProcessStore()
+async def main():
 
-# Store a tensor
-await store.put("my_tensor", torch.randn(3, 4))
+    # Create a store instance
+    store = await MultiProcessStore.create_store()
 
-# Retrieve a tensor
-tensor = await store.get("my_tensor")
+    # Store a tensor
+    await store.put("my_tensor", torch.randn(3, 4))
+
+    # Retrieve a tensor
+    tensor = await store.get("my_tensor")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# checkout out tests/test_resharding.py for more examples with resharding DTensor!
+
 ```
 
 

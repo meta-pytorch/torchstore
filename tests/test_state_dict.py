@@ -158,7 +158,7 @@ class DCPParityTest(Actor):
 
 class TestStateDict(unittest.IsolatedAsyncioTestCase):
     async def test_state_dict(self):
-        store = MultiProcessStore()
+        store = await MultiProcessStore.create_store()
 
         model = CompositeParamModel()
         optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
@@ -189,7 +189,7 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
             save_world_size = math.prod(save_mesh_shape)
             get_world_size = math.prod(get_mesh_shape)
 
-            store = MultiProcessStore()
+            store = await MultiProcessStore.create_store()
             with tempfile.TemporaryDirectory() as tmpdir:
                 dcp_checkpoint_fn = os.path.join(tmpdir, "dcp_checkpoint.pt")
 
