@@ -1,6 +1,55 @@
+# TorchStore
+
+A storage solution for PyTorch tensors with distributed tensor support.
+
 # Under Construction!
 
 Nothing to see here yet, but check back soon
+
+## Installation
+
+### Development Installation
+
+To install the package in development mode:
+
+```bash
+# Clone the repository
+git clone https://github.com/your-username/torchstore.git
+cd torchstore
+
+# Install in development mode
+pip install -e .
+```
+
+### Regular Installation
+
+To install the package directly from the repository:
+
+```bash
+pip install git+https://github.com/your-username/torchstore.git
+```
+
+Once installed, you can import it in your Python code:
+
+```python
+from torchstore import MultiProcessStore
+```
+
+## Usage
+
+```python
+import torch
+from torchstore import MultiProcessStore
+
+# Create a store instance
+store = MultiProcessStore()
+
+# Store a tensor
+await store.put("my_tensor", torch.randn(3, 4))
+
+# Retrieve a tensor
+tensor = await store.get("my_tensor")
+```
 
 
 # Contributing Guidelines
