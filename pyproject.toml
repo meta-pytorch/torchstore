@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A storage solution for PyTorch tensors with distributed tensor support"
 readme = "README.md"
 authors = [
-    {name = "Meta"}
+    { name = "PyTorch Team", email = "packages@pytorch.org" },
 ]
 requires-python = ">=3.6"
 classifiers = [
