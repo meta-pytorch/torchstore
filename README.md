@@ -35,31 +35,9 @@ Once installed, you can import it in your Python code:
 from torchstore import MultiProcessStore
 ```
 
-## Usage
+Note: Setup currently assumes you have a working conda environment with both torch & monarch (this is currently a todo). For now the fastest way of setting up is going through [this](https://www.internalfb.com/wiki/Monarch/Monarch_xlformers_integration/Running_Monarch_on_Conda/#how-to-run-monarch) guide.
 
-```python
-import torch
-import asyncio
-from torchstore import MultiProcessStore
-
-async def main():
-
-    # Create a store instance
-    store = await MultiProcessStore.create_store()
-
-    # Store a tensor
-    await store.put("my_tensor", torch.randn(3, 4))
-
-    # Retrieve a tensor
-    tensor = await store.get("my_tensor")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-# checkout out tests/test_resharding.py for more examples with resharding DTensor!
-
-```
+Protop: Install finetine conda & use the 'local' option for the latest packges
 
 ## Usage
 
@@ -82,12 +60,11 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-# checkout out tests/test_resharding.py for more examples with resharding DTensor!
 
 ```
 
 ### Resharding Support with DTensor
+
 ```python
 from torchstore import MultiProcessStore
 from torch.distributed._tensor import distribute_tensor, Replicate, Shard
@@ -108,7 +85,7 @@ async def place_dtensor_in_store():
 async def fetch_dtensor_from_store()
     # You can now fetch arbitrary shards of this tensor from any rank e.g.
     device_mesh = init_device_mesh("cpu", (2,2))
-    tensor = original_tensor = torch.rand(4)
+    tensor = torch.rand(4)
     dtensor = distribute_tensor(
         tensor,
         device_mesh,
@@ -117,6 +94,8 @@ async def fetch_dtensor_from_store()
 
     # This line copies the previously stored dtensor into local memory.
     await store.get("my_tensor", dtensor)
+
+# checkout out tests/test_resharding.py for more e2e examples with resharding DTensor.
 ```
 
 # Contributing Guidelines
