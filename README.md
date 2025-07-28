@@ -35,22 +35,68 @@ Once installed, you can import it in your Python code:
 from torchstore import MultiProcessStore
 ```
 
+Note: Setup currently assumes you have a working conda environment with both torch & monarch (this is currently a todo). For now the fastest way of setting up is going through [this](https://www.internalfb.com/wiki/Monarch/Monarch_xlformers_integration/Running_Monarch_on_Conda/#how-to-run-monarch) guide.
+
+Protop: Install finetine conda & use the 'local' option for the latest packges
+
 ## Usage
 
 ```python
 import torch
+import asyncio
 from torchstore import MultiProcessStore
 
-# Create a store instance
-store = MultiProcessStore()
+async def main():
 
-# Store a tensor
-await store.put("my_tensor", torch.randn(3, 4))
+    # Create a store instance
+    store = await MultiProcessStore.create_store()
 
-# Retrieve a tensor
-tensor = await store.get("my_tensor")
+    # Store a tensor
+    await store.put("my_tensor", torch.randn(3, 4))
+
+    # Retrieve a tensor
+    tensor = await store.get("my_tensor")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
 ```
 
+### Resharding Support with DTensor
+
+```python
+from torchstore import MultiProcessStore
+from torch.distributed._tensor import distribute_tensor, Replicate, Shard
+from torch.distributed.device_mesh import init_device_mesh
+
+async def place_dtensor_in_store():
+    device_mesh = init_device_mesh("cpu", (4,))
+    tensor = torch.arange(4)
+    dtensor = distribute_tensor(tensor, device_mesh, placements=[Shard(1)])
+
+    # Create a store instance
+    store = await MultiProcessStore.create_store()
+
+    # Store a tensor
+    await store.put("my_tensor", dtensor)
+
+
+async def fetch_dtensor_from_store()
+    # You can now fetch arbitrary shards of this tensor from any rank e.g.
+    device_mesh = init_device_mesh("cpu", (2,2))
+    tensor = torch.rand(4)
+    dtensor = distribute_tensor(
+        tensor,
+        device_mesh,
+        placements=[Replicate(), Shard(0)]
+    )
+
+    # This line copies the previously stored dtensor into local memory.
+    await store.get("my_tensor", dtensor)
+
+# checkout out tests/test_resharding.py for more e2e examples with resharding DTensor.
+```
 
 # Contributing Guidelines
 

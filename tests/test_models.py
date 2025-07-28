@@ -7,7 +7,7 @@ from logging import getLogger
 
 import torch
 
-from monarch.actor_mesh import Actor, current_rank, endpoint
+from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
@@ -88,11 +88,11 @@ class ModelTest(Actor):
 
 
 class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
-    # async def test_basic(self):
-    #     # FSDP
-    #     put_mesh_shape = (1,)
-    #     get_mesh_shape = (1,)
-    #     await self._do_test(put_mesh_shape, get_mesh_shape)
+    async def test_basic(self):
+        # FSDP
+        put_mesh_shape = (1,)
+        get_mesh_shape = (1,)
+        await self._do_test(put_mesh_shape, get_mesh_shape)
 
     async def test_resharding(self):
         # FSDP
@@ -102,10 +102,10 @@ class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
 
     async def _do_test(self, put_mesh_shape, get_mesh_shape):
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = MultiProcessStore()
+            store = await MultiProcessStore.create_store()
 
             put_world_size = math.prod(put_mesh_shape)
-            put_world = spawn_actors(
+            put_world = await spawn_actors(
                 put_world_size,
                 ModelTest,
                 "save_world",
@@ -116,7 +116,7 @@ class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
             await put_world.do_push.call()
 
             get_world_size = math.prod(get_mesh_shape)
-            get_world = spawn_actors(
+            get_world = await spawn_actors(
                 get_world_size,
                 ModelTest,
                 "get_world",

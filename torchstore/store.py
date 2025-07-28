@@ -4,7 +4,7 @@ from logging import getLogger
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
-from monarch.actor_mesh import Actor, endpoint
+from monarch.actor import Actor, endpoint
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
@@ -27,14 +27,27 @@ class DTensorPack:
     def __post_init__(self):
         self.coordinates = tuple(self.coordinates)
 
-
 class MultiProcessStore:
     """This class represents the local store, which exists on every process. Remote storage
     is handled by the client.
     """
 
     def __init__(self):
-        self.client = spawn_actors(1, _MultiProcessClient, "MultiProcessStore")
+        self._client = None
+
+    @classmethod
+    async def create_store(cls):
+        store = cls()
+        await store.spawn()
+        return store
+
+    async def spawn(self):
+        self._client = await spawn_actors(1, _MultiProcessClient, "MultiProcessStore")
+
+    @property
+    def client(self):
+        assert self._client is not None, "Client not initialized, please instantiate this class with 'create_store'"
+        return self._client
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):

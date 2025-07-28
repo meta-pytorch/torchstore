@@ -2,16 +2,16 @@ from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from monarch.proc_mesh import proc_mesh_blocking
+from monarch.actor import proc_mesh
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
 
 
-def spawn_actors(num_processes, actor_cls, name, **init_args):
+async def spawn_actors(num_processes, actor_cls, name, **init_args):
     """Actors are essentially processes wrapped in a class."""
-    mesh = proc_mesh_blocking(gpus=num_processes)
-    actors = mesh.spawn(name, actor_cls, **init_args).get()
+    mesh = await proc_mesh(gpus=num_processes)
+    actors = await mesh.spawn(name, actor_cls, **init_args)
     actors.mesh = mesh
     return actors
 
