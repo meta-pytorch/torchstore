@@ -1,11 +1,9 @@
-from typing import List, Tuple, TYPE_CHECKING
+from typing import List, Tuple
 
 import torch
+from torch._prims_common import ShapeType
 
 from monarch.actor import proc_mesh
-
-if TYPE_CHECKING:
-    from torch._prims_common import ShapeType
 
 
 async def spawn_actors(num_processes, actor_cls, name, **init_args):
@@ -17,8 +15,8 @@ async def spawn_actors(num_processes, actor_cls, name, **init_args):
 
 
 def get_local_tensor(
-    global_tensor: "torch.Tensor",
-    local_shape: "ShapeType",
+    global_tensor: torch.Tensor,
+    local_shape: ShapeType,
     global_offset: Tuple[int, ...],
 ):
     # Calculate the slices for each dimension
@@ -33,8 +31,8 @@ def get_local_tensor(
 
 def assemble_global_tensor(
     local_tensors: List[torch.Tensor],
-    global_shape: "ShapeType",
-    global_offsets: List["ShapeType"],
+    global_shape: ShapeType,
+    global_offsets: List[ShapeType],
 ):
     """
     Assemble a global tensor from local tensors based on their shapes and offsets.

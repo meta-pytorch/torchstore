@@ -46,7 +46,8 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
         await actor_mesh_0.do_put.call()
         tensors = await actor_mesh_1.do_get.call()
         for pt, val in tensors:
-            assert torch.equal(torch.tensor([pt.rank] * 10), val)
+            expected = torch.tensor([pt.rank] * 10)
+            assert torch.equal(expected, val), f"{val=}, {expected=}"
 
 
 if __name__ == "__main__":

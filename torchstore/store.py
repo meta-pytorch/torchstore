@@ -8,6 +8,7 @@ from monarch.actor import Actor, endpoint
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
+from torchstore.transport import RDMAMessage, Message
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
 
 
@@ -34,7 +35,8 @@ class MultiProcessStore:
 
     def __init__(self):
         self._client = None
-
+        self._transport = None
+        
     @classmethod
     async def create_store(cls):
         store = cls()
@@ -71,7 +73,8 @@ class MultiProcessStore:
                 value.device_mesh.shape,
             )
 
-        await self.client.put.call(key, value)  # TODO: remove asyncio
+        msg_packed = await RDMAMessage.pack(value)
+        await self.client.put.call(key, msg_packed)
 
     @torch.no_grad
     async def get(self, key: str, inplace_tensor: Optional[torch.Tensor] = None):
@@ -99,27 +102,34 @@ class MultiProcessStore:
 
         elif isinstance(inplace_tensor, torch.Tensor):
             fetched_tensor = await self.client.get.call_one(key)
-            inplace_tensor.copy_(fetched_tensor)
+
+            self._transport.recv(fetched_tensor, inplace_tensor)
+
+            # inplace_tensor.copy_(fetched_tensor) 
 
             return inplace_tensor
 
+        ret = await self.client.get.call_one(key)
         # call_one returns the value directly instead of the ValueMesh
-        return await self.client.get.call_one(key)
+        return await ret.unpack()
 
 
 class _MultiProcessClient(Actor):
     """The remote logic for storage. Recieves remote put/get requests and handles them via the storage abstraction"""
 
-    def __init__(self):
-        self.store = CopyStore()
+    def __init__(self, store: Optional["CopyStore"] = None):
+        self.store = store if store is not None else CopyStore()
 
     @endpoint
-    async def put(self, key: str, value: torch.Tensor):
-        self.store.put(key, value)
+    async def put(self, key: str, value: torch.Tensor): #TODO: fix type-hint
+        unpacked_val = await value.unpack()
+        self.store.put(key, unpacked_val)
 
     @endpoint
-    def get(self, key: str, dtensor_pack: Optional[DTensorPack] = None):
-        return self.store.get(key, dtensor_pack)
+    async def get(self, key: str, dtensor_pack: Optional[DTensorPack] = None):
+        value = self.store.get(key, dtensor_pack)
+        #TODO: this creates a risky condition where value is deleted while it's being "unpacked"
+        return await RDMAMessage.pack(value)
 
 
 class CopyStore:
