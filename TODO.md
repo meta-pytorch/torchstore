@@ -6,9 +6,9 @@ What's in flight atm?
 * Add a tutorial for resharding models
 
 # Key functionality
-* multi-node support
 * RDMA Support
-* Support for non-blocking operations (overlapping save/load)
+* multi-node support
+* Support for non-blocking operations (overlapping save/load) / trainer integrations
 * Support for key indexing
 * Support for mv/pop/peek/rm
 * Make all operations atomic
@@ -31,9 +31,9 @@ What's in flight atm?
 * Coalescieng multiple put/gets
 * Decrease number of copies
 * Optimize 2x peak memory on full tensor assemble
-* Re-consider "_has_full_tensor"
+* Reconsider "_has_full_tensor"
+* Reconsider assemble full tensor (allow users to fetch subsets before full tensor is written)
 * Refactor DTensorPack to a PendingTensor class
-* Reconsider assemble full tensor
 * Add better handling for DTensor 'replicate' groups. (Avoid writting unnecessary replicates, exposing this as an option to the user)
 
 # Random Things

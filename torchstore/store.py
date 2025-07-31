@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from itertools import product
 from logging import getLogger
 from typing import Any, Dict, Optional, Tuple, Union
@@ -8,7 +7,7 @@ from monarch.actor import Actor, endpoint
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
-from torchstore.transport import RDMAMessage, Message
+from torchstore.transport import RDMAMessage, DTensorPack
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
 
 
@@ -16,17 +15,6 @@ logger = getLogger(__name__)
 
 FULL_TENSOR = "full_tensor"
 
-
-@dataclass
-class DTensorPack:
-    offsets: Tuple
-    coordinates: Tuple
-    local_tensor: torch.Tensor
-    global_shape: Tuple
-    mesh_shape: Tuple
-
-    def __post_init__(self):
-        self.coordinates = tuple(self.coordinates)
 
 class MultiProcessStore:
     """This class represents the local store, which exists on every process. Remote storage
@@ -78,11 +66,9 @@ class MultiProcessStore:
 
     @torch.no_grad
     async def get(self, key: str, inplace_tensor: Optional[torch.Tensor] = None):
-        # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
-        # for now we'll copy into it after fetching from the remote store
-
         logger.warn(f"Fetching {key}")
 
+        # fetch tensor locally
         if isinstance(inplace_tensor, DTensor):
             coordinates = inplace_tensor.device_mesh.get_coordinate()
             _, offsets = _compute_local_shape_and_global_offset(
@@ -91,31 +77,30 @@ class MultiProcessStore:
                 my_coordinate=coordinates,
                 placements=inplace_tensor.placements,
             )
-            # TODO: don't pass inplace_tensor in DTensorPack, we only use tensor.shape and will slow down comms
+            # TODO: (critical) don't pass inplace_tensor in DTensorPack, we only use tensor.shape and will slow down comms
             dtensor_pack = DTensorPack(
                 offsets, coordinates, inplace_tensor._local_tensor, None, None
             )
-            fetched_tensor = await self.client.get.call_one(key, dtensor_pack)
-            inplace_tensor._local_tensor.copy_(
-                fetched_tensor
-            )  # TODO: this is probably not allowed
 
-        elif isinstance(inplace_tensor, torch.Tensor):
-            fetched_tensor = await self.client.get.call_one(key)
+            get_response = await self.client.get.call_one(key, dtensor_pack)
+            
+        else:# isinstance(inplace_tensor, torch.Tensor):
+            get_response = await self.client.get.call_one(key)
+            
 
-            self._transport.recv(fetched_tensor, inplace_tensor)
+        # fetch tensor locally
+        fetched_tensor = await get_response.unpack()
+        if inplace_tensor is not None:
+            assert isinstance(fetched_tensor, torch.Tensor)
+            inplace_tensor.copy_(fetched_tensor) 
 
-            # inplace_tensor.copy_(fetched_tensor) 
-
-            return inplace_tensor
-
-        ret = await self.client.get.call_one(key)
-        # call_one returns the value directly instead of the ValueMesh
-        return await ret.unpack()
+        return fetched_tensor
 
 
 class _MultiProcessClient(Actor):
-    """The remote logic for storage. Recieves remote put/get requests and handles them via the storage abstraction"""
+    """
+    The remote logic for storage. Recieves remote put/get requests and handles them via local storage abstraction.
+    """
 
     def __init__(self, store: Optional["CopyStore"] = None):
         self.store = store if store is not None else CopyStore()
@@ -128,11 +113,12 @@ class _MultiProcessClient(Actor):
     @endpoint
     async def get(self, key: str, dtensor_pack: Optional[DTensorPack] = None):
         value = self.store.get(key, dtensor_pack)
-        #TODO: this creates a risky condition where value is deleted while it's being "unpacked"
         return await RDMAMessage.pack(value)
 
 
 class CopyStore:
+    """Represents local storage, handles sharding logic.
+    """
     # TODO: make functions atomic
     def __init__(self):
         self.kv: Dict[str, Any] = {}
