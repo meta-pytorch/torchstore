@@ -82,17 +82,17 @@ class MultiProcessStore:
                 offsets, coordinates, inplace_tensor._local_tensor, None, None
             )
 
-            get_response = await self.client.get.call_one(key, dtensor_pack)
-            
-        else:# isinstance(inplace_tensor, torch.Tensor):
-            get_response = await self.client.get.call_one(key)
-            
+            get_response = await self.client.get.call_one(key, dtensor_pack)            
+            fetched_tensor = await get_response.unpack()
 
-        # fetch tensor locally
-        fetched_tensor = await get_response.unpack()
-        if inplace_tensor is not None:
-            assert isinstance(fetched_tensor, torch.Tensor)
-            inplace_tensor.copy_(fetched_tensor) 
+            inplace_tensor._local_tensor.copy_(fetched_tensor)
+
+        else:
+            get_response = await self.client.get.call_one(key)
+            fetched_tensor = await get_response.unpack()
+
+            if isinstance(inplace_tensor, torch.Tensor):
+                inplace_tensor.copy_(fetched_tensor)
 
         return fetched_tensor
 
@@ -104,6 +104,7 @@ class _MultiProcessClient(Actor):
 
     def __init__(self, store: Optional["CopyStore"] = None):
         self.store = store if store is not None else CopyStore()
+        self.kv = {}
 
     @endpoint
     async def put(self, key: str, value: torch.Tensor): #TODO: fix type-hint
@@ -113,7 +114,12 @@ class _MultiProcessClient(Actor):
     @endpoint
     async def get(self, key: str, dtensor_pack: Optional[DTensorPack] = None):
         value = self.store.get(key, dtensor_pack)
-        return await RDMAMessage.pack(value)
+        packed = await RDMAMessage.pack(value)
+        import uuid
+
+
+        self.kv[str(uuid.uuid4())] = packed
+        return packed
 
 
 class CopyStore:
@@ -227,7 +233,6 @@ class CopyStore:
             )
 
         logger.warn("Building local tensor")
-        # TODO: should probably be a view
         local_tensor = get_local_tensor(
             self.kv[key][FULL_TENSOR],
             dtensor_pack.local_tensor.shape,

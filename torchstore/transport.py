@@ -74,10 +74,10 @@ class RDMAMessage(Message):
         # practically this occurs every time your tensor is actually a view of a global tensor
         # monarch doesn't support views yet, so for now we copy although this is not ideal
         # TODO: see if we an support RDMABufer from views
-        if tensor.storage_offset() == 0:
-            tensor = tensor.clone()
-            # raise RuntimeError("RDMATransport does not support views yet")
+        if tensor.storage_offset() != 0:
+            print(f"Storage offset is not 0!!!! {tensor.storage_offset()=}")
         byte_tensor = tensor.view(torch.uint8).flatten()
+        print(f"byte_tensor, {byte_tensor.storage_offset()=}, {byte_tensor.stride()}, {byte_tensor=}")
 
         print(f"Packed, {tensor=}")
         return RDMABuffer(byte_tensor), tensor
@@ -103,7 +103,7 @@ class RDMAMessage(Message):
                 value.mesh_shape,
             )
 
-            return cls(dtensor_pack, tensor.shape, tensor.dtype, tensor_ref=tensor_ref, timeout=timeout)
+            return cls(dtensor_pack, tensor_ref.shape, tensor_ref.dtype, tensor_ref=tensor_ref, timeout=timeout)
 
         #TODO (critical): it's important that this tensor is not GC'd before we call
         # `unpack` ont the other side.
