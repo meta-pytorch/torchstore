@@ -27,6 +27,7 @@ class DTensorPack:
     def __post_init__(self):
         self.coordinates = tuple(self.coordinates)
 
+
 class MultiProcessStore:
     """This class represents the local store, which exists on every process. Remote storage
     is handled by the client.
@@ -46,8 +47,19 @@ class MultiProcessStore:
 
     @property
     def client(self):
-        assert self._client is not None, "Client not initialized, please instantiate this class with 'create_store'"
+        assert (
+            self._client is not None
+        ), "Client not initialized, please instantiate this class with 'create_store'"
         return self._client
+
+    @torch.no_grad
+    async def put_all(self, kv_dict: Dict[str, Any]):
+        """Move the all the keys/values in one go to the copy store"""
+        # Following is a bad/wrong impl of the API. The idea is to pack all the tensors
+        # as a one and move to the local copy store via shared memory or rdma transport
+        # if available.
+        for key, value in kv_dict.items():
+            await self.put(key, value)
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
