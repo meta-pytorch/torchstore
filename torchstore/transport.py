@@ -74,13 +74,17 @@ class RDMAMessage(Message):
         # practically this occurs every time your tensor is actually a view of a global tensor
         # monarch doesn't support views yet, so for now we copy although this is not ideal
         # TODO: see if we an support RDMABufer from views
-        if tensor.storage_offset() != 0:
-            print(f"Storage offset is not 0!!!! {tensor.storage_offset()=}")
-        byte_tensor = tensor.view(torch.uint8).flatten()
-        print(f"byte_tensor, {byte_tensor.storage_offset()=}, {byte_tensor.stride()}, {byte_tensor=}")
+        # if tensor.storage_offset() != 0:
+        #     print(f"Storage offset is not 0!!!! {tensor.storage_offset()=}")
 
-        print(f"Packed, {tensor=}")
-        return RDMABuffer(byte_tensor), tensor
+        # tensor = tensor.clone().detach()
+
+        if not tensor.is_contiguous():
+            # tensor = tensor.contiguous()
+            raise RuntimeError("RDMATransport only supports contiguous tensors")
+        byte_tensor = tensor.view(torch.uint8).flatten()
+        print(f"Packed byte_tensor, {byte_tensor=} {tensor.storage_offset()=}", flush=True)
+        return RDMABuffer(byte_tensor, offset_=tensor.storage_offset()*tensor.element_size()), tensor
 
     @classmethod
     async def pack(cls, value, timeout=10) -> "RDMAMessage":
@@ -135,9 +139,16 @@ class RDMAMessage(Message):
                 self.value.mesh_shape,
             )
 
-        assert isinstance(self.value, RDMABuffer)
         byte_tensor = inplace_tensor.view(torch.uint8).flatten()
+        print(f"{byte_tensor.storage_offset()=}", flush=True)
+        print(f"{self.value._buffer}=")
+        import fbvscode
+        # fbvscode.set_trace()
         await self.value.read_into(byte_tensor, timeout=self.timeout)
+        print(f"unpacked {byte_tensor=}", flush=True)
+        import time
+        import random
+        time.sleep(random.randint(1,3))
 
-        print(f"unpacked, {inplace_tensor=}")
+        # print(f"unpacked, {inplace_tensor=}")
         return inplace_tensor

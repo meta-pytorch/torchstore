@@ -274,7 +274,7 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
             )
             # This call fetches the tensor from TorchStore into the local DTensor shards
             value_mesh = await get_mesh.do_get.call()
-
+            
             # assert the correct value is found here
             for _, val in value_mesh:
                 sharded_tensor, coord = val

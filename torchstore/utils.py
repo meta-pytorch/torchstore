@@ -23,6 +23,8 @@ def get_local_tensor(
     slices = tuple(
         slice(offset, offset + size) for offset, size in zip(global_offset, local_shape)
     )
+    for s in slices:
+        assert global_tensor[s].is_contiguous()
 
     # Slice the global_tensor to obtain the local_tensor
     local_tensor = global_tensor[slices]
@@ -54,5 +56,7 @@ def assemble_global_tensor(
     for local_tensor, offset in zip(local_tensors, global_offsets):
         slices = tuple(slice(o, o + s) for o, s in zip(offset, local_tensor.shape))
         global_tensor[slices] = local_tensor
+
+    assert global_tensor.is_contiguous()
 
     return global_tensor

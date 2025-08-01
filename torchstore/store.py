@@ -83,16 +83,12 @@ class MultiProcessStore:
             )
 
             get_response = await self.client.get.call_one(key, dtensor_pack)            
-            fetched_tensor = await get_response.unpack()
-
-            inplace_tensor._local_tensor.copy_(fetched_tensor)
+            fetched_tensor = await get_response.unpack(inplace_tensor._local_tensor)
+            # inplace_tensor._local_tensor.copy_(fetched_tensor)
 
         else:
             get_response = await self.client.get.call_one(key)
-            fetched_tensor = await get_response.unpack()
-
-            if isinstance(inplace_tensor, torch.Tensor):
-                inplace_tensor.copy_(fetched_tensor)
+            fetched_tensor = await get_response.unpack(inplace_tensor)
 
         return fetched_tensor
 
