@@ -6,6 +6,7 @@ from typing import List, Tuple
 import torch
 from monarch.actor import Actor, current_rank, endpoint, proc_mesh
 from torchstore import MultiProcessStore
+from torchstore._state_dict_utils import get_state_dict, push_state_dict
 
 
 # Run the example : python example/torchstore_rl.py
@@ -22,15 +23,11 @@ class Learner(Actor):
             eps=1e-5,
         )
 
-    async def store_weights(self):
-        for k, v in self.model.state_dict().items():
-            await self.store.put(k, v)
-
     @endpoint
     async def step(
         self,
         inputs: List[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ):
         # list(tensor, tensor) => list(tensor), list(tensor)
         inputs, rewards = zip(*inputs)
 
@@ -45,29 +42,28 @@ class Learner(Actor):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optim.step()
-        # put the weights in to torch.store
-        await self.store_weights()
         print("[learner] weights: ", self.model.state_dict())
-        return loss, rewards.sum()
+        # Put weights in to torch.store
+        await push_state_dict(self.store, self.model.state_dict(), key="toy_app")
 
 
 class Generator(Actor):
     def __init__(self, store):
         self.store = store
         self.model = torch.nn.Linear(4, 4, bias=False, device="cuda")
-        # self.weight_buffer = weight_buffer
         self.index = current_rank()["gpus"]
 
     @endpoint
-    def update_weights(self):
+    async def update_weights(self):
         print(
             "[generator {}] original weights: {}".format(
                 self.index, self.model.state_dict()
             )
         )
-        state_dict = self.model.state_dict()
-        for k, v in state_dict.items():
-            asyncio.run(self.store.get(k, inplace_tensor=v))
+        # Fetch weights from torch.store
+        await get_state_dict(
+            self.store, key="toy_app", user_state_dict=self.model.state_dict()
+        )
         print(
             "[generator {}] new weights: {}".format(self.index, self.model.state_dict())
         )
@@ -81,21 +77,24 @@ class Generator(Actor):
 
 
 async def main():
+    num_learners = 1
     num_generators = 1
-    learner_mesh = await proc_mesh(gpus=1, env={})
-    gen_mesh = await proc_mesh(gpus=num_generators, env={})
+
+    # TODO: Show weights re-sharding usecase.
+    learner_mesh = await proc_mesh(gpus=num_learners)
+    gen_mesh = await proc_mesh(gpus=num_generators)
 
     store = await MultiProcessStore.create_store()
+
     learner = await learner_mesh.spawn("learner", Learner, store)
     generators = await gen_mesh.spawn("generator", Generator, store)
 
     generation_stream = generators.generate.stream(torch.randn(4, 4, device="cuda"))
-    for step in range(3):
+    for _ in range(3):
         generations = [gen.get() for gen in generation_stream]
-        loss, rewards = await learner.step.call_one(generations)
-        print(f"step: {step}, loss: {loss}, rewards: {rewards}")
+        await learner.step.call_one(generations)
         generation_stream = generators.generate.stream(torch.randn(4, 4, device="cuda"))
-        generators.update_weights.call().get()
+        await generators.update_weights.call_one()
 
     print("done")
 
