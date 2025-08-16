@@ -26,18 +26,12 @@ class Learner(Actor):
     @endpoint
     async def step(
         self,
-        inputs: List[Tuple[torch.Tensor, torch.Tensor]],
+        input_logit: torch.Tensor,
+        input_reward: torch.Tensor,
     ):
-        # list(tensor, tensor) => list(tensor), list(tensor)
-        inputs, rewards = zip(*inputs)
-
-        # list(tensor) => tensor
-        tensor = torch.stack(inputs).to(self.device)
-        rewards = torch.stack(rewards).to(self.device)
-
-        logits = self.model(tensor)
+        logits = self.model(input_logit)
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        loss = -torch.mean(rewards.detach().squeeze() * log_probs.sum(dim=[1, 2]))
+        loss = -torch.mean(input_reward.detach().squeeze() * log_probs.sum(dim=[1, -2]))
         self.optim.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -77,6 +71,11 @@ class Generator(Actor):
 
 
 async def main():
+    """
+    The example code shows how to use torchstore to share weights between
+    trainer/learner and generator apps. The weights are shared synchronously
+    between the two apps.
+    """
     num_learners = 1
     num_generators = 1
 
@@ -89,11 +88,14 @@ async def main():
     learner = await learner_mesh.spawn("learner", Learner, store)
     generators = await gen_mesh.spawn("generator", Generator, store)
 
-    generation_stream = generators.generate.stream(torch.randn(4, 4, device="cuda"))
+    logits, reward = await generators.generate.call_one(
+        torch.randn(4, 4, device="cuda")
+    )
     for _ in range(3):
-        generations = [gen.get() for gen in generation_stream]
-        await learner.step.call_one(generations)
-        generation_stream = generators.generate.stream(torch.randn(4, 4, device="cuda"))
+        await learner.step.call_one(logits, reward)
+        logits, reward = await generators.generate.call_one(
+            torch.randn(4, 4, device="cuda")
+        )
         await generators.update_weights.call_one()
 
     print("done")
