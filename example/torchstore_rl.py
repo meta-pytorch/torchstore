@@ -13,18 +13,22 @@ from torchstore._state_dict_utils import get_state_dict, push_state_dict
 
 # Run the example : python example/torchstore_rl.py
 
-MAX_BUFFER_SIZE = 2
+MAX_BUFFER_SIZE = 3
 
 
 class WeightsTracker(Actor):
     def __init__(self) -> None:
         # FIFO tracking.
+        # TODO: Synchronize the queue!!.
         self.weights_tracking_queue = asyncio.Queue(maxsize=MAX_BUFFER_SIZE)
 
     @endpoint
     async def mark_weights_ready(self, key: str):
-        print("[weights_life_cycle_manager] weights are ready to consume: ", key)
+        print(f"[weights_life_cycle_manager] weights are ready to consume: {key}")
         await self.weights_tracking_queue.put(key)
+        print(
+            f"[weights_life_cycle_manager] queue content : {self.weights_tracking_queue.qsize()}"
+        )
 
     @endpoint
     async def get(self) -> str:
@@ -88,13 +92,13 @@ class Generator(Actor):
     async def generate(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         inputs = inputs.to("cuda")
         logits = self.model(inputs)
-        await asyncio.sleep(1)  # Simulate extra work
+        # await asyncio.sleep(2)  # Simulate extra work
         reward = torch.sum(logits)
         return logits, reward
 
 
 async def run_learner(learner, tracker, queue):
-    for weights_id in range(3):
+    for weights_id in range(1, 4):
         # fetch generated input from the generator via queue.
         input_logit, input_reward = None, None
         try:
@@ -110,7 +114,8 @@ async def run_learner(learner, tracker, queue):
 
 
 async def run_generator(generators, tracker, queue):
-    for _ in range(3):
+    for _ in range(4):
+        await asyncio.sleep(2)  # Simulate extra work
         weights_id = await tracker.get.call_one()
         await generators.update_weights.call_one(weights_id)
         logits, reward = await generators.generate.call_one(
@@ -144,11 +149,18 @@ async def main():
     generators = await gen_mesh.spawn("generator", Generator, store)
     weights_tracker = await weight_tracker_mesh.spawn("weights_tracker", WeightsTracker)
 
-    logits, reward = await generators.generate.call_one(
-        torch.randn(4, 4, device="cuda")
-    )
-    # send the generated input to the learner via queue.
+    # Bootstrapping the pipeline for off by one processing.
+    # Disclaimer: I do not understand bootstrapping entirely.
+    # I assume we somehow have access to two weights versions (persistent checkpoint?)
+    # to bootstrap the off by one pipeline.
+    cp_loaded_sd1 = {"weight": torch.randn(4, 4, device="cuda")}
+    cp_loaded_sd2 = {"weight": torch.randn(4, 4, device="cuda")}
+
+    logits, reward = await generators.generate.call_one(cp_loaded_sd1["weight"])
     await asyncio.wait_for(queue.put((logits, reward)), timeout=2.0)
+
+    await push_state_dict(store, cp_loaded_sd2, key="v0")
+    await weights_tracker.mark_weights_ready.call_one("v0")
 
     # Concurrent execution of leaner and generator.
     async with asyncio.TaskGroup() as tg:
