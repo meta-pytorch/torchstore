@@ -8,6 +8,20 @@ Nothing to see here yet, but check back soon
 
 ## Installation
 
+### Env Setup
+```bash
+conda create -n torchstore python=3.12
+pip install torch
+
+git clone git@github.com:meta-pytorch/monarch.git
+python monarch/scripts/install_nightly.py
+
+git clone git@github.com:meta-pytorch/torchstore.git
+cd torchstore
+pip install -e .
+```
+
+
 ### Development Installation
 
 To install the package in development mode:
