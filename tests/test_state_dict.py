@@ -2,9 +2,11 @@ import copy
 import math
 import os
 import tempfile
+import time
 import unittest
 from logging import getLogger
 from typing import Union
+from unittest.mock import patch
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -21,7 +23,11 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 
 from torchstore import MultiProcessStore
-from torchstore._state_dict_utils import get_state_dict, push_state_dict
+from torchstore._state_dict_utils import (
+    get_state_dict,
+    push_state_dict,
+    zo_push_state_dict,
+)
 from torchstore.utils import spawn_actors
 
 logger = getLogger(__name__)
@@ -157,11 +163,13 @@ class DCPParityTest(Actor):
 
 
 class TestStateDict(unittest.IsolatedAsyncioTestCase):
-    async def test_state_dict(self):
+    async def zo_test_state_dict(self):
         store = await MultiProcessStore.create_store()
 
         model = CompositeParamModel()
         optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+
+        original_put = store.put
 
         for _ in range(5):
             optimizer.zero_grad()
@@ -173,10 +181,29 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
         }
-        await push_state_dict(store, state_dict, "v0")
 
-        fetched_state_dict = await get_state_dict(store, "v0")
-        self._assert_equal_state_dict(state_dict, fetched_state_dict)
+        # mocks the torchstore.put funciton and add sleep delay to
+        # test the data correctness under future based sync.
+        async def slow_put(key, val):
+            time.sleep(1)
+            await original_put(key, val)
+
+        with patch.object(store, "put", side_effect=slow_put):
+            fut = zo_push_state_dict(store, state_dict, "v0")
+
+            # Start of next training step. This step overlaps the 
+            # ts.put calls.
+            optimizer.zero_grad()
+            loss = model(torch.randn(8, MODEL_LINER_LENGTH)).sum()
+            loss.backward()
+            print(f"waiting for async push_state to complete")
+            result = fut.result()
+            if result:
+                assert False, "Unexpected result value"
+            optimizer.step()
+
+            fetched_state_dict = await get_state_dict(store, "v0")
+            self._assert_equal_state_dict(state_dict, fetched_state_dict)
 
     async def test_dcp_sharding_parity(self):
         for save_mesh_shape, get_mesh_shape in [

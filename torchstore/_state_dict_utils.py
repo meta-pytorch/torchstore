@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import Future
 from logging import getLogger
 from typing import Optional
 
@@ -12,6 +13,27 @@ DELIM = "/"
 MAPPING = "MAPPING"
 
 logger = getLogger(__name__)
+
+from concurrent.futures import ThreadPoolExecutor
+
+
+def zo_push_state_dict(store, state_dict, key) -> Future[None]:
+    """
+    Run the put request in a separate thread. Calller should wait for the future to complete,
+    before updating the state dict.
+    """
+    flattened_state_dict, _ = flatten_state_dict(state_dict)
+    def store_put_wrapper(store, sd, key):
+        puts = []
+        for flattened_key, value in flattened_state_dict.items():
+            puts.append(store.put(f"{key}{DELIM}{flattened_key}", value))
+        asyncio.gather(*puts)
+
+    with ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="PUSH_STATE_DICT_IO"
+    ) as executor:
+        return executor.submit(store_put_wrapper, store, flattened_state_dict, key)
+
 
 
 async def push_state_dict(store, state_dict, key):
