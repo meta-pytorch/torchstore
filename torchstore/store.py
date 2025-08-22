@@ -257,6 +257,19 @@ class CopyStore:
         if dtensor_pack is None:
             return self.kv[key]
 
+        # Check if stored value is a regular tensor (not a dictionary of DTensorPack shards)
+        if isinstance(self.kv[key], torch.Tensor):
+            # Handle slicing directly from the stored tensor
+            logger.warn("Building local tensor from regular tensor")
+            local_tensor = get_local_tensor(
+                self.kv[key],
+                dtensor_pack.local_tensor.shape,
+                dtensor_pack.offsets,
+            )
+            logger.warn("done local tensor")
+            return local_tensor
+
+        # Handle DTensorPack case (stored value is a dictionary)
         # experimenting with creating a full tensor representation on 'get'
         # once all pieces are received.
         # TODO: think more carefully about this
@@ -268,7 +281,7 @@ class CopyStore:
                 f"Not ready to serve full tensor yet for {key}: {self.kv[key]=}"
             )
 
-        logger.warn("Building local tensor")
+        logger.warn("Building local tensor from DTensorPack")
         # TODO: should probably be a view
         local_tensor = get_local_tensor(
             self.kv[key][FULL_TENSOR],

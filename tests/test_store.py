@@ -127,8 +127,6 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             slice_result, expected
         ), f"Expected {expected}, got {slice_result}"
 
-        print("All get_slice tests passed!")
-
 
 if __name__ == "__main__":
     unittest.main()
