@@ -277,7 +277,6 @@ class CopyStore:
             logger.warn("done local tensor")
             return local_tensor
 
-        # Handle DTensorPack case (stored value is a dictionary)
         # experimenting with creating a full tensor representation on 'get'
         # once all pieces are received.
         # TODO: think more carefully about this
@@ -289,7 +288,7 @@ class CopyStore:
                 f"Not ready to serve full tensor yet for {key}: {self.kv[key]=}"
             )
 
-        logger.warn("Building local tensor from DTensorPack")
+        logger.warn("Building local tensor")
         # TODO: should probably be a view
         local_tensor = get_local_tensor(
             self.kv[key][FULL_TENSOR],
