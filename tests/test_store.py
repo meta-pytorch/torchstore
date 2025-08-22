@@ -127,6 +127,25 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             slice_result, expected
         ), f"Expected {expected}, got {slice_result}"
 
+        # Test 8: Test inplace_tensor functionality
+        # Get a slice and copy into a pre-allocated tensor
+        offsets = (0, 0)
+        local_shape = (2, 3)
+        inplace_tensor = torch.zeros(local_shape)  # Pre-allocate tensor
+        result = await store.get_slice(
+            "test_tensor", offsets, local_shape, inplace_tensor
+        )
+        expected = test_tensor[0:2, 0:3]
+
+        # Check that the result is the same tensor object as inplace_tensor
+        assert (
+            result is inplace_tensor
+        ), "Result should be the same object as inplace_tensor"
+        assert torch.equal(result, expected), f"Expected {expected}, got {result}"
+        assert torch.equal(
+            inplace_tensor, expected
+        ), f"inplace_tensor should contain expected values, got {inplace_tensor}"
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -115,6 +115,7 @@ class MultiProcessStore:
         key: str,
         offsets: Tuple,
         local_shape: Tuple,
+        inplace_tensor: Optional[torch.Tensor] = None,
     ):
         """Get a tensor slice at specific offsets.
 
@@ -122,27 +123,34 @@ class MultiProcessStore:
             key: The key to retrieve the tensor for
             offsets: Tuple of slice offsets for each dimension
             local_shape: Shape of the local tensor slice to retrieve
+            inplace_tensor: Optional tensor to copy the result into
 
         Returns:
-            torch.Tensor: The sliced tensor
+            torch.Tensor: The sliced tensor (or inplace_tensor if provided)
         """
         logger.warn(f"Fetching slice for {key} at offsets {offsets}")
 
-        coordinates = (0,)  # Default to coordinate (0,)
-        # Create a dummy local tensor with the desired shape to pass shape information
-        dummy_local_tensor = torch.empty(local_shape)
+        if inplace_tensor is not None:
+            local_tensor = inplace_tensor
+        else:
+            local_tensor = torch.empty(local_shape)
 
         # Create DTensorPack representing the slice to load
         dtensor_pack = DTensorPack(
             offsets=offsets,
-            coordinates=coordinates,
-            local_tensor=dummy_local_tensor,
-            global_shape=None,  # Not needed for slice retrieval
-            mesh_shape=None,  # Not needed for slice retrieval
+            coordinates=(0,),
+            local_tensor=local_tensor,
+            global_shape=None,
+            mesh_shape=None,
         )
 
-        # Call the client to get the slice
-        return await self.client.get.call_one(key, dtensor_pack)
+        fetched_tensor = await self.client.get.call_one(key, dtensor_pack)
+
+        if inplace_tensor is not None:
+            inplace_tensor.copy_(fetched_tensor)
+            return inplace_tensor
+        else:
+            return fetched_tensor
 
 
 class _MultiProcessClient(Actor):
