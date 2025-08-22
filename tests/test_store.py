@@ -48,6 +48,87 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
         for pt, val in tensors:
             assert torch.equal(torch.tensor([pt.rank] * 10), val)
 
+    async def test_get_slice(self):
+        """Test get_slice functionality with offsets and local_shape"""
+        store = await MultiProcessStore.create_store()
+
+        test_tensor = torch.arange(24).reshape(4, 6)
+        global_shape = (4, 6)
+
+        await store.put("test_tensor", test_tensor)
+
+        # Test 1: Get first 2 rows (all columns)
+        # Equivalent to [:2, :]
+        offsets = (0, 0)
+        local_shape = (2, 6)
+        slice_result = await store.get_slice("test_tensor", offsets, local_shape)
+        expected = test_tensor[:2, :]
+        assert torch.equal(
+            slice_result, expected
+        ), f"Expected {expected}, got {slice_result}"
+
+        # Test 2: Get specific columns from all rows
+        # Equivalent to [:, 1:4]
+        offsets = (0, 1)
+        local_shape = (4, 3)
+        slice_result = await store.get_slice("test_tensor", offsets, local_shape)
+        expected = test_tensor[:, 1:4]
+        assert torch.equal(
+            slice_result, expected
+        ), f"Expected {expected}, got {slice_result}"
+
+        # Test 3: Get a specific subregion
+        # Equivalent to [1:3, 2:5]
+        offsets = (1, 2)
+        local_shape = (2, 3)
+        slice_result = await store.get_slice("test_tensor", offsets, local_shape)
+        expected = test_tensor[1:3, 2:5]
+        assert torch.equal(
+            slice_result, expected
+        ), f"Expected {expected}, got {slice_result}"
+
+        # Test 4: Get single row
+        # Equivalent to [2:3, :]
+        offsets = (2, 0)
+        local_shape = (1, 6)
+        slice_result = await store.get_slice("test_tensor", offsets, local_shape)
+        expected = test_tensor[2:3, :]
+        assert torch.equal(
+            slice_result, expected
+        ), f"Expected {expected}, got {slice_result}"
+
+        # Test 5: Get single element region
+        # Equivalent to [1:2, 3:4]
+        offsets = (1, 3)
+        local_shape = (1, 1)
+        slice_result = await store.get_slice("test_tensor", offsets, local_shape)
+        expected = test_tensor[1:2, 3:4]
+        assert torch.equal(
+            slice_result, expected
+        ), f"Expected {expected}, got {slice_result}"
+
+        # Test 6: Test last 2 rows
+        # Equivalent to [-2:, :] which is [2:, :]
+        offsets = (2, 0)
+        local_shape = (2, 6)
+        slice_result = await store.get_slice("test_tensor", offsets, local_shape)
+        expected = test_tensor[-2:, :]
+        assert torch.equal(
+            slice_result, expected
+        ), f"Expected {expected}, got {slice_result}"
+
+        # Test 7: Get middle section
+        # Equivalent to [1:3, 1:5]
+        offsets = (1, 1)
+        local_shape = (2, 4)
+        slice_result = await store.get_slice("test_tensor", offsets, local_shape)
+        expected = test_tensor[1:3, 1:5]
+        assert torch.equal(
+            slice_result, expected
+        ), f"Expected {expected}, got {slice_result}"
+
+        print("All get_slice tests passed!")
+
 
 if __name__ == "__main__":
     unittest.main()

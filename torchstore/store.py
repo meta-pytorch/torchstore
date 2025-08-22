@@ -27,6 +27,7 @@ class DTensorPack:
     def __post_init__(self):
         self.coordinates = tuple(self.coordinates)
 
+
 class MultiProcessStore:
     """This class represents the local store, which exists on every process. Remote storage
     is handled by the client.
@@ -46,7 +47,9 @@ class MultiProcessStore:
 
     @property
     def client(self):
-        assert self._client is not None, "Client not initialized, please instantiate this class with 'create_store'"
+        assert (
+            self._client is not None
+        ), "Client not initialized, please instantiate this class with 'create_store'"
         return self._client
 
     @torch.no_grad
@@ -105,6 +108,41 @@ class MultiProcessStore:
 
         # call_one returns the value directly instead of the ValueMesh
         return await self.client.get.call_one(key)
+
+    @torch.no_grad
+    async def get_slice(
+        self,
+        key: str,
+        offsets: Tuple,
+        local_shape: Tuple,
+    ):
+        """Get a tensor slice at specific offsets.
+
+        Args:
+            key: The key to retrieve the tensor for
+            offsets: Tuple of slice offsets for each dimension
+            local_shape: Shape of the local tensor slice to retrieve
+
+        Returns:
+            torch.Tensor: The sliced tensor
+        """
+        logger.warn(f"Fetching slice for {key} at offsets {offsets}")
+
+        coordinates = (0,)  # Default to coordinate (0,)
+        # Create a dummy local tensor with the desired shape to pass shape information
+        dummy_local_tensor = torch.empty(local_shape)
+
+        # Create DTensorPack representing the slice to load
+        dtensor_pack = DTensorPack(
+            offsets=offsets,
+            coordinates=coordinates,
+            local_tensor=dummy_local_tensor,
+            global_shape=None,  # Not needed for slice retrieval
+            mesh_shape=None,  # Not needed for slice retrieval
+        )
+
+        # Call the client to get the slice
+        return await self.client.get.call_one(key, dtensor_pack)
 
 
 class _MultiProcessClient(Actor):
