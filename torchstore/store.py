@@ -9,6 +9,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
+from torchstore.transport import Pipe
 
 
 logger = getLogger(__name__)
@@ -27,7 +28,7 @@ class DTensorPack:
     def __post_init__(self):
         self.coordinates = tuple(self.coordinates)
 
-class MultiProcessStore:
+class MultiProcessStore: # This is actually the local client
     """This class represents the local store, which exists on every process. Remote storage
     is handled by the client.
     """
@@ -51,6 +52,7 @@ class MultiProcessStore:
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
+        
         logger.warn(f"Putting {key}")
         if isinstance(value, DTensor):
             coordinates = value.device_mesh.get_coordinate()
@@ -71,7 +73,10 @@ class MultiProcessStore:
                 value.device_mesh.shape,
             )
 
-        await self.client.put.call(key, value)  # TODO: remove asyncio
+        pipe = Pipe(self.client)
+        await pipe.put_to_storage_volume(key, value)
+
+        # await self.client.put.call(key, value)  # TODO: remove asyncio
 
     @torch.no_grad
     async def get(self, key: str, inplace_tensor: Optional[torch.Tensor] = None):
@@ -79,6 +84,8 @@ class MultiProcessStore:
         # for now we'll copy into it after fetching from the remote store
 
         logger.warn(f"Fetching {key}")
+
+        pipe = Pipe(self.client)
 
         if isinstance(inplace_tensor, DTensor):
             coordinates = inplace_tensor.device_mesh.get_coordinate()
@@ -103,11 +110,13 @@ class MultiProcessStore:
 
             return inplace_tensor
 
+        return await pipe.get_from_storage_volume(key, inplace_tensor)
+
         # call_one returns the value directly instead of the ValueMesh
-        return await self.client.get.call_one(key)
+        # return await self.client.get.call_one(key)
 
 
-class _MultiProcessClient(Actor):
+class _MultiProcessClient(Actor): # this is the storage volume
     """The remote logic for storage. Recieves remote put/get requests and handles them via the storage abstraction"""
 
     def __init__(self):
@@ -122,7 +131,7 @@ class _MultiProcessClient(Actor):
         return self.store.get(key, dtensor_pack)
 
 
-class CopyStore:
+class CopyStore: # this just represents in memory. The alternative would be something like SSD
     # TODO: make functions atomic
     def __init__(self):
         self.kv: Dict[str, Any] = {}
@@ -199,22 +208,20 @@ class CopyStore:
 
         self.kv[key][value.coordinates] = value
 
-    def put(self, key: str, value: torch.Tensor):
+    def put(self, key: str, value: torch.Tensor): #TODO: value -> transport_buffer
         """ """
         if isinstance(value, DTensorPack):
             self._handle_dtensor(key, value)
             return
-        elif isinstance(value, torch.Tensor):
-            if key not in self.kv:
-                self.kv[key] = torch.empty_like(value)
-            # TODO: I am probably recieved a copy to beging with (unless RDMA is enabled), how can I tell?
-            self.kv[key].copy_(value)
-        else:
-            self.kv[key] = value  # best of luck
+        
+        self.kv[key] = value.read_into() 
 
     def get(self, key: str, dtensor_pack: Optional[DTensorPack] = None):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
+
+        dtensor_pack.write_from(self.kv[key])
+        return dtensor_pack
 
         if dtensor_pack is None:
             return self.kv[key]
