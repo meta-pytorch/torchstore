@@ -22,18 +22,28 @@ def zo_push_state_dict(store, state_dict, key) -> Future[None]:
     Run the put request in a separate thread. Calller should wait for the future to complete,
     before updating the state dict.
     """
-    flattened_state_dict, _ = flatten_state_dict(state_dict)
-    def store_put_wrapper(store, sd, key):
-        puts = []
-        for flattened_key, value in flattened_state_dict.items():
-            puts.append(store.put(f"{key}{DELIM}{flattened_key}", value))
-        asyncio.gather(*puts)
+    flattened_state_dict, mapping = flatten_state_dict(state_dict)
+
+    def work_fn(store, sd, mapping, key):
+        event_loop = asyncio.new_event_loop()
+
+        async def put_wrapper():
+            puts = []
+            for flattend_key, value in sd.items():
+                puts.append(store.put(f"{key}{DELIM}{flattend_key}", value))
+            asyncio.gather(*puts)
+            await store.put(f"{key}{DELIM}{MAPPING}", mapping)
+
+        try:
+            asyncio.set_event_loop(event_loop)
+            event_loop.run_until_complete(put_wrapper())
+        finally:
+            event_loop.close()
 
     with ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="PUSH_STATE_DICT_IO"
     ) as executor:
-        return executor.submit(store_put_wrapper, store, flattened_state_dict, key)
-
+        return executor.submit(work_fn, store, flattened_state_dict, mapping, key)
 
 
 async def push_state_dict(store, state_dict, key):
