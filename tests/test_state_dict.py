@@ -91,7 +91,7 @@ class DCPParityTest(Actor):
 
     def rlog(self, msg):
         # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
-        logger.warning(f"rank: {self.rank} {msg}")
+        logger.info(f"rank: {self.rank} {msg}")
 
     def build_model_optimizer(self):
         mesh_dim_names = ["dp", "tp"] if len(self.mesh_shape) == 2 else None

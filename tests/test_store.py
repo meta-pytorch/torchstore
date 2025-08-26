@@ -20,7 +20,7 @@ class TestActor(Actor):
         self.store = store
 
     def rlog(self, msg):
-        logger.warning(f"rank: {self.rank} {msg}")
+        logger.info(f"rank: {self.rank} {msg}")
 
     @endpoint
     async def do_put(self):

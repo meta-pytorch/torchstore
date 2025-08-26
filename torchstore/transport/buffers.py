@@ -50,14 +50,17 @@ class MonarchTransportBuffer(TransportBuffer):
     def allocate(self, tensor):
         """ In the case of using monarch comms, we don't do any allocation ahead of time
         """
-        return None
+        return tensor
 
     # send
     def read_into(self,tensor=None):
         if tensor is not None:
+            # if there is a tensor here, likely this is the 'inplace' case,
+            # and we should return back a ptr to the original tensor
+            # (as opposed to the stored tensor, which we likely don't want to
+            # keep around)
             tensor.copy_(self.tensor)
-        else:
-            tensor = self.tensor
+            return tensor
         
         return self.tensor
     

@@ -59,7 +59,7 @@ class ModelTest(Actor):
 
     def rlog(self, msg):
         # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
-        logger.warning(f"rank: {self.rank} {msg}")
+        logger.info(f"rank: {self.rank} {msg}")
 
     @endpoint
     async def do_push(self):

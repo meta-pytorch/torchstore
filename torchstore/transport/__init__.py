@@ -1,1 +1,1 @@
-from torchstore.transport.pipe import Pipe
+from torchstore.transport.pipe import Pipe, Message, TensorSlice
