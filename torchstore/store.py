@@ -53,34 +53,9 @@ class MultiProcessStore: # This is actually the local client
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
         logger.info(f"Putting {key}")
 
-        if isinstance(value, DTensor):
-            message = Message.from_dtensor(value, coordinates_only=False)
-        elif isinstance(value, torch.Tensor):
-            message = Message.from_tensor(value)
-        else:
-            message = Message.from_objects(value)
-
-        
-        # if isinstance(value, DTensor):
-        #     coordinates = value.device_mesh.get_coordinate()
-        #     _, offsets = _compute_local_shape_and_global_offset(
-        #         value.shape,
-        #         mesh_shape=value.device_mesh.shape,
-        #         my_coordinate=coordinates,
-        #         placements=value.placements,
-        #     )
-
-        #     # it's helpful representing the critical pieces of DTensor here
-        #     # instead of serializing DTensor itself (which is possible)
-        #     value = DTensorPack(
-        #         offsets,
-        #         coordinates,
-        #         value._local_tensor,
-        #         value.shape,
-        #         value.device_mesh.shape,
-        #     )
-
         pipe = Pipe(self.client)
+        message = Message.from_any(value)
+
         await pipe.put_to_storage_volume(key, message)
 
     @torch.no_grad
@@ -88,49 +63,13 @@ class MultiProcessStore: # This is actually the local client
         # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
         # for now we'll copy into it after fetching from the remote store
 
-        logger.warn(f"Fetching {key}")
+        logger.info(f"Fetching {key}")
 
         pipe = Pipe(self.client)
-
-        if isinstance(inplace_tensor, DTensor):
-            message = Message.from_dtensor(inplace_tensor, coordinates_only=False) #TODO: set this to true
-        elif isinstance(inplace_tensor, torch.Tensor):
-            message = Message.from_tensor(inplace_tensor)
-        else:
-            message = Message.from_objects(inplace_tensor)
+        message = Message.from_any(inplace_tensor)
 
         fetched_tensor = await pipe.get_from_storage_volume(key, message)
         return fetched_tensor if inplace_tensor is None else inplace_tensor
-
-
-
-        # if isinstance(inplace_tensor, DTensor):
-        #     coordinates = inplace_tensor.device_mesh.get_coordinate()
-        #     _, offsets = _compute_local_shape_and_global_offset(
-        #         inplace_tensor.shape,
-        #         mesh_shape=inplace_tensor.device_mesh.shape,
-        #         my_coordinate=coordinates,
-        #         placements=inplace_tensor.placements,
-        #     )
-        #     # TODO: don't pass inplace_tensor in DTensorPack, we only use tensor.shape and will slow down comms
-        #     dtensor_pack = DTensorPack(
-        #         offsets, coordinates, inplace_tensor._local_tensor, None, None
-        #     )
-        #     fetched_tensor = await self.client.get.call_one(key, dtensor_pack)
-        #     inplace_tensor._local_tensor.copy_(
-        #         fetched_tensor
-        #     )  # TODO: this is probably not allowed
-
-        # elif isinstance(inplace_tensor, torch.Tensor):
-        #     fetched_tensor = await self.client.get.call_one(key)
-        #     inplace_tensor.copy_(fetched_tensor)
-
-        #     return inplace_tensor
-
-        return await pipe.get_from_storage_volume(key, inplace_tensor)
-
-        # call_one returns the value directly instead of the ValueMesh
-        # return await self.client.get.call_one(key)
 
 
 class _MultiProcessClient(Actor): # this is the storage volume

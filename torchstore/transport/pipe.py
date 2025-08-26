@@ -32,7 +32,18 @@ class Message:
     objects: Optional[Any] = None # Any, but must be pickleable.
     
     @classmethod
-    def from_dtensor(cls, dtensor: DTensor, coordinates_only: bool) -> "Message":
+    def from_any(cls, value: Any):
+        if isinstance(value, DTensor):
+            message = cls.from_dtensor(value)
+        elif isinstance(value, torch.Tensor):
+            message = cls.from_tensor(value)
+        else:
+            message = cls.from_objects(value)
+
+        return message
+
+    @classmethod
+    def from_dtensor(cls, dtensor: DTensor) -> "Message":
         coordinates = dtensor.device_mesh.get_coordinate()
         _, offsets = _compute_local_shape_and_global_offset(
             dtensor.shape,
@@ -49,7 +60,7 @@ class Message:
             dtensor.device_mesh.shape,
         )
 
-        tensor = dtensor._local_tensor if not coordinates_only else None
+        tensor = dtensor._local_tensor
 
         return cls(
             tensor_val=tensor,
