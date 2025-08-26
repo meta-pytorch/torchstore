@@ -150,9 +150,6 @@ class Pipe:
         # buffer after being processed remotely
         recv_buffer = await self.storage_volume.get.call_one(key, send_buffer, message_without_tensor)
 
-        import fbvscode
-        fbvscode.set_trace()
-
         # it's important send_buffer is not GC'd before 'call_one'
         assert send_buffer is not None
 

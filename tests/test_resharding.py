@@ -119,78 +119,78 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
                     get_placements=[Shard(get_sharding_dim)],
                 )
 
-    # async def test_2d_to_2d_resharding(self):
-    #     put_mesh_shape = get_mesh_shape = (2, 2)
-    #     for put_sharding_dims, get_sharding_dims in [
-    #         ((1, 1), (0, 1)),
-    #         ((1, 0), (1, 0)),
-    #         ((0, 0), (0, 1)),
-    #         ((1, 1), (0, 0)),
-    #     ]:
-    #         await self._test_resharding(
-    #             put_mesh_shape=put_mesh_shape,
-    #             put_placements=[Shard(dim) for dim in put_sharding_dims],
-    #             get_mesh_shape=get_mesh_shape,
-    #             get_placements=[Shard(dim) for dim in get_sharding_dims],
-    #         )
+    async def test_2d_to_2d_resharding(self):
+        put_mesh_shape = get_mesh_shape = (2, 2)
+        for put_sharding_dims, get_sharding_dims in [
+            ((1, 1), (0, 1)),
+            ((1, 0), (1, 0)),
+            ((0, 0), (0, 1)),
+            ((1, 1), (0, 0)),
+        ]:
+            await self._test_resharding(
+                put_mesh_shape=put_mesh_shape,
+                put_placements=[Shard(dim) for dim in put_sharding_dims],
+                get_mesh_shape=get_mesh_shape,
+                get_placements=[Shard(dim) for dim in get_sharding_dims],
+            )
 
-    # async def test_1d_to_2d_resharding(self):
-    #     put_mesh_shape = (4,)
-    #     get_mesh_shape = (2, 2)
-    #     for put_sharding_dims, get_sharding_dims in [
-    #         ((0,), (0, 1)),
-    #         ((1,), (1, 0)),
-    #         ((0,), (0, 0)),
-    #         ((1,), (1, 1)),
-    #     ]:
-    #         await self._test_resharding(
-    #             put_mesh_shape=put_mesh_shape,
-    #             put_placements=[Shard(dim) for dim in put_sharding_dims],
-    #             get_mesh_shape=get_mesh_shape,
-    #             get_placements=[Shard(dim) for dim in get_sharding_dims],
-    #         )
+    async def test_1d_to_2d_resharding(self):
+        put_mesh_shape = (4,)
+        get_mesh_shape = (2, 2)
+        for put_sharding_dims, get_sharding_dims in [
+            ((0,), (0, 1)),
+            ((1,), (1, 0)),
+            ((0,), (0, 0)),
+            ((1,), (1, 1)),
+        ]:
+            await self._test_resharding(
+                put_mesh_shape=put_mesh_shape,
+                put_placements=[Shard(dim) for dim in put_sharding_dims],
+                get_mesh_shape=get_mesh_shape,
+                get_placements=[Shard(dim) for dim in get_sharding_dims],
+            )
 
-    # async def test_2d_to_1d_resharding(self):
-    #     put_mesh_shape = (2, 2)
-    #     get_mesh_shape = (4,)
-    #     for put_sharding_dims, get_sharding_dims in [
-    #         ((0, 0), (0,)),
-    #         ((1, 0), (1,)),
-    #         ((0, 1), (0,)),
-    #         ((1, 1), (1,)),
-    #     ]:
-    #         await self._test_resharding(
-    #             put_mesh_shape=put_mesh_shape,
-    #             put_placements=[Shard(dim) for dim in put_sharding_dims],
-    #             get_mesh_shape=get_mesh_shape,
-    #             get_placements=[Shard(dim) for dim in get_sharding_dims],
-    #         )
+    async def test_2d_to_1d_resharding(self):
+        put_mesh_shape = (2, 2)
+        get_mesh_shape = (4,)
+        for put_sharding_dims, get_sharding_dims in [
+            ((0, 0), (0,)),
+            ((1, 0), (1,)),
+            ((0, 1), (0,)),
+            ((1, 1), (1,)),
+        ]:
+            await self._test_resharding(
+                put_mesh_shape=put_mesh_shape,
+                put_placements=[Shard(dim) for dim in put_sharding_dims],
+                get_mesh_shape=get_mesh_shape,
+                get_placements=[Shard(dim) for dim in get_sharding_dims],
+            )
 
-    # async def test_data_parallel(self):
-    #     # # 1d
-    #     put_mesh_shape = (2,)
-    #     get_mesh_shape = (4,)
+    async def test_data_parallel(self):
+        # # 1d
+        put_mesh_shape = (2,)
+        get_mesh_shape = (4,)
 
-    #     placements = [Replicate()]
-    #     await self._test_resharding(
-    #         put_mesh_shape=put_mesh_shape,
-    #         put_placements=placements,
-    #         get_mesh_shape=get_mesh_shape,
-    #         get_placements=placements,
-    #     )
+        placements = [Replicate()]
+        await self._test_resharding(
+            put_mesh_shape=put_mesh_shape,
+            put_placements=placements,
+            get_mesh_shape=get_mesh_shape,
+            get_placements=placements,
+        )
 
-    #     # 2d -> 1d
-    #     put_mesh_shape = (2, 2)
-    #     get_mesh_shape = (4,)
-    #     await self._test_resharding(
-    #         put_mesh_shape=put_mesh_shape,
-    #         put_placements=[
-    #             Replicate(),
-    #             Shard(0),
-    #         ],  # maps to default for fsdp's fully_shard
-    #         get_mesh_shape=get_mesh_shape,
-    #         get_placements=[Shard(1)],
-    #     )
+        # 2d -> 1d
+        put_mesh_shape = (2, 2)
+        get_mesh_shape = (4,)
+        await self._test_resharding(
+            put_mesh_shape=put_mesh_shape,
+            put_placements=[
+                Replicate(),
+                Shard(0),
+            ],  # maps to default for fsdp's fully_shard
+            get_mesh_shape=get_mesh_shape,
+            get_placements=[Shard(1)],
+        )
 
     async def _test_resharding(
         self, put_mesh_shape, put_placements, get_mesh_shape, get_placements
