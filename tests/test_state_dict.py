@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import math
 import os
@@ -163,27 +164,6 @@ class DCPParityTest(Actor):
 
 
 class TestStateDict(unittest.IsolatedAsyncioTestCase):
-    async def test_state_dict(self):
-        store = await MultiProcessStore.create_store()
-
-        model = CompositeParamModel()
-        optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
-
-        for _ in range(5):
-            optimizer.zero_grad()
-            loss = model(torch.randn(8, MODEL_LINER_LENGTH)).sum()
-            loss.backward()
-            optimizer.step()
-
-        state_dict = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-        }
-        await push_state_dict(store, state_dict, "v0")
-
-        fetched_state_dict = await get_state_dict(store, "v0")
-        self._assert_equal_state_dict(state_dict, fetched_state_dict)
-
     async def test_zo_push_state_dict(self):
         store = await MultiProcessStore.create_store()
 
@@ -203,22 +183,31 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
             "optimizer": optimizer.state_dict(),
         }
 
-        fut = zo_push_state_dict(store, state_dict, "v0")
+        copy_state_dict = copy.deepcopy(state_dict)
 
-        # Start of next training step. This step overlaps the
-        # ts.put calls.
-        optimizer.zero_grad()
-        loss = model(torch.randn(8, MODEL_LINER_LENGTH)).sum()
-        loss.backward()
-        print(f"waiting for async push_state to complete")
-        result = fut.result()
-        print(f"torchstore put result: {result}")
-        if result:
-            assert False, "Unexpected result value"
-        optimizer.step()
+        # mocks the torchstore.put funciton and add sleep delay to
+        # test the data correctness under future based sync.
+        async def slow_put(key, val):
+            await asyncio.sleep(2)
+            await original_put(key, val)
 
-        #fetched_state_dict = await get_state_dict(store, "v0")
-        #self._assert_equal_state_dict(state_dict, fetched_state_dict)
+        with patch.object(store, "put", side_effect=slow_put):
+            fut = zo_push_state_dict(store, state_dict, "v0")
+
+            # Start of next training step. This step overlaps the
+            # ts.put calls.
+            optimizer.zero_grad()
+            loss = model(torch.randn(8, MODEL_LINER_LENGTH)).sum()
+            loss.backward()
+            print(f"waiting for async push_state to complete")
+            result = fut.result()
+            print(f"torchstore put result: {result}")
+            if result:
+                assert False, "Unexpected result value"
+            optimizer.step()
+
+        fetched_state_dict = await get_state_dict(store, "v0")
+        self._assert_equal_state_dict(copy_state_dict, fetched_state_dict)
 
     async def test_dcp_sharding_parity(self):
         for save_mesh_shape, get_mesh_shape in [

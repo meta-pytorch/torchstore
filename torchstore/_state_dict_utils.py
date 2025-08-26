@@ -1,6 +1,7 @@
 import asyncio
 from concurrent.futures import Future
 from logging import getLogger
+from time import sleep
 from typing import Optional
 
 import torch
@@ -38,6 +39,7 @@ def zo_push_state_dict(store, state_dict, key) -> Future[None]:
             asyncio.set_event_loop(event_loop)
             event_loop.run_until_complete(put_wrapper())
         finally:
+            logger.warning(f"[PUT_WRAPPER]Closing asyncio event loop")
             event_loop.close()
 
     with ThreadPoolExecutor(
