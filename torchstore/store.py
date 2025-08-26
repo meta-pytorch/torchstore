@@ -171,11 +171,16 @@ class CopyStore: # this just represents in memory. The alternative would be some
         """ """
         # TODO: handle messagte with objects != None
 
+        if message.objects is not None:
+            self.kv[key] = {"obj": message.objects}
+            return transport_buffer
+
         tensor = transport_buffer.read_into()
+        assert tensor is not None, "Tensor is None"
         if message.tensor_slice is not None:
             self._handle_dtensor(key, message.tensor_slice, tensor)
             return  
-        
+    
         self.kv[key] = tensor
 
     def get(self, key: str, transport_buffer: torch.Tensor, message: Message):
@@ -183,8 +188,12 @@ class CopyStore: # this just represents in memory. The alternative would be some
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
-        
-        # TODO: handle messagte with objects != None
+        #TODO: clean up
+        val = self.kv[key]
+        if isinstance(val, dict) and "obj" in val:
+            transport_buffer.is_object = False
+            transport_buffer.objects = val["obj"]
+            return transport_buffer
 
         if message.tensor_slice is None:
             transport_buffer.write_from(self.kv[key])
@@ -200,14 +209,14 @@ class CopyStore: # this just represents in memory. The alternative would be some
                 f"Not ready to serve full tensor yet for {key}: {self.kv[key]=}"
             )
 
-        logger.warn("Building local tensor")
+        logger.info("Building local tensor")
         # TODO: should probably be a view
         local_tensor = get_local_tensor(
             self.kv[key][FULL_TENSOR],
             message.tensor_slice.local_shape, #TODO: remove tensor_val from messages by setting coordinates_only=True in msg cstrct
             message.tensor_slice.offsets,
         )
-        logger.warn("done local tensor")
+        logger.info("done local tensor")
 
         transport_buffer.write_from(local_tensor)
 

@@ -1,5 +1,5 @@
 import torch
-
+from typing import Optional, Any
 
 try:
     from monarch.tensor_engine import is_available as monarch_rdma_available, RDMABuffer
@@ -14,6 +14,8 @@ def rdma_available():
 
 class TransportBuffer:
     finalize: bool = False
+    is_object: bool = False
+    objects: Optional[Any] = None
 
     def allocate(self, tensor) -> torch.Tensor:
         raise NotImplemented()

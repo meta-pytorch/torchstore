@@ -126,11 +126,8 @@ class Pipe:
     async def put_to_storage_volume(self, key, message: Message):
 
         transport_buffer = self.create_transport_buffer()
-
-        #TODO: handle tensor=None?
         tensor = message.tensor_val
         
-        #TODO: deal with tensor ref here., buffers now need to know how to deal with messages.
         transport_buffer.allocate(tensor) 
         transport_buffer.write_from(tensor)
         
@@ -160,11 +157,10 @@ class Pipe:
         )
         # buffer after being processed remotely
         recv_buffer = await self.storage_volume.get.call_one(key, send_buffer, message_without_tensor)
+        assert send_buffer is not None # it's important send_buffer is not GC'd before 'call_one'
 
-        # it's important send_buffer is not GC'd before 'call_one'
-        assert send_buffer is not None
-
-        #TODO: ok, another issue here is rdma transfer in the case of inplace_tensor = None
+        if recv_buffer.is_object:
+            return recv_buffer.objects
 
         # finialize -- only necessary for MonarchCommsBuffer
         # but in the case of rdma, this was already done remotely.
