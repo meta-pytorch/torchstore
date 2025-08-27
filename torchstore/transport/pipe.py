@@ -91,26 +91,6 @@ class Message:
 class Pipe:
     """
     Transport wrapper for communicating from local clients to storage volumes.
-    
-
-    Storage volumes roughl follow:
-    class StorageVolume(Actor):
-        @endpoint
-        def get(self, k, transport_buffer):
-            transport_buffer.write_from(self.kv[k])
-            return transport_buffer
-
-        @endpoint
-        def put(self, k, transport_buffer):
-            
-            if k not in self.kv:
-                fetched_tensor = transport_buffer.read_into() # should allocate on the fly
-                self.kv[k] = fetched_tensor
-            else: #inplace update
-                transport_buffer.read_into(self.kv[v])
-
-            return transport_buffer
-
     """
     def __init__(self, storage_volume) -> None:
         self.storage_volume = storage_volume
@@ -128,8 +108,8 @@ class Pipe:
         transport_buffer = self.create_transport_buffer()
         tensor = message.tensor_val
         
-        transport_buffer.allocate(tensor) 
-        transport_buffer.write_from(tensor)
+        tensor_ref = transport_buffer.allocate(tensor) 
+        await transport_buffer.write_from(tensor)
         
         # transporting tensors is handled by the buffer, so we don't want to send it 
         # via monarch RPC since that would generate considerable overhead
@@ -140,6 +120,7 @@ class Pipe:
         )
 
         await self.storage_volume.put.call_one(key, transport_buffer, message_without_tensor)
+        assert tensor_ref is not None #UGH, really tensor ref need to be in the buffer
 
     async def get_from_storage_volume(self, key, message: Message):
 
@@ -147,7 +128,15 @@ class Pipe:
         # maybe split out allocation, maybe don't
 
         send_buffer = self.create_transport_buffer()
-        tensor_ref = send_buffer.allocate(message.tensor_val)
+
+        # workaround until we develop streaming support. RDMA needs to know
+        # the size of the tensor so we can allocate the right amount of memory.
+        # locally. This is avoided if the operation is being done in place.
+        if send_buffer.requires_meta and message.tensor_val is None:
+            meta = await self.storage_volume.get_meta.call_one(key)
+            tensor_ref = send_buffer.allocate(meta) #TODO: prblem starts here.
+        else:
+            tensor_ref = send_buffer.allocate(message.tensor_val) #TODO: prblem starts here.
 
         # TODO: consider placing the buffer inside the message
         message_without_tensor = Message(

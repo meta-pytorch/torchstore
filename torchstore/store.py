@@ -79,12 +79,17 @@ class _MultiProcessClient(Actor): # this is the storage volume
         self.store = CopyStore()
 
     @endpoint
-    def put(self, key: str, transport_buffer: torch.Tensor, message: Message):
-        self.store.put(key, transport_buffer, message)
+    async def put(self, key: str, transport_buffer: torch.Tensor, message: Message):
+        await self.store.put(key, transport_buffer, message)
 
     @endpoint
-    def get(self, key: str, transport_buffer: torch.Tensor, message: Message):
-        return self.store.get(key, transport_buffer, message)
+    async def get(self, key: str, transport_buffer: torch.Tensor, message: Message):
+        return await self.store.get(key, transport_buffer, message)
+
+    @endpoint
+    async def get_meta(self, key: str):
+        return await self.store.get_meta(key)
+
 
 
 class CopyStore: # this just represents in memory. The alternative would be something like SSD
@@ -166,7 +171,7 @@ class CopyStore: # this just represents in memory. The alternative would be some
             "tensor": tensor
         }
 
-    def put(self, key: str, transport_buffer: torch.Tensor, message: Message):
+    async def put(self, key: str, transport_buffer: torch.Tensor, message: Message):
     # def put(self, key: str, value: torch.Tensor): #TODO: value -> transport_buffer
         """ """
         # TODO: handle messagte with objects != None
@@ -175,15 +180,14 @@ class CopyStore: # this just represents in memory. The alternative would be some
             self.kv[key] = {"obj": message.objects}
             return transport_buffer
 
-        tensor = transport_buffer.read_into()
-        assert tensor is not None, "Tensor is None"
+        tensor = await transport_buffer.read_into()
         if message.tensor_slice is not None:
             self._handle_dtensor(key, message.tensor_slice, tensor)
             return  
     
         self.kv[key] = tensor
 
-    def get(self, key: str, transport_buffer: torch.Tensor, message: Message):
+    async def get(self, key: str, transport_buffer: torch.Tensor, message: Message):
 
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
@@ -191,12 +195,12 @@ class CopyStore: # this just represents in memory. The alternative would be some
         #TODO: clean up
         val = self.kv[key]
         if isinstance(val, dict) and "obj" in val:
-            transport_buffer.is_object = False
+            transport_buffer.is_object = True
             transport_buffer.objects = val["obj"]
             return transport_buffer
 
         if message.tensor_slice is None:
-            transport_buffer.write_from(self.kv[key])
+            await transport_buffer.write_from(self.kv[key])
             return transport_buffer
 
         # Maps to "reshard on load"
@@ -221,3 +225,14 @@ class CopyStore: # this just represents in memory. The alternative would be some
         transport_buffer.write_from(local_tensor)
 
         return transport_buffer
+
+    async def get_meta(self, key: str):
+        if key not in self.kv:
+            raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
+
+        val = self.kv[key]
+        if isinstance(val, dict) and "obj" in val:
+            return "obj"
+
+        t = val if isinstance(val, dict) and "FULL_TENSOR" in val else val
+        return t.shape, t.dtype
