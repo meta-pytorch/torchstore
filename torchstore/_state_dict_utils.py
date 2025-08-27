@@ -42,10 +42,10 @@ def zo_push_state_dict(store, state_dict, key) -> Future[None]:
             logger.warning(f"[PUT_WRAPPER]Closing asyncio event loop")
             event_loop.close()
 
-    with ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="PUSH_STATE_DICT_IO"
-    ) as executor:
-        return executor.submit(work_fn, store, flattened_state_dict, mapping, key)
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="STATE_DICT_IO")
+    fut = executor.submit(work_fn, store, flattened_state_dict, mapping, key)
+    fut.add_done_callback(lambda f: executor.shutdown(wait=False))
+    return fut
 
 
 async def push_state_dict(store, state_dict, key):
