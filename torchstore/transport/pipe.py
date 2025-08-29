@@ -1,6 +1,10 @@
 from typing import Optional, Tuple, Any
 from dataclasses import dataclass
 
+import logging
+import sys
+from logging import getLogger
+
 import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
@@ -12,6 +16,11 @@ from torchstore.transport.buffers import (
     rdma_available
 )
 
+logger = getLogger(__name__)
+logger.root.setLevel(logging.DEBUG)
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.DEBUG)
+logger.root.addHandler(stdout_handler)
 
 
 @dataclass
@@ -30,6 +39,7 @@ class Message:
     tensor_val: Optional[torch.Tensor] = None
     tensor_slice: Optional[TensorSlice] = None
     objects: Optional[Any] = None # Any, but must be pickleable.
+    is_object: bool = False 
     
     @classmethod
     def from_any(cls, value: Any):
@@ -65,7 +75,6 @@ class Message:
         return cls(
             tensor_val=tensor,
             tensor_slice=tensor_slice,
-            objects=None,
         )
 
     @classmethod
@@ -74,7 +83,7 @@ class Message:
 
     @classmethod
     def from_objects(cls, objects):
-        return cls(objects=objects)
+        return cls(objects=objects, is_object=True)
 
     @classmethod
     def from_tensor_offsets(
@@ -95,9 +104,9 @@ class Pipe:
     def __init__(self, storage_volume) -> None:
         self.storage_volume = storage_volume
 
-    def create_transport_buffer(self) -> TransportBuffer:
+    def create_transport_buffer(self, force_monarch_comms=False) -> TransportBuffer:
         #TODO: eventually this should be dependent on the connections available to a storage_volume
-        if rdma_available():
+        if rdma_available() and not force_monarch_comms:
             buffer_cls = RDMATransportBuffer
         else:
             buffer_cls = MonarchTransportBuffer
@@ -105,7 +114,8 @@ class Pipe:
     
     async def put_to_storage_volume(self, key, message: Message):
 
-        transport_buffer = self.create_transport_buffer()
+        force_monarch_comms = message.tensor_val is not None and message.tensor_val.dim() == 0
+        transport_buffer = self.create_transport_buffer(force_monarch_comms=force_monarch_comms)
         tensor = message.tensor_val
         
         tensor_ref = transport_buffer.allocate(tensor) 
@@ -116,29 +126,32 @@ class Pipe:
         message_without_tensor = Message(
             tensor_val=None,
             tensor_slice=message.tensor_slice,
-            objects=message.objects
+            objects=message.objects,
+            is_object=message.is_object
         )
 
         await self.storage_volume.put.call_one(key, transport_buffer, message_without_tensor)
-        assert tensor_ref is not None #UGH, really tensor ref need to be in the buffer
-
+        if not message.is_object:
+            assert tensor_ref is not None, "it's important tensor_ref is not GC'd before 'storage_volume.put'"
     async def get_from_storage_volume(self, key, message: Message):
 
-        # passing a tensor here is only important so we can create the right buffer size
-        # maybe split out allocation, maybe don't
+        #TODO: monarch rdma buffers hate scalars, and this barely makes sense for rdma until we're
+        # streaming
+        force_monarch_comms = message.tensor_val is not None and message.tensor_val.dim() == 0
+        send_buffer = self.create_transport_buffer(force_monarch_comms=force_monarch_comms)
 
-        send_buffer = self.create_transport_buffer()
-
-        # workaround until we develop streaming support. RDMA needs to know
-        # the size of the tensor so we can allocate the right amount of memory.
-        # locally. This is avoided if the operation is being done in place.
+        # workaround until we develop streaming support. Certain buffers (RDMA) 
+        # need to know the size of the tensor so we can allocate the right 
+        # amount of memory locally. This can be avoided if the message
+        # contains a tensor slice.
         if send_buffer.requires_meta and message.tensor_val is None:
             meta = await self.storage_volume.get_meta.call_one(key)
-            tensor_ref = send_buffer.allocate(meta) #TODO: prblem starts here.
+            # passing a tensor here is only important so we can create the right buffer size        
+            tensor_ref = send_buffer.allocate(meta)
         else:
-            tensor_ref = send_buffer.allocate(message.tensor_val) #TODO: prblem starts here.
+            tensor_ref = send_buffer.allocate(message.tensor_val)
 
-        # TODO: consider placing the buffer inside the message
+        # TODO: consider placing the buffer inside the message or vice versa
         message_without_tensor = Message(
             tensor_val=None,
             tensor_slice=message.tensor_slice,
@@ -154,7 +167,11 @@ class Pipe:
         # finialize -- only necessary for MonarchCommsBuffer
         # but in the case of rdma, this was already done remotely.
         if recv_buffer.finalize:
-            # still a little confusing but close
-            tensor_ref = recv_buffer.read_into(tensor_ref) 
+            tensor_ref = await recv_buffer.read_into() 
+
+        # rdma buffer unfortunately is currently returning a copy for tensor_ref,
+        # which is not ideal. We should fix this.
+        if message.tensor_val is not None and id(tensor_ref) != id(message.tensor_val):
+            message.tensor_val.copy_(tensor_ref)
 
         return tensor_ref

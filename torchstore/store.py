@@ -1,5 +1,6 @@
 from itertools import product
 from logging import getLogger
+from threading import local
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -9,8 +10,14 @@ from torch.distributed.tensor import DTensor
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
 from torchstore.transport import Pipe, Message, TensorSlice
 
-
+import sys
+import logging
 logger = getLogger(__name__)
+
+logger.root.setLevel(logging.DEBUG)
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.DEBUG)
+logger.root.addHandler(stdout_handler)
 
 FULL_TENSOR = "full_tensor"
 
@@ -176,11 +183,13 @@ class CopyStore: # this just represents in memory. The alternative would be some
         """ """
         # TODO: handle messagte with objects != None
 
-        if message.objects is not None:
+        if message.is_object:
             self.kv[key] = {"obj": message.objects}
             return transport_buffer
 
-        tensor = await transport_buffer.read_into()
+        # since we pass tensor=None to the transport buffer,
+        # we allocate on the fly
+        tensor = await transport_buffer.read_into() 
         if message.tensor_slice is not None:
             self._handle_dtensor(key, message.tensor_slice, tensor)
             return  
@@ -221,8 +230,8 @@ class CopyStore: # this just represents in memory. The alternative would be some
             message.tensor_slice.offsets,
         )
         logger.info("done local tensor")
-
-        transport_buffer.write_from(local_tensor)
+        local_tensor = local_tensor.clone()
+        await transport_buffer.write_from(local_tensor)
 
         return transport_buffer
 

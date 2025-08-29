@@ -32,39 +32,57 @@ class RDMATransportBuffer(TransportBuffer):
     requires_meta: bool = True
 
     def __init__(self) -> None:
-        self.rdma_buff: Optional[RDMABuffer] = None
-        # self.tensor_buff:torch.Tensor = None 
-        #TODO: really keep it for defence reasons and dump it on pickle
+        self.rdma_buff: Optional[RDMABuffer] = None        
+        self.tensor_ref: Optional[torch.Tensor] = None
         self.shape = None
         self.dtype = None
 
-    def allocate(self, tensor) -> torch.Tensor:
-        
-        if isinstance(tensor, str):
-            return # is an object, ignore for now
+    def __getstate__(self) -> object:
+        state = self.__dict__.copy()
+        state["tensor_ref"] = None
+        return state
 
-        if isinstance(tensor, Tuple):
-            tensor = torch.empty(tensor[0], dtype=tensor[1])
-        
-        assert isinstance(tensor, torch.Tensor), f"{tensor=} is not a tensor"
-        
-        tensor_ref = torch.empty_like(tensor)
-        self.shape = tensor.shape
-        self.dtype = tensor.dtype
-        
-        self.rdma_buff = RDMABuffer(tensor_ref.view(torch.uint8).flatten())
-        return tensor_ref
+    def allocate(self, tensor) -> torch.Tensor:
+        #TODO: potentially pass Message object here directly.
+
+        if isinstance(tensor, str) or tensor is None:
+            return # is an object, ignore for now
+        elif isinstance(tensor, Tuple):
+            self.tensor_ref = torch.empty(tensor[0], dtype=tensor[1])
+        elif isinstance(tensor, torch.Tensor):
+            #TODO: avoid copy if tensor.is_contiguous()
+            self.tensor_ref = torch.empty_like(tensor)
+
+        assert isinstance(self.tensor_ref, torch.Tensor)
+        self.shape = self.tensor_ref.shape
+        self.dtype = self.tensor_ref.dtype
+
+        # Handle scalar tensors specially - they cannot be viewed as uint8 directly
+        # safe because t.squeeze/unsqueeze is a view.
+        t = self.tensor_ref if self.tensor_ref.dim() > 0 else self.tensor_ref.unsqueeze(0)
+        self.rdma_buff = RDMABuffer(t.view(torch.uint8).flatten())
+
+        return self.tensor_ref
 
 
     # send
-    async def read_into(self, tensor=None) -> torch.Tensor:
+    async def read_into(self, tensor=None) -> torch.Tensor:        
         if tensor is None:
             # allocate a tensor to return
+            print(f"{self.shape=} {self.dtype=}") 
             tensor = torch.empty(self.shape, dtype=self.dtype)
 
         assert tensor.is_contiguous()
         assert self.rdma_buff is not None
-        await self.rdma_buff.read_into(tensor.view(torch.uint8).flatten())
+        
+        # Handle scalar tensors specially
+        if tensor.dim() == 0:
+            # For scalar tensors, create a temporary 1-element tensor for RDMA
+            temp_tensor = tensor.unsqueeze(0)
+            await self.rdma_buff.read_into(temp_tensor.view(torch.uint8).flatten())
+            # The original scalar tensor is already updated since temp_tensor shares storage
+        else:
+            await self.rdma_buff.read_into(tensor.view(torch.uint8).flatten())
 
         return tensor
 
@@ -72,12 +90,26 @@ class RDMATransportBuffer(TransportBuffer):
     async def write_from(self, tensor) -> None:
         if tensor is None:
             return
-        # if I have tensor_buff copy"???
+
+        if self.tensor_ref is not None:
+            self.tensor_ref.copy_(tensor)
+            return
+
+        assert self.shape == tensor.shape, f"{self.shape} != {tensor.shape}"
+        assert self.dtype == tensor.dtype, f"{self.dtype} != {tensor.dtype}"
+
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+
         assert self.rdma_buff is not None
-        await self.rdma_buff.write_from(tensor.view(torch.uint8).flatten())
-
-
-
+        
+        # Handle scalar tensors specially
+        if tensor.dim() == 0:
+            # For scalar tensors, create a temporary 1-element tensor for RDMA
+            temp_tensor = tensor.unsqueeze(0)
+            await self.rdma_buff.write_from(temp_tensor.view(torch.uint8).flatten())
+        else:
+            await self.rdma_buff.write_from(tensor.view(torch.uint8).flatten())
 
 
 class MonarchTransportBuffer(TransportBuffer):

@@ -25,7 +25,9 @@ async def push_state_dict(store, state_dict, key):
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
     puts = []
     for flattened_key, value in flattened_state_dict.items():
-        puts.append(store.put(f"{key}{DELIM}{flattened_key}", value))
+        print(f"{value=}")
+        await store.put(f"{key}{DELIM}{flattened_key}", value)
+        # puts.append(store.put(f"{key}{DELIM}{flattened_key}", value))
     asyncio.gather(*puts)
 
     await store.put(f"{key}{DELIM}{MAPPING}", mapping)
