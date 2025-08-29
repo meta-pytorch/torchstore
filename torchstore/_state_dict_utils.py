@@ -25,7 +25,6 @@ async def push_state_dict(store, state_dict, key):
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
     puts = []
     for flattened_key, value in flattened_state_dict.items():
-        print(f"{value=}")
         await store.put(f"{key}{DELIM}{flattened_key}", value)
         # puts.append(store.put(f"{key}{DELIM}{flattened_key}", value))
     asyncio.gather(*puts)
@@ -58,7 +57,6 @@ async def get_state_dict(
     fetched_state_dict = {}
     for flattened_key in fetched_mapping.keys():
         inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
-        logger.info(f"Fetching {flattened_key} with {inplace_tensor=}")
         fetched_state_dict[flattened_key] = await store.get(
             f"{key}{DELIM}{flattened_key}",
             inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,

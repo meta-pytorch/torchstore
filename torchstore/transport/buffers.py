@@ -1,3 +1,5 @@
+import logging
+from sys import exc_info
 import torch
 from typing import Optional, Any, Tuple
 
@@ -11,6 +13,16 @@ except ImportError:
 
 def rdma_available():
     return monarch_rdma_available()
+
+import logging
+import sys
+logger = logging.getLogger(__name__)
+
+
+logger.root.setLevel(logging.DEBUG)
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.DEBUG)
+logger.root.addHandler(stdout_handler)
 
 
 class TransportBuffer:
@@ -103,13 +115,17 @@ class RDMATransportBuffer(TransportBuffer):
 
         assert self.rdma_buff is not None
         
-        # Handle scalar tensors specially
-        if tensor.dim() == 0:
-            # For scalar tensors, create a temporary 1-element tensor for RDMA
-            temp_tensor = tensor.unsqueeze(0)
-            await self.rdma_buff.write_from(temp_tensor.view(torch.uint8).flatten())
-        else:
-            await self.rdma_buff.write_from(tensor.view(torch.uint8).flatten())
+        try:
+            # Handle scalar tensors specially
+            if tensor.dim() == 0:
+                # For scalar tensors, create a temporary 1-element tensor for RDMA
+                temp_tensor = tensor.unsqueeze(0)
+                await self.rdma_buff.write_from(temp_tensor.view(torch.uint8).flatten())
+            else:
+                await self.rdma_buff.write_from(tensor.view(torch.uint8).flatten())
+        except Exception as e:
+            logging.exception(f"Failed to write, {self.shape=}, {self.dtype=}", exc_info=e)
+            raise e
 
 
 class MonarchTransportBuffer(TransportBuffer):

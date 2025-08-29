@@ -69,6 +69,7 @@ class ModelTest(Actor):
             "optimizer": optimizer.state_dict(),
         }
 
+        torch.distributed.barrier()
         self.rlog("pushing state dict")
         t = time.time()
         await push_state_dict(self.store, state_dict, "v0")
@@ -81,6 +82,8 @@ class ModelTest(Actor):
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
         }
+        
+        torch.distributed.barrier()
         self.rlog("getting state dict")
         t = time.time()
         await get_state_dict(self.store, "v0", state_dict)
@@ -112,8 +115,7 @@ class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
                 store=store,
                 mesh_shape=put_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "save_world"),
-            )
-            await put_world.do_push.call()
+            )            
 
             get_world_size = math.prod(get_mesh_shape)
             get_world = await spawn_actors(
@@ -124,7 +126,17 @@ class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
                 mesh_shape=get_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
+
+            t = time.perf_counter()
+            print("pushing state dict")
+
+            await put_world.do_push.call()
+
+            print(f"pushing state dict took: {time.perf_counter()-t} seconds")
+            t = time.perf_counter()
             await get_world.do_get.call()
+
+            print(f"getting state dict took: {time.perf_counter()-t} seconds")
 
 
 if __name__ == "__main__":
