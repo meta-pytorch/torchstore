@@ -48,7 +48,7 @@ class ModelTest(Actor):
     def build_model(self):
         self.rlog("building model")
         model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-3.1-8B", token=os.environ["HF_TOKEN"]
+            TEST_MODEL, token=os.environ["HF_TOKEN"]
         )
         if self.world_size > 1:
             self.initialize_distributed()
@@ -92,7 +92,7 @@ class ModelTest(Actor):
         self.rlog(f"got state dict in {time.time() - t} seconds")
 
 
-class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
+class TestHFModel(unittest.IsolatedAsyncioTestCase):
     async def test_basic(self):
         # FSDP
         put_mesh_shape = (1,)
