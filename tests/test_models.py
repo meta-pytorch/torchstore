@@ -19,6 +19,11 @@ from transformers import AutoModelForCausalLM
 logger = getLogger(__name__)
 
 
+assert os.environ.get("HF_TOKEN", None) is not None, "HF_TOKEN must be set"
+TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~2GB
+# TEST_MODEL = "meta-llama/Llama-3.1-8B" # ~ 16GB
+
+
 class ModelTest(Actor):
     def __init__(self, store, mesh_shape, file_store_name):
         self.rank = current_rank().rank
