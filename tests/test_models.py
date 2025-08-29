@@ -69,7 +69,8 @@ class ModelTest(Actor):
             "optimizer": optimizer.state_dict(),
         }
 
-        torch.distributed.barrier()
+        if self.world_size > 1:
+            torch.distributed.barrier()
         self.rlog("pushing state dict")
         t = time.time()
         await push_state_dict(self.store, state_dict, "v0")
@@ -83,7 +84,8 @@ class ModelTest(Actor):
             "optimizer": optimizer.state_dict(),
         }
         
-        torch.distributed.barrier()
+        if self.world_size > 1:
+            torch.distributed.barrier()
         self.rlog("getting state dict")
         t = time.time()
         await get_state_dict(self.store, "v0", state_dict)
