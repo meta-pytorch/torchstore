@@ -42,11 +42,6 @@ class DTensorActor(Actor):
         self.original_tensor = original_tensor
         self.placements = placements
         self.file_store_name = file_store_name
-
-        self.logger.root.setLevel(logging.DEBUG)
-        stdout_handler = logging.StreamHandler(sys.stdout)
-        stdout_handler.setLevel(logging.DEBUG)
-        self.logger.root.addHandler(stdout_handler)
         
 
         # this is only necessary for nccl, but we're not using it in this test.
@@ -54,7 +49,7 @@ class DTensorActor(Actor):
 
     def rlog(self, msg):
         # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
-        self.logger.info(f"rank: {self.rank} {msg}")
+        logger.info(f"rank: {self.rank} {msg}")
 
     def initialize_distributed(self):
         self.rlog(f"Initialize process group using {self.file_store_name=} ")

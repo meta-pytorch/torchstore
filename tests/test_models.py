@@ -11,10 +11,16 @@ from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
+from transformers import AutoModelForCausalLM
+
 from torchstore import MultiProcessStore
 from torchstore._state_dict_utils import get_state_dict, push_state_dict
 from torchstore.utils import spawn_actors
-from transformers import AutoModelForCausalLM
+from torchstore.logging import init_logging
+
+# Monarch data plane can be slow -- this essentially sets the 
+# max timeout for put/gets on store.
+os.environ["HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT_SECS"] = "600"
 
 logger = getLogger(__name__)
 
@@ -26,6 +32,7 @@ TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~2GB
 
 class ModelTest(Actor):
     def __init__(self, store, mesh_shape, file_store_name):
+        init_logging()
         self.rank = current_rank().rank
         self.store = store
         self.mesh_shape = mesh_shape
@@ -107,7 +114,7 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
     async def test_resharding(self):
         # FSDP
         put_mesh_shape = (4,)
-        get_mesh_shape = (8,)
+        get_mesh_shape = (4,)
         await self._do_test(put_mesh_shape, get_mesh_shape)
 
     async def _do_test(self, put_mesh_shape, get_mesh_shape):
@@ -147,4 +154,5 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__ == "__main__":
+    init_logging()
     unittest.main()

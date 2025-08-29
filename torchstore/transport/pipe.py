@@ -1,8 +1,5 @@
 from typing import Optional, Tuple, Any
 from dataclasses import dataclass
-
-import logging
-import sys
 from logging import getLogger
 
 import torch
@@ -17,11 +14,6 @@ from torchstore.transport.buffers import (
 )
 
 logger = getLogger(__name__)
-logger.root.setLevel(logging.DEBUG)
-stdout_handler = logging.StreamHandler(sys.stdout)
-stdout_handler.setLevel(logging.DEBUG)
-logger.root.addHandler(stdout_handler)
-
 
 @dataclass
 class TensorSlice:

@@ -3,10 +3,12 @@ import unittest
 from logging import getLogger
 
 import torch
+import math
 
 from monarch.actor import Actor, current_rank, endpoint
 
 from torchstore import MultiProcessStore
+from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
 logger = getLogger(__name__)
@@ -49,6 +51,33 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             expected = torch.tensor([pt.rank+1] * 10)
             assert torch.equal(expected, val), f"{expected} != {val}"
 
+    async def test_large_tensors(self):
+        """Test basic put/get functionality for multiple processes"""
+        class LargeTensorActor(Actor):
+            def __init__(self, store) -> None:
+                self.store=store
+                self.rank = current_rank().rank
+                init_logging()
+
+            @endpoint
+            async def put(self):
+
+                for n in range(1, 500, 100):
+                    shape = (1024, 1024 * n)                      
+                    size_bytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb
+                    logger.info(f"Testing {n=} {size_bytes=}")
+                    try:
+                        t = torch.randn(shape, dtype=torch.float32) 
+                        await self.store.put(self.rank, t)
+                    except Exception as e:
+                        logger.exception(f"Test failed with {size_bytes=}")
+                        raise e
+
+        store = await MultiProcessStore.create_store()
+        actor = await spawn_actors(1, LargeTensorActor, "large_tensor", store=store)
+        await actor.put.call_one()
+
+
     async def test_scalar(self):
         """Test basic put/get functionality for multiple processes"""
         store = await MultiProcessStore.create_store()
@@ -77,47 +106,5 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
                 torch.equal(t, fetched), f"{t} != {fetched} {inplace=}"
             )
 
-
-import torch
-import monarch
-from torchstore.utils import spawn_actors
-
-
-class Foo(Actor):
-
-    def __init__(self) -> None:
-        self.tensor = torch.rand(10)
-
-    @endpoint
-    async def get_tensor(self):
-        return self.tensor
-
-    @endpoint
-    async def source(self, rdma_buffer):
-        await rdma_buffer.write_from(self.tensor.view(torch.uint8).flatten())
-
-    @endpoint
-    async def destination(self, other_actor):
-        tensor = torch.rand(10)
-        rdma_buffer = monarch.tensor_engine.RDMABuffer(
-            tensor.view(torch.uint8).flatten()
-        )
-        await rdma_buffer.write_from(tensor.view(torch.uint8).flatten())
-
-        await other_actor.source.call_one(rdma_buffer)
-        other_tensor = await other_actor.get_tensor.call_one()
-
-        assert torch.equal(tensor, other_tensor)
-
-
-async def main():
-    actor_0 = await spawn_actors(1, Foo, "foo0")    
-    actor_1 = await spawn_actors(1, Foo, "foo1")
-
-    await actor_0.destination.call_one(actor_1)
-
-
 if __name__ == "__main__":
-    import asyncio
-    # asyncio.run(main())
     unittest.main()

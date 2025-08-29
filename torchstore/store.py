@@ -10,29 +10,11 @@ from torch.distributed.tensor import DTensor
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
 from torchstore.transport import Pipe, Message, TensorSlice
 
-import sys
-import logging
 logger = getLogger(__name__)
 
-logger.root.setLevel(logging.INFO)
-stdout_handler = logging.StreamHandler(sys.stdout)
-stdout_handler.setLevel(logging.INFO)
-logger.root.addHandler(stdout_handler)
 
 FULL_TENSOR = "full_tensor"
 
-
-
-# @dataclass
-# class DTensorPack:
-#     offsets: Tuple
-#     coordinates: Tuple
-#     local_tensor: torch.Tensor
-#     global_shape: Tuple
-#     mesh_shape: Tuple
-
-#     def __post_init__(self):
-#         self.coordinates = tuple(self.coordinates)
 
 class MultiProcessStore: # This is actually the local client
     """This class represents the local store, which exists on every process. Remote storage
@@ -58,7 +40,7 @@ class MultiProcessStore: # This is actually the local client
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
-        logger.info(f"Putting {key}")
+        logger.debug(f"Putting {key}")
 
         pipe = Pipe(self.client)
         message = Message.from_any(value)
@@ -70,7 +52,7 @@ class MultiProcessStore: # This is actually the local client
         # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
         # for now we'll copy into it after fetching from the remote store
 
-        logger.info(f"Fetching {key}")
+        logger.debug(f"Fetching {key}")
 
         pipe = Pipe(self.client)
         message = Message.from_any(inplace_tensor)

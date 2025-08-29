@@ -14,16 +14,6 @@ except ImportError:
 def rdma_available():
     return monarch_rdma_available()
 
-import logging
-import sys
-logger = logging.getLogger(__name__)
-
-
-logger.root.setLevel(logging.DEBUG)
-stdout_handler = logging.StreamHandler(sys.stdout)
-stdout_handler.setLevel(logging.DEBUG)
-logger.root.addHandler(stdout_handler)
-
 
 class TransportBuffer:
     finalize: bool = False
@@ -81,20 +71,39 @@ class RDMATransportBuffer(TransportBuffer):
     async def read_into(self, tensor=None) -> torch.Tensor:        
         if tensor is None:
             # allocate a tensor to return
-            print(f"{self.shape=} {self.dtype=}") 
             tensor = torch.empty(self.shape, dtype=self.dtype)
 
         assert tensor.is_contiguous()
         assert self.rdma_buff is not None
         
-        # Handle scalar tensors specially
-        if tensor.dim() == 0:
-            # For scalar tensors, create a temporary 1-element tensor for RDMA
-            temp_tensor = tensor.unsqueeze(0)
-            await self.rdma_buff.read_into(temp_tensor.view(torch.uint8).flatten())
-            # The original scalar tensor is already updated since temp_tensor shares storage
-        else:
-            await self.rdma_buff.read_into(tensor.view(torch.uint8).flatten())
+        try:
+            # scalars are special
+            t = tensor if tensor.dim() > 0 else tensor.unsqueeze(0)
+            t_bytes = t.view(torch.uint8).flatten()
+            
+            # Handle large tensors by chunking (500MB limit)
+            MAX_CHUNK_SIZE = 500 * 1024 * 1024  # 500MB in bytes
+            total_bytes = t_bytes.numel()
+            print("-"*50 +"\n")
+            print(f"{total_bytes=} {t_bytes.numel()=}")
+              
+            if total_bytes <= MAX_CHUNK_SIZE:
+                await self.rdma_buff.read_into(t_bytes)
+            else:
+                # Process in chunks - read from RDMA buffer in chunks into destination tensor
+                offset = 0
+                while offset < total_bytes:
+                    chunk_size = min(MAX_CHUNK_SIZE, total_bytes - offset)
+                    chunk = t_bytes[offset:offset + chunk_size]
+                    
+                    print(f"{chunk_size=} {chunk.element_size()=} {chunk.numel()=} {offset=} {chunk.untyped_storage().data_ptr()=}")
+                    
+                    await self.rdma_buff.read_into(chunk, offset)
+                    offset += chunk_size
+            
+        except Exception as e:
+            logging.exception(f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e)
+            raise e
 
         return tensor
 
@@ -116,13 +125,25 @@ class RDMATransportBuffer(TransportBuffer):
         assert self.rdma_buff is not None
         
         try:
-            # Handle scalar tensors specially
-            if tensor.dim() == 0:
-                # For scalar tensors, create a temporary 1-element tensor for RDMA
-                temp_tensor = tensor.unsqueeze(0)
-                await self.rdma_buff.write_from(temp_tensor.view(torch.uint8).flatten())
+            # scalars are special
+            t = tensor if tensor.dim() > 0 else tensor.unsqueeze(0)
+            t_bytes = t.view(torch.uint8).flatten()
+            
+            # Handle large tensors by chunking (500MB limit)
+            MAX_CHUNK_SIZE = 500 * 1024 * 1024  # 500MB in bytes
+            total_bytes = t_bytes.numel()
+            
+            if total_bytes <= MAX_CHUNK_SIZE:
+                await self.rdma_buff.write_from(t_bytes)
             else:
-                await self.rdma_buff.write_from(tensor.view(torch.uint8).flatten())
+                # Process in chunks - write to RDMA buffer in chunks from source tensor
+                offset = 0
+                while offset < total_bytes:
+                    chunk_size = min(MAX_CHUNK_SIZE, total_bytes - offset)
+                    chunk = t_bytes[offset:offset + chunk_size]
+                    await self.rdma_buff.write_from(chunk, offset)
+                    offset += chunk_size
+                    
         except Exception as e:
             logging.exception(f"Failed to write, {self.shape=}, {self.dtype=}", exc_info=e)
             raise e
