@@ -97,12 +97,12 @@ class ModelTest(Actor):
         self.rlog(f"got state dict in {time.time() - t} seconds")
 
 
-class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
-    # async def test_basic(self):
-    #     # FSDP
-    #     put_mesh_shape = (1,)
-    #     get_mesh_shape = (1,)
-    #     await self._do_test(put_mesh_shape, get_mesh_shape)
+class TestHFModel(unittest.IsolatedAsyncioTestCase):
+    async def test_basic(self):
+        # FSDP
+        put_mesh_shape = (1,)
+        get_mesh_shape = (1,)
+        await self._do_test(put_mesh_shape, get_mesh_shape)
 
     async def test_resharding(self):
         # FSDP
