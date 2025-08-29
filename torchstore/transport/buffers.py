@@ -81,25 +81,27 @@ class RDMATransportBuffer(TransportBuffer):
             t = tensor if tensor.dim() > 0 else tensor.unsqueeze(0)
             t_bytes = t.view(torch.uint8).flatten()
             
-            # Handle large tensors by chunking (500MB limit)
-            MAX_CHUNK_SIZE = 500 * 1024 * 1024  # 500MB in bytes
-            total_bytes = t_bytes.numel()
-            print("-"*50 +"\n")
-            print(f"{total_bytes=} {t_bytes.numel()=}")
+            await self.rdma_buff.read_into(t_bytes)
+
+            # # Handle large tensors by chunking (500MB limit)
+            # MAX_CHUNK_SIZE = 500 * 1024 * 1024  # 500MB in bytes
+            # total_bytes = t_bytes.numel()
+            # print("-"*50 +"\n")
+            # print(f"{total_bytes=} {t_bytes.numel()=}")
               
-            if total_bytes <= MAX_CHUNK_SIZE:
-                await self.rdma_buff.read_into(t_bytes)
-            else:
-                # Process in chunks - read from RDMA buffer in chunks into destination tensor
-                offset = 0
-                while offset < total_bytes:
-                    chunk_size = min(MAX_CHUNK_SIZE, total_bytes - offset)
-                    chunk = t_bytes[offset:offset + chunk_size]
+            # if total_bytes <= MAX_CHUNK_SIZE:
+            #     await self.rdma_buff.read_into(t_bytes)
+            # else:
+            #     # Process in chunks - read from RDMA buffer in chunks into destination tensor
+            #     offset = 0
+            #     while offset < total_bytes:
+            #         chunk_size = min(MAX_CHUNK_SIZE, total_bytes - offset)
+            #         chunk = t_bytes[offset:offset + chunk_size]
                     
-                    print(f"{chunk_size=} {chunk.element_size()=} {chunk.numel()=} {offset=} {chunk.untyped_storage().data_ptr()=}")
+            #         print(f"{chunk_size=} {chunk.element_size()=} {chunk.numel()=} {offset=} {chunk.untyped_storage().data_ptr()=}")
                     
-                    await self.rdma_buff.read_into(chunk, offset)
-                    offset += chunk_size
+            #         await self.rdma_buff.read_into(chunk, offset)
+            #         offset += chunk_size
             
         except Exception as e:
             logging.exception(f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e)

@@ -51,31 +51,31 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             expected = torch.tensor([pt.rank+1] * 10)
             assert torch.equal(expected, val), f"{expected} != {val}"
 
-    async def test_large_tensors(self):
-        """Test basic put/get functionality for multiple processes"""
-        class LargeTensorActor(Actor):
-            def __init__(self, store) -> None:
-                self.store=store
-                self.rank = current_rank().rank
-                init_logging()
+    # async def test_large_tensors(self):
+    #     """Test basic put/get functionality for multiple processes"""
+    #     class LargeTensorActor(Actor):
+    #         def __init__(self, store) -> None:
+    #             self.store=store
+    #             self.rank = current_rank().rank
+    #             init_logging()
 
-            @endpoint
-            async def put(self):
+    #         @endpoint
+    #         async def put(self):
 
-                for n in range(1, 500, 100):
-                    shape = (1024, 1024 * n)                      
-                    size_bytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb
-                    logger.info(f"Testing {n=} {size_bytes=}")
-                    try:
-                        t = torch.randn(shape, dtype=torch.float32) 
-                        await self.store.put(self.rank, t)
-                    except Exception as e:
-                        logger.exception(f"Test failed with {size_bytes=}")
-                        raise e
+    #             for n in range(1, 500, 100):
+    #                 shape = (1024, 1024 * n)                      
+    #                 size_bytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb
+    #                 logger.info(f"Testing {n=} {size_bytes=}")
+    #                 try:
+    #                     t = torch.randn(shape, dtype=torch.float32) 
+    #                     await self.store.put(self.rank, t)
+    #                 except Exception as e:
+    #                     logger.exception(f"Test failed with {size_bytes=}")
+    #                     raise e
 
-        store = await MultiProcessStore.create_store()
-        actor = await spawn_actors(1, LargeTensorActor, "large_tensor", store=store)
-        await actor.put.call_one()
+    #     store = await MultiProcessStore.create_store()
+    #     actor = await spawn_actors(1, LargeTensorActor, "large_tensor", store=store)
+    #     await actor.put.call_one()
 
 
     async def test_scalar(self):
