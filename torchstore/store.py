@@ -14,9 +14,9 @@ import sys
 import logging
 logger = getLogger(__name__)
 
-logger.root.setLevel(logging.DEBUG)
+logger.root.setLevel(logging.INFO)
 stdout_handler = logging.StreamHandler(sys.stdout)
-stdout_handler.setLevel(logging.DEBUG)
+stdout_handler.setLevel(logging.INFO)
 logger.root.addHandler(stdout_handler)
 
 FULL_TENSOR = "full_tensor"
@@ -105,7 +105,7 @@ class CopyStore: # this just represents in memory. The alternative would be some
         self.kv: Dict[str, Any] = {}
 
     def _build_full_tensor(self, key: str):
-        logger.warn(f"Building full tensor for {key}")
+        logger.debug(f"Building full tensor for {key}")
         # we can also consider in the future not requiring the full tensor to be
         # assembled, and instead only that the requested offsets are available
         # this is a performance optimization, but could be tricky to implement.
@@ -148,7 +148,7 @@ class CopyStore: # this just represents in memory. The alternative would be some
         )
 
         self.kv[key] = {FULL_TENSOR: full_tensor}
-        logger.warn(f"Finished full tensor for {key}")
+        logger.debug(f"Finished full tensor for {key}")
 
     def _has_full_tensor(self, key: str) -> bool:
         if key not in self.kv:
@@ -222,14 +222,14 @@ class CopyStore: # this just represents in memory. The alternative would be some
                 f"Not ready to serve full tensor yet for {key}: {self.kv[key]=}"
             )
 
-        logger.info("Building local tensor")
+        logger.debug("Building local tensor")
         # TODO: should probably be a view
         local_tensor = get_local_tensor(
             self.kv[key][FULL_TENSOR],
             message.tensor_slice.local_shape, #TODO: remove tensor_val from messages by setting coordinates_only=True in msg cstrct
             message.tensor_slice.offsets,
         )
-        logger.info("done local tensor")
+        logger.debug("done local tensor")
         local_tensor = local_tensor.clone()
         await transport_buffer.write_from(local_tensor)
 
