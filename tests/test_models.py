@@ -19,6 +19,11 @@ from transformers import AutoModelForCausalLM
 logger = getLogger(__name__)
 
 
+assert os.environ.get("HF_TOKEN", None) is not None, "HF_TOKEN must be set"
+TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~2GB
+# TEST_MODEL = "meta-llama/Llama-3.1-8B" # ~ 16GB
+
+
 class ModelTest(Actor):
     def __init__(self, store, mesh_shape, file_store_name):
         self.rank = current_rank().rank
@@ -43,7 +48,7 @@ class ModelTest(Actor):
     def build_model(self):
         self.rlog("building model")
         model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-3.1-8B", token=os.environ["HF_TOKEN"]
+            TEST_MODEL, token=os.environ["HF_TOKEN"]
         )
         if self.world_size > 1:
             self.initialize_distributed()
@@ -87,7 +92,7 @@ class ModelTest(Actor):
         self.rlog(f"got state dict in {time.time() - t} seconds")
 
 
-class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
+class TestHFModel(unittest.IsolatedAsyncioTestCase):
     async def test_basic(self):
         # FSDP
         put_mesh_shape = (1,)
@@ -125,7 +130,6 @@ class TestLlama3_8b(unittest.IsolatedAsyncioTestCase):
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
             await get_world.do_get.call()
-
 
 if __name__ == "__main__":
     unittest.main()
