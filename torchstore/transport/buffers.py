@@ -1,3 +1,4 @@
+import os
 import logging
 from typing import Optional, Any, Tuple, List
 
@@ -13,6 +14,10 @@ except ImportError:
 def rdma_available():
     return monarch_rdma_available()
 
+
+RDMDA_CHUNK_SIZE_MB= int(
+    os.environ.get("RDMDA_CHUNK_SIZE_MB", "512")
+)
 
 class TransportBuffer:
     finalize: bool = False
@@ -50,9 +55,10 @@ class RDMATransportBuffer(TransportBuffer):
         return state
 
     def _create_byte_views_from_tensor(self, tensor) -> List[torch.Tensor]:
-
+        if tensor.dim()==0:
+            tensor = tensor.unsqueeze(0)
         byte_view = tensor.view(torch.uint8).flatten()
-        chunk_size = 536870912 # 512 * 1024 * 1024
+        chunk_size = RDMDA_CHUNK_SIZE_MB * 1024 * 1024
         offset = 0
         tensor_chunks = []
         while offset < byte_view.numel():
@@ -70,22 +76,21 @@ class RDMATransportBuffer(TransportBuffer):
         elif isinstance(tensor, Tuple): #TODO: fix this shit
             # nothing was passed inplace, so we need to allocate some memory here
             tensor = torch.empty(tensor[0], dtype=tensor[1]) 
-            
-        assert isinstance(tensor, torch.Tensor)                
+        else:
+            tensor = torch.empty_like(tensor)
+
+        assert isinstance(tensor, torch.Tensor)    
+        assert tensor.is_contiguous()            
         self.shape = tensor.shape
         self.dtype = tensor.dtype
         self.dim = tensor.dim()
+        logging.debug(f"{self.shape=} {self.dtype=} {self.dim=}")
 
         # special handling for scalars
-        # t = tensor if self.tensor_ref.dim() > 0 else tensor.unsqueeze(0)
-
-        # byte_view_chunks = [tensor.view(torch.uint8).flatten()[0:100000000000000]]
         byte_view_chunks = self._create_byte_views_from_tensor(tensor)
         self.tensor_ref = [torch.empty_like(chunk) for chunk in byte_view_chunks]
         self.rdma_buff = [RDMABuffer(chunk) for chunk in self.tensor_ref]
-        logging.debug(f"{len(self.rdma_buff)=}")
-
-        return tensor
+        logging.debug(f"Allocted {len(self.rdma_buff)} rdma buffers")
 
     def update(self, other_buffer):
         super().update(other_buffer)
@@ -115,8 +120,6 @@ class RDMATransportBuffer(TransportBuffer):
         # the rdma buffer
 
         try:
-            # scalars are special
-            # t = tensor if tensor.dim() > 0 else tensor.unsqueeze(0)
             for idx, chunk in enumerate(chunked_byte_view):
                 await self.rdma_buff[idx].read_into(chunk)
             
@@ -144,13 +147,8 @@ class RDMATransportBuffer(TransportBuffer):
 
         assert self.shape == tensor.shape, f"{self.shape} != {tensor.shape}"
         assert self.dtype == tensor.dtype, f"{self.dtype} != {tensor.dtype}"
-
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
-
         assert self.rdma_buff is not None
         
-        # t = tensor if tensor.dim() > 0 else tensor.unsqueeze(0)
         chunked_byte_view = self._create_byte_views_from_tensor(tensor)
 
         for idx, chunk in enumerate(chunked_byte_view):

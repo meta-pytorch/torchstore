@@ -96,18 +96,16 @@ class Pipe:
     def __init__(self, storage_volume) -> None:
         self.storage_volume = storage_volume
 
-    def create_transport_buffer(self, force_monarch_comms=False) -> TransportBuffer:
+    def create_transport_buffer(self) -> TransportBuffer:
         #TODO: eventually this should be dependent on the connections available to a storage_volume
-        if rdma_available() and not force_monarch_comms:
+        if rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
             buffer_cls = MonarchTransportBuffer
         return buffer_cls()
     
     async def put_to_storage_volume(self, key, message: Message):
-
-        force_monarch_comms = message.tensor_val is not None and message.tensor_val.dim() == 0
-        transport_buffer = self.create_transport_buffer(force_monarch_comms=force_monarch_comms)
+        transport_buffer = self.create_transport_buffer()
         tensor = message.tensor_val
         
         tensor_ref = transport_buffer.allocate(tensor) 
@@ -123,15 +121,10 @@ class Pipe:
         )
 
         await self.storage_volume.put.call_one(key, transport_buffer, message_without_tensor)
-        if not message.is_object:
-            assert tensor_ref is not None, "it's important tensor_ref is not GC'd before 'storage_volume.put'"
     
     async def get_from_storage_volume(self, key, message: Message):
 
-        #TODO: monarch rdma buffers hate scalars, and this barely makes sense for rdma until we're
-        # streaming
-        force_monarch_comms = message.tensor_val is not None and message.tensor_val.dim() == 0
-        transport_buffer = self.create_transport_buffer(force_monarch_comms=force_monarch_comms)
+        transport_buffer = self.create_transport_buffer()
 
         # workaround until we develop streaming support. Certain buffers (RDMA) 
         # need to know the size of the tensor so we can allocate the right 
@@ -162,5 +155,4 @@ class Pipe:
         if transport_buffer.is_object:
             return transport_buffer.objects
 
-        # return message.tensor_val
         return await transport_buffer.read_into(message.tensor_val)

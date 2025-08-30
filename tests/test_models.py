@@ -83,6 +83,7 @@ class ModelTest(Actor):
 
         if self.world_size > 1:
             torch.distributed.barrier()
+
         self.rlog("pushing state dict")
         t = time.time()
         await push_state_dict(self.store, state_dict, "v0")
