@@ -2,7 +2,7 @@ from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from monarch.actor import proc_mesh, this_host
+from monarch.actor import proc_mesh#, this_host
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType

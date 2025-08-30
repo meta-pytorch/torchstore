@@ -2,9 +2,9 @@ import os
 import sys
 import logging
 def init_logging():
-
     log_level = os.environ.get("TORCHSTORE_LOG_LEVEL", "INFO")
+    log_level = "DEBUG"
     logging.root.setLevel(log_level)
     stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setLevel(logging.DEBUG)
+    stdout_handler.setLevel(log_level)
     logging.root.addHandler(stdout_handler)

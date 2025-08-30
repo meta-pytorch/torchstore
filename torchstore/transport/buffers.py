@@ -1,8 +1,7 @@
 import logging
-from sys import exc_info
-import torch
-from typing import Optional, Any, Tuple
+from typing import Optional, Any, Tuple, List
 
+import torch
 try:
     from monarch.tensor_engine import is_available as monarch_rdma_available, RDMABuffer
 except ImportError:
@@ -20,6 +19,12 @@ class TransportBuffer:
     is_object: bool = False
     objects: Optional[Any] = None
     requires_meta: bool = False
+
+    def update(self, other_buffer) -> None:
+        self.finalize = other_buffer.finalize
+        self.is_object = other_buffer.is_object
+        self.objects = other_buffer.objects
+        self.requires_meta = other_buffer.requires_meta
 
     def allocate(self, tensor) -> torch.Tensor:
         raise NotImplemented()
@@ -44,64 +49,76 @@ class RDMATransportBuffer(TransportBuffer):
         state["tensor_ref"] = None
         return state
 
+    def _create_byte_views_from_tensor(self, tensor) -> List[torch.Tensor]:
+
+        byte_view = tensor.view(torch.uint8).flatten()
+        chunk_size = 536870912 # 512 * 1024 * 1024
+        offset = 0
+        tensor_chunks = []
+        while offset < byte_view.numel():
+            tensor_chunks.append(byte_view[offset:offset + chunk_size])
+            offset += chunk_size
+
+        return tensor_chunks
+
     def allocate(self, tensor) -> torch.Tensor:
+        logging.debug("Allocating rdma buffer")
         #TODO: potentially pass Message object here directly.
 
         if isinstance(tensor, str) or tensor is None:
             return # is an object, ignore for now
-        elif isinstance(tensor, Tuple):
-            self.tensor_ref = torch.empty(tensor[0], dtype=tensor[1])
-        elif isinstance(tensor, torch.Tensor):
-            #TODO: avoid copy if tensor.is_contiguous()
-            self.tensor_ref = torch.empty_like(tensor)
+        elif isinstance(tensor, Tuple): #TODO: fix this shit
+            # nothing was passed inplace, so we need to allocate some memory here
+            tensor = torch.empty(tensor[0], dtype=tensor[1]) 
+            
+        assert isinstance(tensor, torch.Tensor)                
+        self.shape = tensor.shape
+        self.dtype = tensor.dtype
+        self.dim = tensor.dim()
 
-        assert isinstance(self.tensor_ref, torch.Tensor)
-        self.shape = self.tensor_ref.shape
-        self.dtype = self.tensor_ref.dtype
+        # special handling for scalars
+        # t = tensor if self.tensor_ref.dim() > 0 else tensor.unsqueeze(0)
 
-        # Handle scalar tensors specially - they cannot be viewed as uint8 directly
-        # safe because t.squeeze/unsqueeze is a view.
-        t = self.tensor_ref if self.tensor_ref.dim() > 0 else self.tensor_ref.unsqueeze(0)
-        self.rdma_buff = RDMABuffer(t.view(torch.uint8).flatten())
+        # byte_view_chunks = [tensor.view(torch.uint8).flatten()[0:100000000000000]]
+        byte_view_chunks = self._create_byte_views_from_tensor(tensor)
+        self.tensor_ref = [torch.empty_like(chunk) for chunk in byte_view_chunks]
+        self.rdma_buff = [RDMABuffer(chunk) for chunk in self.tensor_ref]
+        logging.debug(f"{len(self.rdma_buff)=}")
 
-        return self.tensor_ref
+        return tensor
 
+    def update(self, other_buffer):
+        super().update(other_buffer)
 
     # send
-    async def read_into(self, tensor=None) -> torch.Tensor:        
+    async def read_into(self, tensor=None) -> torch.Tensor:     
         if tensor is None:
             # allocate a tensor to return
             tensor = torch.empty(self.shape, dtype=self.dtype)
 
+        #TODO: assert safe
+        assert tensor.dtype == self.dtype, f"{tensor.dtype} != {self.dtype}"
+        assert tensor.shape == self.shape, f"{tensor.shape} != {self.shape}"
         assert tensor.is_contiguous()
         assert self.rdma_buff is not None
         
+        chunked_byte_view = self._create_byte_views_from_tensor(tensor)
+        
+        # if we have tensor refs locally, we're still in the local case,
+        # and we're just copying over our chunks into the tensor from
+        # local memory
+        if self.tensor_ref is not None:
+            for idx, chunk in enumerate(chunked_byte_view):
+                chunk.copy_(self.tensor_ref[idx])
+            return tensor
+        # else: we are in the remote case (in a different process), and must read from 
+        # the rdma buffer
+
         try:
             # scalars are special
-            t = tensor if tensor.dim() > 0 else tensor.unsqueeze(0)
-            t_bytes = t.view(torch.uint8).flatten()
-            
-            await self.rdma_buff.read_into(t_bytes)
-
-            # # Handle large tensors by chunking (500MB limit)
-            # MAX_CHUNK_SIZE = 500 * 1024 * 1024  # 500MB in bytes
-            # total_bytes = t_bytes.numel()
-            # print("-"*50 +"\n")
-            # print(f"{total_bytes=} {t_bytes.numel()=}")
-              
-            # if total_bytes <= MAX_CHUNK_SIZE:
-            #     await self.rdma_buff.read_into(t_bytes)
-            # else:
-            #     # Process in chunks - read from RDMA buffer in chunks into destination tensor
-            #     offset = 0
-            #     while offset < total_bytes:
-            #         chunk_size = min(MAX_CHUNK_SIZE, total_bytes - offset)
-            #         chunk = t_bytes[offset:offset + chunk_size]
-                    
-            #         print(f"{chunk_size=} {chunk.element_size()=} {chunk.numel()=} {offset=} {chunk.untyped_storage().data_ptr()=}")
-                    
-            #         await self.rdma_buff.read_into(chunk, offset)
-            #         offset += chunk_size
+            # t = tensor if tensor.dim() > 0 else tensor.unsqueeze(0)
+            for idx, chunk in enumerate(chunked_byte_view):
+                await self.rdma_buff[idx].read_into(chunk)
             
         except Exception as e:
             logging.exception(f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e)
@@ -114,9 +131,16 @@ class RDMATransportBuffer(TransportBuffer):
         if tensor is None:
             return
 
+        # if we have tensor refs locally, we're still in the local case,
+        # and we're just copying over our chunks into the tensor from
+        # local memory
         if self.tensor_ref is not None:
-            self.tensor_ref.copy_(tensor)
+            chunked_byte_view = self._create_byte_views_from_tensor(tensor)
+            for idx, chunk in enumerate(chunked_byte_view):
+                self.tensor_ref[idx].copy_(chunk)            
             return
+        # else: we are in the remote case (in a different process), and must read from 
+        # the rdma buffer
 
         assert self.shape == tensor.shape, f"{self.shape} != {tensor.shape}"
         assert self.dtype == tensor.dtype, f"{self.dtype} != {tensor.dtype}"
@@ -126,29 +150,11 @@ class RDMATransportBuffer(TransportBuffer):
 
         assert self.rdma_buff is not None
         
-        try:
-            # scalars are special
-            t = tensor if tensor.dim() > 0 else tensor.unsqueeze(0)
-            t_bytes = t.view(torch.uint8).flatten()
-            
-            # Handle large tensors by chunking (500MB limit)
-            MAX_CHUNK_SIZE = 500 * 1024 * 1024  # 500MB in bytes
-            total_bytes = t_bytes.numel()
-            
-            if total_bytes <= MAX_CHUNK_SIZE:
-                await self.rdma_buff.write_from(t_bytes)
-            else:
-                # Process in chunks - write to RDMA buffer in chunks from source tensor
-                offset = 0
-                while offset < total_bytes:
-                    chunk_size = min(MAX_CHUNK_SIZE, total_bytes - offset)
-                    chunk = t_bytes[offset:offset + chunk_size]
-                    await self.rdma_buff.write_from(chunk, offset)
-                    offset += chunk_size
-                    
-        except Exception as e:
-            logging.exception(f"Failed to write, {self.shape=}, {self.dtype=}", exc_info=e)
-            raise e
+        # t = tensor if tensor.dim() > 0 else tensor.unsqueeze(0)
+        chunked_byte_view = self._create_byte_views_from_tensor(tensor)
+
+        for idx, chunk in enumerate(chunked_byte_view):
+            await self.rdma_buff[idx].write_from(chunk)
 
 
 class MonarchTransportBuffer(TransportBuffer):
@@ -166,7 +172,7 @@ class MonarchTransportBuffer(TransportBuffer):
         return tensor
 
     # send
-    async def read_into(self,tensor=None):
+    async def read_into(self, tensor=None):
         if tensor is not None:
             # if there is a tensor here, likely this is the 'inplace' case,
             # and we should return back a ptr to the original tensor
@@ -180,3 +186,7 @@ class MonarchTransportBuffer(TransportBuffer):
     # recv
     async def write_from(self, tensor):
         self.tensor = tensor
+
+    def update(self, other_buffer):
+        super().update(other_buffer)
+        self.tensor = other_buffer.tensor

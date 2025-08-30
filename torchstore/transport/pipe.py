@@ -125,23 +125,24 @@ class Pipe:
         await self.storage_volume.put.call_one(key, transport_buffer, message_without_tensor)
         if not message.is_object:
             assert tensor_ref is not None, "it's important tensor_ref is not GC'd before 'storage_volume.put'"
+    
     async def get_from_storage_volume(self, key, message: Message):
 
         #TODO: monarch rdma buffers hate scalars, and this barely makes sense for rdma until we're
         # streaming
         force_monarch_comms = message.tensor_val is not None and message.tensor_val.dim() == 0
-        send_buffer = self.create_transport_buffer(force_monarch_comms=force_monarch_comms)
+        transport_buffer = self.create_transport_buffer(force_monarch_comms=force_monarch_comms)
 
         # workaround until we develop streaming support. Certain buffers (RDMA) 
         # need to know the size of the tensor so we can allocate the right 
         # amount of memory locally. This can be avoided if the message
         # contains a tensor slice.
-        if send_buffer.requires_meta and message.tensor_val is None:
+        if transport_buffer.requires_meta and message.tensor_val is None:
             meta = await self.storage_volume.get_meta.call_one(key)
             # passing a tensor here is only important so we can create the right buffer size        
-            tensor_ref = send_buffer.allocate(meta)
+            transport_buffer.allocate(meta)
         else:
-            tensor_ref = send_buffer.allocate(message.tensor_val)
+            transport_buffer.allocate(message.tensor_val)
 
         # TODO: consider placing the buffer inside the message or vice versa
         message_without_tensor = Message(
@@ -150,20 +151,16 @@ class Pipe:
             objects=message.objects
         )
         # buffer after being processed remotely
-        recv_buffer = await self.storage_volume.get.call_one(key, send_buffer, message_without_tensor)
-        assert send_buffer is not None # it's important send_buffer is not GC'd before 'call_one'
+        transport_buffer.update(
+            await self.storage_volume.get.call_one(
+                key,
+                transport_buffer,
+                message_without_tensor
+            )
+        )
 
-        if recv_buffer.is_object:
-            return recv_buffer.objects
+        if transport_buffer.is_object:
+            return transport_buffer.objects
 
-        # finialize -- only necessary for MonarchCommsBuffer
-        # but in the case of rdma, this was already done remotely.
-        if recv_buffer.finalize:
-            tensor_ref = await recv_buffer.read_into() 
-
-        # rdma buffer unfortunately is currently returning a copy for tensor_ref,
-        # which is not ideal. We should fix this.
-        if message.tensor_val is not None and id(tensor_ref) != id(message.tensor_val):
-            message.tensor_val.copy_(tensor_ref)
-
-        return tensor_ref
+        # return message.tensor_val
+        return await transport_buffer.read_into(message.tensor_val)
