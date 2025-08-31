@@ -1,6 +1,7 @@
 from typing import Optional, Tuple, Any
 from dataclasses import dataclass
 from logging import getLogger
+import os
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -14,6 +15,8 @@ from torchstore.transport.buffers import (
 )
 
 logger = getLogger(__name__)
+
+RDMA_ENABLED = os.environ.get("RDMA_AVAILABLE", "1") == "1"
 
 @dataclass
 class TensorSlice:
@@ -98,7 +101,7 @@ class Pipe:
 
     def create_transport_buffer(self) -> TransportBuffer:
         #TODO: eventually this should be dependent on the connections available to a storage_volume
-        if rdma_available():
+        if RDMA_ENABLED and rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
             buffer_cls = MonarchTransportBuffer

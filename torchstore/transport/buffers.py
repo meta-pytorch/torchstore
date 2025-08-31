@@ -14,7 +14,8 @@ except ImportError:
 def rdma_available():
     return monarch_rdma_available()
 
-
+#TODO: for some reason, RDMABuffer is breaking for certain tensors on the HF models (qwen, llama)
+# but setting this chunk size works around the issue until we can fix it
 RDMDA_CHUNK_SIZE_MB= int(
     os.environ.get("RDMDA_CHUNK_SIZE_MB", "1") 
 )
