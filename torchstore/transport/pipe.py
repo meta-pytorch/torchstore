@@ -128,13 +128,12 @@ class Pipe:
 
         transport_buffer = self.create_transport_buffer()
 
-        # workaround until we develop streaming support. Certain buffers (RDMA) 
-        # need to know the size of the tensor so we can allocate the right 
-        # amount of memory locally. This can be avoided if the message
-        # contains a tensor slice.
+        # Certain buffers (RDMA) need to know the size of the tensor 
+        # so we can allocate the right amount of memory locally.
+        # This can be avoided if the message contains a tensor slice.
+        # Could likely be optimized away in the future.
         if transport_buffer.requires_meta and message.tensor_val is None:
             meta = await self.storage_volume.get_meta.call_one(key)
-            # passing a tensor here is only important so we can create the right buffer size        
             transport_buffer.allocate(meta)
         else:
             transport_buffer.allocate(message.tensor_val)
@@ -145,7 +144,6 @@ class Pipe:
             tensor_slice=message.tensor_slice,
             objects=message.objects
         )
-        # buffer after being processed remotely
         transport_buffer.update(
             await self.storage_volume.get.call_one(
                 key,

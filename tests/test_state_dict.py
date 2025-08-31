@@ -90,7 +90,6 @@ class DCPParityTest(Actor):
         self.rank = current_rank().rank
 
     def rlog(self, msg):
-        # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
         logger.info(f"rank: {self.rank} {msg}")
 
     def build_model_optimizer(self):
@@ -191,10 +190,10 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
     async def test_dcp_sharding_parity(self):
         for save_mesh_shape, get_mesh_shape in [
             ((2,), (4,)),
-            # ((4,), (2,)),
-            # ((2, 2), (4,)),
-            # ((2,), (2, 4)),
-            # ((4, 2), (2, 4)),
+            ((4,), (2,)),
+            ((2, 2), (4,)),
+            ((2,), (2, 4)),
+            ((4, 2), (2, 4)),
         ]:
             save_world_size = math.prod(save_mesh_shape)
             get_world_size = math.prod(get_mesh_shape)

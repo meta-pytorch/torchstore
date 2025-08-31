@@ -1,6 +1,5 @@
 from itertools import product
 from logging import getLogger
-from threading import local
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -161,8 +160,6 @@ class CopyStore: # this just represents in memory. The alternative would be some
         }
 
     async def put(self, key: str, transport_buffer: torch.Tensor, message: Message):
-    # def put(self, key: str, value: torch.Tensor): #TODO: value -> transport_buffer
-        """ """
         if message.is_object:
             self.kv[key] = {"obj": message.objects}
             return transport_buffer

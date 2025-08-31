@@ -99,6 +99,8 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
         await actor.put.call_one()
         await actor.get.call_one()
 
+        #TODO: assert equal tensors from put/get
+
 
     async def test_scalar(self):
         """Test basic put/get functionality for multiple processes"""
@@ -116,10 +118,8 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
                 fetched = await self.store.get("key", t if inplace else None)
                 return t if inplace else fetched
 
-        # each actor mesh represents a group of processes.
         test_actor = await spawn_actors(1, ScalarTest, "scalar", store=store)
         
-        # inplace
         t = torch.tensor(42.)
         await test_actor.put.call_one(t)        
         for inplace in [True, False]:

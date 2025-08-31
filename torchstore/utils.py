@@ -13,11 +13,11 @@ async def spawn_actors(num_processes, actor_cls, name, **init_args):
     mesh = await proc_mesh(gpus=num_processes)
 
     await mesh.logging_option(True, None)
+    # once monarch updates
     # mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
-
     # await mesh.initialized
+
     actors = await mesh.spawn(name, actor_cls, **init_args)
-    
     return actors
 
 
@@ -55,7 +55,7 @@ def assemble_global_tensor(
     global_tensor = torch.empty(
         global_shape,
         dtype=local_tensors[0].dtype,
-    )  # TODO: could be better to initialize to NaN and do an if NaN check here
+    ) 
 
     # Iterate over each local tensor and place it in the correct position in the global tensor
     for local_tensor, offset in zip(local_tensors, global_offsets):

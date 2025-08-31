@@ -70,7 +70,6 @@ class ModelTest(Actor):
         return model, optimizer
 
     def rlog(self, msg):
-        # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
         logger.info(f"rank: {self.rank} {msg}")
 
     @endpoint
@@ -115,7 +114,7 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
     async def test_resharding(self):
         # FSDP
         put_mesh_shape = (4,)
-        get_mesh_shape = (4,)
+        get_mesh_shape = (8,)
         await self._do_test(put_mesh_shape, get_mesh_shape)
 
     async def _do_test(self, put_mesh_shape, get_mesh_shape):
@@ -143,11 +142,11 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
             )
 
             t = time.perf_counter()
-            print("pushing state dict")
+            logger.info("pushing state dict")
 
             await put_world.do_push.call()
 
-            print(f"pushing state dict took: {time.perf_counter()-t} seconds")
+            logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
             t = time.perf_counter()
             await get_world.do_get.call()
 
