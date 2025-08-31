@@ -108,7 +108,7 @@ class Pipe:
         transport_buffer = self.create_transport_buffer()
         tensor = message.tensor_val
         
-        tensor_ref = transport_buffer.allocate(tensor) 
+        transport_buffer.allocate(tensor) 
         await transport_buffer.write_from(tensor)
         
         # transporting tensors is handled by the buffer, so we don't want to send it 

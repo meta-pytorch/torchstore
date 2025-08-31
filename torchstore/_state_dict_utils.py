@@ -26,6 +26,7 @@ async def push_state_dict(store, state_dict, key):
     for flattened_key, value in flattened_state_dict.items():
         logger.info(f"Putting {flattened_key}")
         await store.put(f"{key}{DELIM}{flattened_key}", value)
+        break
 
     await store.put(f"{key}{DELIM}{MAPPING}", mapping)
 
@@ -59,6 +60,7 @@ async def get_state_dict(
             f"{key}{DELIM}{flattened_key}",
             inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
         )
+        break
 
     # # Prepare all the coroutines first
     # coros = []

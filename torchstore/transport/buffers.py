@@ -16,8 +16,9 @@ def rdma_available():
 
 
 RDMDA_CHUNK_SIZE_MB= int(
-    os.environ.get("RDMDA_CHUNK_SIZE_MB", "512")
+    os.environ.get("RDMDA_CHUNK_SIZE_MB", "1") 
 )
+assert RDMDA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
 class TransportBuffer:
     finalize: bool = False
@@ -89,6 +90,11 @@ class RDMATransportBuffer(TransportBuffer):
         # special handling for scalars
         byte_view_chunks = self._create_byte_views_from_tensor(tensor)
         self.tensor_ref = [torch.empty_like(chunk) for chunk in byte_view_chunks]
+        chunk_sizes = set()
+        for chunk in self.tensor_ref:
+            chunk_sizes.add(chunk.shape)
+        logging.debug(f"{chunk_sizes=}")
+
         self.rdma_buff = [RDMABuffer(chunk) for chunk in self.tensor_ref]
         logging.debug(f"Allocted {len(self.rdma_buff)} rdma buffers")
 
@@ -134,22 +140,22 @@ class RDMATransportBuffer(TransportBuffer):
         if tensor is None:
             return
 
+        assert self.shape == tensor.shape, f"{self.shape} != {tensor.shape}"
+        assert self.dtype == tensor.dtype, f"{self.dtype} != {tensor.dtype}"
+        assert self.rdma_buff is not None
+        assert tensor.is_contiguous()
+
+        chunked_byte_view = self._create_byte_views_from_tensor(tensor)
+
         # if we have tensor refs locally, we're still in the local case,
         # and we're just copying over our chunks into the tensor from
         # local memory
         if self.tensor_ref is not None:
-            chunked_byte_view = self._create_byte_views_from_tensor(tensor)
             for idx, chunk in enumerate(chunked_byte_view):
                 self.tensor_ref[idx].copy_(chunk)            
             return
         # else: we are in the remote case (in a different process), and must read from 
         # the rdma buffer
-
-        assert self.shape == tensor.shape, f"{self.shape} != {tensor.shape}"
-        assert self.dtype == tensor.dtype, f"{self.dtype} != {tensor.dtype}"
-        assert self.rdma_buff is not None
-        
-        chunked_byte_view = self._create_byte_views_from_tensor(tensor)
 
         for idx, chunk in enumerate(chunked_byte_view):
             await self.rdma_buff[idx].write_from(chunk)
