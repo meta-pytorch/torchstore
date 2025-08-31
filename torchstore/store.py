@@ -163,9 +163,6 @@ class CopyStore: # this just represents in memory. The alternative would be some
     async def put(self, key: str, transport_buffer: torch.Tensor, message: Message):
     # def put(self, key: str, value: torch.Tensor): #TODO: value -> transport_buffer
         """ """
-        # TODO: handle messagte with objects != None
-
-        assert transport_buffer.tensor_ref is None #TODO: remove
         if message.is_object:
             self.kv[key] = {"obj": message.objects}
             return transport_buffer
@@ -183,8 +180,6 @@ class CopyStore: # this just represents in memory. The alternative would be some
 
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
-
-        assert transport_buffer.tensor_ref is None #TODO: remove
 
         #TODO: clean up
         val = self.kv[key]

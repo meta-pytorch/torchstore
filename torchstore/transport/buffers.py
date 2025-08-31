@@ -11,15 +11,17 @@ except ImportError:
         raise NotImplementedError("RDMABuffer is not available")
         
 
-def rdma_available():
-    return monarch_rdma_available()
-
 #TODO: for some reason, RDMABuffer is breaking for certain tensors on the HF models (qwen, llama)
 # but setting this chunk size works around the issue until we can fix it
 RDMDA_CHUNK_SIZE_MB= int(
-    os.environ.get("RDMDA_CHUNK_SIZE_MB", "1") 
+    os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB", "1") 
 )
 assert RDMDA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
+
+RDMA_ENABLED = os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
+
+def rdma_available():
+    return RDMA_ENABLED and monarch_rdma_available()
 
 class TransportBuffer:
     finalize: bool = False

@@ -1,7 +1,6 @@
-import os
 import unittest
 from logging import getLogger
-
+import time
 import torch
 import math
 
@@ -67,26 +66,32 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             async def put(self):
                 for n in range(1, self.max_step, self.step_size):
                     shape = (1024, 1024 * n)                      
-                    size_mbytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb
+                    size_mbytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb                                        
+                    tensor = torch.randn(shape, dtype=torch.float32) 
+                    
                     logger.info(f"Put {n=} {size_mbytes=}")
-                    try:
-                        t = torch.randn(shape, dtype=torch.float32) 
-                        await self.store.put(str(n), t)
+                    t = time.perf_counter()
+                    try:                        
+                        await self.store.put(str(n), tensor)
                     except Exception as e:
                         logger.exception(f"Test failed with {size_mbytes=}")
                         raise e
+                    logger.info(f"Took {time.perf_counter() - t} seconds to put")
             
             @endpoint
             async def get(self):
                 for n in range(1, self.max_step, self.step_size):
                     shape = (1024, 1024 * n)                      
                     size_mbytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb
-                    logger.info(f"Get {n=} {size_mbytes=}")
+                   
+                    logger.info(f"Get {n=} {size_mbytes=}") 
+                    t = time.perf_counter()
                     try:
                         await self.store.get(str(n))
                     except Exception as e:
                         logger.exception(f"Test failed with {size_mbytes=}")
                         raise e
+                    logger.info(f"Took {time.perf_counter() - t} seconds to fetch")
                         
 
         store = await MultiProcessStore.create_store()
