@@ -1,3 +1,4 @@
 # Python build artifacts
 __pycache__/
 torchstore.egg-info/
+build/
