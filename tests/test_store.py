@@ -58,12 +58,14 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             step_size: int = 100 
             max_step: int = 600 # 4mb -> 2gb
 
-            def __init__(self, store) -> None:
+            def __init__(self, store, generate_benchmark=False) -> None:
                 self.store=store
+                self.generate_benchmark = generate_benchmark
                 init_logging()
 
             @endpoint
             async def put(self):
+                dps = []
                 for n in range(1, self.max_step, self.step_size):
                     shape = (1024, 1024 * n)                      
                     size_mbytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb                                        
@@ -76,10 +78,20 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
                     except Exception as e:
                         logger.exception(f"Test failed with {size_mbytes=}")
                         raise e
-                    logger.info(f"Took {time.perf_counter() - t} seconds to put")
+                    
+                    delta = time.perf_counter() - t
+                    dps.append((size_mbytes, delta))
+                    logger.info(f"Took {delta} seconds to put")
+
+                if self.generate_benchmark:
+                    with open("put_benchmark.csv", "w") as fp:
+                        fp.write("size_mbytes, delta\n")
+                        for size_mbytes, delta in dps:
+                            fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
             
             @endpoint
             async def get(self):
+                dps = []
                 for n in range(1, self.max_step, self.step_size):
                     shape = (1024, 1024 * n)                      
                     size_mbytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb
@@ -91,7 +103,16 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
                     except Exception as e:
                         logger.exception(f"Test failed with {size_mbytes=}")
                         raise e
-                    logger.info(f"Took {time.perf_counter() - t} seconds to fetch")
+
+                    delta = time.perf_counter() - t
+                    dps.append((size_mbytes, delta))
+                    logger.info(f"Took {delta} seconds to fetch")
+
+                if self.generate_benchmark:
+                    with open("get_benchmark.csv", "w") as fp:
+                        fp.write("size_mbytes, delta\n")
+                        for size_mbytes, delta in dps:
+                            fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
                         
 
         store = await MultiProcessStore.create_store()

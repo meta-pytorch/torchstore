@@ -13,7 +13,7 @@ except ImportError:
 
 #TODO: for some reason, RDMABuffer is breaking for certain tensors on the HF models (qwen, llama)
 # but setting this chunk size works around the issue until we can fix it
-# N.B. from benchmarking, we know the ideal size is any size >256mb.
+# N.B. from benchmarking, we know the ideal size is any size >=256mb.
 RDMDA_CHUNK_SIZE_MB= int(
     os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB", "1") 
 )

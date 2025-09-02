@@ -7,7 +7,7 @@ if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
     logger = getLogger(__name__)
     logger.warning(
         "Warning: setting HYPERACTOR_CODEC_MAX_FRAME_LENGTH since this needs to be set"
-        " to enable large RPC calls via Monarch RPC."
+        " to enable large RPC calls via Monarch"
     )
     os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = "910737418240"
 

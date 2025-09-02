@@ -11,11 +11,11 @@ if TYPE_CHECKING:
 async def spawn_actors(num_processes, actor_cls, name, **init_args):
     """Actors are essentially processes wrapped in a class."""
     mesh = await proc_mesh(gpus=num_processes)
-
-    await mesh.logging_option(True, None)
     # once monarch updates
     # mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
-    # await mesh.initialized
+
+    await mesh.initialized
+    await mesh.logging_option(True, None)
 
     actors = await mesh.spawn(name, actor_cls, **init_args)
     return actors
