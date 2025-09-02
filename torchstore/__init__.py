@@ -1,5 +1,6 @@
 import os
 from logging import getLogger
+
 from torchstore.logging import init_logging
 
 if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
@@ -11,7 +12,7 @@ if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
     )
     os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = "910737418240"
 
-from torchstore.store import MultiProcessStore
+from torchstore.store import get, put
 
 
-__all__ = ["MultiProcessStore"]
+__all__ = ["put", "get"]
