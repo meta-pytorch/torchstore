@@ -2,6 +2,8 @@ import math
 import os
 import tempfile
 import unittest
+import logging
+import sys
 from logging import getLogger
 
 import torch
@@ -40,13 +42,14 @@ class DTensorActor(Actor):
         self.original_tensor = original_tensor
         self.placements = placements
         self.file_store_name = file_store_name
+        
 
         # this is only necessary for nccl, but we're not using it in this test.
         os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
 
     def rlog(self, msg):
         # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
-        logger.warning(f"rank: {self.rank} {msg}")
+        logger.info(f"rank: {self.rank} {msg}")
 
     def initialize_distributed(self):
         self.rlog(f"Initialize process group using {self.file_store_name=} ")
@@ -264,7 +267,7 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
                 DTensorActor,
                 "get_mesh",
                 original_tensor=torch.zeros(
-                    8, 8
+                    8, 8, dtype=original_tensor.dtype
                 ),  # these values get replaced with values from original_tensor after fetching
                 placements=get_placements,
                 store=store,
