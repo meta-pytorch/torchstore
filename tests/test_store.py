@@ -6,7 +6,7 @@ import math
 
 from monarch.actor import Actor, current_rank, endpoint
 
-from torchstore import MultiProcessStore
+import torchstore
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
@@ -40,7 +40,7 @@ class TestActor(Actor):
 class TestStore(unittest.IsolatedAsyncioTestCase):
     async def test_basic(self):
         """Test basic put/get functionality for multiple processes"""
-        store = await MultiProcessStore.create_store()
+        store = await torchstore.create_store(num_hosts=2)
 
         # each actor mesh represents a group of processes.
         actor_mesh_0 = await spawn_actors(2, TestActor, "actor_mesh_0", store=store)

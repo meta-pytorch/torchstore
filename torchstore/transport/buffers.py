@@ -46,6 +46,9 @@ class TransportBuffer:
         raise NotImplemented()
 
 class RDMATransportBuffer(TransportBuffer):
+    # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
+    # for now we utilize copies.
+    # The major blocker for this is dealing with non-contiguous tensors
     requires_meta: bool = True
 
     def __init__(self) -> None:
