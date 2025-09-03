@@ -3,6 +3,7 @@ from logging import getLogger
 from typing import Optional
 
 import torch
+import torchstore as store
 from torch.distributed.checkpoint._nested_dict import (
     flatten_state_dict,
     unflatten_state_dict,
@@ -14,7 +15,7 @@ MAPPING = "MAPPING"
 logger = getLogger(__name__)
 
 
-async def push_state_dict(store, state_dict, key):
+async def push_state_dict(state_dict, key):
     """
     We have an option here. Either we can "flatten state dict", by turning state dict names into a single key,
     or I can actually just maintain the dictionary representation of the state dict, and we can allow some recursive behavior in the store.
@@ -30,9 +31,7 @@ async def push_state_dict(store, state_dict, key):
     await store.put(f"{key}{DELIM}{MAPPING}", mapping)
 
 
-async def get_state_dict(
-    store, key, user_state_dict: Optional[dict] = None, strict=True
-):
+async def get_state_dict(key, user_state_dict: Optional[dict] = None, strict=True):
     """Unflatten the state dict from the store"""
 
     try:
