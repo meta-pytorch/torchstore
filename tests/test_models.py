@@ -18,10 +18,6 @@ from torchstore._state_dict_utils import get_state_dict, push_state_dict
 from torchstore.utils import spawn_actors
 from torchstore.logging import init_logging
 
-# Monarch data plane can be slow -- this essentially sets the 
-# max timeout for put/gets on store.
-os.environ["HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT_SECS"] = "600"
-
 logger = getLogger(__name__)
 
 
@@ -84,9 +80,9 @@ class ModelTest(Actor):
             torch.distributed.barrier()
 
         self.rlog("pushing state dict")
-        t = time.time()
+        t = time.perf_counter()
         await push_state_dict(self.store, state_dict, "v0")
-        self.rlog(f"pushed state dict in {time.time()-t} seconds")
+        self.rlog(f"pushed state dict in {time.perf_counter()-t} seconds")
 
     @endpoint
     async def do_get(self):
@@ -99,9 +95,9 @@ class ModelTest(Actor):
         if self.world_size > 1:
             torch.distributed.barrier()
         self.rlog("getting state dict")
-        t = time.time()
+        t = time.perf_counter()
         await get_state_dict(self.store, "v0", state_dict)
-        self.rlog(f"got state dict in {time.time() - t} seconds")
+        self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
 
 
 class TestHFModel(unittest.IsolatedAsyncioTestCase):
@@ -141,16 +137,16 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
 
-            t = time.perf_counter()
+            
             logger.info("pushing state dict")
-
+            t = time.perf_counter()
             await put_world.do_push.call()
-
             logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
+            
+            logger.info("fetching state dict")
             t = time.perf_counter()
             await get_world.do_get.call()
-
-            print(f"getting state dict took: {time.perf_counter()-t} seconds")
+            logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
 
 
 if __name__ == "__main__":
