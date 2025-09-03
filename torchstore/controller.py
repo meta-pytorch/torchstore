@@ -1,32 +1,106 @@
+import os
 from typing import TYPE_CHECKING
+import asyncio
 
-from monarch.actor import Actor, endpoint
+from monarch.actor import Actor, endpoint, current_rank
 
+from torchstore.storage_volume import StorageVolume
 from torchstore.transport.pipe import Request
 
 if TYPE_CHECKING:
     from torchstore import LocalClient
 
-class Controller(Actor):
-    def __init__(self, placement_strategy) -> None:
-        self.storage_volumes = None
-        self.keys_to_storage_volumes = {}
-        self.host_id_to_storage_volume = {}
+class TorchStoreStrategy:
+    async def set_storage_volumes(self, storage_volumes):
+        raise NotImplementedError()
 
-    @endpoint
-    def set_storage_volumes(self, storage_volumes):
-        self.storage_volumes = storage_volumes
+    @classmethod
+    def get_volume_id(cls):
+        raise NotImplementedError()
 
-    @endpoint
-    def select_storage_volume_for_put(
+    @classmethod
+    def get_client_id(cls):
+        raise NotImplementedError()
+
+    def select_storage_volume(self):
+        raise NotImplementedError()
+
+#TODO:
+# class SingletonStrategy(TorchStoreStrategy):
+#     pass
+# class LocalHostStrategy(TorchStoreStrategy):
+#     pass
+
+class LocalRankStrategy(TorchStoreStrategy):
+    """Relies on 'LOCAL_RANK' set from env.
+    """
+
+    def __init__(
         self,
-        key: str,
-        request: Request,
-        client_id: str
-    ) -> str:
-        return self.client_id_to_storage_volume[client_id]
+    ):
+        self.storage_volumes = None
+        self.volume_id_to_coord = {}
 
-    def select_storage_volume_for_get(
+    async def set_storage_volumes(self, storage_volumes):
+        self.storage_volumes = storage_volumes
+        self.volume_id_to_coord = {
+            val : coord for coord, val in await self.storage_volumes.get_id.call()
+        }        
+
+    @classmethod
+    def get_volume_id(cls):
+        return str(current_rank().rank)
+
+    @classmethod
+    def get_client_id(cls):
+        return os.environ["LOCAL_RANK"]
+
+    def select_storage_volume(self):
+        client_id = self.get_client_id()
+        if client_id not in self.volume_id_to_coord:
+            raise KeyError(f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}")
+            
+        volume_coord = self.volume_id_to_coord[client_id]
+        return self.storage_volumes.slice(**volume_coord)
+
+    def _hash_coord(self, coord):
+        return str(coord)
+class Controller(Actor):
+    def __init__(
+        self,
+        strategy: TorchStoreStrategy,
+        num_storage_volumes: int
+    ):
+        self.keys_to_storage_volumes = {}
+        self.strategy = strategy
+        self.num_storage_volumes = num_storage_volumes
+        self.is_initialized = False
+
+    def assert_initialized(self):
+        assert self.is_initialized, (
+            "Please call torchstore.initialize_store before attempting to use store."
+        ) 
+
+    @endpoint
+    async def init(self):
+        if self.is_initialized:
+            raise RuntimeError("TorchStore is already initialized")
+
+        self.storage_volumes = await StorageVolume.spawn(
+            num_volumes=self.num_storage_volumes,
+            id_func=self.strategy.get_volume_id
+        )
+        
+        await self.strategy.set_storage_volumes(self.storage_volumes)
+        self.is_initialized = True
+
+    @endpoint
+    def get_controller_strategy(self):
+        self.assert_initialized()
+        return self.strategy
+    
+    @endpoint
+    def locate_request_volumes(
         self,
         key: str,
         request: Request,

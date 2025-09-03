@@ -16,10 +16,14 @@ class LocalClient:
     is handled by the client.
     """
 
-    def __init__(self, storage_volumes, controller):
-        self._storage_volumes = storage_volumes
+    def __init__(
+        self,
+        controller,
+        controller_strategy,
+    ):
         self._controller = controller
-        self._id = None #TODO: think this through
+        self._controller_strategy = controller_strategy
+        
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
@@ -30,12 +34,8 @@ class LocalClient:
         # this will probably always be the case
         # we probably don't need a remote call for this case since
         # it will never be dynamic. e.g. it's always based on the 
-        # PlacementStrategy defined during intiailization
-        storage_volume = self._controller.select_storage_volume_for_put.call_one(
-            request,
-            key,
-            self._id
-        )
+        # ControllerStrategy defined during intiailization
+        storage_volume = self._controller_strategy.select_storage_volume()
 
         pipe = Pipe(storage_volume)
 

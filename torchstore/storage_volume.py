@@ -1,26 +1,39 @@
 from itertools import product
 from logging import getLogger
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict
 
 import torch
-from monarch.actor import Actor, endpoint
-from torch.distributed.tensor import DTensor
+from monarch.actor import Actor, endpoint, current_rank
 
 from torchstore.transport.pipe import Request
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
-from torchstore.transport import Pipe, Request, TensorSlice
-from torchstore.controller import Controller
+from torchstore.transport import Request, TensorSlice
 
 logger = getLogger(__name__)
 
 
 FULL_TENSOR = "full_tensor"
 
+
 class StorageVolume(Actor):
     """The remote logic for storage. Recieves remote put/get requests and handles them via the storage abstraction"""
 
-    def __init__(self):
+    actor_name: str = "StorageVolumes"
+
+    def __init__(
+        self,
+        id_func,
+    ): 
         self.store = InMemoryStore()
+        self.volume_id = id_func()
+
+    @classmethod
+    def spawn(cls, num_volumes, *init_args, **init_kwargs):
+        return spawn_actors(num_volumes, cls, cls.actor_name, *init_args, **init_kwargs)
+
+    @endpoint
+    async def get_id(self):
+        return self.volume_id
 
     @endpoint
     async def put(
