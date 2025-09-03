@@ -11,21 +11,24 @@ from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
+from transformers import AutoModelForCausalLM
+
 from torchstore import MultiProcessStore
 from torchstore._state_dict_utils import get_state_dict, push_state_dict
 from torchstore.utils import spawn_actors
-from transformers import AutoModelForCausalLM
+from torchstore.logging import init_logging
 
 logger = getLogger(__name__)
 
 
 assert os.environ.get("HF_TOKEN", None) is not None, "HF_TOKEN must be set"
-TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~2GB
+TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
 # TEST_MODEL = "meta-llama/Llama-3.1-8B" # ~ 16GB
 
 
 class ModelTest(Actor):
     def __init__(self, store, mesh_shape, file_store_name):
+        init_logging()
         self.rank = current_rank().rank
         self.store = store
         self.mesh_shape = mesh_shape
@@ -63,8 +66,7 @@ class ModelTest(Actor):
         return model, optimizer
 
     def rlog(self, msg):
-        # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
-        logger.warning(f"rank: {self.rank} {msg}")
+        logger.info(f"rank: {self.rank} {msg}")
 
     @endpoint
     async def do_push(self):
@@ -74,10 +76,13 @@ class ModelTest(Actor):
             "optimizer": optimizer.state_dict(),
         }
 
+        if self.world_size > 1:
+            torch.distributed.barrier()
+
         self.rlog("pushing state dict")
-        t = time.time()
+        t = time.perf_counter()
         await push_state_dict(self.store, state_dict, "v0")
-        self.rlog(f"pushed state dict in {time.time()-t} seconds")
+        self.rlog(f"pushed state dict in {time.perf_counter()-t} seconds")
 
     @endpoint
     async def do_get(self):
@@ -86,10 +91,13 @@ class ModelTest(Actor):
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
         }
+        
+        if self.world_size > 1:
+            torch.distributed.barrier()
         self.rlog("getting state dict")
-        t = time.time()
+        t = time.perf_counter()
         await get_state_dict(self.store, "v0", state_dict)
-        self.rlog(f"got state dict in {time.time() - t} seconds")
+        self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
 
 
 class TestHFModel(unittest.IsolatedAsyncioTestCase):
@@ -117,8 +125,7 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
                 store=store,
                 mesh_shape=put_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "save_world"),
-            )
-            await put_world.do_push.call()
+            )            
 
             get_world_size = math.prod(get_mesh_shape)
             get_world = await spawn_actors(
@@ -129,7 +136,19 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
                 mesh_shape=get_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
+
+            
+            logger.info("pushing state dict")
+            t = time.perf_counter()
+            await put_world.do_push.call()
+            logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
+            
+            logger.info("fetching state dict")
+            t = time.perf_counter()
             await get_world.do_get.call()
+            logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
+
 
 if __name__ == "__main__":
+    init_logging()
     unittest.main()

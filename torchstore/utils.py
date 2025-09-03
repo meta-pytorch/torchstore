@@ -2,7 +2,7 @@ from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from monarch.actor import proc_mesh
+from monarch.actor import proc_mesh#, this_host
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
@@ -11,8 +11,13 @@ if TYPE_CHECKING:
 async def spawn_actors(num_processes, actor_cls, name, **init_args):
     """Actors are essentially processes wrapped in a class."""
     mesh = await proc_mesh(gpus=num_processes)
+    # once monarch updates
+    # mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
+
+    # await mesh.initialized
+    await mesh.logging_option(True, None)
+
     actors = await mesh.spawn(name, actor_cls, **init_args)
-    actors.mesh = mesh
     return actors
 
 
@@ -47,10 +52,10 @@ def assemble_global_tensor(
     # Create an empty global tensor of the specified shape
     assert local_tensors
 
-    global_tensor = torch.zeros(
+    global_tensor = torch.empty(
         global_shape,
         dtype=local_tensors[0].dtype,
-    )  # TODO: could be better to initialize to NaN and do an if NaN check here
+    ) 
 
     # Iterate over each local tensor and place it in the correct position in the global tensor
     for local_tensor, offset in zip(local_tensors, global_offsets):
