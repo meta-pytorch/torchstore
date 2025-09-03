@@ -49,6 +49,8 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
         for pt, val in tensors:
             expected = torch.tensor([pt.rank + 1] * 10)
             assert torch.equal(expected, val), f"{expected} != {val}"
+        await actor_mesh_0._proc_mesh.stop()
+        await actor_mesh_1._proc_mesh.stop()
 
     async def test_large_tensors(self):
         """Test basic put/get functionality for multiple processes"""
@@ -119,6 +121,7 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
         actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
         await actor.put.call_one()
         await actor.get.call_one()
+        await actor._proc_mesh.stop()
 
         # TODO: assert equal tensors from put/get
 
@@ -143,6 +146,7 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
         for inplace in [True, False]:
             fetched = await test_actor.get.call_one(inplace)
             self.assertTrue(torch.equal(t, fetched), f"{t} != {fetched} {inplace=}")
+        await test_actor._proc_mesh.stop()
 
 
 if __name__ == "__main__":
