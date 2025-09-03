@@ -148,6 +148,7 @@ class RDMATransportBuffer(TransportBuffer):
             return tensor
         # else: we are in the remote case (in a different process), and must read from
         # the rdma buffer
+        #TODO: gather instead of reading sequentially
         try:
             for idx, chunk in enumerate(chunked_byte_view):
                 await self.rdma_buffers[idx].read_into(chunk)
@@ -177,7 +178,7 @@ class RDMATransportBuffer(TransportBuffer):
             return
         # else: we are in the remote case (in a different process), and must read from
         # the rdma buffer
-
+        #TODO: gather instead of reading sequentially
         for idx, chunk in enumerate(chunked_byte_view):
             await self.rdma_buffers[idx].write_from(chunk)
 
