@@ -281,6 +281,9 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
             await put_mesh.destroy_process_group.call()
             await get_mesh.destroy_process_group.call()
 
+            await put_mesh._proc_mesh.stop()
+            await get_mesh._proc_mesh.stop()
+
     def _assert_correct_sharded_tensor(
         self, full_tensor, sharded_tensor, get_placements, coordinate
     ):

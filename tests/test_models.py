@@ -19,7 +19,6 @@ from transformers import AutoModelForCausalLM
 logger = getLogger(__name__)
 
 
-assert os.environ.get("HF_TOKEN", None) is not None, "HF_TOKEN must be set"
 TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
 # TEST_MODEL = "meta-llama/Llama-3.1-8B" # ~ 16GB
 
@@ -47,9 +46,7 @@ class ModelTest(Actor):
 
     def build_model(self):
         self.rlog("building model")
-        model = AutoModelForCausalLM.from_pretrained(
-            TEST_MODEL, token=os.environ["HF_TOKEN"]
-        )
+        model = AutoModelForCausalLM.from_pretrained(TEST_MODEL)
         if self.world_size > 1:
             self.initialize_distributed()
             self.rlog("sharding")
@@ -140,8 +137,8 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
             await get_world.do_get.call()
             logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
 
-            await put_world._proc_mesh.shutdown()
-            await get_world._proc_mesh.shutdown()
+            await put_world._proc_mesh.stop()
+            await get_world._proc_mesh.stop()
 
 
 if __name__ == "__main__":
