@@ -1,9 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import math
 import os
 import tempfile
 import time
 import unittest
 from logging import getLogger
+
+import pytest
 
 import torch
 
@@ -17,6 +25,11 @@ from torchstore.utils import spawn_actors
 from transformers import AutoModelForCausalLM
 
 logger = getLogger(__name__)
+
+needs_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA not available",
+)
 
 
 assert os.environ.get("HF_TOKEN", None) is not None, "HF_TOKEN must be set"
@@ -92,6 +105,7 @@ class ModelTest(Actor):
         self.rlog(f"got state dict in {time.time() - t} seconds")
 
 
+@needs_cuda
 class TestHFModel(unittest.IsolatedAsyncioTestCase):
     async def test_basic(self):
         # FSDP
@@ -130,6 +144,7 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
             await get_world.do_get.call()
+
 
 if __name__ == "__main__":
     unittest.main()
