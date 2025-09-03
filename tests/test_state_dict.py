@@ -20,7 +20,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 
-from torchstore import MultiProcessStore
 from torchstore._state_dict_utils import get_state_dict, push_state_dict
 from torchstore.utils import spawn_actors
 
@@ -160,7 +159,7 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
         class Trainer(Actor):
             # Monarch RDMA does not work outside of an actor, so we need
             # to wrapp this test first
-            #TODO: assert this within rdma buffer
+            # TODO: assert this within rdma buffer
             @endpoint
             async def do_test(self, store):
                 model = CompositeParamModel()
@@ -182,10 +181,8 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
                 return state_dict, fetched_state_dict
 
         trainer = await spawn_actors(1, Trainer, "trainer")
-        store = await MultiProcessStore.create_store()
         state_dict, fetched_state_dict = await trainer.do_test.call_one(store)
         self._assert_equal_state_dict(state_dict, fetched_state_dict)
-        
 
     async def test_dcp_sharding_parity(self):
         for save_mesh_shape, get_mesh_shape in [
@@ -198,7 +195,6 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
             save_world_size = math.prod(save_mesh_shape)
             get_world_size = math.prod(get_mesh_shape)
 
-            store = await MultiProcessStore.create_store()
             with tempfile.TemporaryDirectory() as tmpdir:
                 dcp_checkpoint_fn = os.path.join(tmpdir, "dcp_checkpoint.pt")
 
@@ -232,7 +228,7 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
                     except Exception as e:
                         raise AssertionError(
                             f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
-                       ) from e
+                        ) from e
 
     def _assert_equal_state_dict(self, state_dict1, state_dict2):
         flattened_state_dict_1, _ = flatten_state_dict(state_dict1)

@@ -2,18 +2,16 @@ import math
 import os
 import tempfile
 import unittest
-import logging
-import sys
 from logging import getLogger
 
 import torch
+
+import torchstore as store
 
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor, Replicate, Shard
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
-
-from torchstore import MultiProcessStore
 from torchstore.utils import get_local_tensor, spawn_actors
 
 logger = getLogger(__name__)
@@ -28,7 +26,6 @@ class DTensorActor(Actor):
 
     def __init__(
         self,
-        store,
         mesh_shape,
         original_tensor,
         placements,
@@ -36,20 +33,18 @@ class DTensorActor(Actor):
         visible_devices="0,1,2,3,4,5,6,7",
     ):
         self.rank = current_rank().rank
-        self.store = store
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
         self.original_tensor = original_tensor
         self.placements = placements
         self.file_store_name = file_store_name
-        
 
         # this is only necessary for nccl, but we're not using it in this test.
         os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
 
     def rlog(self, msg):
         # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
-        logger.info(f"rank: {self.rank} {msg}")
+        logger.warning(f"rank: {self.rank} {msg}")
 
     def initialize_distributed(self):
         self.rlog(f"Initialize process group using {self.file_store_name=} ")
@@ -76,7 +71,7 @@ class DTensorActor(Actor):
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 
         self.rlog(f"calling put with {dtensor=}")
-        await self.store.put(self.shared_key, dtensor)
+        await store.put(self.shared_key, dtensor)
 
     @endpoint
     async def do_get(self):
@@ -91,7 +86,7 @@ class DTensorActor(Actor):
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 
         self.rlog(f"calling get with {dtensor=}")
-        fetched_tensor = await self.store.get(self.shared_key, dtensor)
+        fetched_tensor = await store.get(self.shared_key, dtensor)
         self.rlog(f"after fetch: {dtensor=}")
         assert torch.equal(dtensor, fetched_tensor)
 
@@ -200,8 +195,8 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
     ):
         """Given a "put" mesh shape and a "get" mesh shape.
         1. Create separate worlds for each mesh shape, running on different devices /PGs.
-        2. Each rank in 'put' world will create a DTensor, and call self.store.put(key="test_key", value=dtensor)
-        3. Each rank in 'get' world will create a DTensor (with a different sharding, and seeded with torch.zero), and call self.store.get(key="test_key", value=dtensor)
+        2. Each rank in 'put' world will create a DTensor, and call store.put(key="test_key", value=dtensor)
+        3. Each rank in 'get' world will create a DTensor (with a different sharding, and seeded with torch.zero), and call store.get(key="test_key", value=dtensor)
         4. The result of the above operation should be the original DTensor, but resharded between putter/getter worlds
 
         Example:
@@ -209,13 +204,13 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
         original_tensor = [0,1,2,3], world_size=4
         dtensor = distribute_tensor(original_tensor)
         # Rank0: dtensor._local_tensor == [0], Rank1: dtensor._local_tensor == [1], Rank2: dtensor._local_tensor == [2], ...
-        self.store.put("shared_key", dtensor)
+        store.put("shared_key", dtensor)
 
         #Our "put" world starts with something like this:
         original_Tensor = [0, 0, 0, 0], world_size=2
         dtensor = distribute_tensor(original_tensor)
         # Rank0: dtensor._local_tensor == [0,0], Rank1: dtensor._local_tensor == [0,0]
-        self.store.get("shared_key", dtensor)
+        store.get("shared_key", dtensor)
 
         # Rank0: dtensor._local_tensor == [0,1], Rank1: dtensor._local_tensor == [2,3]
         """
@@ -238,7 +233,6 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
         original_tensor = torch.arange(8**2).reshape(
             8, 8
         )  # 8x8 square, with ([[0...7],[8...15],[...]])
-        store = await MultiProcessStore.create_store()
         with tempfile.TemporaryDirectory() as filesystem_store_dir:
             # each actor mesh represents a group of processes.
             # e.g., two different islands running spmd
@@ -251,7 +245,6 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
                 "put_mesh",
                 original_tensor=original_tensor,
                 placements=put_placements,
-                store=store,
                 mesh_shape=put_mesh_shape,
                 file_store_name=os.path.join(filesystem_store_dir, "put_test"),
                 visible_devices=put_visible_devices,
@@ -267,10 +260,9 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
                 DTensorActor,
                 "get_mesh",
                 original_tensor=torch.zeros(
-                    8, 8, dtype=original_tensor.dtype
+                    8, 8
                 ),  # these values get replaced with values from original_tensor after fetching
                 placements=get_placements,
-                store=store,
                 mesh_shape=get_mesh_shape,
                 file_store_name=os.path.join(filesystem_store_dir, "get_test"),
                 visible_devices=get_visible_devices,
