@@ -1,11 +1,12 @@
 import os
-from typing import TYPE_CHECKING
-import asyncio
+from enum import Enum, auto
+from typing import Optional, Set, Dict, TYPE_CHECKING
+from dataclasses import dataclass, field
 
 from monarch.actor import Actor, endpoint, current_rank
 
 from torchstore.storage_volume import StorageVolume
-from torchstore.transport.pipe import Request
+from torchstore.transport.pipe import Request, TensorSlice
 
 if TYPE_CHECKING:
     from torchstore import LocalClient
@@ -60,19 +61,54 @@ class LocalRankStrategy(TorchStoreStrategy):
         if client_id not in self.volume_id_to_coord:
             raise KeyError(f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}")
             
-        volume_coord = self.volume_id_to_coord[client_id]
+        return self.get_storage_volume(client_id), client_id # client_id == volume_id
+
+    def get_storage_volume(self, volume_id: str) -> StorageVolume:
+        volume_coord = self.volume_id_to_coord[volume_id]
         return self.storage_volumes.slice(**volume_coord)
 
-    def _hash_coord(self, coord):
-        return str(coord)
+
+#TODO: actually just move this into request as a field
+class ObjectType(Enum):
+    OBJECT = auto()
+    TENSOR = auto()
+    TENSOR_SLICE = auto()
+
+    @classmethod
+    def from_request(cls, request: Request):
+        if request.is_object:
+            return cls.OBJECT
+
+        elif request.tensor_slice is not None:
+            return cls.TENSOR_SLICE
+        else:
+            return cls.TENSOR
+
+
+@dataclass
+class StorageInfo:
+    object_type: ObjectType 
+    tensor_slices: Set[Optional[TensorSlice]] = field(default_factory=set)    
+
+    def update(self, other_storage_info: "StorageInfo"):
+        assert self.object_type == other_storage_info.object_type, (
+            "Particularly dangerous to change storage type of an existing key, are you sure? Raise an issue if so."
+        ) 
+
+        self.tensor_slices.update(other_storage_info.tensor_slices)
+
+
+
 class Controller(Actor):
     def __init__(
         self,
         strategy: TorchStoreStrategy,
-        num_storage_volumes: int
+        num_storage_volumes: int,
+        storage_volumes: StorageVolume
     ):
         self.keys_to_storage_volumes = {}
         self.strategy = strategy
+        self.storage_volumes = storage_volumes
         self.num_storage_volumes = num_storage_volumes
         self.is_initialized = False
 
@@ -85,11 +121,6 @@ class Controller(Actor):
     async def init(self):
         if self.is_initialized:
             raise RuntimeError("TorchStore is already initialized")
-
-        self.storage_volumes = await StorageVolume.spawn(
-            num_volumes=self.num_storage_volumes,
-            id_func=self.strategy.get_volume_id
-        )
         
         await self.strategy.set_storage_volumes(self.storage_volumes)
         self.is_initialized = True
@@ -100,12 +131,11 @@ class Controller(Actor):
         return self.strategy
     
     @endpoint
-    def locate_request_volumes(
+    def locate_volumes(
         self,
         key: str,
         request: Request,
-        local_client: "LocalClient"
-    ):
+    ) -> Dict[str, StorageInfo]:
         # to start with, something like storage_volume_map = {
         # storage_volume_map = {
         #     "<dtensor_fqn>": {
@@ -120,18 +150,27 @@ class Controller(Actor):
         #     ...
         # }
 
-        # dtensor fqn goes here
+        if key not in self.keys_to_storage_volumes:
+            raise KeyError(f"Unable to locate {key} in any storage volumes.")
         storage_volume_map = self.keys_to_storage_volumes[key]        
+
+        object_type = ObjectType.from_request(request)
         storage_volumes_that_have_the_data = {}
         # filter for storage volumes that have the data
-        for storage_volume_id, tensor_slice_set in storage_volume_map.items():
+        for storage_volume_id, storage_info in storage_volume_map.items():
+            if object_type in (ObjectType.OBJECT, ObjectType.TENSOR):
+                storage_volumes_that_have_the_data[storage_volume_id] = storage_info
+                continue
+
+            #dtensor / tensor_slice
             tensors_overlap = False # TODO: request.tensor_slice
             if tensors_overlap:
-                storage_volumes_that_have_the_data[storage_volume_id] = tensor_slice_set            
+                storage_volumes_that_have_the_data[storage_volume_id] = storage_info
+                
 
         # we return something that looks like
         # storage_volumes_that_have_the_data = {
-        #     "<storage_volume_id>": set([
+        #     "<storage_volume_id>": StorageInfo.tensor_slices=set([
         #         "<tensor_slice>",
         #         "<tensor_slice>",
         #         "<tensor_slice>",
@@ -147,10 +186,15 @@ class Controller(Actor):
         storage_volume_id: str
     ):
 
-        if key not in self.keys_to_storage_volumes[key]:
+        if key not in self.keys_to_storage_volumes:
             self.keys_to_storage_volumes[key] = {}
 
-        if storage_volume_id not in self.keys_to_storage_volumes[key]:
-            self.keys_to_storage_volumes[key][storage_volume_id] = set()
+        storage_info = StorageInfo(
+            object_type =ObjectType.from_request(request),
+            tensor_slices=set([request.tensor_slice])
+        )
 
-        self.keys_to_storage_volumes[key][storage_volume_id].add(request.tensor_slice)
+        if storage_volume_id not in self.keys_to_storage_volumes[key]:
+            self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
+        else:
+            self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
