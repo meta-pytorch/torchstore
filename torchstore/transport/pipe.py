@@ -28,6 +28,16 @@ class TensorSlice:
     def __post_init__(self):
         self.coordinates = tuple(self.coordinates)
 
+    def __hash__(self):
+        # Hash all fields as a tuple, converting local_shape to tuple if it's a torch.Size
+        return hash((
+            self.offsets,
+            self.coordinates,
+            self.global_shape,
+            tuple(self.local_shape) if hasattr(self.local_shape, "__iter__") else self.local_shape,
+            self.mesh_shape
+        ))
+
 @dataclass
 class Request:
     tensor_val: Optional[torch.Tensor] = None
@@ -63,11 +73,8 @@ class Request:
             dtensor._local_tensor.shape,
             dtensor.device_mesh.shape,
         )
-
-        tensor = dtensor._local_tensor
-
         return cls(
-            tensor_val=tensor,
+            tensor_val=dtensor._local_tensor,
             tensor_slice=tensor_slice,
         )
 

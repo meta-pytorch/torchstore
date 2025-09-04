@@ -12,6 +12,9 @@ from torchstore.client import LocalClient
 # I need to keep this somewhere, so here we go
 DEFAULT_TORCHSTORE_NAME = "TorchStoreController"
 
+# cache for local clients
+_local_clent_map = {}
+
 async def initialize_store(
     num_storage_volumes=1,
     strategy=None,
@@ -26,6 +29,8 @@ async def initialize_store(
     elif strategy is None:
         raise RuntimeError("Must specify controller strategy if num_storage_volumes > 1")
 
+    #todo: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
+    # ideally this is done in the controller.init
     storage_volumes = await StorageVolume.spawn(
         num_volumes=num_storage_volumes,
         id_func=strategy.get_volume_id
@@ -34,20 +39,23 @@ async def initialize_store(
     controller = await get_or_spawn_controller(
         store_name,
         Controller,
+    )
+    await controller.init.call(
         strategy=strategy,
         num_storage_volumes=num_storage_volumes,
         storage_volumes=storage_volumes,
     )
-    await controller.init.call()
 
-_local_clent_map = {}
+async def teardown_store(store_name=DEFAULT_TORCHSTORE_NAME):
+    controller = await get_or_spawn_controller(store_name, Controller)    
+    await controller.teardown.call()
+    global _local_clent_map
+    _local_clent_map = {}
+
 async def client(store_name=DEFAULT_TORCHSTORE_NAME):
     if store_name in _local_clent_map:
         return _local_clent_map[store_name]
         
-    #todo: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
-    # ideally this is done in the controller.init
-
     controller = await get_or_spawn_controller(store_name, Controller)
     controller_strategy = await controller.get_controller_strategy.call_one()       
     

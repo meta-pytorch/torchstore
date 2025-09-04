@@ -194,28 +194,18 @@ class InMemoryStore(StorageImpl):
             await transport_buffer.write_from(self.kv[key])
             return transport_buffer
 
-        # Maps to "reshard on load"
-        # once all pieces are received.
-        if FULL_TENSOR not in self.kv[key] and self._has_full_tensor(key):
-            self._build_full_tensor(key)
-
-        if not self._has_full_tensor(key):
-            raise RuntimeError(
-                f"Not ready to serve full tensor yet for {key}: {self.kv[key]=}"
-            )
-
-        logger.debug("Building local tensor")
-        # TODO: should probably be a view
-        local_tensor = get_local_tensor(
-            self.kv[key][FULL_TENSOR],
-            request.tensor_slice.local_shape,
-            request.tensor_slice.offsets,
-        )
-        logger.debug("done local tensor")
-        local_tensor = local_tensor.clone()
-        await transport_buffer.write_from(local_tensor)
-
-        return transport_buffer
+        # TODO:
+        # for now, we're only going to support requesting the entire tensor_slice,
+        # but this goes entire the value prop of torchstore. StorageVolume must
+        # support requesting a subset of the regions which exist locally in the
+        # store. 
+        
+        for shard in self.kv[key].values():
+            if shard["slice"] == request.tensor_slice:
+                await transport_buffer.write_from(shard["tensor"])
+                return transport_buffer
+        
+        raise RuntimeError(f"Tensor slice {request.tensor_slice} not found in {key}")
 
     async def get_meta(
         self,
@@ -225,8 +215,14 @@ class InMemoryStore(StorageImpl):
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
         val = self.kv[key]
-        if isinstance(val, dict) and "obj" in val:
+        if isinstance(val, torch.Tensor):
+            return val.shape, val.dtype
+
+        assert isinstance(val, dict)
+        if "obj" in val:
             return "obj"
 
-        t = val if isinstance(val, dict) and "FULL_TENSOR" in val else val
-        return t.shape, t.dtype
+        if "tensor" in val:
+            return val["tensor"].shape, val["tensor"].dtype
+
+        raise RuntimeError(f"Unknown type for {key}")

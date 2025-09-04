@@ -1,6 +1,7 @@
 from functools import partial
 from itertools import product
 from logging import getLogger
+import re
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -56,21 +57,63 @@ class LocalClient:
             storage_volume = self.strategy.get_storage_volume(volume_id)
             pipe = Pipe(storage_volume)
 
-            if object_type in (ObjectType.OBJECT, ObjectType.TENSOR_SLICE):
+            if object_type in (ObjectType.OBJECT, ObjectType.TENSOR):
+                #TODO: in the future, we could intelligently select the best storage volume
+                # but for now any should work.
                 fetched_tensor = await pipe.get_from_storage_volume(key, request)
                 return fetched_tensor if inplace_tensor is None else inplace_tensor
 
-            # else: dtensor
+            # else: this is the dtensor / tensor slice case
             # fetch from all storage volumes, something like this 
             # TODO: fix so we can request all tensor slices from a storage volume
             # at once, this is silly
             for tensor_slice in storage_info.tensor_slices:
                 tensor_slice_request = Request.from_tensor_slice(tensor_slice)
-                partial_results.append(
-                    await pipe.get_from_storage_volume(key, tensor_slice_request)
-                )
 
-        return self._merge(partial_results, inplace_tensor=inplace_tensor)
+                local_tensor = await pipe.get_from_storage_volume(key, tensor_slice_request)
+                partial_results.append((local_tensor, tensor_slice))
 
-    def _merge(self, partial_results, inplace_tensor):
-        pass #TODO:
+
+        assert partial_results, "No partial results found"
+        assert request.tensor_slice is not None
+
+        # build the entire tensor. 
+        # TODO: again, we should have better control over 
+        # rebuilding only the portion I need, but this is a good start
+
+        local_tensors = []
+        global_offsets = []
+        global_shape = None
+        device_mesh_shape = None
+        for local_tensor, tensor_slice in partial_results:
+            local_tensors.append(local_tensor)
+
+            global_offsets.append(tensor_slice.offsets)
+            if global_shape is None:
+                global_shape = tensor_slice.global_shape
+            else:
+                assert global_shape == tensor_slice.global_shape
+
+            if device_mesh_shape is None:
+                device_mesh_shape = tensor_slice.mesh_shape
+            else:
+                assert device_mesh_shape == tensor_slice.mesh_shape
+
+        full_tensor = assemble_global_tensor(
+            local_tensors,
+            global_shape,
+            global_offsets,
+        )
+
+        fetched_tensor = get_local_tensor(
+            full_tensor,
+            request.tensor_slice.local_shape,
+            request.tensor_slice.offsets,
+        )
+        # Pipe does not have support for inplace copies of fetched tensors yet,
+        # so we just copy
+        if inplace_tensor is not None:
+            assert request.tensor_val is not None
+            request.tensor_val.copy_(fetched_tensor)
+            return inplace_tensor
+        return fetched_tensor

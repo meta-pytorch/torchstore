@@ -13,7 +13,8 @@ from torch.distributed._tensor import distribute_tensor, Replicate, Shard
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
-from torchstore import MultiProcessStore
+import torchstore as ts
+from torchstore.controller import LocalRankStrategy
 from torchstore.utils import get_local_tensor, spawn_actors
 
 logger = getLogger(__name__)
@@ -28,21 +29,21 @@ class DTensorActor(Actor):
 
     def __init__(
         self,
-        store,
         mesh_shape,
         original_tensor,
         placements,
         file_store_name,
         visible_devices="0,1,2,3,4,5,6,7",
-    ):
+    ):        
         self.rank = current_rank().rank
-        self.store = store
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
         self.original_tensor = original_tensor
         self.placements = placements
         self.file_store_name = file_store_name
         
+        #torchstore will fail without this (see LocalRankStrategy)
+        os.environ["LOCAL_RANK"] = str(self.rank)
 
         # this is only necessary for nccl, but we're not using it in this test.
         os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
@@ -76,7 +77,7 @@ class DTensorActor(Actor):
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 
         self.rlog(f"calling put with {dtensor=}")
-        await self.store.put(self.shared_key, dtensor)
+        await ts.put(self.shared_key, dtensor)
 
     @endpoint
     async def do_get(self):
@@ -91,7 +92,7 @@ class DTensorActor(Actor):
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 
         self.rlog(f"calling get with {dtensor=}")
-        fetched_tensor = await self.store.get(self.shared_key, dtensor)
+        fetched_tensor = await ts.get(self.shared_key, dtensor)
         self.rlog(f"after fetch: {dtensor=}")
         assert torch.equal(dtensor, fetched_tensor)
 
@@ -238,7 +239,10 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
         original_tensor = torch.arange(8**2).reshape(
             8, 8
         )  # 8x8 square, with ([[0...7],[8...15],[...]])
-        store = await MultiProcessStore.create_store()
+        await ts.initialize_store(
+            num_storage_volumes=put_world_size,
+            strategy=LocalRankStrategy()
+        )
         with tempfile.TemporaryDirectory() as filesystem_store_dir:
             # each actor mesh represents a group of processes.
             # e.g., two different islands running spmd
@@ -251,7 +255,6 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
                 "put_mesh",
                 original_tensor=original_tensor,
                 placements=put_placements,
-                store=store,
                 mesh_shape=put_mesh_shape,
                 file_store_name=os.path.join(filesystem_store_dir, "put_test"),
                 visible_devices=put_visible_devices,
@@ -270,7 +273,6 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
                     8, 8, dtype=original_tensor.dtype
                 ),  # these values get replaced with values from original_tensor after fetching
                 placements=get_placements,
-                store=store,
                 mesh_shape=get_mesh_shape,
                 file_store_name=os.path.join(filesystem_store_dir, "get_test"),
                 visible_devices=get_visible_devices,
@@ -287,7 +289,11 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
 
             # teardown distributed or the next test will complain
             await put_mesh.destroy_process_group.call()
+            await put_mesh._proc_mesh.stop()
             await get_mesh.destroy_process_group.call()
+            await get_mesh._proc_mesh.stop()
+
+            await ts.teardown_store()
 
     def _assert_correct_sharded_tensor(
         self, full_tensor, sharded_tensor, get_placements, coordinate

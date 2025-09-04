@@ -7,6 +7,7 @@ from torchstore.api import (
     put,
     get,
     client,
+    teardown_store
 )
 
 if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
@@ -25,5 +26,6 @@ __all__ = [
     "init_logging",
     "put",
     "get",
-    "client"
+    "client",
+    "teardown_store"
 ]

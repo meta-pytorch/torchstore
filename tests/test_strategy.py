@@ -66,6 +66,10 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             assert torch.equal(expected, val), f"{expected} != {val}"
 
         tensors = await actor_mesh_1.do_get.call()
+        
+        await actor_mesh_0._proc_mesh.stop()
+        await actor_mesh_1._proc_mesh.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
