@@ -1,9 +1,8 @@
 import os
-import unittest
 from logging import getLogger
 
 import torch
-
+import pytest
 from monarch.actor import Actor, current_rank, endpoint
 
 import torchstore as ts
@@ -15,7 +14,7 @@ init_logging()
 logger = getLogger(__name__)
 
 
-class TestActor(Actor):
+class StrategyTestActor(Actor):
     """Each instance of this actor represents a single process."""
 
     def __init__(self, actor_init, world_size):
@@ -43,8 +42,8 @@ class TestActor(Actor):
         other_rank = (self.rank + 1) % self.world_size
         return await ts.get(f"key_{other_rank}")
 
-class TestStore(unittest.IsolatedAsyncioTestCase):
-    async def test_local_rank(self):
+@pytest.mark.asyncio
+async def test_local_rank():        
         """Test basic put/get functionality for multiple processes"""
         await ts.initialize_store(
             num_storage_volumes=2,
@@ -56,8 +55,8 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             
         world_size = 2
         # each actor mesh represents a group of processes.
-        actor_mesh_0 = await spawn_actors(2, TestActor, "actor_mesh_0", actor_init=actor_init, world_size=world_size)
-        actor_mesh_1 = await spawn_actors(2, TestActor, "actor_mesh_1", actor_init=actor_init, world_size=world_size)
+        actor_mesh_0 = await spawn_actors(2, StrategyTestActor, "actor_mesh_0", actor_init=actor_init, world_size=world_size)
+        actor_mesh_1 = await spawn_actors(2, StrategyTestActor, "actor_mesh_1", actor_init=actor_init, world_size=world_size)
 
         await actor_mesh_0.do_put.call()
         tensors = await actor_mesh_1.do_get.call()
@@ -66,10 +65,9 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             assert torch.equal(expected, val), f"{expected} != {val}"
 
         tensors = await actor_mesh_1.do_get.call()
-        
+
         await actor_mesh_0._proc_mesh.stop()
         await actor_mesh_1._proc_mesh.stop()
 
-
 if __name__ == "__main__":
-    unittest.main()
+    pytest.main([__file__])

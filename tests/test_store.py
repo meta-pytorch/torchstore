@@ -38,6 +38,7 @@ class TestActor(Actor):
 
 
 class TestStore(unittest.IsolatedAsyncioTestCase):
+
     async def test_basic(self):
         """Test basic put/get functionality for multiple processes"""
         store = await torchstore.initialize_store()
