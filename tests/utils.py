@@ -2,7 +2,7 @@ import pytest
 from itertools import product
 import torchstore as ts
 
-def test_main(file):
+def main(file):
     ts.init_logging()
     pytest.main([file])
 

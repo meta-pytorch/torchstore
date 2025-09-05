@@ -22,7 +22,7 @@ from torch.distributed.tensor import DTensor
 
 import torchstore as ts
 from torchstore.utils import spawn_actors
-from .utils import test_main, transport_plus_strategy_params
+from .utils import main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -87,6 +87,8 @@ class DCPParityTest(Actor):
         self.dcp_checkpoint_fn = dcp_checkpoint_fn
         self.file_store_name = file_store_name
         self.rank = current_rank().rank
+        # needed for LocalRankStrategy
+        os.environ["LOCAL_RANK"] = str(self.rank)
 
     def rlog(self, msg):
         logger.info(f"rank: {self.rank} {msg}")
@@ -163,6 +165,11 @@ async def test_state_dict(strategy_params, use_rdma):
         # Monarch RDMA does not work outside of an actor, so we need
         # to wrapp this test first
         #TODO: assert this within rdma buffer
+        def __init__(self) -> None:
+            self.rank = current_rank().rank
+            # needed for LocalRankStrategy
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
         @endpoint
         async def do_test(self):
             model = CompositeParamModel()
@@ -183,10 +190,9 @@ async def test_state_dict(strategy_params, use_rdma):
             fetched_state_dict = await ts.get_state_dict("v0")
             return state_dict, fetched_state_dict
 
-
-    volume_world_size, strategy = strategy_params
+    _, strategy = strategy_params
     await ts.initialize(
-        num_storage_volumes=volume_world_size,
+        num_storage_volumes=1,
         strategy=strategy
     )
     trainer = await spawn_actors(1, Trainer, "trainer")
@@ -196,8 +202,11 @@ async def test_state_dict(strategy_params, use_rdma):
         await ts.teardown_store()
     _assert_equal_state_dict(state_dict, fetched_state_dict)
     
+@pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_dcp_sharding_parity():
+async def test_dcp_sharding_parity(strategy_params, use_rdma):
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+
     for save_mesh_shape, get_mesh_shape in [
         ((2,), (4,)),
         ((4,), (2,)),
@@ -208,7 +217,11 @@ async def test_dcp_sharding_parity():
         save_world_size = math.prod(save_mesh_shape)
         get_world_size = math.prod(get_mesh_shape)
 
-        await ts.initialize()
+        _, strategy = strategy_params
+        await ts.initialize(
+            num_storage_volumes=save_world_size,
+            strategy=strategy
+        )
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 dcp_checkpoint_fn = os.path.join(tmpdir, "dcp_checkpoint.pt")
@@ -271,4 +284,4 @@ def _assert_equal_state_dict(state_dict1, state_dict2):
             )
 
 if __name__ == "__main__":
-    test_main(__file__) 
+    main(__file__) 

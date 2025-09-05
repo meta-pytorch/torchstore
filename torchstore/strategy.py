@@ -40,11 +40,6 @@ class TorchStoreStrategy:
         volume_coord = self.volume_id_to_coord[volume_id]
         return self.storage_volumes.slice(**volume_coord)
 
-#TODO:
-# class SingletonStrategy(TorchStoreStrategy):
-#     pass
-# class LocalHostStrategy(TorchStoreStrategy):
-#     pass
 
 class SingletonStrategy(TorchStoreStrategy):
     """There can be only one!

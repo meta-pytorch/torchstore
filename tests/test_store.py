@@ -11,7 +11,7 @@ import torchstore as ts
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
-from .utils import test_main, transport_plus_strategy_params
+from .utils import main, transport_plus_strategy_params
 
 init_logging()
 logger = getLogger(__name__)
@@ -203,4 +203,4 @@ async def test_large_tensors():
 
 
 if __name__ == "__main__":
-    test_main(__file__)
+    main(__file__)

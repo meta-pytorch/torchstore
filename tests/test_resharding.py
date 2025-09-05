@@ -14,7 +14,7 @@ from torch.distributed.tensor._utils import _compute_local_shape_and_global_offs
 
 import torchstore as ts
 from torchstore.utils import get_local_tensor, spawn_actors
-from .utils import test_main, transport_plus_strategy_params
+from .utils import main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -350,4 +350,4 @@ def _assert_correct_sharded_tensor(
 
 
 if __name__ == "__main__":
-    test_main(__file__) 
+    main(__file__) 
