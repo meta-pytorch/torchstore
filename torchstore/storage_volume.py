@@ -225,4 +225,4 @@ class InMemoryStore(StorageImpl):
         if "tensor" in val:
             return val["tensor"].shape, val["tensor"].dtype
 
-        raise RuntimeError(f"Unknown type for {key}")
+        raise RuntimeError(f"Unknown type for {key} type={type(val)}")

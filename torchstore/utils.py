@@ -1,8 +1,10 @@
 from typing import List, Tuple, TYPE_CHECKING
+import uuid
 
 import torch
 
 from monarch.actor import proc_mesh#, this_host
+
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
@@ -17,7 +19,11 @@ async def spawn_actors(num_processes, actor_cls, name, **init_args):
     # await mesh.initialized
     await mesh.logging_option(True, None)
 
-    actors = await mesh.spawn(name, actor_cls, **init_args)
+    actors = await mesh.spawn(
+        f"{name}_{str(uuid.uuid4())[:8]}",
+        actor_cls,
+        **init_args
+    )
     return actors
 
 

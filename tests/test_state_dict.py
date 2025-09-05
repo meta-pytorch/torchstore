@@ -198,39 +198,41 @@ async def test_dcp_sharding_parity():
         get_world_size = math.prod(get_mesh_shape)
 
         await ts.initialize()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            dcp_checkpoint_fn = os.path.join(tmpdir, "dcp_checkpoint.pt")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                dcp_checkpoint_fn = os.path.join(tmpdir, "dcp_checkpoint.pt")
 
-            save_world = await spawn_actors(
-                save_world_size,
-                DCPParityTest,
-                "save_world",
-                mesh_shape=save_mesh_shape,
-                dcp_checkpoint_fn=dcp_checkpoint_fn,
-                file_store_name=os.path.join(tmpdir, "save_world"),
-            )
-            await save_world.do_put.call()
+                save_world = await spawn_actors(
+                    save_world_size,
+                    DCPParityTest,
+                    "save_world",
+                    mesh_shape=save_mesh_shape,
+                    dcp_checkpoint_fn=dcp_checkpoint_fn,
+                    file_store_name=os.path.join(tmpdir, "save_world"),
+                )
+                await save_world.do_put.call()
 
-            get_world = await spawn_actors(
-                get_world_size,
-                DCPParityTest,
-                "get_world",
-                mesh_shape=get_mesh_shape,
-                dcp_checkpoint_fn=dcp_checkpoint_fn,
-                file_store_name=os.path.join(tmpdir, "get_world"),
-            )
-            value_mesh = await get_world.do_get.call()
-            for coord, val in value_mesh:
-                try:
-                    dcp_state_dict, torchstore_state_dict = val
-                    _assert_equal_state_dict(
-                        dcp_state_dict, torchstore_state_dict
-                    )
-                except Exception as e:
-                    raise AssertionError(
-                        f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
-                    ) from e
-        await ts.teardown_store()
+                get_world = await spawn_actors(
+                    get_world_size,
+                    DCPParityTest,
+                    "get_world",
+                    mesh_shape=get_mesh_shape,
+                    dcp_checkpoint_fn=dcp_checkpoint_fn,
+                    file_store_name=os.path.join(tmpdir, "get_world"),
+                )
+                value_mesh = await get_world.do_get.call()
+                for coord, val in value_mesh:
+                    try:
+                        dcp_state_dict, torchstore_state_dict = val
+                        _assert_equal_state_dict(
+                            dcp_state_dict, torchstore_state_dict
+                        )
+                    except Exception as e:
+                        raise AssertionError(
+                            f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
+                        ) from e
+        finally:
+            await ts.teardown_store()
 
 def _assert_equal_state_dict(state_dict1, state_dict2):
     flattened_state_dict_1, _ = flatten_state_dict(state_dict1)

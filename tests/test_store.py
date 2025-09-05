@@ -2,7 +2,6 @@ import os
 import time
 import math
 import pytest
-from itertools import product
 from logging import getLogger
 
 import torch
@@ -78,7 +77,7 @@ async def test_basic(strategy_params, use_rdma):
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_objects(strategy_params, use_rdma):
-    """Test basic put/get functionality for multiple processes"""
+    """Test put/get on arbitrary object"""
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
     
     class ObjectActor(Actor):
