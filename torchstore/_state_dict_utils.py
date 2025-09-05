@@ -24,7 +24,6 @@ async def push_state_dict(store, state_dict, key):
     """
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
     for flattened_key, value in flattened_state_dict.items():
-        logger.info(f"Putting {flattened_key}")
         await store.put(f"{key}{DELIM}{flattened_key}", value)
 
     await store.put(f"{key}{DELIM}{MAPPING}", mapping)
