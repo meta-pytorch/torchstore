@@ -90,7 +90,7 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
                     with open("put_benchmark.csv", "w") as fp:
                         fp.write("size_mbytes, delta\n")
                         for size_mbytes, delta in dps:
-                            fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
+                            fp.write(f"{size_mbytes}, {delta}, {size_mbytes / delta}\n")
 
             @endpoint
             async def get(self):
@@ -117,7 +117,7 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
                     with open("get_benchmark.csv", "w") as fp:
                         fp.write("size_mbytes, delta\n")
                         for size_mbytes, delta in dps:
-                            fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
+                            fp.write(f"{size_mbytes}, {delta}, {size_mbytes / delta}\n")
 
         store = await MultiProcessStore.create_store()
         actor = await spawn_actors(1, LargeTensorActor, "large_tensor", store=store)

@@ -1,7 +1,6 @@
 from typing import Optional, Tuple, Any
 from dataclasses import dataclass
 from logging import getLogger
-import os
 
 import torch
 from torch.distributed.tensor import DTensor

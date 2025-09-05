@@ -28,7 +28,8 @@ def get_local_tensor(
 ):
     # Calculate the slices for each dimension
     slices = tuple(
-        slice(offset, offset + size) for offset, size in zip(global_offset, local_shape)
+        slice(offset, offset + size)
+        for offset, size in zip(global_offset, local_shape, strict=True)
     )
 
     # Slice the global_tensor to obtain the local_tensor
@@ -58,8 +59,10 @@ def assemble_global_tensor(
     )
 
     # Iterate over each local tensor and place it in the correct position in the global tensor
-    for local_tensor, offset in zip(local_tensors, global_offsets):
-        slices = tuple(slice(o, o + s) for o, s in zip(offset, local_tensor.shape, strict=True))
+    for local_tensor, offset in zip(local_tensors, global_offsets, strict=True):
+        slices = tuple(
+            slice(o, o + s) for o, s in zip(offset, local_tensor.shape, strict=True)
+        )
         global_tensor[slices] = local_tensor
 
     return global_tensor

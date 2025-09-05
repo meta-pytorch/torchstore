@@ -1,7 +1,7 @@
 # pyre-unsafe
 import asyncio
 
-from typing import List, Tuple
+from typing import Tuple
 
 import torch
 from monarch.actor import Actor, current_rank, endpoint, proc_mesh

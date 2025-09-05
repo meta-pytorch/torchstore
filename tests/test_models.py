@@ -95,7 +95,7 @@ class ModelTest(Actor):
         self.rlog("pushing state dict")
         t = time.perf_counter()
         await push_state_dict(self.store, state_dict, "v0")
-        self.rlog(f"pushed state dict in {time.perf_counter()-t} seconds")
+        self.rlog(f"pushed state dict in {time.perf_counter() - t} seconds")
 
     @endpoint
     async def do_get(self):
@@ -154,12 +154,12 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
             logger.info("pushing state dict")
             t = time.perf_counter()
             await put_world.do_push.call()
-            logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
+            logger.info(f"pushing state dict took: {time.perf_counter() - t} seconds")
 
             logger.info("fetching state dict")
             t = time.perf_counter()
             await get_world.do_get.call()
-            logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
+            logger.info(f"getting state dict took: {time.perf_counter() - t} seconds")
 
 
 if __name__ == "__main__":

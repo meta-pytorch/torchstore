@@ -1,10 +1,9 @@
 from itertools import product
 from logging import getLogger
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 from monarch.actor import Actor, endpoint
-from torch.distributed.tensor import DTensor
 
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
 from torchstore.transport import Pipe, Message, TensorSlice
@@ -203,10 +202,9 @@ class CopyStore:  # this just represents in memory. The alternative would be som
             )
 
         logger.debug("Building local tensor")
-        # TODO: should probably be a view
         local_tensor = get_local_tensor(
             self.kv[key][FULL_TENSOR],
-            message.tensor_slice.local_shape,  # TODO: remove tensor_val from messages by setting coordinates_only=True in msg cstrct
+            message.tensor_slice.local_shape,
             message.tensor_slice.offsets,
         )
         logger.debug("done local tensor")

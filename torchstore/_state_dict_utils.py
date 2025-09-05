@@ -1,4 +1,3 @@
-import asyncio
 from logging import getLogger
 from typing import Optional
 
@@ -17,9 +16,11 @@ logger = getLogger(__name__)
 async def push_state_dict(store, state_dict, key):
     """
     We have an option here. Either we can "flatten state dict", by turning state dict names into a single key,
-    or I can actually just maintain the dictionary representation of the state dict, and we can allow some recursive behavior in the store.
+    or I can actually just maintain the dictionary representation of the state dict, and we can allow some
+    recursive behavior in the store.
 
-    Overall, this might not even be something we want to solve for in the TorchStore, but I'm adding this utility so we can test sharding models.
+    Overall, this might not even be something we want to solve for in the TorchStore, but I'm adding this
+    utility so we can test sharding models.
 
     """
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
