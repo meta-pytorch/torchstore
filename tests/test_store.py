@@ -70,7 +70,7 @@ async def test_basic(strategy_params, use_rdma):
     finally:
         await actor_mesh_0._proc_mesh.stop()
         await actor_mesh_1._proc_mesh.stop()
-        await ts.teardown_store()
+        await ts.shutdown()
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -128,7 +128,7 @@ async def test_objects(strategy_params, use_rdma):
     finally:
         await actor_mesh_0._proc_mesh.stop()
         await actor_mesh_1._proc_mesh.stop()
-        await ts.teardown_store()
+        await ts.shutdown()
 
 @pytest.mark.asyncio
 async def test_large_tensors():

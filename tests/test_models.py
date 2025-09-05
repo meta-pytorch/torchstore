@@ -7,16 +7,15 @@ from logging import getLogger
 
 import torch
 
+from transformers import AutoModelForCausalLM
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-import torchstore as ts
-from transformers import AutoModelForCausalLM
+from .utils import main, transport_plus_strategy_params
 
-from torchstore._state_dict_utils import get_state_dict, push_state_dict
+import torchstore as ts
 from torchstore.utils import spawn_actors
-from torchstore.logging import init_logging
 
 logger = getLogger(__name__)
 
@@ -28,7 +27,7 @@ TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
 
 class ModelTest(Actor):
     def __init__(self, mesh_shape, file_store_name):
-        init_logging()
+        ts.init_logging()
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
@@ -82,7 +81,7 @@ class ModelTest(Actor):
 
         self.rlog("pushing state dict")
         t = time.perf_counter()
-        await push_state_dict(await ts.client(), state_dict, "v0")
+        await ts.put_state_dict(state_dict, "v0")
         self.rlog(f"pushed state dict in {time.perf_counter()-t} seconds")
 
     @endpoint
@@ -97,60 +96,64 @@ class ModelTest(Actor):
             torch.distributed.barrier()
         self.rlog("getting state dict")
         t = time.perf_counter()
-        await get_state_dict(await ts.client(), "v0", state_dict)
+        await ts.get_state_dict("v0", state_dict)
         self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
 
-
+@pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_basic(self):
+async def test_basic(strategy_params, use_rdma):
     # FSDP
     put_mesh_shape = (1,)
     get_mesh_shape = (1,)
-    await self._do_test(put_mesh_shape, get_mesh_shape)
+    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
 
+@pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_resharding(self):
+async def test_resharding(strategy_params, use_rdma):
     # FSDP
     put_mesh_shape = (4,)
     get_mesh_shape = (8,)
-    await self._do_test(put_mesh_shape, get_mesh_shape)
+    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
 
-async def _do_test(self, put_mesh_shape, get_mesh_shape):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        await ts.initialize(
-            num_storage_volumes=math.prod(put_mesh_shape),
-            strategy=ts.LocalRankStrategy(),
-        )
+async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
-        put_world_size = math.prod(put_mesh_shape)
-        put_world = await spawn_actors(
-            put_world_size,
-            ModelTest,
-            "save_world",
-            mesh_shape=put_mesh_shape,
-            file_store_name=os.path.join(tmpdir, "save_world"),
-        )            
+    put_world_size = math.prod(put_mesh_shape)
+    await ts.initialize(
+        num_storage_volumes=put_world_size if strategy is not None else 1,
+        strategy=strategy,
+    )
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            put_world_size = math.prod(put_mesh_shape)
+            put_world = await spawn_actors(
+                put_world_size,
+                ModelTest,
+                "save_world",
+                mesh_shape=put_mesh_shape,
+                file_store_name=os.path.join(tmpdir, "save_world"),
+            )            
 
-        get_world_size = math.prod(get_mesh_shape)
-        get_world = await spawn_actors(
-            get_world_size,
-            ModelTest,
-            "get_world",
-            mesh_shape=get_mesh_shape,
-            file_store_name=os.path.join(tmpdir, "get_world"),
-        )
+            get_world_size = math.prod(get_mesh_shape)
+            get_world = await spawn_actors(
+                get_world_size,
+                ModelTest,
+                "get_world",
+                mesh_shape=get_mesh_shape,
+                file_store_name=os.path.join(tmpdir, "get_world"),
+            )
 
-        logger.info("pushing state dict")
-        t = time.perf_counter()
-        await put_world.do_push.call()
-        logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
-        
-        logger.info("fetching state dict")
-        t = time.perf_counter()
-        await get_world.do_get.call()
-        logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
-
+            logger.info("pushing state dict")
+            t = time.perf_counter()
+            await put_world.do_push.call()
+            logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
+            
+            logger.info("fetching state dict")
+            t = time.perf_counter()
+            await get_world.do_get.call()
+            logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
+    finally:
+        await ts.shutdown()
 
 if __name__ == "__main__":
-    init_logging()
-    pytest.main([__file__])
+    main([__file__])

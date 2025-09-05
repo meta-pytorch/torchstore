@@ -114,6 +114,7 @@ if __name__ == "__main__":
     ts.initialize()
     run_in_parallel(place_dtensor_in_store)
     run_in_parallel(fetch_dtensor_from_store)
+    ts.shutdown()
 
 # checkout out tests/test_resharding.py for more e2e examples with resharding DTensor.
 ```

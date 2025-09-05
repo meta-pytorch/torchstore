@@ -200,7 +200,6 @@ async def test_data_parallel(strategy_params, use_rdma):
     # # 1d
     put_mesh_shape = (2,)
     get_mesh_shape = (4,)
-
     placements = [Replicate()]
     await _test_resharding(
         put_mesh_shape=put_mesh_shape,
@@ -329,7 +328,7 @@ async def _test_resharding(
         await put_mesh._proc_mesh.stop()
         await get_mesh.destroy_process_group.call()
         await get_mesh._proc_mesh.stop()
-        await ts.teardown_store()
+        await ts.shutdown()
 
 def _assert_correct_sharded_tensor(
     full_tensor, sharded_tensor, get_placements, coordinate

@@ -7,7 +7,7 @@ from torchstore.api import (
     put,
     get,
     client,
-    teardown_store,
+    shutdown,
     put_state_dict,
     get_state_dict
 )
@@ -29,7 +29,7 @@ __all__ = [
     "put",
     "get",
     "client",
-    "teardown_store",
+    "shutdown",
     "TorchStoreStrategy",
     "LocalRankStrategy",
     "SingletonStrategy",

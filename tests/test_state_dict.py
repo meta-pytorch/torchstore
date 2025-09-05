@@ -199,7 +199,7 @@ async def test_state_dict(strategy_params, use_rdma):
     try:
         state_dict, fetched_state_dict = await trainer.do_test.call_one()
     finally:
-        await ts.teardown_store()
+        await ts.shutdown()
     _assert_equal_state_dict(state_dict, fetched_state_dict)
     
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -216,10 +216,13 @@ async def test_dcp_sharding_parity(strategy_params, use_rdma):
     ]:
         save_world_size = math.prod(save_mesh_shape)
         get_world_size = math.prod(get_mesh_shape)
+        logger.info(
+            f"Testing -- save_mesh_shape: {save_mesh_shape} get_mesh_shape: {get_mesh_shape}"
+        )
 
         _, strategy = strategy_params
         await ts.initialize(
-            num_storage_volumes=save_world_size,
+            num_storage_volumes=save_world_size if strategy is not None else 1,
             strategy=strategy
         )
         try:
@@ -255,8 +258,10 @@ async def test_dcp_sharding_parity(strategy_params, use_rdma):
                         raise AssertionError(
                             f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
                         ) from e
-        finally:
-            await ts.teardown_store()
+        finally:            
+            await save_world._proc_mesh.stop()
+            await get_world._proc_mesh.stop()
+            await ts.shutdown()
 
 def _assert_equal_state_dict(state_dict1, state_dict2):
     flattened_state_dict_1, _ = flatten_state_dict(state_dict1)

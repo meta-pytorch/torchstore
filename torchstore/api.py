@@ -48,7 +48,7 @@ async def initialize(
         storage_volumes=storage_volumes,
     )
 
-async def teardown_store(store_name=DEFAULT_TORCHSTORE_NAME):
+async def shutdown(store_name=DEFAULT_TORCHSTORE_NAME):
     controller = await get_or_spawn_controller(store_name, Controller)    
     await controller.teardown.call()
     global _local_clent_map
