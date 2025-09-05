@@ -7,9 +7,11 @@ from torchstore.api import (
     put,
     get,
     client,
-    teardown_store
+    teardown_store,
+    put_state_dict,
+    get_state_dict
 )
-from torchstore.strategy import LocalRankStrategy, SingletonStrategy
+from torchstore.strategy import TorchStoreStrategy, LocalRankStrategy, SingletonStrategy
 
 if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
     init_logging()
@@ -21,7 +23,6 @@ if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
     os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = "910737418240"
 
 
-
 __all__ = [
     "initialize",
     "init_logging",
@@ -29,6 +30,9 @@ __all__ = [
     "get",
     "client",
     "teardown_store",
+    "TorchStoreStrategy",
     "LocalRankStrategy",
-    "SingletonStrategy"
+    "SingletonStrategy",
+    "put_state_dict",
+    "get_state_dict",
 ]

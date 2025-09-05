@@ -2,6 +2,7 @@ import os
 import time
 import math
 import pytest
+from itertools import product
 from logging import getLogger
 
 import torch
@@ -12,26 +13,17 @@ import torchstore as ts
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
+from .utils import test_main, transport_plus_strategy_params
+
 init_logging()
 logger = getLogger(__name__)
 
 
-
-def strategy_params():
-    return "volume_world_size, strategy", [
-        (2, ts.LocalRankStrategy()),
-        (1, None), # Singleton
-    ]
-
-@pytest.mark.parametrize(
-    "volume_world_size, strategy", [
-        (2, ts.LocalRankStrategy()),
-        (1, None), # Singleton
-    ]
-)
+@pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_basic(volume_world_size, strategy):
+async def test_basic(strategy_params, use_rdma):
     """Test basic put/get functionality for multiple processes"""
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
     
     class PutGetActor(Actor):
         """Each instance of this actor represents a single process."""
@@ -45,21 +37,16 @@ async def test_basic(volume_world_size, strategy):
 
             # required by LocalRankStrategy
             os.environ["LOCAL_RANK"] = str(self.rank)
-
-        def rlog(self, msg):
-            logger.info(f"rank: {self.rank} {msg}")
-
         @endpoint
         async def put(self):
-            self.rlog("pyt")
             t = torch.tensor([self.rank+1] * 10)
             await ts.put(f"key_{self.rank}", t)
         @endpoint
         async def get(self, rank_offset=0):
             other_rank = (self.rank + rank_offset) % self.world_size
-            self.rlog(f"get {other_rank=}")
             return await ts.get(f"key_{other_rank}")
 
+    volume_world_size, strategy = strategy_params
     await torchstore.initialize(
         num_storage_volumes=volume_world_size,
         strategy=strategy
@@ -82,6 +69,64 @@ async def test_basic(volume_world_size, strategy):
             other_rank = (pt.rank + rank_offset) % volume_world_size
             expected = torch.tensor([other_rank+1] * 10)
             assert torch.equal(expected, val), f"{expected} != {val}"
+    finally:
+        await actor_mesh_0._proc_mesh.stop()
+        await actor_mesh_1._proc_mesh.stop()
+        await ts.teardown_store()
+
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_objects(strategy_params, use_rdma):
+    """Test basic put/get functionality for multiple processes"""
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+    
+    class ObjectActor(Actor):
+        """Each instance of this actor represents a single process."""
+        def __init__(
+            self,
+            world_size,
+        ):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            # required by LocalRankStrategy
+            os.environ["LOCAL_RANK"] = str(self.rank)
+        @endpoint
+        async def put(self, obj):        
+            await ts.put(f"key_{self.rank}", obj)
+        @endpoint
+        async def get(self, rank_offset=0):
+            other_rank = (self.rank + rank_offset) % self.world_size
+            return await ts.get(f"key_{other_rank}")
+
+    volume_world_size, strategy = strategy_params
+    await torchstore.initialize(
+        num_storage_volumes=volume_world_size,
+        strategy=strategy
+    )
+    # each actor mesh represents a group of processes.
+    actor_mesh_0 = await spawn_actors(volume_world_size, ObjectActor, "actor_mesh_0", world_size=volume_world_size)
+    actor_mesh_1 = await spawn_actors(volume_world_size, ObjectActor, "actor_mesh_1", world_size=volume_world_size)
+
+    class MyTestObject:
+        def __init__(self, val):
+            self.val = val
+
+    try:        
+        for idx in range(volume_world_size):
+            actor = actor_mesh_0.slice(**{"hosts":0, "gpus": idx})
+            await actor.put(
+                MyTestObject(idx)
+            )
+
+        for rank_offset in (0, 1):
+            objects = await actor_mesh_1.get.call(rank_offset=rank_offset)
+            for pt, val in objects:
+                other_rank = (pt.rank + rank_offset) % volume_world_size
+                expected = MyTestObject(other_rank)
+                assert torch.equal(expected, val), f"{expected} != {val}"
+
     finally:
         await actor_mesh_0._proc_mesh.stop()
         await actor_mesh_1._proc_mesh.stop()
@@ -160,5 +205,4 @@ async def test_large_tensors():
 
 
 if __name__ == "__main__":
-    init_logging()
-    pytest.main([__file__])
+    test_main(__file__)

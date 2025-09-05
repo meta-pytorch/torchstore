@@ -1,6 +1,16 @@
 import pytest
-from torchstore.logging import init_logging
+from itertools import product
+import torchstore as ts
 
 def test_main(file):
-    init_logging()
+    ts.init_logging()
     pytest.main([file])
+
+def transport_plus_strategy_params():
+    strategies = [
+        (2, ts.LocalRankStrategy()),
+        (1, None), #singleton
+    ]
+    rdma_options = [False] #, True] broken on my build
+    
+    return "strategy_params, use_rdma", list(product(strategies, rdma_options))

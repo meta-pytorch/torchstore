@@ -2,7 +2,7 @@ import copy
 import math
 import os
 import tempfile
-import unittest
+import pytest
 from logging import getLogger
 from typing import Union
 
@@ -20,9 +20,9 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 
-from torchstore import MultiProcessStore
-from torchstore._state_dict_utils import get_state_dict, push_state_dict
+import torchstore as ts
 from torchstore.utils import spawn_actors
+from .utils import test_main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -81,8 +81,7 @@ class DCPParityTest(Actor):
 
     torchstore_checkpoint_fn: str = "torchstore_checkpoint.pt"
 
-    def __init__(self, store, mesh_shape, dcp_checkpoint_fn, file_store_name):
-        self.store = store
+    def __init__(self, mesh_shape, dcp_checkpoint_fn, file_store_name):
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
         self.dcp_checkpoint_fn = dcp_checkpoint_fn
@@ -135,7 +134,7 @@ class DCPParityTest(Actor):
         }
 
         dcp.save(state_dict, checkpoint_id=self.dcp_checkpoint_fn)
-        await push_state_dict(self.store, state_dict, "v0")
+        await ts.put_state_dict(state_dict, "v0")
 
     @endpoint
     async def do_get(self):
@@ -150,119 +149,113 @@ class DCPParityTest(Actor):
         dcp.load(dcp_state_dict, checkpoint_id=self.dcp_checkpoint_fn)
 
         torchstore_state_dict = copy.deepcopy(state_dict)
-        await get_state_dict(self.store, "v0", torchstore_state_dict)
+        await ts.get_state_dict("v0", torchstore_state_dict)
 
         return dcp_state_dict, torchstore_state_dict
 
+@pytest.mark.asyncio
+async def test_state_dict():
+    class Trainer(Actor):
+        # Monarch RDMA does not work outside of an actor, so we need
+        # to wrapp this test first
+        #TODO: assert this within rdma buffer
+        @endpoint
+        async def do_test(self):
+            model = CompositeParamModel()
+            optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
 
-class TestStateDict(unittest.IsolatedAsyncioTestCase):
-    async def test_state_dict(self):
-        class Trainer(Actor):
-            # Monarch RDMA does not work outside of an actor, so we need
-            # to wrapp this test first
-            #TODO: assert this within rdma buffer
-            @endpoint
-            async def do_test(self, store):
-                model = CompositeParamModel()
-                optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+            for _ in range(5):
+                optimizer.zero_grad()
+                loss = model(torch.randn(8, MODEL_LINER_LENGTH)).sum()
+                loss.backward()
+                optimizer.step()
 
-                for _ in range(5):
-                    optimizer.zero_grad()
-                    loss = model(torch.randn(8, MODEL_LINER_LENGTH)).sum()
-                    loss.backward()
-                    optimizer.step()
+            state_dict = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+            await ts.put_state_dict(state_dict, "v0")
 
-                state_dict = {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                }
-                await push_state_dict(store, state_dict, "v0")
+            fetched_state_dict = await ts.get_state_dict("v0")
+            return state_dict, fetched_state_dict
 
-                fetched_state_dict = await get_state_dict(store, "v0")
-                return state_dict, fetched_state_dict
+    trainer = await spawn_actors(1, Trainer, "trainer")
+    await ts.initialize()
+    state_dict, fetched_state_dict = await trainer.do_test.call_one()
+    await ts.teardown_store()
+    _assert_equal_state_dict(state_dict, fetched_state_dict)
+    
+@pytest.mark.asyncio
+async def test_dcp_sharding_parity():
+    for save_mesh_shape, get_mesh_shape in [
+        ((2,), (4,)),
+        ((4,), (2,)),
+        ((2, 2), (4,)),
+        ((2,), (2, 4)),
+        ((4, 2), (2, 4)),
+    ]:
+        save_world_size = math.prod(save_mesh_shape)
+        get_world_size = math.prod(get_mesh_shape)
 
-        trainer = await spawn_actors(1, Trainer, "trainer")
-        store = await MultiProcessStore.create_store()
-        state_dict, fetched_state_dict = await trainer.do_test.call_one(store)
-        self._assert_equal_state_dict(state_dict, fetched_state_dict)
-        
+        await ts.initialize()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dcp_checkpoint_fn = os.path.join(tmpdir, "dcp_checkpoint.pt")
 
-    async def test_dcp_sharding_parity(self):
-        for save_mesh_shape, get_mesh_shape in [
-            ((2,), (4,)),
-            ((4,), (2,)),
-            ((2, 2), (4,)),
-            ((2,), (2, 4)),
-            ((4, 2), (2, 4)),
-        ]:
-            save_world_size = math.prod(save_mesh_shape)
-            get_world_size = math.prod(get_mesh_shape)
+            save_world = await spawn_actors(
+                save_world_size,
+                DCPParityTest,
+                "save_world",
+                mesh_shape=save_mesh_shape,
+                dcp_checkpoint_fn=dcp_checkpoint_fn,
+                file_store_name=os.path.join(tmpdir, "save_world"),
+            )
+            await save_world.do_put.call()
 
-            store = await MultiProcessStore.create_store()
-            with tempfile.TemporaryDirectory() as tmpdir:
-                dcp_checkpoint_fn = os.path.join(tmpdir, "dcp_checkpoint.pt")
+            get_world = await spawn_actors(
+                get_world_size,
+                DCPParityTest,
+                "get_world",
+                mesh_shape=get_mesh_shape,
+                dcp_checkpoint_fn=dcp_checkpoint_fn,
+                file_store_name=os.path.join(tmpdir, "get_world"),
+            )
+            value_mesh = await get_world.do_get.call()
+            for coord, val in value_mesh:
+                try:
+                    dcp_state_dict, torchstore_state_dict = val
+                    _assert_equal_state_dict(
+                        dcp_state_dict, torchstore_state_dict
+                    )
+                except Exception as e:
+                    raise AssertionError(
+                        f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
+                    ) from e
+        await ts.teardown_store()
 
-                save_world = await spawn_actors(
-                    save_world_size,
-                    DCPParityTest,
-                    "save_world",
-                    store=store,
-                    mesh_shape=save_mesh_shape,
-                    dcp_checkpoint_fn=dcp_checkpoint_fn,
-                    file_store_name=os.path.join(tmpdir, "save_world"),
-                )
-                await save_world.do_put.call()
+def _assert_equal_state_dict(state_dict1, state_dict2):
+    flattened_state_dict_1, _ = flatten_state_dict(state_dict1)
+    flattened_state_dict_2, _ = flatten_state_dict(state_dict2)
 
-                get_world = await spawn_actors(
-                    get_world_size,
-                    DCPParityTest,
-                    "get_world",
-                    store=store,
-                    mesh_shape=get_mesh_shape,
-                    dcp_checkpoint_fn=dcp_checkpoint_fn,
-                    file_store_name=os.path.join(tmpdir, "get_world"),
-                )
-                value_mesh = await get_world.do_get.call()
-                for coord, val in value_mesh:
-                    try:
-                        dcp_state_dict, torchstore_state_dict = val
-                        self._assert_equal_state_dict(
-                            dcp_state_dict, torchstore_state_dict
-                        )
-                    except Exception as e:
-                        raise AssertionError(
-                            f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
-                       ) from e
+    assert len(flattened_state_dict_1) == len(flattened_state_dict_2), (
+         f"{flattened_state_dict_1.keys()=}\n{flattened_state_dict_2.keys()=}"
+    )
+    for key in flattened_state_dict_1:
 
-    def _assert_equal_state_dict(self, state_dict1, state_dict2):
-        flattened_state_dict_1, _ = flatten_state_dict(state_dict1)
-        flattened_state_dict_2, _ = flatten_state_dict(state_dict2)
+        assert key in flattened_state_dict_2
+        if isinstance(flattened_state_dict_1[key], torch.Tensor):
+            t1, t2 = flattened_state_dict_1[key], flattened_state_dict_2[key]
+            if isinstance(t1, DTensor):
+                t1 = t1._local_tensor
+            if isinstance(t2, DTensor):
+                t2 = t2._local_tensor
 
-        self.assertEqual(
-            len(flattened_state_dict_1),
-            len(flattened_state_dict_2),
-            msg=f"{flattened_state_dict_1.keys()=}\n{flattened_state_dict_2.keys()=} ",
-        )
-        for key in flattened_state_dict_1:
-            self.assertTrue(key in flattened_state_dict_2)
-            if isinstance(flattened_state_dict_1[key], torch.Tensor):
-                t1, t2 = flattened_state_dict_1[key], flattened_state_dict_2[key]
-                if isinstance(t1, DTensor):
-                    t1 = t1._local_tensor
-                if isinstance(t2, DTensor):
-                    t2 = t2._local_tensor
-
-                self.assertTrue(
-                    torch.equal(t1, t2),
-                    f"{key=} {flattened_state_dict_1[key]=} {t1.shape=} {flattened_state_dict_2[key]=} {t2.shape=}",
-                )
-            else:
-                self.assertEqual(
-                    flattened_state_dict_1[key],
-                    flattened_state_dict_2[key],
-                    f"{key=} {flattened_state_dict_1[key]=} {flattened_state_dict_2[key]=}",
-                )
-
+            assert torch.equal(t1, t2), (
+                f"{key=} {flattened_state_dict_1[key]=} {t1.shape=} {flattened_state_dict_2[key]=} {t2.shape=}",
+            )
+        else:
+            assert flattened_state_dict_1[key] == flattened_state_dict_2[key], (
+                f"{key=} {flattened_state_dict_1[key]=} {flattened_state_dict_2[key]=}"
+            )
 
 if __name__ == "__main__":
-    unittest.main()
+    test_main(__file__) 

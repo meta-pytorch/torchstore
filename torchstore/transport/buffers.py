@@ -21,11 +21,9 @@ except ImportError:
 RDMDA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB", "1"))
 assert RDMDA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
-RDMA_ENABLED: bool = os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
-
-
 def rdma_available() -> bool:
-    return RDMA_ENABLED and monarch_rdma_available()
+    rdma_enabled = os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
+    return rdma_enabled and monarch_rdma_available()
 
 
 class TransportBuffer:

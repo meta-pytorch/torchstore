@@ -1,9 +1,11 @@
 from typing import Union, Any, Optional
 
+from tests import utils
 import torch
 from monarch.actor import get_or_spawn_controller
 
 
+import torchstore.state_dict_utils
 from torchstore.strategy import TorchStoreStrategy, SingletonStrategy
 from torchstore.storage_volume import StorageVolume
 from torchstore.controller import Controller
@@ -75,3 +77,13 @@ async def put(key: str, value: Union[torch.Tensor, Any], store_name=DEFAULT_TORC
 async def get(key: str, inplace_tensor: Optional[torch.Tensor] = None, store_name=DEFAULT_TORCHSTORE_NAME):
     cl = await client(store_name)
     return await cl.get(key, inplace_tensor)
+
+async def put_state_dict(state_dict, key:str, store_name: str=DEFAULT_TORCHSTORE_NAME):
+    cl = await client(store_name)
+    await torchstore.state_dict_utils.put_state_dict(store=cl,state_dict=state_dict, key=key)
+
+async def get_state_dict(
+    key: str, user_state_dict: Optional[dict] = None, strict:bool =True, store_name:str =DEFAULT_TORCHSTORE_NAME
+):
+    cl = await client(store_name)
+    return await torchstore.state_dict_utils.get_state_dict(cl, key, user_state_dict, strict)
