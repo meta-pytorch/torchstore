@@ -14,7 +14,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
 import torchstore as ts
-from torchstore.controller import LocalRankStrategy
 from torchstore.utils import get_local_tensor, spawn_actors
 
 logger = getLogger(__name__)
@@ -240,9 +239,9 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
         original_tensor = torch.arange(8**2).reshape(
             8, 8
         )  # 8x8 square, with ([[0...7],[8...15],[...]])
-        await ts.initialize_store(
+        await ts.initialize(
             num_storage_volumes=put_world_size,
-            strategy=LocalRankStrategy()
+            strategy=ts.LocalRankStrategy()
         )
         with tempfile.TemporaryDirectory() as filesystem_store_dir:
             # each actor mesh represents a group of processes.

@@ -3,12 +3,13 @@ from logging import getLogger
 
 from torchstore.logging import init_logging
 from torchstore.api import (
-    initialize_store,
+    initialize,
     put,
     get,
     client,
     teardown_store
 )
+from torchstore.strategy import LocalRankStrategy, SingletonStrategy
 
 if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
     init_logging()
@@ -22,10 +23,12 @@ if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
 
 
 __all__ = [
-    "initialize_store",
+    "initialize",
     "init_logging",
     "put",
     "get",
     "client",
-    "teardown_store"
+    "teardown_store",
+    "LocalRankStrategy",
+    "SingletonStrategy"
 ]

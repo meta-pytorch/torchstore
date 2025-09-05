@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import Any, Dict
 
 import torch
-from monarch.actor import Actor, endpoint, current_rank
+from monarch.actor import Actor, endpoint
 
 from torchstore.transport.pipe import Request
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors

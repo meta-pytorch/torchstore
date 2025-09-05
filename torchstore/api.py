@@ -4,6 +4,7 @@ import torch
 from monarch.actor import get_or_spawn_controller
 
 
+from torchstore.strategy import TorchStoreStrategy, SingletonStrategy
 from torchstore.storage_volume import StorageVolume
 from torchstore.controller import Controller
 from torchstore.client import LocalClient
@@ -15,21 +16,20 @@ DEFAULT_TORCHSTORE_NAME = "TorchStoreController"
 # cache for local clients
 _local_clent_map = {}
 
-async def initialize_store(
+async def initialize(
     num_storage_volumes=1,
-    strategy=None,
-    store_name=DEFAULT_TORCHSTORE_NAME # must be unique per monarch context
+    strategy: Optional[TorchStoreStrategy]=None,
+    store_name=DEFAULT_TORCHSTORE_NAME 
 ):
     """Initializes the global store, and returns a local client.
     """
 
     if num_storage_volumes == 1 and strategy is None:
-        #TODO: Singleton case
-        raise NotImplementedError()
+        strategy = SingletonStrategy()
     elif strategy is None:
         raise RuntimeError("Must specify controller strategy if num_storage_volumes > 1")
 
-    #todo: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
+    #TODO: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
     # ideally this is done in the controller.init
     storage_volumes = await StorageVolume.spawn(
         num_volumes=num_storage_volumes,

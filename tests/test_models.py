@@ -2,7 +2,7 @@ import math
 import os
 import tempfile
 import time
-import unittest
+import pytest
 from logging import getLogger
 
 import torch
@@ -11,9 +11,9 @@ from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
+import torchstore as ts
 from transformers import AutoModelForCausalLM
 
-from torchstore import MultiProcessStore
 from torchstore._state_dict_utils import get_state_dict, push_state_dict
 from torchstore.utils import spawn_actors
 from torchstore.logging import init_logging
@@ -27,13 +27,14 @@ TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
 
 
 class ModelTest(Actor):
-    def __init__(self, store, mesh_shape, file_store_name):
+    def __init__(self, mesh_shape, file_store_name):
         init_logging()
         self.rank = current_rank().rank
-        self.store = store
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
         self.file_store_name = file_store_name
+
+        os.environ["LOCAL_RANK"] = str(self.rank)
 
     def initialize_distributed(self):
         self.rlog(f"Initialize process group using {self.file_store_name=} ")
@@ -81,7 +82,7 @@ class ModelTest(Actor):
 
         self.rlog("pushing state dict")
         t = time.perf_counter()
-        await push_state_dict(self.store, state_dict, "v0")
+        await push_state_dict(await ts.client(), state_dict, "v0")
         self.rlog(f"pushed state dict in {time.perf_counter()-t} seconds")
 
     @endpoint
@@ -96,59 +97,60 @@ class ModelTest(Actor):
             torch.distributed.barrier()
         self.rlog("getting state dict")
         t = time.perf_counter()
-        await get_state_dict(self.store, "v0", state_dict)
+        await get_state_dict(await ts.client(), "v0", state_dict)
         self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
 
 
-class TestHFModel(unittest.IsolatedAsyncioTestCase):
-    async def test_basic(self):
-        # FSDP
-        put_mesh_shape = (1,)
-        get_mesh_shape = (1,)
-        await self._do_test(put_mesh_shape, get_mesh_shape)
+@pytest.mark.asyncio
+async def test_basic(self):
+    # FSDP
+    put_mesh_shape = (1,)
+    get_mesh_shape = (1,)
+    await self._do_test(put_mesh_shape, get_mesh_shape)
 
-    async def test_resharding(self):
-        # FSDP
-        put_mesh_shape = (4,)
-        get_mesh_shape = (8,)
-        await self._do_test(put_mesh_shape, get_mesh_shape)
+@pytest.mark.asyncio
+async def test_resharding(self):
+    # FSDP
+    put_mesh_shape = (4,)
+    get_mesh_shape = (8,)
+    await self._do_test(put_mesh_shape, get_mesh_shape)
 
-    async def _do_test(self, put_mesh_shape, get_mesh_shape):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = await MultiProcessStore.create_store()
+async def _do_test(self, put_mesh_shape, get_mesh_shape):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        await ts.initialize(
+            num_storage_volumes=math.prod(put_mesh_shape),
+            strategy=ts.LocalRankStrategy(),
+        )
 
-            put_world_size = math.prod(put_mesh_shape)
-            put_world = await spawn_actors(
-                put_world_size,
-                ModelTest,
-                "save_world",
-                store=store,
-                mesh_shape=put_mesh_shape,
-                file_store_name=os.path.join(tmpdir, "save_world"),
-            )            
+        put_world_size = math.prod(put_mesh_shape)
+        put_world = await spawn_actors(
+            put_world_size,
+            ModelTest,
+            "save_world",
+            mesh_shape=put_mesh_shape,
+            file_store_name=os.path.join(tmpdir, "save_world"),
+        )            
 
-            get_world_size = math.prod(get_mesh_shape)
-            get_world = await spawn_actors(
-                get_world_size,
-                ModelTest,
-                "get_world",
-                store=store,
-                mesh_shape=get_mesh_shape,
-                file_store_name=os.path.join(tmpdir, "get_world"),
-            )
+        get_world_size = math.prod(get_mesh_shape)
+        get_world = await spawn_actors(
+            get_world_size,
+            ModelTest,
+            "get_world",
+            mesh_shape=get_mesh_shape,
+            file_store_name=os.path.join(tmpdir, "get_world"),
+        )
 
-            
-            logger.info("pushing state dict")
-            t = time.perf_counter()
-            await put_world.do_push.call()
-            logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
-            
-            logger.info("fetching state dict")
-            t = time.perf_counter()
-            await get_world.do_get.call()
-            logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
+        logger.info("pushing state dict")
+        t = time.perf_counter()
+        await put_world.do_push.call()
+        logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
+        
+        logger.info("fetching state dict")
+        t = time.perf_counter()
+        await get_world.do_get.call()
+        logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
 
 
 if __name__ == "__main__":
     init_logging()
-    unittest.main()
+    pytest.main([__file__])
