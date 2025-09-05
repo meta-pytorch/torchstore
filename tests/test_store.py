@@ -7,7 +7,6 @@ from logging import getLogger
 import torch
 from monarch.actor import Actor, current_rank, endpoint
 
-import torchstore
 import torchstore as ts
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
@@ -46,7 +45,7 @@ async def test_basic(strategy_params, use_rdma):
             return await ts.get(f"key_{other_rank}")
 
     volume_world_size, strategy = strategy_params
-    await torchstore.initialize(
+    await ts.initialize(
         num_storage_volumes=volume_world_size,
         strategy=strategy
     )
@@ -100,7 +99,7 @@ async def test_objects(strategy_params, use_rdma):
             return await ts.get(f"key_{other_rank}")
 
     volume_world_size, strategy = strategy_params
-    await torchstore.initialize(
+    await ts.initialize(
         num_storage_volumes=volume_world_size,
         strategy=strategy
     )

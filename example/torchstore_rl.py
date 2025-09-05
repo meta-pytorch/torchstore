@@ -1,12 +1,12 @@
 # pyre-unsafe
 import asyncio
 
-from typing import List, Tuple
+from typing import Tuple
 
 import torch
+import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint, proc_mesh
-from torchstore import MultiProcessStore
-from torchstore._state_dict_utils import get_state_dict, push_state_dict
+
 
 
 # Run the example : python example/torchstore_rl.py
@@ -38,7 +38,7 @@ class Learner(Actor):
         self.optim.step()
         print("[learner] weights: ", self.model.state_dict())
         # Put weights in to torch.store
-        await push_state_dict(self.store, self.model.state_dict(), key="toy_app")
+        await ts.put_state_dict(self.model.state_dict(), key="toy_app")
 
 
 class Generator(Actor):
@@ -55,8 +55,8 @@ class Generator(Actor):
             )
         )
         # Fetch weights from torch.store
-        await get_state_dict(
-            self.store, key="toy_app", user_state_dict=self.model.state_dict()
+        await ts.get_state_dict(
+            key="toy_app", user_state_dict=self.model.state_dict()
         )
         print(
             "[generator {}] new weights: {}".format(self.index, self.model.state_dict())
@@ -83,10 +83,10 @@ async def main():
     learner_mesh = await proc_mesh(gpus=num_learners)
     gen_mesh = await proc_mesh(gpus=num_generators)
 
-    store = await MultiProcessStore.create_store()
+    await ts.initialize()
 
-    learner = await learner_mesh.spawn("learner", Learner, store)
-    generators = await gen_mesh.spawn("generator", Generator, store)
+    learner = await learner_mesh.spawn("learner", Learner)
+    generators = await gen_mesh.spawn("generator", Generator)
 
     logits, reward = await generators.generate.call_one(
         torch.randn(4, 4, device="cuda")

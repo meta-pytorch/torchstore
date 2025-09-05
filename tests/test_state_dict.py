@@ -153,8 +153,12 @@ class DCPParityTest(Actor):
 
         return dcp_state_dict, torchstore_state_dict
 
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_state_dict():
+async def test_state_dict(strategy_params, use_rdma):
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+
     class Trainer(Actor):
         # Monarch RDMA does not work outside of an actor, so we need
         # to wrapp this test first
@@ -179,10 +183,17 @@ async def test_state_dict():
             fetched_state_dict = await ts.get_state_dict("v0")
             return state_dict, fetched_state_dict
 
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(
+        num_storage_volumes=volume_world_size,
+        strategy=strategy
+    )
     trainer = await spawn_actors(1, Trainer, "trainer")
-    await ts.initialize()
-    state_dict, fetched_state_dict = await trainer.do_test.call_one()
-    await ts.teardown_store()
+    try:
+        state_dict, fetched_state_dict = await trainer.do_test.call_one()
+    finally:
+        await ts.teardown_store()
     _assert_equal_state_dict(state_dict, fetched_state_dict)
     
 @pytest.mark.asyncio
