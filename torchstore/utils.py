@@ -2,7 +2,7 @@ from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from monarch.actor import proc_mesh#, this_host
+from monarch.actor import proc_mesh  # , this_host
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
@@ -55,11 +55,11 @@ def assemble_global_tensor(
     global_tensor = torch.empty(
         global_shape,
         dtype=local_tensors[0].dtype,
-    ) 
+    )
 
     # Iterate over each local tensor and place it in the correct position in the global tensor
     for local_tensor, offset in zip(local_tensors, global_offsets):
-        slices = tuple(slice(o, o + s) for o, s in zip(offset, local_tensor.shape))
+        slices = tuple(slice(o, o + s) for o, s in zip(offset, local_tensor.shape, strict=True))
         global_tensor[slices] = local_tensor
 
     return global_tensor

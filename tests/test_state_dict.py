@@ -160,7 +160,7 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
         class Trainer(Actor):
             # Monarch RDMA does not work outside of an actor, so we need
             # to wrapp this test first
-            #TODO: assert this within rdma buffer
+            # TODO: assert this within rdma buffer
             @endpoint
             async def do_test(self, store):
                 model = CompositeParamModel()
@@ -185,7 +185,6 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
         store = await MultiProcessStore.create_store()
         state_dict, fetched_state_dict = await trainer.do_test.call_one(store)
         self._assert_equal_state_dict(state_dict, fetched_state_dict)
-        
 
     async def test_dcp_sharding_parity(self):
         for save_mesh_shape, get_mesh_shape in [
@@ -232,7 +231,7 @@ class TestStateDict(unittest.IsolatedAsyncioTestCase):
                     except Exception as e:
                         raise AssertionError(
                             f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
-                       ) from e
+                        ) from e
 
     def _assert_equal_state_dict(self, state_dict1, state_dict2):
         flattened_state_dict_1, _ = flatten_state_dict(state_dict1)

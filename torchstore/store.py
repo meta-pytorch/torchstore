@@ -15,7 +15,7 @@ logger = getLogger(__name__)
 FULL_TENSOR = "full_tensor"
 
 
-class MultiProcessStore: # This is actually the local client
+class MultiProcessStore:  # This is actually the local client
     """This class represents the local store, which exists on every process. Remote storage
     is handled by the client.
     """
@@ -34,7 +34,9 @@ class MultiProcessStore: # This is actually the local client
 
     @property
     def client(self):
-        assert self._client is not None, "Client not initialized, please instantiate this class with 'create_store'"
+        assert (
+            self._client is not None
+        ), "Client not initialized, please instantiate this class with 'create_store'"
         return self._client
 
     @torch.no_grad
@@ -60,7 +62,7 @@ class MultiProcessStore: # This is actually the local client
         return fetched_tensor if inplace_tensor is None else inplace_tensor
 
 
-class _MultiProcessClient(Actor): # this is the storage volume
+class _MultiProcessClient(Actor):  # this is the storage volume
     """The remote logic for storage. Recieves remote put/get requests and handles them via the storage abstraction"""
 
     def __init__(self):
@@ -79,8 +81,7 @@ class _MultiProcessClient(Actor): # this is the storage volume
         return await self.store.get_meta(key)
 
 
-
-class CopyStore: # this just represents in memory. The alternative would be something like SSD
+class CopyStore:  # this just represents in memory. The alternative would be something like SSD
     # TODO: make functions atomic
     def __init__(self):
         self.kv: Dict[str, Any] = {}
@@ -96,8 +97,8 @@ class CopyStore: # this just represents in memory. The alternative would be some
         if FULL_TENSOR in self.kv[key]:
             return
 
-        # TODO: Utility fucntions may make more sense in a 
-        # a "PendingTensor" class and have these functions 
+        # TODO: Utility fucntions may make more sense in a
+        # a "PendingTensor" class and have these functions
         # defined there instead. should also totally simplify the logic here
         local_tensors = []
         global_offsets = []
@@ -150,13 +151,15 @@ class CopyStore: # this just represents in memory. The alternative would be some
 
         return True
 
-    def _handle_dtensor(self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor):
+    def _handle_dtensor(
+        self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
+    ):
         if key not in self.kv:
             self.kv[key] = {}
 
         self.kv[key][tensor_slice.coordinates] = {
             "slice": tensor_slice,
-            "tensor": tensor
+            "tensor": tensor,
         }
 
     async def put(self, key: str, transport_buffer: torch.Tensor, message: Message):
@@ -166,11 +169,11 @@ class CopyStore: # this just represents in memory. The alternative would be some
 
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
-        tensor = await transport_buffer.read_into() 
+        tensor = await transport_buffer.read_into()
         if message.tensor_slice is not None:
             self._handle_dtensor(key, message.tensor_slice, tensor)
-            return  
-    
+            return
+
         self.kv[key] = tensor
 
     async def get(self, key: str, transport_buffer: torch.Tensor, message: Message):
@@ -178,7 +181,7 @@ class CopyStore: # this just represents in memory. The alternative would be some
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
-        #TODO: clean up
+        # TODO: clean up
         val = self.kv[key]
         if isinstance(val, dict) and "obj" in val:
             transport_buffer.is_object = True
@@ -203,7 +206,7 @@ class CopyStore: # this just represents in memory. The alternative would be some
         # TODO: should probably be a view
         local_tensor = get_local_tensor(
             self.kv[key][FULL_TENSOR],
-            message.tensor_slice.local_shape, #TODO: remove tensor_val from messages by setting coordinates_only=True in msg cstrct
+            message.tensor_slice.local_shape,  # TODO: remove tensor_val from messages by setting coordinates_only=True in msg cstrct
             message.tensor_slice.offsets,
         )
         logger.debug("done local tensor")

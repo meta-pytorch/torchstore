@@ -28,7 +28,7 @@ class TestActor(Actor):
     @endpoint
     async def do_put(self):
         self.rlog("do_put")
-        t = torch.tensor([self.rank+1] * 10)
+        t = torch.tensor([self.rank + 1] * 10)
         await self.store.put(f"key_{self.rank}", t)
 
     @endpoint
@@ -49,17 +49,18 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
         await actor_mesh_0.do_put.call()
         tensors = await actor_mesh_1.do_get.call()
         for pt, val in tensors:
-            expected = torch.tensor([pt.rank+1] * 10)
+            expected = torch.tensor([pt.rank + 1] * 10)
             assert torch.equal(expected, val), f"{expected} != {val}"
 
     async def test_large_tensors(self):
         """Test basic put/get functionality for multiple processes"""
+
         class LargeTensorActor(Actor):
-            step_size: int = 100 
-            max_step: int = 600 # 4mb -> 2gb
+            step_size: int = 100
+            max_step: int = 600  # 4mb -> 2gb
 
             def __init__(self, store, generate_benchmark=False) -> None:
-                self.store=store
+                self.store = store
                 self.generate_benchmark = generate_benchmark
                 init_logging()
 
@@ -67,18 +68,20 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
             async def put(self):
                 dps = []
                 for n in range(1, self.max_step, self.step_size):
-                    shape = (1024, 1024 * n)                      
-                    size_mbytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb                                        
-                    tensor = torch.randn(shape, dtype=torch.float32) 
-                    
+                    shape = (1024, 1024 * n)
+                    size_mbytes = (
+                        math.prod(shape) * 4 // (1024 * 1024)
+                    )  # float32 is 4 bytes, // mb
+                    tensor = torch.randn(shape, dtype=torch.float32)
+
                     logger.info(f"Put {n=} {size_mbytes=}")
                     t = time.perf_counter()
-                    try:                        
+                    try:
                         await self.store.put(str(n), tensor)
                     except Exception as e:
                         logger.exception(f"Test failed with {size_mbytes=}")
                         raise e
-                    
+
                     delta = time.perf_counter() - t
                     dps.append((size_mbytes, delta))
                     logger.info(f"Took {delta} seconds to put")
@@ -88,15 +91,17 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
                         fp.write("size_mbytes, delta\n")
                         for size_mbytes, delta in dps:
                             fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
-            
+
             @endpoint
             async def get(self):
                 dps = []
                 for n in range(1, self.max_step, self.step_size):
-                    shape = (1024, 1024 * n)                      
-                    size_mbytes = math.prod(shape) * 4 // (1024 * 1024)  # float32 is 4 bytes, // mb
-                   
-                    logger.info(f"Get {n=} {size_mbytes=}") 
+                    shape = (1024, 1024 * n)
+                    size_mbytes = (
+                        math.prod(shape) * 4 // (1024 * 1024)
+                    )  # float32 is 4 bytes, // mb
+
+                    logger.info(f"Get {n=} {size_mbytes=}")
                     t = time.perf_counter()
                     try:
                         await self.store.get(str(n))
@@ -113,15 +118,13 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
                         fp.write("size_mbytes, delta\n")
                         for size_mbytes, delta in dps:
                             fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
-                        
 
         store = await MultiProcessStore.create_store()
         actor = await spawn_actors(1, LargeTensorActor, "large_tensor", store=store)
         await actor.put.call_one()
         await actor.get.call_one()
 
-        #TODO: assert equal tensors from put/get
-
+        # TODO: assert equal tensors from put/get
 
     async def test_scalar(self):
         """Test basic put/get functionality for multiple processes"""
@@ -129,25 +132,26 @@ class TestStore(unittest.IsolatedAsyncioTestCase):
 
         class ScalarTest(Actor):
             def __init__(self, store) -> None:
-                self.store=store
+                self.store = store
+
             @endpoint
             async def put(self, val):
                 await self.store.put("key", val)
+
             @endpoint
             async def get(self, inplace):
-                t = torch.tensor(0.) if inplace else None
+                t = torch.tensor(0.0) if inplace else None
                 fetched = await self.store.get("key", t if inplace else None)
                 return t if inplace else fetched
 
         test_actor = await spawn_actors(1, ScalarTest, "scalar", store=store)
-        
-        t = torch.tensor(42.)
-        await test_actor.put.call_one(t)        
+
+        t = torch.tensor(42.0)
+        await test_actor.put.call_one(t)
         for inplace in [True, False]:
             fetched = await test_actor.get.call_one(inplace)
-            self.assertTrue(
-                torch.equal(t, fetched), f"{t} != {fetched} {inplace=}"
-            )
+            self.assertTrue(torch.equal(t, fetched), f"{t} != {fetched} {inplace=}")
+
 
 if __name__ == "__main__":
     unittest.main()

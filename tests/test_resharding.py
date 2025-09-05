@@ -42,7 +42,6 @@ class DTensorActor(Actor):
         self.original_tensor = original_tensor
         self.placements = placements
         self.file_store_name = file_store_name
-        
 
         # this is only necessary for nccl, but we're not using it in this test.
         os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices

@@ -11,7 +11,7 @@ from torchstore.transport.buffers import (
     TransportBuffer,
     RDMATransportBuffer,
     MonarchTransportBuffer,
-    rdma_available
+    rdma_available,
 )
 
 logger = getLogger(__name__)
@@ -22,19 +22,20 @@ class TensorSlice:
     offsets: Tuple
     coordinates: Tuple
     global_shape: Tuple
-    local_shape: Tuple #TODO: fix type hints 
+    local_shape: Tuple  # TODO: fix type hints
     mesh_shape: Tuple
 
     def __post_init__(self):
         self.coordinates = tuple(self.coordinates)
 
+
 @dataclass
 class Message:
     tensor_val: Optional[torch.Tensor] = None
     tensor_slice: Optional[TensorSlice] = None
-    objects: Optional[Any] = None # Any, but must be pickleable.
-    is_object: bool = False 
-    
+    objects: Optional[Any] = None  # Any, but must be pickleable.
+    is_object: bool = False
+
     @classmethod
     def from_any(cls, value: Any):
         if isinstance(value, DTensor):
@@ -80,55 +81,51 @@ class Message:
         return cls(objects=objects, is_object=True)
 
     @classmethod
-    def from_tensor_offsets(
-        cls,
-        offsets,
-        coordinates,
-        global_shape,
-        mesh_shape
-    ):
+    def from_tensor_offsets(cls, offsets, coordinates, global_shape, mesh_shape):
         raise NotImplementedError()
-
 
 
 class Pipe:
     """
     Transport wrapper for communicating from local clients to storage volumes.
     """
+
     def __init__(self, storage_volume) -> None:
         self.storage_volume = storage_volume
 
     def create_transport_buffer(self) -> TransportBuffer:
-        #TODO: eventually this should be dependent on the connections available to a storage_volume
+        # TODO: eventually this should be dependent on the connections available to a storage_volume
         if rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
             buffer_cls = MonarchTransportBuffer
         return buffer_cls()
-    
+
     async def put_to_storage_volume(self, key, message: Message):
         transport_buffer = self.create_transport_buffer()
         tensor = message.tensor_val
-        
-        transport_buffer.allocate(tensor) 
+
+        transport_buffer.allocate(tensor)
         await transport_buffer.write_from(tensor)
-        
-        # transporting tensors is handled by the buffer, so we don't want to send it 
+
+        # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
         message_without_tensor = Message(
             tensor_val=None,
             tensor_slice=message.tensor_slice,
             objects=message.objects,
-            is_object=message.is_object
+            is_object=message.is_object,
         )
 
-        await self.storage_volume.put.call_one(key, transport_buffer, message_without_tensor)
-    
+        await self.storage_volume.put.call_one(
+            key, transport_buffer, message_without_tensor
+        )
+
     async def get_from_storage_volume(self, key, message: Message):
 
         transport_buffer = self.create_transport_buffer()
 
-        # Certain buffers (RDMA) need to know the size of the tensor 
+        # Certain buffers (RDMA) need to know the size of the tensor
         # so we can allocate the right amount of memory locally.
         # This can be avoided if the message contains a tensor slice.
         # Could likely be optimized away in the future.
@@ -140,15 +137,11 @@ class Pipe:
 
         # TODO: consider placing the buffer inside the message or vice versa
         message_without_tensor = Message(
-            tensor_val=None,
-            tensor_slice=message.tensor_slice,
-            objects=message.objects
+            tensor_val=None, tensor_slice=message.tensor_slice, objects=message.objects
         )
         transport_buffer.update(
             await self.storage_volume.get.call_one(
-                key,
-                transport_buffer,
-                message_without_tensor
+                key, transport_buffer, message_without_tensor
             )
         )
 
