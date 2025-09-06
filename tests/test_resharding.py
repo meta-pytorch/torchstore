@@ -1,9 +1,13 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import math
 import os
 import tempfile
 import unittest
-import logging
-import sys
 from logging import getLogger
 
 import torch
@@ -42,7 +46,6 @@ class DTensorActor(Actor):
         self.original_tensor = original_tensor
         self.placements = placements
         self.file_store_name = file_store_name
-        
 
         # this is only necessary for nccl, but we're not using it in this test.
         os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
@@ -86,7 +89,7 @@ class DTensorActor(Actor):
         # TODO: nccl is giving me a weird error on process group split for 2d mesh
         device_mesh = init_device_mesh("cpu", self.mesh_shape)
 
-        self.rlog(f"distributing dtensor")
+        self.rlog("distributing dtensor")
         tensor = self.original_tensor.to("cpu")
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 
@@ -201,7 +204,8 @@ class TestMultiProcessingStore(unittest.IsolatedAsyncioTestCase):
         """Given a "put" mesh shape and a "get" mesh shape.
         1. Create separate worlds for each mesh shape, running on different devices /PGs.
         2. Each rank in 'put' world will create a DTensor, and call self.store.put(key="test_key", value=dtensor)
-        3. Each rank in 'get' world will create a DTensor (with a different sharding, and seeded with torch.zero), and call self.store.get(key="test_key", value=dtensor)
+        3. Each rank in 'get' world will create a DTensor (with a different sharding, and seeded with torch.zero),
+            and call self.store.get(key="test_key", value=dtensor)
         4. The result of the above operation should be the original DTensor, but resharded between putter/getter worlds
 
         Example:

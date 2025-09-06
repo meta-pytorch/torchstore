@@ -19,12 +19,12 @@ from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
-from transformers import AutoModelForCausalLM
-
 from torchstore import MultiProcessStore
 from torchstore._state_dict_utils import get_state_dict, push_state_dict
-from torchstore.utils import spawn_actors
 from torchstore.logging import init_logging
+from torchstore.utils import spawn_actors
+
+from transformers import AutoModelForCausalLM
 
 logger = getLogger(__name__)
 
@@ -95,7 +95,7 @@ class ModelTest(Actor):
         self.rlog("pushing state dict")
         t = time.perf_counter()
         await push_state_dict(self.store, state_dict, "v0")
-        self.rlog(f"pushed state dict in {time.perf_counter()-t} seconds")
+        self.rlog(f"pushed state dict in {time.perf_counter() - t} seconds")
 
     @endpoint
     async def do_get(self):
@@ -104,7 +104,7 @@ class ModelTest(Actor):
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
         }
-        
+
         if self.world_size > 1:
             torch.distributed.barrier()
         self.rlog("getting state dict")
@@ -139,7 +139,7 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
                 store=store,
                 mesh_shape=put_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "save_world"),
-            )            
+            )
 
             get_world_size = math.prod(get_mesh_shape)
             get_world = await spawn_actors(
@@ -151,17 +151,15 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
 
-            
             logger.info("pushing state dict")
             t = time.perf_counter()
             await put_world.do_push.call()
-            logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
-            
+            logger.info(f"pushing state dict took: {time.perf_counter() - t} seconds")
+
             logger.info("fetching state dict")
             t = time.perf_counter()
             await get_world.do_get.call()
-            logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
-
+            logger.info(f"getting state dict took: {time.perf_counter() - t} seconds")
 
 
 if __name__ == "__main__":
