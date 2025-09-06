@@ -15,6 +15,7 @@ ignore =
     EXE001,
     # these ignores are from flake8-bugbear; please fix!
     B007,B008,
+    N802
 optional-ascii-coding = True
 exclude =
     ./.git,
