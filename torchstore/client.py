@@ -51,7 +51,7 @@ class LocalClient:
         object_type = ObjectType.from_request(request)
 
         # multinode support here
-        volume_map = await self._controller.locate_volumes.call_one(key, request)
+        volume_map = await self._controller.locate_volumes.call_one(key)
 
         partial_results = []
         for volume_id, storage_info in volume_map.items():

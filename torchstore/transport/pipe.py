@@ -47,6 +47,16 @@ class TensorSlice:
 
 @dataclass
 class Request:
+    """Request object encapsulating data to be stored or retrieved from TorchStore.
+    
+    Attributes:
+        tensor_val (Optional[torch.Tensor]): The actual tensor data to store/retrieve.
+            For DTensors, this contains the local tensor shard.
+        tensor_slice (Optional[TensorSlice]): Metadata about distributed tensor sharding,
+            including offsets, coordinates, and shape information.
+        objects (Optional[Any]): Arbitrary Python objects that must be pickleable.
+        is_object (bool): Flag indicating whether this request contains a non-tensor object.
+    """
     tensor_val: Optional[torch.Tensor] = None
     tensor_slice: Optional[TensorSlice] = None
     objects: Optional[Any] = None  # Any, but must be pickleable.

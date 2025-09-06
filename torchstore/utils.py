@@ -25,6 +25,7 @@ async def spawn_actors(num_processes, actor_cls, name, **init_args):
     # await mesh.initialized
     await mesh.logging_option(True, None)
 
+    #uuid is to try to help with log spew from monarch.
     actors = await mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
     return actors
 
