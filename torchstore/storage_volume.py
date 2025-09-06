@@ -6,13 +6,13 @@
 
 from itertools import product
 from logging import getLogger
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from monarch.actor import Actor, endpoint
 
-from torchstore.transport.pipe import Request
-from torchstore.transport import Request, TensorSlice
+from torchstore.transport.pipe import Request, TensorSlice
+from torchstore.transport.buffers import TransportBuffer
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
 
 logger = getLogger(__name__)
@@ -29,49 +29,54 @@ class StorageVolume(Actor):
     def __init__(
         self,
         id_func,
-    ):
-        self.store = InMemoryStore()
-        self.volume_id = id_func()
+    ) -> None:
+        self.store: StorageImpl = InMemoryStore()
+        self.volume_id: str = id_func()
 
     @classmethod
-    def spawn(cls, num_volumes, *init_args, **init_kwargs):
-        return spawn_actors(num_volumes, cls, cls.actor_name, *init_args, **init_kwargs)
+    async def spawn(cls, num_volumes: int, *init_args: Any, **init_kwargs: Any) -> "StorageVolume":
+        return await spawn_actors(num_volumes, cls, cls.actor_name, *init_args, **init_kwargs)
 
     @endpoint
-    async def get_id(self):
+    async def get_id(self) -> str:
         return self.volume_id
 
     @endpoint
-    async def put(self, key: str, transport_buffer: torch.Tensor, request: Request):
+    async def put(self, key: str, transport_buffer: TransportBuffer, request: Request) -> None:
         await self.store.put(key, transport_buffer, request)
 
     @endpoint
-    async def get(self, key: str, transport_buffer: torch.Tensor, request: Request):
+    async def get(self, key: str, transport_buffer: TransportBuffer, request: Request) -> TransportBuffer:
         return await self.store.get(key, transport_buffer, request)
 
     @endpoint
-    async def get_meta(self, key: str):
+    async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
         return await self.store.get_meta(key)
 
 
 class StorageImpl:
-    async def put(self, key: str, transport_buffer: torch.Tensor, request: Request):
+    """Abstract base class for storage implementations."""
+    
+    async def put(self, key: str, transport_buffer: TransportBuffer, request: Request) -> Optional[TransportBuffer]:
+        """Store data in the storage backend."""
         raise NotImplementedError()
 
-    async def get(self, key: str, transport_buffer: torch.Tensor, request: Request):
+    async def get(self, key: str, transport_buffer: TransportBuffer, request: Request) -> TransportBuffer:
+        """Retrieve data from the storage backend."""
         raise NotImplementedError()
 
-    async def get_meta(self, key: str):
+    async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
+        """Get metadata about stored data."""
         raise NotImplementedError()
 
 
 class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.kv: Dict[str, Any] = {}
 
-    def _build_full_tensor(self, key: str):
+    def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")
         # we can also consider in the future not requiring the full tensor to be
         # assembled, and instead only that the requested offsets are available
@@ -138,7 +143,7 @@ class InMemoryStore(StorageImpl):
 
     def _handle_dtensor(
         self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
-    ):
+    ) -> None:
         if key not in self.kv:
             self.kv[key] = {}
 
@@ -147,21 +152,21 @@ class InMemoryStore(StorageImpl):
             "tensor": tensor,
         }
 
-    async def put(self, key: str, transport_buffer: torch.Tensor, request: Request):
+    async def put(self, key: str, transport_buffer: TransportBuffer, request: Request) -> None:
         if request.is_object:
             self.kv[key] = {"obj": request.objects}
-            return transport_buffer
+            return
 
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
-        tensor = await transport_buffer.read_into()
+        tensor = await transport_buffer.read_into(tensor=None)
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
 
         self.kv[key] = tensor
 
-    async def get(self, key: str, transport_buffer: torch.Tensor, request: Request):
+    async def get(self, key: str, transport_buffer: TransportBuffer, request: Request) -> TransportBuffer:
 
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
@@ -190,7 +195,7 @@ class InMemoryStore(StorageImpl):
 
         raise RuntimeError(f"Tensor slice {request.tensor_slice} not found in {key}")
 
-    async def get_meta(self, key: str):
+    async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
