@@ -120,17 +120,20 @@ async def test_objects(strategy_params, use_rdma):
         def __init__(self, val):
             self.val = val
 
+        def __eq__(self, other: object) -> bool:
+            return self.val == other.val
+
     try:
         for idx in range(volume_world_size):
             actor = actor_mesh_0.slice(**{"hosts": 0, "gpus": idx})
-            await actor.put(MyTestObject(idx))
+            await actor.put.call(MyTestObject(idx))
 
         for rank_offset in (0, 1):
             objects = await actor_mesh_1.get.call(rank_offset=rank_offset)
             for pt, val in objects:
                 other_rank = (pt.rank + rank_offset) % volume_world_size
                 expected = MyTestObject(other_rank)
-                assert torch.equal(expected, val), f"{expected} != {val}"
+                assert expected == val, f"{expected.val} != {val.val}"
 
     finally:
         await actor_mesh_0._proc_mesh.stop()
@@ -146,8 +149,7 @@ async def test_large_tensors():
         step_size: int = 100  # -> 400mb
         max_step: int = 600  # 4mb -> 2gb
 
-        def __init__(self, store, generate_benchmark=False) -> None:
-            self.store = store
+        def __init__(self, generate_benchmark=False) -> None:
             self.generate_benchmark = generate_benchmark
             init_logging()
 
@@ -164,7 +166,7 @@ async def test_large_tensors():
                 logger.info(f"Put {n=} {size_mbytes=}")
                 t = time.perf_counter()
                 try:
-                    await self.store.put(str(n), tensor)
+                    await ts.put(str(n), tensor)
                 except Exception as e:
                     logger.exception(f"Test failed with {size_mbytes=}")
                     raise e
@@ -191,7 +193,7 @@ async def test_large_tensors():
                 logger.info(f"Get {n=} {size_mbytes=}")
                 t = time.perf_counter()
                 try:
-                    await self.store.get(str(n))
+                    await ts.get(str(n))
                 except Exception as e:
                     logger.exception(f"Test failed with {size_mbytes=}")
                     raise e
@@ -207,8 +209,8 @@ async def test_large_tensors():
                         fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
 
     # controller code
-    store = await ts.initialize()
-    actor = await spawn_actors(1, LargeTensorActor, "large_tensor", store=store)
+    await ts.initialize()
+    actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
     await actor.put.call_one()
     await actor.get.call_one()
     # TODO: assert equal tensors from put/get
