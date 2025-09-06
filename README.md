@@ -2,6 +2,18 @@
 
 A storage solution for PyTorch tensors with distributed tensor support.
 
+TorchStore provides a distributed, asynchronous tensor storage system built on top of
+Monarch actors. It enables efficient storage and retrieval of PyTorch tensors across
+multiple processes and nodes with support for various transport mechanisms including
+RDMA when available.
+
+Key Features:
+- Distributed tensor storage with configurable storage strategies
+- Asynchronous put/get operations for tensors and arbitrary objects
+- Support for PyTorch state_dict serialization/deserialization
+- Multiple transport backends (RDMA, regular TCP) for optimal performance
+- Flexible storage volume management and sharding strategies
+
 # Under Construction!
 
 Nothing to see here yet, but check back soon
