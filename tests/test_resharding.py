@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import math
 import os
 import tempfile
@@ -86,7 +92,7 @@ class DTensorActor(Actor):
         # TODO: nccl is giving me a weird error on process group split for 2d mesh
         device_mesh = init_device_mesh("cpu", self.mesh_shape)
 
-        self.rlog(f"distributing dtensor")
+        self.rlog("distributing dtensor")
         tensor = self.original_tensor.to("cpu")
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 

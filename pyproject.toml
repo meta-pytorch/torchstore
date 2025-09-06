@@ -26,3 +26,14 @@ dependencies = [] #todo: add toml
 [project.urls]
 "Homepage" = "https://github.com/your-username/torchstore"
 "Bug Tracker" = "https://github.com/your-username/torchstore/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "pytest-timeout",
+    "expecttest",
+    "anyio",
+    "pytest-asyncio",
+]

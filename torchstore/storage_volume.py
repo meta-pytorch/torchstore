@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 from itertools import product
 from logging import getLogger
 from typing import Any, Dict
@@ -91,8 +97,8 @@ class InMemoryStore(StorageImpl):
         if FULL_TENSOR in self.kv[key]:
             return
 
-        # TODO: Utility fucntions may make more sense in a 
-        # a "PendingTensor" class and have these functions 
+        # TODO: Utility fucntions may make more sense in a
+        # a "PendingTensor" class and have these functions
         # defined there instead. should also totally simplify the logic here
         local_tensors = []
         global_offsets = []
@@ -145,13 +151,15 @@ class InMemoryStore(StorageImpl):
 
         return True
 
-    def _handle_dtensor(self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor):
+    def _handle_dtensor(
+        self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
+    ):
         if key not in self.kv:
             self.kv[key] = {}
 
         self.kv[key][tensor_slice.coordinates] = {
             "slice": tensor_slice,
-            "tensor": tensor
+            "tensor": tensor,
         }
 
     async def put(
@@ -183,7 +191,7 @@ class InMemoryStore(StorageImpl):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
-        #TODO: clean up
+        # TODO: clean up
         val = self.kv[key]
         if isinstance(val, dict) and "obj" in val:
             transport_buffer.is_object = True

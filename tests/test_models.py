@@ -1,9 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import math
 import os
 import tempfile
 import time
 import pytest
 from logging import getLogger
+
+import pytest
 
 import torch
 
@@ -18,6 +26,11 @@ import torchstore as ts
 from torchstore.utils import spawn_actors
 
 logger = getLogger(__name__)
+
+needs_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA not available",
+)
 
 
 assert os.environ.get("HF_TOKEN", None) is not None, "HF_TOKEN must be set"
@@ -91,7 +104,7 @@ class ModelTest(Actor):
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
         }
-        
+
         if self.world_size > 1:
             torch.distributed.barrier()
         self.rlog("getting state dict")
@@ -132,7 +145,7 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
                 "save_world",
                 mesh_shape=put_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "save_world"),
-            )            
+            )
 
             get_world_size = math.prod(get_mesh_shape)
             get_world = await spawn_actors(
@@ -146,8 +159,8 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
             logger.info("pushing state dict")
             t = time.perf_counter()
             await put_world.do_push.call()
-            logger.info(f"pushing state dict took: {time.perf_counter()-t} seconds")
-            
+            logger.info(f"pushing state dict took: {time.perf_counter() - t} seconds")
+
             logger.info("fetching state dict")
             t = time.perf_counter()
             await get_world.do_get.call()

@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import copy
 import math
 import os
@@ -47,7 +53,8 @@ class UnitModule(nn.Module):
 
 class CompositeParamModel(nn.Module):
     """
-    ref: https://github.com/pytorch/pytorch/blob/e2c9d8d6414927ce754bbc40b767edf103cf16da/torch/testing/_internal/common_dist_composable.py#L52
+    ref:
+    https://github.com/pytorch/pytorch/blob/e2c9d8d6414927ce754bbc40b767edf103cf16da/torch/testing/_internal/common_dist_composable.py#L52
     """
 
     def __init__(self, device: Union[torch.device, str] = "cpu"):

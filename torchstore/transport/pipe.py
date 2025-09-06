@@ -8,10 +8,10 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
 from torchstore.transport.buffers import (
-    TransportBuffer,
-    RDMATransportBuffer,
     MonarchTransportBuffer,
-    rdma_available
+    rdma_available,
+    RDMATransportBuffer,
+    TransportBuffer,
 )
 
 logger = getLogger(__name__)
@@ -22,7 +22,7 @@ class TensorSlice:
     offsets: Tuple
     coordinates: Tuple
     global_shape: Tuple
-    local_shape: Tuple #TODO: fix type hints 
+    local_shape: Tuple  # TODO: fix type hints
     mesh_shape: Tuple
 
     def __post_init__(self):
@@ -42,9 +42,9 @@ class TensorSlice:
 class Request:
     tensor_val: Optional[torch.Tensor] = None
     tensor_slice: Optional[TensorSlice] = None
-    objects: Optional[Any] = None # Any, but must be pickleable.
-    is_object: bool = False 
-    
+    objects: Optional[Any] = None  # Any, but must be pickleable.
+    is_object: bool = False
+
     @classmethod
     def from_any(cls, value: Any):
         if isinstance(value, DTensor):
@@ -96,11 +96,12 @@ class Pipe:
     """
     Transport wrapper for communicating from local clients to storage volumes.
     """
+
     def __init__(self, storage_volume) -> None:
         self.storage_volume = storage_volume
 
     def create_transport_buffer(self) -> TransportBuffer:
-        #TODO: eventually this should be dependent on the connections available to a storage_volume
+        # TODO: eventually this should be dependent on the connections available to a storage_volume
         if rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
@@ -113,8 +114,8 @@ class Pipe:
         
         transport_buffer.allocate(tensor) 
         await transport_buffer.write_from(tensor)
-        
-        # transporting tensors is handled by the buffer, so we don't want to send it 
+
+        # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
         request_without_tensor = Request(
             tensor_val=None,
@@ -129,7 +130,7 @@ class Pipe:
 
         transport_buffer = self.create_transport_buffer()
 
-        # Certain buffers (RDMA) need to know the size of the tensor 
+        # Certain buffers (RDMA) need to know the size of the tensor
         # so we can allocate the right amount of memory locally.
         # This can be avoided if the request contains a tensor slice.
         # Could likely be optimized away in the future.
