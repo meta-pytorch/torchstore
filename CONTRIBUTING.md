@@ -16,3 +16,8 @@ You can also run this manually on every file using:
 ```
 pre-commit run --all-files
 ```
+
+Run formatter manually:
+`
+ufmt format .
+`
