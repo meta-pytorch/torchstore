@@ -13,12 +13,12 @@ from torchstore.storage_volume import StorageVolume
 
 class TorchStoreStrategy:
     """Base class for TorchStore distribution strategies.
-    
+
     A strategy defines how tensors are distributed across storage volumes by:
     1. Assigning unique volume IDs to storage volumes
-    2. Mapping client processes to storage volumes 
+    2. Mapping client processes to storage volumes
     3. Providing access to the appropriate storage volume for operations
-    
+
     Subclasses must implement get_volume_id() and get_client_id() methods.
     """
 
@@ -29,7 +29,7 @@ class TorchStoreStrategy:
     @classmethod
     def get_volume_id(cls):
         """Get the unique ID for this process's storage volume. Called by volume on init.
-        
+
         Returns:
             str: Unique identifier for the storage volume this process should use.
         """
@@ -38,7 +38,7 @@ class TorchStoreStrategy:
     @classmethod
     def get_client_id(cls):
         """Get the unique ID for this client process. Called by the client on each put.
-        
+
         Returns:
             str: Unique identifier for this client process.
         """
@@ -46,7 +46,7 @@ class TorchStoreStrategy:
 
     async def set_storage_volumes(self, storage_volumes):
         """Configure the storage volumes and build ID-to-coordinate mapping.
-        
+
         Args:
             storage_volumes: Actor mesh of storage volume actors.
         """
@@ -57,7 +57,7 @@ class TorchStoreStrategy:
 
     def select_storage_volume(self):
         """Select the storage volume for the current client process.
-        
+
         Returns:
             tuple: (StorageVolume actor, volume_id) for this client.
         """
@@ -74,10 +74,10 @@ class TorchStoreStrategy:
 
     def get_storage_volume(self, volume_id: str) -> StorageVolume:
         """Retrieves storage volume actor for a given volume ID.
-        
+
         Args:
             volume_id (str): The volume ID to look up.
-            
+
         Returns:
             StorageVolume: The storage volume actor for the given ID.
         """
@@ -87,7 +87,7 @@ class TorchStoreStrategy:
 
 class SingletonStrategy(TorchStoreStrategy):
     """There can be only one. Likely to OOM if used unwisely.
-    
+
     Used when only one storage volume is needed. All operations are routed
     to the single volume. This is the default strategy for simple setups.
     """
@@ -97,7 +97,7 @@ class SingletonStrategy(TorchStoreStrategy):
     @classmethod
     def get_volume_id(cls):
         """Return the singleton volume ID.
-        
+
         Returns:
             str: Always returns "Singleton" for the single volume.
         """
@@ -116,7 +116,7 @@ class SingletonStrategy(TorchStoreStrategy):
 
 class LocalRankStrategy(TorchStoreStrategy):
     """Strategy that maps storage volumes based on LOCAL_RANK environment variable.
-    
+
     Each process uses its LOCAL_RANK to determine which storage volume to connect to.
     This strategy requires the LOCAL_RANK environment variable to be set and assumes
     one storage volume per local rank.
@@ -128,8 +128,8 @@ class LocalRankStrategy(TorchStoreStrategy):
 
     @classmethod
     def get_volume_id(cls):
-        #Note: this should only called at spawn, which makes this safe.
-        return str(current_rank().rank) 
+        # Note: this should only called at spawn, which makes this safe.
+        return str(current_rank().rank)
 
     @classmethod
     def get_client_id(cls):

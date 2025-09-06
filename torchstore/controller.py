@@ -11,7 +11,7 @@ from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport.pipe import Request, TensorSlice
 
 
-#TODO: move this into request as a field
+# TODO: move this into request as a field
 class ObjectType(Enum):
     OBJECT = auto()
     TENSOR = auto()
@@ -86,7 +86,7 @@ class Controller(Actor):
     ) -> Dict[str, StorageInfo]:
         """Locate storage volumes containing shards of the specified key.
 
-        Returns {<storage_volume_id> -> StorageInfo} where <storage_volume_id> 
+        Returns {<storage_volume_id> -> StorageInfo} where <storage_volume_id>
         are IDs of storage volumes holding shards of the data.
 
         For example, if the data is a DTensor with 3 shards, the returned map will look like:
@@ -105,11 +105,11 @@ class Controller(Actor):
 
         Args:
             key (str): The key to locate in storage volumes.
-            
+
         Returns:
-            Dict[str, StorageInfo]: Mapping from storage volume IDs to StorageInfo 
+            Dict[str, StorageInfo]: Mapping from storage volume IDs to StorageInfo
                 objects containing metadata about the stored data shards.
-                
+
         Raises:
             KeyError: If the key is not found in any storage volumes.
         """
@@ -122,10 +122,10 @@ class Controller(Actor):
     @endpoint
     def notify_put(self, key: str, request: Request, storage_volume_id: str) -> None:
         """Notify the controller that data has been stored in a storage volume.
-        
+
         This should called after a successful put operation to
         maintain the distributed storage index.
-        
+
         Args:
             key (str): The unique identifier for the stored data.
             request (Request): The storage request containing metadata about the stored data.

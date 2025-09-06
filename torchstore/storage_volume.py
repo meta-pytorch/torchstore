@@ -11,8 +11,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 
-from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.transport.buffers import TransportBuffer
+
+from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
 
 logger = getLogger(__name__)
@@ -34,19 +35,27 @@ class StorageVolume(Actor):
         self.volume_id: str = id_func()
 
     @classmethod
-    async def spawn(cls, num_volumes: int, *init_args: Any, **init_kwargs: Any) -> "StorageVolume":
-        return await spawn_actors(num_volumes, cls, cls.actor_name, *init_args, **init_kwargs)
+    async def spawn(
+        cls, num_volumes: int, *init_args: Any, **init_kwargs: Any
+    ) -> "StorageVolume":
+        return await spawn_actors(
+            num_volumes, cls, cls.actor_name, *init_args, **init_kwargs
+        )
 
     @endpoint
     async def get_id(self) -> str:
         return self.volume_id
 
     @endpoint
-    async def put(self, key: str, transport_buffer: TransportBuffer, request: Request) -> None:
+    async def put(
+        self, key: str, transport_buffer: TransportBuffer, request: Request
+    ) -> None:
         await self.store.put(key, transport_buffer, request)
 
     @endpoint
-    async def get(self, key: str, transport_buffer: TransportBuffer, request: Request) -> TransportBuffer:
+    async def get(
+        self, key: str, transport_buffer: TransportBuffer, request: Request
+    ) -> TransportBuffer:
         return await self.store.get(key, transport_buffer, request)
 
     @endpoint
@@ -56,12 +65,16 @@ class StorageVolume(Actor):
 
 class StorageImpl:
     """Abstract base class for storage implementations."""
-    
-    async def put(self, key: str, transport_buffer: TransportBuffer, request: Request) -> Optional[TransportBuffer]:
+
+    async def put(
+        self, key: str, transport_buffer: TransportBuffer, request: Request
+    ) -> Optional[TransportBuffer]:
         """Store data in the storage backend."""
         raise NotImplementedError()
 
-    async def get(self, key: str, transport_buffer: TransportBuffer, request: Request) -> TransportBuffer:
+    async def get(
+        self, key: str, transport_buffer: TransportBuffer, request: Request
+    ) -> TransportBuffer:
         """Retrieve data from the storage backend."""
         raise NotImplementedError()
 
@@ -152,7 +165,9 @@ class InMemoryStore(StorageImpl):
             "tensor": tensor,
         }
 
-    async def put(self, key: str, transport_buffer: TransportBuffer, request: Request) -> None:
+    async def put(
+        self, key: str, transport_buffer: TransportBuffer, request: Request
+    ) -> None:
         if request.is_object:
             self.kv[key] = {"obj": request.objects}
             return
@@ -166,7 +181,9 @@ class InMemoryStore(StorageImpl):
 
         self.kv[key] = tensor
 
-    async def get(self, key: str, transport_buffer: TransportBuffer, request: Request) -> TransportBuffer:
+    async def get(
+        self, key: str, transport_buffer: TransportBuffer, request: Request
+    ) -> TransportBuffer:
 
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")

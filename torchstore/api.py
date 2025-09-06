@@ -1,9 +1,9 @@
 from typing import Any, Dict, Optional, Union
 
 import torch
+from monarch.actor import get_or_spawn_controller
 
 import torchstore.state_dict_utils
-from monarch.actor import get_or_spawn_controller
 
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
@@ -24,22 +24,22 @@ async def initialize(
     store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> None:
     """Initialize the TorchStore distributed storage system.
-    
+
     Sets up storage volumes and controller. Must be called before any put/get operations.
-    
+
     Args:
         num_storage_volumes (int): Number of storage volumes to create. Defaults to 1.
         strategy (TorchStoreStrategy, optional): Strategy for distributing tensors across volumes.
             Uses SingletonStrategy if None and num_storage_volumes=1.
         store_name (str): Unique name for this store instance. Defaults to DEFAULT_TORCHSTORE_NAME.
-    
+
     Raises:
         RuntimeError: If num_storage_volumes > 1 but no strategy is provided.
-    
+
     Example:
         >>> import torchstore as ts
         >>> await ts.initialize(num_storage_volumes=4, strategy=LocalRankStrategy()) # uses default namespace.
-        >>> >>> await ts.initialize("my_custom_store") 
+        >>> >>> await ts.initialize("my_custom_store")
     """
     if num_storage_volumes == 1 and strategy is None:
         strategy = SingletonStrategy()
@@ -67,12 +67,12 @@ async def initialize(
 
 async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     """Shutdown and cleanup a TorchStore instance.
-    
+
     Gracefully shuts down all storage volumes and controllers associated with the store.
-    
+
     Args:
         store_name (str): Name of the store to shutdown. Defaults to DEFAULT_TORCHSTORE_NAME.
-    
+
     Example:
         >>> import torchstore as ts
         >>> await ts.shutdown()  # Shutdown default store
@@ -86,15 +86,15 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
 async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
     """Get a local client handle for interacting with the store.
-    
+
     Returns a cached LocalClient instance that provides the interface for put/get operations.
-    
+
     Args:
         store_name (str): Name of the store to get a client for. Defaults to DEFAULT_TORCHSTORE_NAME.
-    
+
     Returns:
         LocalClient: A client instance for performing storage operations.
-    
+
     Example:
         >>> store_client = await client()
         >>> await store_client.put("my_key", tensor)
@@ -118,12 +118,12 @@ async def put(
     key: str, value: Union[torch.Tensor, Any], store_name: str = DEFAULT_TORCHSTORE_NAME
 ) -> None:
     """Store a tensor or object in the distributed store.
-    
+
     Args:
         key (str): Unique identifier for the stored value.
         value (torch.Tensor or Any): Tensor or object to store.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
-    
+
     Example:
         >>> tensor = torch.randn(100, 100)
         >>> await put("my_tensor", tensor)
@@ -139,15 +139,15 @@ async def get(
     store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> Union[torch.Tensor, Any]:
     """Retrieve a tensor or object from the distributed store.
-    
+
     Args:
         key (str): Unique identifier of the value to retrieve.
         inplace_tensor (torch.Tensor, optional): Pre-allocated tensor for in-place retrieval.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
-    
+
     Returns:
         The stored tensor or object.
-    
+
     Example:
         >>> tensor = await get("my_tensor")
         >>> obj = await get("my_object")
@@ -160,12 +160,12 @@ async def put_state_dict(
     state_dict: Dict[str, Any], key: str, store_name: str = DEFAULT_TORCHSTORE_NAME
 ) -> None:
     """Store a PyTorch model state_dict in the distributed store.
-    
+
     Args:
         state_dict (dict): Model state_dict to store.
         key (str): Unique identifier for the state_dict.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
-    
+
     Example:
         >>> model = torch.nn.Linear(10, 5)
         >>> await put_state_dict(model.state_dict(), "model_checkpoint")
@@ -183,16 +183,16 @@ async def get_state_dict(
     store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> Dict[str, Any]:
     """Retrieve a PyTorch model state_dict from the distributed store.
-    
+
     Args:
         key (str): Unique identifier of the state_dict to retrieve.
         user_state_dict (dict, optional): Pre-existing state_dict to merge with.
         strict (bool): Whether to enforce strict loading. Defaults to True.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
-    
+
     Returns:
         dict: The retrieved state_dict.
-    
+
     Example:
         >>> state_dict = await get_state_dict("model_checkpoint")
         >>> model.load_state_dict(state_dict)
