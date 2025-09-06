@@ -1,3 +1,3 @@
-from torchstore.transport.pipe import Pipe, Message, TensorSlice
+from torchstore.transport.pipe import Message, Pipe, TensorSlice
 
 __all__ = ["Pipe", "Message", "TensorSlice"]

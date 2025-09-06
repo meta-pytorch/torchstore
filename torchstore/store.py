@@ -5,8 +5,9 @@ from typing import Any, Dict, Optional, Union
 import torch
 from monarch.actor import Actor, endpoint
 
+from torchstore.transport import Message, Pipe, TensorSlice
+
 from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
-from torchstore.transport import Pipe, Message, TensorSlice
 
 logger = getLogger(__name__)
 
