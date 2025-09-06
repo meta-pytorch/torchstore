@@ -7,19 +7,21 @@
 import math
 import os
 import tempfile
-from typing import Tuple, List, Union
-import pytest
 from logging import getLogger
+from typing import List, Tuple, Union
+
+import pytest
 
 import torch
+
+import torchstore as ts
 
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor, Replicate, Shard
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
-
-import torchstore as ts
 from torchstore.utils import get_local_tensor, spawn_actors
+
 from .utils import main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
@@ -39,15 +41,15 @@ class DTensorActor(Actor):
         placements,
         file_store_name,
         visible_devices="0,1,2,3,4,5,6,7",
-    ):        
+    ):
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
         self.original_tensor = original_tensor
         self.placements = placements
         self.file_store_name = file_store_name
-        
-        #torchstore will fail without this (see LocalRankStrategy)
+
+        # torchstore will fail without this (see LocalRankStrategy)
         os.environ["LOCAL_RANK"] = str(self.rank)
 
         # this is only necessary for nccl, but we're not using it in this test.
@@ -133,6 +135,7 @@ async def test_1d_resharding(strategy_params, use_rdma):
                 use_rdma=use_rdma,
             )
 
+
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_2d_to_2d_resharding(strategy_params, use_rdma):
@@ -153,6 +156,7 @@ async def test_2d_to_2d_resharding(strategy_params, use_rdma):
             strategy=strategy,
             use_rdma=use_rdma,
         )
+
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
@@ -176,6 +180,7 @@ async def test_1d_to_2d_resharding(strategy_params, use_rdma):
             use_rdma=use_rdma,
         )
 
+
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_2d_to_1d_resharding(strategy_params, use_rdma):
@@ -197,6 +202,7 @@ async def test_2d_to_1d_resharding(strategy_params, use_rdma):
             strategy=strategy,
             use_rdma=use_rdma,
         )
+
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
@@ -231,13 +237,14 @@ async def test_data_parallel(strategy_params, use_rdma):
         use_rdma=use_rdma,
     )
 
+
 async def _test_resharding(
     put_mesh_shape: Tuple[int],
     put_placements: List[Union[Replicate, Shard]],
     get_mesh_shape: Tuple[int],
     get_placements: List[Union[Replicate, Shard]],
     strategy: ts.TorchStoreStrategy,
-    use_rdma: bool
+    use_rdma: bool,
 ):
     """Given a "put" mesh shape and a "get" mesh shape.
     1. Create separate worlds for each mesh shape, running on different devices /PGs.
@@ -283,7 +290,7 @@ async def _test_resharding(
     )  # 8x8 square, with ([[0...7],[8...15],[...]])
     await ts.initialize(
         num_storage_volumes=put_world_size if strategy is not None else 1,
-        strategy=strategy
+        strategy=strategy,
     )
     with tempfile.TemporaryDirectory() as filesystem_store_dir:
         # each actor mesh represents a group of processes.
@@ -336,6 +343,7 @@ async def _test_resharding(
         await get_mesh._proc_mesh.stop()
         await ts.shutdown()
 
+
 def _assert_correct_sharded_tensor(
     full_tensor, sharded_tensor, get_placements, coordinate
 ):
@@ -345,9 +353,7 @@ def _assert_correct_sharded_tensor(
         my_coordinate=coordinate,
         placements=get_placements,
     )
-    expected_local_tensor = get_local_tensor(
-        full_tensor, local_shape, global_offsets
-    )
+    expected_local_tensor = get_local_tensor(full_tensor, local_shape, global_offsets)
 
     assert torch.equal(
         expected_local_tensor, sharded_tensor._local_tensor.cpu()
@@ -355,4 +361,4 @@ def _assert_correct_sharded_tensor(
 
 
 if __name__ == "__main__":
-    main(__file__) 
+    main(__file__)

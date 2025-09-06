@@ -1,7 +1,7 @@
 import copy
-from logging import getLogger
 from dataclasses import dataclass
-from typing import Optional, Tuple, Any
+from logging import getLogger
+from typing import Any, Optional, Tuple
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -30,13 +30,20 @@ class TensorSlice:
 
     def __hash__(self):
         # Hash all fields as a tuple, converting local_shape to tuple if it's a torch.Size
-        return hash((
-            self.offsets,
-            self.coordinates,
-            self.global_shape,
-            tuple(self.local_shape) if hasattr(self.local_shape, "__iter__") else self.local_shape,
-            self.mesh_shape
-        ))
+        return hash(
+            (
+                self.offsets,
+                self.coordinates,
+                self.global_shape,
+                (
+                    tuple(self.local_shape)
+                    if hasattr(self.local_shape, "__iter__")
+                    else self.local_shape
+                ),
+                self.mesh_shape,
+            )
+        )
+
 
 @dataclass
 class Request:
@@ -88,9 +95,8 @@ class Request:
 
     @classmethod
     def from_tensor_slice(cls, tensor_slice: TensorSlice) -> "Request":
-        return cls(
-            tensor_slice=copy.deepcopy(tensor_slice)
-        )
+        return cls(tensor_slice=copy.deepcopy(tensor_slice))
+
 
 class Pipe:
     """
@@ -107,12 +113,12 @@ class Pipe:
         else:
             buffer_cls = MonarchTransportBuffer
         return buffer_cls()
-    
+
     async def put_to_storage_volume(self, key, request: Request):
         transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
-        
-        transport_buffer.allocate(tensor) 
+
+        transport_buffer.allocate(tensor)
         await transport_buffer.write_from(tensor)
 
         # transporting tensors is handled by the buffer, so we don't want to send it
@@ -121,11 +127,13 @@ class Pipe:
             tensor_val=None,
             tensor_slice=request.tensor_slice,
             objects=request.objects,
-            is_object=request.is_object
+            is_object=request.is_object,
         )
 
-        await self.storage_volume.put.call_one(key, transport_buffer, request_without_tensor)
-    
+        await self.storage_volume.put.call_one(
+            key, transport_buffer, request_without_tensor
+        )
+
     async def get_from_storage_volume(self, key, request: Request):
 
         transport_buffer = self.create_transport_buffer()
@@ -142,15 +150,11 @@ class Pipe:
 
         # TODO: consider placing the buffer inside the request or vice versa
         request_without_tensor = Request(
-            tensor_val=None,
-            tensor_slice=request.tensor_slice,
-            objects=request.objects
+            tensor_val=None, tensor_slice=request.tensor_slice, objects=request.objects
         )
         transport_buffer.update(
             await self.storage_volume.get.call_one(
-                key,
-                transport_buffer,
-                request_without_tensor
+                key, transport_buffer, request_without_tensor
             )
         )
 

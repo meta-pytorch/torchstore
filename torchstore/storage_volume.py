@@ -12,8 +12,8 @@ import torch
 from monarch.actor import Actor, endpoint
 
 from torchstore.transport.pipe import Request
-from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
 from torchstore.transport import Request, TensorSlice
+from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
 
 logger = getLogger(__name__)
 
@@ -29,7 +29,7 @@ class StorageVolume(Actor):
     def __init__(
         self,
         id_func,
-    ): 
+    ):
         self.store = InMemoryStore()
         self.volume_id = id_func()
 
@@ -42,12 +42,7 @@ class StorageVolume(Actor):
         return self.volume_id
 
     @endpoint
-    async def put(
-        self,
-        key: str,
-        transport_buffer: torch.Tensor,
-        request: Request
-    ):
+    async def put(self, key: str, transport_buffer: torch.Tensor, request: Request):
         await self.store.put(key, transport_buffer, request)
 
     @endpoint
@@ -60,29 +55,19 @@ class StorageVolume(Actor):
 
 
 class StorageImpl:
-    async def put(
-        self,
-        key: str,
-        transport_buffer: torch.Tensor,
-        request: Request
-    ):
-        raise NotImplementedError()
-    async def get(
-        self,
-        key: str,
-        transport_buffer: torch.Tensor,
-        request: Request
-    ):
-        raise NotImplementedError()
-    async def get_meta(
-        self,
-        key: str
-    ):
+    async def put(self, key: str, transport_buffer: torch.Tensor, request: Request):
         raise NotImplementedError()
 
-class InMemoryStore(StorageImpl): 
-    """ Local in memory storage. 
-    """
+    async def get(self, key: str, transport_buffer: torch.Tensor, request: Request):
+        raise NotImplementedError()
+
+    async def get_meta(self, key: str):
+        raise NotImplementedError()
+
+
+class InMemoryStore(StorageImpl):
+    """Local in memory storage."""
+
     def __init__(self):
         self.kv: Dict[str, Any] = {}
 
@@ -162,31 +147,21 @@ class InMemoryStore(StorageImpl):
             "tensor": tensor,
         }
 
-    async def put(
-        self,
-        key: str,
-        transport_buffer: torch.Tensor,
-        request: Request
-    ):
+    async def put(self, key: str, transport_buffer: torch.Tensor, request: Request):
         if request.is_object:
             self.kv[key] = {"obj": request.objects}
             return transport_buffer
 
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
-        tensor = await transport_buffer.read_into() 
+        tensor = await transport_buffer.read_into()
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
-            return  
-    
+            return
+
         self.kv[key] = tensor
 
-    async def get(
-        self,
-        key: str,
-        transport_buffer: torch.Tensor,
-        request: Request
-    ):
+    async def get(self, key: str, transport_buffer: torch.Tensor, request: Request):
 
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
@@ -206,19 +181,16 @@ class InMemoryStore(StorageImpl):
         # for now, we're only going to support requesting the entire tensor_slice,
         # but this goes entire the value prop of torchstore. StorageVolume must
         # support requesting a subset of the regions which exist locally in the
-        # store. 
-        
+        # store.
+
         for shard in self.kv[key].values():
             if shard["slice"] == request.tensor_slice:
                 await transport_buffer.write_from(shard["tensor"])
                 return transport_buffer
-        
+
         raise RuntimeError(f"Tensor slice {request.tensor_slice} not found in {key}")
 
-    async def get_meta(
-        self,
-        key: str
-    ):
+    async def get_meta(self, key: str):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 

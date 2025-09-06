@@ -1,5 +1,6 @@
-import pytest
 from logging import getLogger
+
+import pytest
 
 import torch
 

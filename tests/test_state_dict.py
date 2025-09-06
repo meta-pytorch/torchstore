@@ -8,13 +8,16 @@ import copy
 import math
 import os
 import tempfile
-import pytest
 from logging import getLogger
 from typing import Union
+
+import pytest
 
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
+
+import torchstore as ts
 
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
@@ -25,9 +28,8 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
-
-import torchstore as ts
 from torchstore.utils import spawn_actors
+
 from .utils import main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
@@ -171,7 +173,7 @@ async def test_state_dict(strategy_params, use_rdma):
     class Trainer(Actor):
         # Monarch RDMA does not work outside of an actor, so we need
         # to wrapp this test first
-        #TODO: assert this within rdma buffer
+        # TODO: assert this within rdma buffer
         def __init__(self) -> None:
             self.rank = current_rank().rank
             # needed for LocalRankStrategy
@@ -198,17 +200,15 @@ async def test_state_dict(strategy_params, use_rdma):
             return state_dict, fetched_state_dict
 
     _, strategy = strategy_params
-    await ts.initialize(
-        num_storage_volumes=1,
-        strategy=strategy
-    )
+    await ts.initialize(num_storage_volumes=1, strategy=strategy)
     trainer = await spawn_actors(1, Trainer, "trainer")
     try:
         state_dict, fetched_state_dict = await trainer.do_test.call_one()
     finally:
         await ts.shutdown()
     _assert_equal_state_dict(state_dict, fetched_state_dict)
-    
+
+
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_dcp_sharding_parity(strategy_params, use_rdma):
@@ -230,7 +230,7 @@ async def test_dcp_sharding_parity(strategy_params, use_rdma):
         _, strategy = strategy_params
         await ts.initialize(
             num_storage_volumes=save_world_size if strategy is not None else 1,
-            strategy=strategy
+            strategy=strategy,
         )
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -258,25 +258,24 @@ async def test_dcp_sharding_parity(strategy_params, use_rdma):
                 for coord, val in value_mesh:
                     try:
                         dcp_state_dict, torchstore_state_dict = val
-                        _assert_equal_state_dict(
-                            dcp_state_dict, torchstore_state_dict
-                        )
+                        _assert_equal_state_dict(dcp_state_dict, torchstore_state_dict)
                     except Exception as e:
                         raise AssertionError(
                             f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
                         ) from e
-        finally:            
+        finally:
             await save_world._proc_mesh.stop()
             await get_world._proc_mesh.stop()
             await ts.shutdown()
+
 
 def _assert_equal_state_dict(state_dict1, state_dict2):
     flattened_state_dict_1, _ = flatten_state_dict(state_dict1)
     flattened_state_dict_2, _ = flatten_state_dict(state_dict2)
 
-    assert len(flattened_state_dict_1) == len(flattened_state_dict_2), (
-         f"{flattened_state_dict_1.keys()=}\n{flattened_state_dict_2.keys()=}"
-    )
+    assert len(flattened_state_dict_1) == len(
+        flattened_state_dict_2
+    ), f"{flattened_state_dict_1.keys()=}\n{flattened_state_dict_2.keys()=}"
     for key in flattened_state_dict_1:
 
         assert key in flattened_state_dict_2
@@ -291,9 +290,10 @@ def _assert_equal_state_dict(state_dict1, state_dict2):
                 f"{key=} {flattened_state_dict_1[key]=} {t1.shape=} {flattened_state_dict_2[key]=} {t2.shape=}",
             )
         else:
-            assert flattened_state_dict_1[key] == flattened_state_dict_2[key], (
-                f"{key=} {flattened_state_dict_1[key]=} {flattened_state_dict_2[key]=}"
-            )
+            assert (
+                flattened_state_dict_1[key] == flattened_state_dict_2[key]
+            ), f"{key=} {flattened_state_dict_1[key]=} {flattened_state_dict_2[key]=}"
+
 
 if __name__ == "__main__":
-    main(__file__) 
+    main(__file__)

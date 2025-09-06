@@ -27,8 +27,11 @@ except ImportError:
 RDMDA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB", "1"))
 assert RDMDA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
+
 def rdma_available() -> bool:
-    rdma_enabled = os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1" #TODO: enable on this build
+    rdma_enabled = (
+        os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
+    )  # TODO: enable on this build
     return rdma_enabled and monarch_rdma_available()
 
 

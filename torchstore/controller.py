@@ -1,15 +1,17 @@
 import os
-from enum import Enum, auto
-from typing import Optional, Set, Dict
 from dataclasses import dataclass, field
+from enum import auto, Enum
+from typing import Dict, Optional, Set
 
 from monarch.actor import Actor, endpoint
 
-from torchstore.strategy import TorchStoreStrategy
 from torchstore.storage_volume import StorageVolume
+
+from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport.pipe import Request, TensorSlice
 
-#TODO: actually just move this into request as a field
+
+# TODO: actually just move this into request as a field
 class ObjectType(Enum):
     OBJECT = auto()
     TENSOR = auto()
@@ -27,13 +29,13 @@ class ObjectType(Enum):
 
 @dataclass
 class StorageInfo:
-    object_type: ObjectType 
-    tensor_slices: Set[Optional[TensorSlice]] = field(default_factory=set)    
+    object_type: ObjectType
+    tensor_slices: Set[Optional[TensorSlice]] = field(default_factory=set)
 
     def update(self, other_storage_info: "StorageInfo"):
-        assert self.object_type == other_storage_info.object_type, (
-            "Particularly dangerous to change storage type of an existing key, are you sure? Raise an issue if so."
-        ) 
+        assert (
+            self.object_type == other_storage_info.object_type
+        ), "Particularly dangerous to change storage type of an existing key, are you sure? Raise an issue if so."
 
         self.tensor_slices.update(other_storage_info.tensor_slices)
 
@@ -42,20 +44,20 @@ class Controller(Actor):
     def __init__(
         self,
     ):
-        self.keys_to_storage_volumes = {}        
+        self.keys_to_storage_volumes = {}
         self.is_initialized = False
 
     def assert_initialized(self):
-        assert self.is_initialized, (
-            "Please call torchstore.initialize before attempting to use store."
-        ) 
+        assert (
+            self.is_initialized
+        ), "Please call torchstore.initialize before attempting to use store."
 
     @endpoint
     async def init(
         self,
         strategy: TorchStoreStrategy,
         num_storage_volumes: int,
-        storage_volumes: StorageVolume
+        storage_volumes: StorageVolume,
     ):
         if self.is_initialized:
             raise RuntimeError("TorchStore is already initialized")
@@ -63,7 +65,7 @@ class Controller(Actor):
         self.strategy = strategy
         self.storage_volumes = storage_volumes
         self.num_storage_volumes = num_storage_volumes
-        
+
         await self.strategy.set_storage_volumes(self.storage_volumes)
         self.is_initialized = True
 
@@ -71,7 +73,7 @@ class Controller(Actor):
     def get_controller_strategy(self):
         self.assert_initialized()
         return self.strategy
-    
+
     @endpoint
     def locate_volumes(
         self,
@@ -96,22 +98,18 @@ class Controller(Actor):
 
         if key not in self.keys_to_storage_volumes:
             raise KeyError(f"Unable to locate {key} in any storage volumes.")
-        return self.keys_to_storage_volumes[key]        
+        return self.keys_to_storage_volumes[key]
 
     @endpoint
-    def notify_put(self,
-        key: str,
-        request: Request,
-        storage_volume_id: str
-    ):
+    def notify_put(self, key: str, request: Request, storage_volume_id: str):
         self.assert_initialized()
 
         if key not in self.keys_to_storage_volumes:
             self.keys_to_storage_volumes[key] = {}
 
         storage_info = StorageInfo(
-            object_type =ObjectType.from_request(request),
-            tensor_slices=set([request.tensor_slice])
+            object_type=ObjectType.from_request(request),
+            tensor_slices=set([request.tensor_slice]),
         )
 
         if storage_volume_id not in self.keys_to_storage_volumes[key]:

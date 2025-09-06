@@ -3,6 +3,8 @@ import os
 from monarch.actor import current_rank
 
 from torchstore.storage_volume import StorageVolume
+
+
 class TorchStoreStrategy:
 
     def __init__(self):
@@ -20,21 +22,26 @@ class TorchStoreStrategy:
     async def set_storage_volumes(self, storage_volumes):
         self.storage_volumes = storage_volumes
         self.volume_id_to_coord = {
-            val : coord for coord, val in await self.storage_volumes.get_id.call()
+            val: coord for coord, val in await self.storage_volumes.get_id.call()
         }
 
     async def set_storage_volumes(self, storage_volumes):
         self.storage_volumes = storage_volumes
         self.volume_id_to_coord = {
-            val : coord for coord, val in await self.storage_volumes.get_id.call()
-        }        
+            val: coord for coord, val in await self.storage_volumes.get_id.call()
+        }
 
     def select_storage_volume(self):
         client_id = self.get_client_id()
         if client_id not in self.volume_id_to_coord:
-            raise KeyError(f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}")
-            
-        return self.get_storage_volume(client_id), client_id # client_id == volume_id for this strategy
+            raise KeyError(
+                f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
+            )
+
+        return (
+            self.get_storage_volume(client_id),
+            client_id,
+        )  # client_id == volume_id for this strategy
 
     def get_storage_volume(self, volume_id: str) -> StorageVolume:
         volume_coord = self.volume_id_to_coord[volume_id]
@@ -42,8 +49,7 @@ class TorchStoreStrategy:
 
 
 class SingletonStrategy(TorchStoreStrategy):
-    """There can be only one!
-    """
+    """There can be only one!"""
 
     strategy_id: str = "Singleton"
 
@@ -56,21 +62,20 @@ class SingletonStrategy(TorchStoreStrategy):
         return cls.strategy_id
 
     async def set_storage_volumes(self, storage_volumes):
-        assert len(storage_volumes) == 1, f"{self.__class__.__name__} support only one storage volume"
+        assert (
+            len(storage_volumes) == 1
+        ), f"{self.__class__.__name__} support only one storage volume"
         await super().set_storage_volumes(storage_volumes)
 
 
 class LocalRankStrategy(TorchStoreStrategy):
-    """Relies on 'LOCAL_RANK' set from env.
-    """
+    """Relies on 'LOCAL_RANK' set from env."""
 
     def __init__(
         self,
     ):
         self.storage_volumes = None
         self.volume_id_to_coord = {}
-
-    
 
     @classmethod
     def get_volume_id(cls):
@@ -83,9 +88,14 @@ class LocalRankStrategy(TorchStoreStrategy):
     def select_storage_volume(self):
         client_id = self.get_client_id()
         if client_id not in self.volume_id_to_coord:
-            raise KeyError(f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}")
-            
-        return self.get_storage_volume(client_id), client_id # client_id == volume_id for this strategy
+            raise KeyError(
+                f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
+            )
+
+        return (
+            self.get_storage_volume(client_id),
+            client_id,
+        )  # client_id == volume_id for this strategy
 
     def get_storage_volume(self, volume_id: str) -> StorageVolume:
         volume_coord = self.volume_id_to_coord[volume_id]

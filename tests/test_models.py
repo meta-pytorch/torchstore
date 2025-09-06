@@ -8,22 +8,21 @@ import math
 import os
 import tempfile
 import time
-import pytest
 from logging import getLogger
 
 import pytest
 
 import torch
 
-from transformers import AutoModelForCausalLM
+import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
+from torchstore.utils import spawn_actors
+
+from transformers import AutoModelForCausalLM
 
 from .utils import main, transport_plus_strategy_params
-
-import torchstore as ts
-from torchstore.utils import spawn_actors
 
 logger = getLogger(__name__)
 
@@ -112,6 +111,7 @@ class ModelTest(Actor):
         await ts.get_state_dict("v0", state_dict)
         self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
 
+
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_basic(strategy_params, use_rdma):
@@ -120,6 +120,7 @@ async def test_basic(strategy_params, use_rdma):
     get_mesh_shape = (1,)
     await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
 
+
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_resharding(strategy_params, use_rdma):
@@ -127,6 +128,7 @@ async def test_resharding(strategy_params, use_rdma):
     put_mesh_shape = (4,)
     get_mesh_shape = (8,)
     await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
+
 
 async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
@@ -167,6 +169,7 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
             logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
     finally:
         await ts.shutdown()
+
 
 if __name__ == "__main__":
     main([__file__])

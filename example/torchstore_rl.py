@@ -14,7 +14,6 @@ import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint, proc_mesh
 
 
-
 # Run the example : python example/torchstore_rl.py
 
 
@@ -61,9 +60,7 @@ class Generator(Actor):
             )
         )
         # Fetch weights from torch.store
-        await ts.get_state_dict(
-            key="toy_app", user_state_dict=self.model.state_dict()
-        )
+        await ts.get_state_dict(key="toy_app", user_state_dict=self.model.state_dict())
         print(
             "[generator {}] new weights: {}".format(self.index, self.model.state_dict())
         )

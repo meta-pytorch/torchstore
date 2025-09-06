@@ -4,8 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import List, Tuple, TYPE_CHECKING
 import uuid
+from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
@@ -25,11 +25,7 @@ async def spawn_actors(num_processes, actor_cls, name, **init_args):
     # await mesh.initialized
     await mesh.logging_option(True, None)
 
-    actors = await mesh.spawn(
-        f"{name}_{str(uuid.uuid4())[:8]}",
-        actor_cls,
-        **init_args
-    )
+    actors = await mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
     return actors
 
 
