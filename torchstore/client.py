@@ -8,9 +8,11 @@ from logging import getLogger
 from typing import Any, Optional, Union
 
 import torch
+import time
 
 from torchstore.controller import ObjectType
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport import Pipe, Request
 from torchstore.utils import assemble_global_tensor, get_local_tensor
 
@@ -32,7 +34,7 @@ class LocalClient:
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
-        logger.debug(f"Putting {key}")
+        latency_tracker = LatencyTracker(f"Put {key}")
 
         request = Request.from_any(value)
         # for now, we only write to one storage volume.
@@ -44,11 +46,17 @@ class LocalClient:
         pipe = Pipe(storage_volume)
 
         await pipe.put_to_storage_volume(key, request)
+        latency_tracker.track_step("put_to_storage_volume")
+        
         await self._controller.notify_put.call(key, request, volume_id)
+        latency_tracker.track_step("notify_put")
+        latency_tracker.track_e2e()
+
 
     @torch.no_grad
     async def get(self, key: str, inplace_tensor: Optional[torch.Tensor] = None):
         logger.debug(f"Fetching {key}")
+        t = time.perf_counter()
         request = Request.from_any(inplace_tensor)
         object_type = ObjectType.from_request(request)
 
@@ -84,6 +92,7 @@ class LocalClient:
         # build the entire tensor.
         # TODO: again, we should have better control over
         # rebuilding only the portion I need, but this is a good start
+        logger.debug(f"Fetching took: {time.perf_counter() - t} s")
 
         local_tensors = []
         global_offsets = []
@@ -114,10 +123,14 @@ class LocalClient:
             request.tensor_slice.local_shape,
             request.tensor_slice.offsets,
         )
+
+        logger.debug(f"sharding logic took: {time.perf_counter() - t} s")
+        t = time.perf_counter()
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
         if inplace_tensor is not None:
             assert request.tensor_val is not None
             request.tensor_val.copy_(fetched_tensor)
+            logger.debug(f"copy took: {time.perf_counter() - t} s")
             return inplace_tensor
         return fetched_tensor
