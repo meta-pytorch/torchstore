@@ -121,3 +121,20 @@ class LocalClient:
             request.tensor_val.copy_(fetched_tensor)
             return inplace_tensor
         return fetched_tensor
+
+    async def keys(self, prefix: str | None = None):
+        """
+        Get all keys that match the given prefix.
+
+        This method retrieves all keys from the storage that start with the specified prefix.
+        The prefix matching follows reverse domain name notation convention.
+
+        Args:
+            prefix (str): The prefix to match against stored keys.
+                          For example, "xyz" matches "xyz.abc.def" but "xy" does not.
+
+        Returns:
+            List[str]: A list of keys that match the given prefix.
+        """
+        # Keys are synced across all storage volumes, so we just call one.
+        return await self._controller.keys.call_one(prefix)

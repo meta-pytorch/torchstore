@@ -6,10 +6,11 @@
 
 from itertools import product
 from logging import getLogger
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, List, MutableMapping, Optional, Tuple, Union
 
 import torch
 from monarch.actor import Actor, endpoint
+from torchstore.data_structures.trie import StringTrie
 
 from torchstore.transport.buffers import TransportBuffer
 
@@ -62,6 +63,10 @@ class StorageVolume(Actor):
     async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
         return await self.store.get_meta(key)
 
+    @endpoint
+    async def keys(self, prefix: str | None = None) -> List[str]:
+        return await self.store.keys(prefix)
+
 
 class StorageImpl:
     """Abstract base class for storage implementations."""
@@ -82,12 +87,34 @@ class StorageImpl:
         """Get metadata about stored data."""
         raise NotImplementedError()
 
+    async def keys(self, prefix: str | None = None) -> List[str]:
+        """
+        Get all keys in the storage backend that match the given prefix.
+
+        This method retrieves all keys from the storage that start with the specified prefix.
+        The prefix matching follows reverse domain name notation convention.
+
+        Args:
+            prefix (str): The prefix to match against stored keys.
+                          For example, "xyz" matches "xyz.abc.def" but "xy" does not.
+
+        Returns:
+            List[str]: A list of keys that match the given prefix.
+
+        Raises:
+            NotImplementedError: This is an abstract method that must be implemented
+                                by concrete storage implementations.
+        """
+        _ = prefix  # Mark prefix as used to avoid lint error
+        raise NotImplementedError()
+
 
 class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
     def __init__(self) -> None:
-        self.kv: Dict[str, Any] = {}
+
+        self.kv = StringTrie(separator=".")
 
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")
@@ -228,3 +255,8 @@ class InMemoryStore(StorageImpl):
             return val["tensor"].shape, val["tensor"].dtype
 
         raise RuntimeError(f"Unknown type for {key} type={type(val)}")
+
+    async def keys(self, prefix: str | None = None) -> List[str]:
+        if prefix is None:
+            return list(self.kv.keys())
+        return self.kv.keys().filter_by_prefix(prefix)
