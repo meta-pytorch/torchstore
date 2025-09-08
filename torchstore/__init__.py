@@ -7,7 +7,18 @@
 import os
 from logging import getLogger
 
+from torchstore.api import (
+    client,
+    get,
+    get_state_dict,
+    initialize,
+    put,
+    put_state_dict,
+    shutdown,
+)
+
 from torchstore.logging import init_logging
+from torchstore.strategy import LocalRankStrategy, SingletonStrategy, TorchStoreStrategy
 
 if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
     init_logging()
@@ -18,7 +29,17 @@ if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
     )
     os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = "910737418240"
 
-from torchstore.store import MultiProcessStore
 
-
-__all__ = ["MultiProcessStore"]
+__all__ = [
+    "initialize",
+    "init_logging",
+    "put",
+    "get",
+    "client",
+    "shutdown",
+    "TorchStoreStrategy",
+    "LocalRankStrategy",
+    "SingletonStrategy",
+    "put_state_dict",
+    "get_state_dict",
+]

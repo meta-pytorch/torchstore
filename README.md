@@ -2,6 +2,18 @@
 
 A storage solution for PyTorch tensors with distributed tensor support.
 
+TorchStore provides a distributed, asynchronous tensor storage system built on top of
+Monarch actors. It enables efficient storage and retrieval of PyTorch tensors across
+multiple processes and nodes with support for various transport mechanisms including
+RDMA when available.
+
+Key Features:
+- Distributed tensor storage with configurable storage strategies
+- Asynchronous put/get operations for tensors and arbitrary objects
+- Support for PyTorch state_dict serialization/deserialization
+- Multiple transport backends (RDMA, regular TCP) for optimal performance
+- Flexible storage volume management and sharding strategies
+
 # Under Construction!
 
 Nothing to see here yet, but check back soon
@@ -46,7 +58,7 @@ pip install git+https://github.com/your-username/torchstore.git
 Once installed, you can import it in your Python code:
 
 ```python
-from torchstore import MultiProcessStore
+import torchstore
 ```
 
 Note: Setup currently assumes you have a working conda environment with both torch & monarch (this is currently a todo). For now the fastest way of setting up is going through [this](https://www.internalfb.com/wiki/Monarch/Monarch_xlformers_integration/Running_Monarch_on_Conda/#how-to-run-monarch) guide.
@@ -58,18 +70,18 @@ Protop: Install finetine conda & use the 'local' option for the latest packges
 ```python
 import torch
 import asyncio
-from torchstore import MultiProcessStore
+import torchstore as ts
 
 async def main():
 
     # Create a store instance
-    store = await MultiProcessStore.create_store()
+    store = await ts.initialize()
 
     # Store a tensor
-    await store.put("my_tensor", torch.randn(3, 4))
+    await ts.put("my_tensor", torch.randn(3, 4))
 
     # Retrieve a tensor
-    tensor = await store.get("my_tensor")
+    tensor = await ts.get("my_tensor")
 
 
 if __name__ == "__main__":
@@ -80,7 +92,7 @@ if __name__ == "__main__":
 ### Resharding Support with DTensor
 
 ```python
-from torchstore import MultiProcessStore
+import torchstore as ts
 from torch.distributed._tensor import distribute_tensor, Replicate, Shard
 from torch.distributed.device_mesh import init_device_mesh
 
@@ -89,11 +101,8 @@ async def place_dtensor_in_store():
     tensor = torch.arange(4)
     dtensor = distribute_tensor(tensor, device_mesh, placements=[Shard(1)])
 
-    # Create a store instance
-    store = await MultiProcessStore.create_store()
-
     # Store a tensor
-    await store.put("my_tensor", dtensor)
+    await ts.put("my_tensor", dtensor)
 
 
 async def fetch_dtensor_from_store()
@@ -107,7 +116,17 @@ async def fetch_dtensor_from_store()
     )
 
     # This line copies the previously stored dtensor into local memory.
-    await store.get("my_tensor", dtensor)
+    await ts.get("my_tensor", dtensor)
+
+def run_in_parallel(func):
+    # just for demonstrative purposes
+    return func
+
+if __name__ == "__main__":
+    ts.initialize()
+    run_in_parallel(place_dtensor_in_store)
+    run_in_parallel(fetch_dtensor_from_store)
+    ts.shutdown()
 
 # checkout out tests/test_resharding.py for more e2e examples with resharding DTensor.
 ```

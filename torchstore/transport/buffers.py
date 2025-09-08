@@ -38,11 +38,12 @@ else:
 
 assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
-RDMA_ENABLED: bool = os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
-
 
 def rdma_available() -> bool:
-    return RDMA_ENABLED and monarch_rdma_available()
+    rdma_enabled = (
+        os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
+    )  # TODO: enable on this build
+    return rdma_enabled and monarch_rdma_available()
 
 
 class TransportBuffer:
@@ -71,6 +72,9 @@ class TransportBuffer:
 
 
 class RDMATransportBuffer(TransportBuffer):
+    # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
+    # for now we utilize copies.
+    # The major blocker for this is dealing with non-contiguous tensors
     requires_meta: bool = True
 
     def __init__(self) -> None:

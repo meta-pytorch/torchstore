@@ -8,23 +8,21 @@ import math
 import os
 import tempfile
 import time
-import unittest
 from logging import getLogger
 
 import pytest
 
 import torch
 
+import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
-
-from torchstore import MultiProcessStore
-from torchstore._state_dict_utils import get_state_dict, push_state_dict
-from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
 from transformers import AutoModelForCausalLM
+
+from .utils import main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -40,13 +38,14 @@ TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
 
 
 class ModelTest(Actor):
-    def __init__(self, store, mesh_shape, file_store_name):
-        init_logging()
+    def __init__(self, mesh_shape, file_store_name):
+        ts.init_logging()
         self.rank = current_rank().rank
-        self.store = store
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
         self.file_store_name = file_store_name
+
+        os.environ["LOCAL_RANK"] = str(self.rank)
 
     def initialize_distributed(self):
         self.rlog(f"Initialize process group using {self.file_store_name=} ")
@@ -94,8 +93,8 @@ class ModelTest(Actor):
 
         self.rlog("pushing state dict")
         t = time.perf_counter()
-        await push_state_dict(self.store, state_dict, "v0")
-        self.rlog(f"pushed state dict in {time.perf_counter() - t} seconds")
+        await ts.put_state_dict(state_dict, "v0")
+        self.rlog(f"pushed state dict in {time.perf_counter()-t} seconds")
 
     @endpoint
     async def do_get(self):
@@ -109,34 +108,43 @@ class ModelTest(Actor):
             torch.distributed.barrier()
         self.rlog("getting state dict")
         t = time.perf_counter()
-        await get_state_dict(self.store, "v0", state_dict)
+        await ts.get_state_dict("v0", state_dict)
         self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
 
 
-@needs_cuda
-class TestHFModel(unittest.IsolatedAsyncioTestCase):
-    async def test_basic(self):
-        # FSDP
-        put_mesh_shape = (1,)
-        get_mesh_shape = (1,)
-        await self._do_test(put_mesh_shape, get_mesh_shape)
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_basic(strategy_params, use_rdma):
+    # FSDP
+    put_mesh_shape = (1,)
+    get_mesh_shape = (1,)
+    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
 
-    async def test_resharding(self):
-        # FSDP
-        put_mesh_shape = (4,)
-        get_mesh_shape = (8,)
-        await self._do_test(put_mesh_shape, get_mesh_shape)
 
-    async def _do_test(self, put_mesh_shape, get_mesh_shape):
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_resharding(strategy_params, use_rdma):
+    # FSDP
+    put_mesh_shape = (4,)
+    get_mesh_shape = (8,)
+    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
+
+
+async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+
+    put_world_size = math.prod(put_mesh_shape)
+    await ts.initialize(
+        num_storage_volumes=put_world_size if strategy is not None else 1,
+        strategy=strategy,
+    )
+    try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = await MultiProcessStore.create_store()
-
             put_world_size = math.prod(put_mesh_shape)
             put_world = await spawn_actors(
                 put_world_size,
                 ModelTest,
                 "save_world",
-                store=store,
                 mesh_shape=put_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "save_world"),
             )
@@ -146,7 +154,6 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
                 get_world_size,
                 ModelTest,
                 "get_world",
-                store=store,
                 mesh_shape=get_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
@@ -159,9 +166,10 @@ class TestHFModel(unittest.IsolatedAsyncioTestCase):
             logger.info("fetching state dict")
             t = time.perf_counter()
             await get_world.do_get.call()
-            logger.info(f"getting state dict took: {time.perf_counter() - t} seconds")
+            logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
+    finally:
+        await ts.shutdown()
 
 
 if __name__ == "__main__":
-    init_logging()
-    unittest.main()
+    main([__file__])

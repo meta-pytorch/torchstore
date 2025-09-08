@@ -10,15 +10,11 @@ readme = "README.md"
 authors = [
     { name = "PyTorch Team", email = "packages@pytorch.org" },
 ]
-requires-python = ">=3.6"
+requires-python = ">=3.9"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.6",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -26,8 +22,8 @@ classifiers = [
 dependencies = [] #todo: add toml
 
 [project.urls]
-"Homepage" = "https://github.com/your-username/torchstore"
-"Bug Tracker" = "https://github.com/your-username/torchstore/issues"
+"Homepage" = "https://github.com/meta-pytorch/torchstore"
+"Bug Tracker" = "https://github.com/meta-pytorch/torchstore/issues"
 
 [project.optional-dependencies]
 dev = [
