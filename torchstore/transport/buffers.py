@@ -84,11 +84,7 @@ class RDMATransportBuffer(TransportBuffer):
             tensor = tensor.unsqueeze(0)
         byte_view = tensor.view(torch.uint8).flatten()
         chunk_size = RDMDA_CHUNK_SIZE_MB * 1024 * 1024
-        offset = 0
-        tensor_chunks = []
-        while offset < byte_view.numel():
-            tensor_chunks.append(byte_view[offset : offset + chunk_size])
-            offset += chunk_size
+        tensor_chunks = torch.split(byte_view, chunk_size, dim=0)
 
         return tensor_chunks
 
