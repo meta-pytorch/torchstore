@@ -249,7 +249,8 @@ async def _test_resharding(
     """Given a "put" mesh shape and a "get" mesh shape.
     1. Create separate worlds for each mesh shape, running on different devices /PGs.
     2. Each rank in 'put' world will create a DTensor, and call self.store.put(key="test_key", value=dtensor)
-    3. Each rank in 'get' world will create a DTensor (with a different sharding, and seeded with torch.zero), and call self.store.get(key="test_key", value=dtensor)
+    3. Each rank in 'get' world will create a DTensor (with a different sharding, and seeded with torch.zero),
+        and call self.store.get(key="test_key", value=dtensor)
     4. The result of the above operation should be the original DTensor, but resharded between putter/getter worlds
 
     Example:

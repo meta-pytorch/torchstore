@@ -4,10 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
 from dataclasses import dataclass, field
 from enum import auto, Enum
-from typing import Any, Dict, Optional, Set
+from typing import Dict, Optional, Set
 
 from monarch.actor import Actor, endpoint
 

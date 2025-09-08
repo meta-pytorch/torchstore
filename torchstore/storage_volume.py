@@ -14,7 +14,7 @@ from monarch.actor import Actor, endpoint
 from torchstore.transport.buffers import TransportBuffer
 
 from torchstore.transport.pipe import Request, TensorSlice
-from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
+from torchstore.utils import assemble_global_tensor, spawn_actors
 
 logger = getLogger(__name__)
 

@@ -4,19 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import re
-from functools import partial
-from itertools import product
 from logging import getLogger
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
 
-from torchstore.controller import Controller, ObjectType
+from torchstore.controller import ObjectType
 
-from torchstore.transport.pipe import Request
-from torchstore.transport import Pipe, Request, TensorSlice
-from torchstore.utils import assemble_global_tensor, get_local_tensor, spawn_actors
+from torchstore.transport import Pipe, Request
+from torchstore.utils import assemble_global_tensor, get_local_tensor
 
 logger = getLogger(__name__)
 
