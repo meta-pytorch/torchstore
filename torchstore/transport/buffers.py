@@ -24,8 +24,19 @@ except ImportError:
 # TODO: for some reason, RDMABuffer is breaking for certain tensors on the HF models (qwen, llama)
 # but setting this chunk size works around the issue until we can fix it
 # N.B. from benchmarking, we know the ideal size is any size >=256mb.
-RDMDA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB", "1"))
-assert RDMDA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
+
+# Check for misspelled environment variable for backward compatibility
+rdma_chunk_size_env = os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB")
+if rdma_chunk_size_env is not None:
+    logging.warning(
+        "Using deprecated environment variable 'TORCHSTORE_RDMDA_CHUNK_SIZE_MB'. "
+        "Please use 'TORCHSTORE_RDMA_CHUNK_SIZE_MB' instead."
+    )
+    RDMA_CHUNK_SIZE_MB: int = int(rdma_chunk_size_env)
+else:
+    RDMA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "4"))
+
+assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
 RDMA_ENABLED: bool = os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
 
@@ -83,12 +94,8 @@ class RDMATransportBuffer(TransportBuffer):
         if tensor.dim() == 0:
             tensor = tensor.unsqueeze(0)
         byte_view = tensor.view(torch.uint8).flatten()
-        chunk_size = RDMDA_CHUNK_SIZE_MB * 1024 * 1024
-        offset = 0
-        tensor_chunks = []
-        while offset < byte_view.numel():
-            tensor_chunks.append(byte_view[offset : offset + chunk_size])
-            offset += chunk_size
+        chunk_size = RDMA_CHUNK_SIZE_MB * 1024 * 1024
+        tensor_chunks = torch.split(byte_view, chunk_size, dim=0)
 
         return tensor_chunks
 
