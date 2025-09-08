@@ -123,7 +123,6 @@ class LocalRankStrategy(TorchStoreStrategy):
     """
 
     def __init__(self):
-        """Initialize the LocalRankStrategy with empty mappings."""
         super().__init__()
 
     @classmethod
