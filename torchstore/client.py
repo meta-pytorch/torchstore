@@ -34,7 +34,7 @@ class LocalClient:
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
-        latency_tracker = LatencyTracker(f"Put {key}")
+        latency_tracker = LatencyTracker(f"put:{key}")
 
         request = Request.from_any(value)
         # for now, we only write to one storage volume.
@@ -48,15 +48,14 @@ class LocalClient:
         await pipe.put_to_storage_volume(key, request)
         latency_tracker.track_step("put_to_storage_volume")
         
-        await self._controller.notify_put.call(key, request, volume_id)
+        await self._controller.notify_put.call(key, request.meta_only(), volume_id)
         latency_tracker.track_step("notify_put")
         latency_tracker.track_e2e()
 
 
     @torch.no_grad
     async def get(self, key: str, inplace_tensor: Optional[torch.Tensor] = None):
-        logger.debug(f"Fetching {key}")
-        t = time.perf_counter()
+        latency_tracker = LatencyTracker(f"get:{key}") 
         request = Request.from_any(inplace_tensor)
         object_type = ObjectType.from_request(request)
 
@@ -72,6 +71,8 @@ class LocalClient:
                 # TODO: in the future, we could intelligently select the best storage volume
                 # but for now any should work.
                 fetched_tensor = await pipe.get_from_storage_volume(key, request)
+                latency_tracker.track_step("get_from_storage_volume")
+                latency_tracker.track_e2e()
                 return fetched_tensor if inplace_tensor is None else inplace_tensor
 
             # else: this is the dtensor / tensor slice case
@@ -89,10 +90,11 @@ class LocalClient:
         assert partial_results, "No partial results found"
         assert request.tensor_slice is not None
 
+        latency_tracker.track_step("get_from_storage_volume")
+
         # build the entire tensor.
         # TODO: again, we should have better control over
         # rebuilding only the portion I need, but this is a good start
-        logger.debug(f"Fetching took: {time.perf_counter() - t} s")
 
         local_tensors = []
         global_offsets = []
@@ -124,13 +126,16 @@ class LocalClient:
             request.tensor_slice.offsets,
         )
 
-        logger.debug(f"sharding logic took: {time.perf_counter() - t} s")
+        latency_tracker.track_step("assemble_tensor")
         t = time.perf_counter()
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
         if inplace_tensor is not None:
             assert request.tensor_val is not None
             request.tensor_val.copy_(fetched_tensor)
-            logger.debug(f"copy took: {time.perf_counter() - t} s")
+            latency_tracker.track_step("copy")
+            latency_tracker.track_e2e()
             return inplace_tensor
+
+        latency_tracker.track_e2e()
         return fetched_tensor

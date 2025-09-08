@@ -137,6 +137,9 @@ class Controller(Actor):
             storage_volume_id (str): ID of the storage volume where the data was stored.
         """
         self.assert_initialized()
+        assert request.tensor_val is None, (
+            f"request should not contain tensor data, as this will significantly increase e2e latency"  
+        ) 
 
         if key not in self.keys_to_storage_volumes:
             self.keys_to_storage_volumes[key] = {}

@@ -9,27 +9,30 @@ import logging
 import os
 import sys
 
-logger = logging.getLogger(__name__)
-
 
 def init_logging():
     log_level = os.environ.get("TORCHSTORE_LOG_LEVEL", "INFO").upper()
+    
     logging.root.setLevel(log_level)
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(log_level)
-    logging.root.addHandler(stdout_handler)
 
+    # Check if a StreamHandler to sys.stdout is already present
+    for handler in logging.root.handlers:
+        if isinstance(handler, logging.StreamHandler) and getattr(handler, 'stream', None) == sys.stdout:
+            # Already has a stdout handler, no need to add another
+            return
+    logging.root.addHandler(stdout_handler)
 
 class LatencyTracker:
     def __init__(self, name: str) -> None:
         self.name = name
-        self.start_time = 0.0
-        self.last_step = 0.0
+        self.last_step = self.start_time = time.perf_counter()
 
     def track_step(self, step_name: str) -> None:
         now = time.perf_counter()
-        logger.debug(f"{self.name}:{step_name} took {now - self.last_step} seconds")
+        logging.debug(f"{self.name}:{step_name} took {now - self.last_step} seconds")
         self.last_step = now
         
     def track_e2e(self) -> None:
-        logger.debug(f"{self.name} took {time.time() - self.start_time} seconds")
+        logging.debug(f"{self.name} took {time.perf_counter() - self.start_time} seconds")

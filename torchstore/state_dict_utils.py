@@ -55,8 +55,7 @@ async def get_state_dict(
         else ({}, None)
     )
     if strict and user_mapping is not None:
-        pass
-        # assert user_mapping == fetched_mapping
+        assert user_mapping == fetched_mapping
 
     fetched_state_dict = {}
     for flattened_key in fetched_mapping.keys():

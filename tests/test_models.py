@@ -40,6 +40,7 @@ TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~8GB
 
 class ModelTest(Actor):
     def __init__(self, mesh_shape, file_store_name):
+        ts.init_logging()
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
@@ -164,7 +165,7 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
 
-            logger.info(f"do_pushs")
+            logger.info(f"do_push ")
             await put_world.do_push.call()
 
             

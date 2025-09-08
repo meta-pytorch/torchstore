@@ -20,6 +20,6 @@ def transport_plus_strategy_params():
         (2, ts.LocalRankStrategy()),
         (1, None),  # singleton
     ]
-    rdma_options = [True]  # , True] broken on my build
+    rdma_options = [True, False]
 
     return "strategy_params, use_rdma", list(product(strategies, rdma_options))
