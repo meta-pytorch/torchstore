@@ -75,7 +75,7 @@ import torchstore as ts
 async def main():
 
     # Create a store instance
-    store = await ts.initialize()
+    await ts.initialize()
 
     # Store a tensor
     await ts.put("my_tensor", torch.randn(3, 4))
