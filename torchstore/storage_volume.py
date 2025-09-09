@@ -63,10 +63,6 @@ class StorageVolume(Actor):
     async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
         return await self.store.get_meta(key)
 
-    @endpoint
-    async def keys(self, prefix: str | None = None) -> List[str]:
-        return await self.store.keys(prefix)
-
 
 class StorageImpl:
     """Abstract base class for storage implementations."""
@@ -85,27 +81,6 @@ class StorageImpl:
 
     async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
         """Get metadata about stored data."""
-        raise NotImplementedError()
-
-    async def keys(self, prefix: str | None = None) -> List[str]:
-        """
-        Get all keys in the storage backend that match the given prefix.
-
-        This method retrieves all keys from the storage that start with the specified prefix.
-        The prefix matching follows reverse domain name notation convention.
-
-        Args:
-            prefix (str): The prefix to match against stored keys.
-                          For example, "xyz" matches "xyz.abc.def" but "xy" does not.
-
-        Returns:
-            List[str]: A list of keys that match the given prefix.
-
-        Raises:
-            NotImplementedError: This is an abstract method that must be implemented
-                                by concrete storage implementations.
-        """
-        _ = prefix  # Mark prefix as used to avoid lint error
         raise NotImplementedError()
 
 
@@ -255,8 +230,3 @@ class InMemoryStore(StorageImpl):
             return val["tensor"].shape, val["tensor"].dtype
 
         raise RuntimeError(f"Unknown type for {key} type={type(val)}")
-
-    async def keys(self, prefix: str | None = None) -> List[str]:
-        if prefix is None:
-            return list(self.kv.keys())
-        return self.kv.keys().filter_by_prefix(prefix)

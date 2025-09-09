@@ -6,12 +6,12 @@
 
 from dataclasses import dataclass, field
 from enum import auto, Enum
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from monarch.actor import Actor, endpoint
 
+from torchstore.data_structures.trie import StringTrie
 from torchstore.storage_volume import StorageVolume
-
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport.pipe import Request, TensorSlice
 
@@ -49,7 +49,9 @@ class Controller(Actor):
     def __init__(
         self,
     ) -> None:
-        self.keys_to_storage_volumes: Dict[str, Dict[str, StorageInfo]] = {}
+        self.keys_to_storage_volumes = (
+            StringTrie()
+        )  # MutableMapping[str, Dict[str, StorageInfo]] = {}
         self.is_initialized: bool = False
         self.strategy: Optional[TorchStoreStrategy] = None
         self.storage_volumes: Optional[StorageVolume] = None
@@ -154,7 +156,13 @@ class Controller(Actor):
     @endpoint
     def teardown(self) -> None:
         self.is_initialized = False
-        self.keys_to_storage_volumes = {}
+        self.keys_to_storage_volumes = StringTrie()
         self.strategy = None
         self.storage_volumes = None
         self.num_storage_volumes = None
+
+    @endpoint
+    def keys(self, prefix=None) -> List[str]:
+        if prefix is None:
+            return list(self.keys_to_storage_volumes.keys())
+        return self.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
