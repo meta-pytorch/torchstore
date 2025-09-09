@@ -188,6 +188,28 @@ async def keys(
     return await cl.keys(prefix)
 
 
+async def exists(key: str, store_name: str = DEFAULT_TORCHSTORE_NAME) -> bool:
+    """Check if a key exists in the distributed store.
+
+    Args:
+        key (str): Unique identifier to check for existence.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Returns:
+        bool: True if the key exists, False otherwise.
+
+    Example:
+        >>> if await exists("my_tensor"):
+        ...     tensor = await get("my_tensor")
+        >>>
+        >>> # Check before storing
+        >>> if not await exists("checkpoint_1"):
+        ...     await put("checkpoint_1", model.state_dict())
+    """
+    cl = await client(store_name)
+    return await cl.exists(key)
+
+
 async def put_state_dict(
     state_dict: Dict[str, Any], key: str, store_name: str = DEFAULT_TORCHSTORE_NAME
 ) -> None:

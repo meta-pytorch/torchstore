@@ -37,6 +37,7 @@ dev = [
     "expecttest",
     "anyio",
     "pytest-asyncio",
+    "transformers",
 ]
 
 [tool.setuptools.packages.find]

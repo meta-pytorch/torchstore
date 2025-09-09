@@ -148,6 +148,74 @@ async def test_objects(strategy_params, use_rdma):
         await ts.shutdown()
 
 
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_exists(strategy_params, use_rdma):
+    """Test the exists() API functionality"""
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+
+    class ExistsTestActor(Actor):
+        """Actor for testing exists functionality."""
+
+        def __init__(self, world_size):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            # required by LocalRankStrategy
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def put(self, key, value):
+            await ts.put(key, value)
+
+        @endpoint
+        async def exists(self, key):
+            return await ts.exists(key)
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+
+    # Spawn test actors
+    actor_mesh = await spawn_actors(
+        volume_world_size,
+        ExistsTestActor,
+        "exists_test_actors",
+        world_size=volume_world_size,
+    )
+
+    try:
+        # Test 1: Check non-existent keys
+        results = await actor_mesh.exists.call("non_existent_key")
+        for pt, exists_result in results:
+            assert not exists_result
+
+        # Test 2: Store tensors and check existence
+        tensor = torch.tensor([1, 2, 3, 4, 5])
+        for rank in range(volume_world_size):
+            actor = actor_mesh.slice(**{"hosts": 0, "gpus": rank})
+            await actor.put.call(f"tensor_key_{rank}", tensor)
+
+        for rank in range(volume_world_size):
+            results = await actor_mesh.exists.call(f"tensor_key_{rank}")
+            for pt, exists_result in results:
+                assert exists_result
+
+        # Test 3: Store objects and check existence
+        obj = {"rank": 0, "data": [1, 2, 3]}
+        for rank in range(volume_world_size):
+            actor = actor_mesh.slice(**{"hosts": 0, "gpus": rank})
+            await actor.put.call(f"object_key_{rank}", obj)
+
+        for rank in range(volume_world_size):
+            results = await actor_mesh.exists.call(f"object_key_{rank}")
+            for pt, exists_result in results:
+                assert exists_result
+
+    finally:
+        await actor_mesh._proc_mesh.stop()
+        await ts.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_large_tensors():
     """Test basic put/get functionality for large tensors"""

@@ -138,3 +138,29 @@ class LocalClient:
         """
         # Keys are synced across all storage volumes, so we just call one.
         return await self._controller.keys.call_one(prefix)
+
+    async def exists(self, key: str) -> bool:
+        """Check if a key exists in the distributed store.
+
+        This is an efficient operation that only checks metadata at the controller level
+        without retrieving the actual data.
+
+        Args:
+            key (str): The key to check for existence.
+
+        Returns:
+            bool: True if the key exists, False otherwise.
+        """
+        logger.debug(f"Checking existence of {key}")
+        try:
+            # Use the controller to check if key exists
+            # This is efficient as it only checks metadata
+            await self._controller.locate_volumes.call_one(key)
+            return True
+        except Exception as e:
+            # Controller raises KeyError if key doesn't exist, but it comes wrapped
+            # in an ActorError from the Monarch framework
+            if "KeyError" in str(e) or "Unable to locate" in str(e):
+                return False
+            # Re-raise if it's a different kind of error
+            raise e
