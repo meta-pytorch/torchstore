@@ -33,6 +33,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "pytest-timeout",
+    "pytest-unordered",
     "expecttest",
     "anyio",
     "pytest-asyncio",
