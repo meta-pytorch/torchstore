@@ -32,7 +32,12 @@ needs_cuda = pytest.mark.skipif(
 )
 
 
-assert os.environ.get("HF_TOKEN", None) is not None, "HF_TOKEN must be set"
+# Skip all tests in this module if HF_TOKEN is not available
+pytestmark = pytest.mark.skipif(
+    os.environ.get("HF_TOKEN", None) is None,
+    reason="HF_TOKEN not available - skipping Transformers model tests",
+)
+
 TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
 # TEST_MODEL = "meta-llama/Llama-3.1-8B" # ~ 16GB
 
