@@ -35,7 +35,7 @@ needs_cuda = pytest.mark.skipif(
 # Skip all tests in this module if HF_TOKEN is not available
 pytestmark = pytest.mark.skipif(
     os.environ.get("HF_TOKEN", None) is None,
-    reason="HF_TOKEN not available - skipping Transformers model tests"
+    reason="HF_TOKEN not available - skipping Transformers model tests",
 )
 
 TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
