@@ -44,6 +44,12 @@ class StringTrie(MutableMapping[str, Any]):
     an additional ``filter_keys`` method that allows for prefix-based filtering of
     keys.
 
+    Args:
+        mapping: Optional Mapping to initialize the trie with
+
+    Keyword Args:
+        separator: Character used to separate path elements in keys (default: ".")
+
     Example:
         trie = StringTrie({"abc.xyz": 1, "abc": 2, "xyz": 3})
         for key in trie.keys().filter_by_prefix("abc"):
@@ -51,15 +57,8 @@ class StringTrie(MutableMapping[str, Any]):
     """
 
     def __init__(
-        self, mapping: Optional[Mapping[str, Any]] = None, separator: str = "."
+        self, mapping: Optional[Mapping[str, Any]] = None, *, separator: str = "."
     ) -> None:
-        """
-        Initialize a new StringTrie.
-
-        Args:
-            mapping: Optional Mapping to initialize the trie with
-            separator: Character used to separate path elements in keys
-        """
         self._trie = pygtrie.StringTrie(separator=separator)
 
         if mapping:
