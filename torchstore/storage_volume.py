@@ -6,7 +6,7 @@
 
 from itertools import product
 from logging import getLogger
-from typing import Any, List, MutableMapping, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import torch
 from monarch.actor import Actor, endpoint
