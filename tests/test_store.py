@@ -184,7 +184,7 @@ async def test_exists(strategy_params, use_rdma):
 
     try:
         # Test 1: Check non-existent keys
-        results = await actor_mesh.exists.call(f"non_existent_key")
+        results = await actor_mesh.exists.call("non_existent_key")
         for pt, exists_result in results:
             assert not exists_result
 
