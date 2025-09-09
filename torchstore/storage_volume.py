@@ -10,7 +10,6 @@ from typing import Any, List, MutableMapping, Optional, Tuple, Union
 
 import torch
 from monarch.actor import Actor, endpoint
-from torchstore.data_structures.trie import StringTrie
 
 from torchstore.transport.buffers import TransportBuffer
 
@@ -88,8 +87,7 @@ class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
     def __init__(self) -> None:
-
-        self.kv = StringTrie(separator=".")
+        self.kv = {}
 
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")
