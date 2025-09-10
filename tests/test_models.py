@@ -173,21 +173,5 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
     finally:
         await ts.shutdown()
 
-
-# logger = getLogger(__name__)
-
-class Foo(Actor):
-    
-    def __init__(self) -> None:
-        init_logging()
-
-    @endpoint
-    def foo(self):
-        print("foo")
-        self.logger.info("foo")
-        logger.info("foo")
-
-        return "foo"
-
 if __name__ == "__main__":
     main([__file__])

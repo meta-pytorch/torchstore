@@ -4,22 +4,26 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from logging import getLogger
+
 import uuid
 from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from monarch.actor import proc_mesh, this_host, HostMesh, ProcMesh
+from monarch.actor import this_host, ProcMesh
 
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
 
+logger = getLogger(__name__)
 
-async def spawn_actors(num_processes, actor_cls, name, mesh, **init_args):
+async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
     """Actors are essentially processes wrapped in a class."""
 
     if mesh is None:
+        logger.debug("Spawning actors on the local host")
         mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
         await mesh.initialized
         actors = await mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
