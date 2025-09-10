@@ -161,3 +161,7 @@ class Controller(Actor):
         self.strategy = None
         self.storage_volumes = None
         self.num_storage_volumes = None
+
+    @endpoint
+    def get_keys_to_storage_volumes(self) -> Dict[str, Dict[str, StorageInfo]]:
+        return self.keys_to_storage_volumes

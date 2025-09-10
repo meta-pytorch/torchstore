@@ -35,7 +35,6 @@ class LocalClient:
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
         latency_tracker = LatencyTracker(f"put:{key}")
-
         request = Request.from_any(value)
         # for now, we only write to one storage volume.
         # we probably don't need a remote call for this case since

@@ -9,24 +9,25 @@ from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from monarch.actor import proc_mesh, this_host
+from monarch.actor import proc_mesh, this_host, HostMesh, ProcMesh
 
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
 
 
-async def spawn_actors(num_processes, actor_cls, name, **init_args):
+async def spawn_actors(num_processes, actor_cls, name, mesh, **init_args):
     """Actors are essentially processes wrapped in a class."""
-    # mesh = await proc_mesh(gpus=num_processes)
-    # once monarch updates
-    mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
 
-    await mesh.initialized
-    # await mesh.logging_option(True, None)
+    if mesh is None:
+        mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
+        await mesh.initialized
+        actors = await mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
+        return actors
 
-    # uuid is to try to help with log spew from monarch.
-    actors = await mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
+    assert isinstance(mesh, ProcMesh)
+    actors = mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
+
     return actors
 
 

@@ -32,7 +32,8 @@ class TensorSlice:
     mesh_shape: Tuple
 
     def __post_init__(self):
-        self.coordinates = tuple(self.coordinates)
+        if self.coordinates is not None:
+            self.coordinates = tuple(self.coordinates)
 
     def __hash__(self):
         # Hash all fields as a tuple, converting local_shape to tuple if it's a torch.Size
