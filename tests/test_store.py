@@ -15,7 +15,12 @@ import torch
 
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
+
+# DTensor imports for DTensor slice testing
+from torch.distributed._tensor import distribute_tensor, Shard
+from torch.distributed.device_mesh import init_device_mesh
 from torchstore.logging import init_logging
+from torchstore.transport.pipe import TensorSlice
 from torchstore.utils import spawn_actors
 
 from .utils import main, transport_plus_strategy_params
@@ -214,6 +219,182 @@ async def test_exists(strategy_params, use_rdma):
         await actor_mesh._proc_mesh.stop()
         await ts.shutdown()
 
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_get_tensor_slice(strategy_params, use_rdma):
+    """Test tensor slice API functionality"""
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+
+    class TensorSlicePutActor(Actor):
+        """Actor for putting tensors."""
+
+        def __init__(self, world_size):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            # required by LocalRankStrategy
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def put(self, key, tensor):
+            await ts.put(key, tensor)
+
+    class TensorSliceGetActor(Actor):
+        """Actor for getting tensor slices."""
+
+        def __init__(self, world_size):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            # required by LocalRankStrategy
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def get(self, key, slice_spec=None):
+            if slice_spec is None:
+                return await ts.get(key)
+            else:
+                return await ts.get(key, tensor_slice_spec=slice_spec)
+
+        @endpoint
+        async def test_slice_error(self, key, slice_spec):
+            """Test that slicing non-tensor objects raises appropriate errors"""
+            try:
+                await ts.get(key, tensor_slice_spec=slice_spec)
+                return False  # Should have raised an error
+            except ValueError:
+                return True  # Expected error occurred
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+
+    # Spawn test actors - separate meshes for put and get to test cross-process communication
+    put_actor_mesh = await spawn_actors(
+        volume_world_size,
+        TensorSlicePutActor,
+        "tensor_slice_put_actors",
+        world_size=volume_world_size,
+    )
+    get_actor_mesh = await spawn_actors(
+        volume_world_size,
+        TensorSliceGetActor,
+        "tensor_slice_get_actors",
+        world_size=volume_world_size,
+    )
+
+    try:
+        test_tensor = torch.randn(1000, 2000)
+        key = "test_tensor"
+
+        # Store the tensor using put actor mesh
+        put_actor = put_actor_mesh.slice(**{"hosts": 0, "gpus": 0})
+        await put_actor.put.call(key, test_tensor)
+
+        # Test full tensor retrieval using get actor mesh
+        results = await get_actor_mesh.get.call(key)
+        for pt, retrieved_tensor in results:
+            assert torch.equal(test_tensor, retrieved_tensor)
+
+        # Test slice retrieval using get actor mesh
+        slice_spec = TensorSlice(
+            offsets=(100, 200),
+            coordinates=(),
+            global_shape=(1000, 2000),
+            local_shape=(50, 100),
+            mesh_shape=(),
+        )
+
+        results = await get_actor_mesh.get.call(key, slice_spec)
+        for pt, sliced_tensor in results:
+            expected_slice = test_tensor[100:150, 200:300]
+            assert torch.equal(sliced_tensor, expected_slice)
+            assert sliced_tensor.shape == (50, 100)
+
+        # Test 2: Different slice specifications
+        slice_spec2 = TensorSlice(
+            offsets=(0, 0),
+            coordinates=(),
+            global_shape=(1000, 2000),
+            local_shape=(200, 300),
+            mesh_shape=(),
+        )
+
+        results = await get_actor_mesh.get.call(key, slice_spec2)
+        for pt, sliced_tensor2 in results:
+            expected_slice2 = test_tensor[0:200, 0:300]
+            assert torch.equal(sliced_tensor2, expected_slice2)
+            assert sliced_tensor2.shape == (200, 300)
+
+        # Test 3: Full tensor via slice
+        full_slice_spec = TensorSlice(
+            offsets=(0, 0),
+            coordinates=(),
+            global_shape=(1000, 2000),
+            local_shape=(1000, 2000),
+            mesh_shape=(),
+        )
+
+        results = await get_actor_mesh.get.call(key, full_slice_spec)
+        for pt, full_via_slice in results:
+            assert torch.equal(full_via_slice, test_tensor)
+
+        # Test 4: Error handling - try to slice a non-tensor object
+        non_tensor_key = "non_tensor"
+        await put_actor.put.call(non_tensor_key, {"key": "value", "data": [1, 2, 3]})
+
+        error_slice_spec = TensorSlice(
+            offsets=(0, 0),
+            coordinates=(),
+            global_shape=(10, 10),
+            local_shape=(5, 5),
+            mesh_shape=(),
+        )
+
+        results = await get_actor_mesh.test_slice_error.call(
+            non_tensor_key, error_slice_spec
+        )
+        for pt, error_caught in results:
+            assert error_caught  # Should have caught ValueError
+
+    finally:
+        await put_actor_mesh._proc_mesh.stop()
+        await get_actor_mesh._proc_mesh.stop()
+        await ts.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_tensor_slice_inplace():
+    """Test tensor slice API with in-place operations"""
+    await ts.initialize(num_storage_volumes=1)
+
+    try:
+        # Store a test tensor
+        test_tensor = torch.randn(100, 200)
+        await ts.put("inplace_test", test_tensor)
+
+        # Test in-place retrieval with slice
+        slice_spec = TensorSlice(
+            offsets=(10, 20),
+            coordinates=(),
+            global_shape=(100, 200),
+            local_shape=(30, 40),
+            mesh_shape=(),
+        )
+
+        # Create pre-allocated buffer
+        slice_buffer = torch.empty(30, 40)
+        result = await ts.get(
+            "inplace_test", inplace_tensor=slice_buffer, tensor_slice_spec=slice_spec
+        )
+
+        # Verify in-place operation
+        assert result is slice_buffer
+        expected_slice = test_tensor[10:40, 20:60]
+        assert torch.equal(slice_buffer, expected_slice)
+
+    finally:
+        await ts.shutdown()
 
 @pytest.mark.asyncio
 async def test_large_tensors():

@@ -11,7 +11,7 @@ import torch
 
 from torchstore.controller import ObjectType
 
-from torchstore.transport import Pipe, Request
+from torchstore.transport import Pipe, Request, TensorSlice
 from torchstore.utils import assemble_global_tensor, get_local_tensor
 
 logger = getLogger(__name__)
@@ -47,9 +47,18 @@ class LocalClient:
         await self._controller.notify_put.call(key, request, volume_id)
 
     @torch.no_grad
-    async def get(self, key: str, inplace_tensor: Optional[torch.Tensor] = None):
+    async def get(
+        self,
+        key: str,
+        inplace_tensor: Optional[torch.Tensor] = None,
+        tensor_slice_spec: Optional[TensorSlice] = None,
+    ):
         logger.debug(f"Fetching {key}")
-        request = Request.from_any(inplace_tensor)
+
+        # When slicing, don't use inplace_tensor for the request because the transport
+        # layer will try to load full tensor into slice-sized buffer (size mismatch)
+        request_inplace = None if tensor_slice_spec is not None else inplace_tensor
+        request = Request.from_any(request_inplace)
         object_type = ObjectType.from_request(request)
 
         # multinode support here
@@ -64,6 +73,25 @@ class LocalClient:
                 # TODO: in the future, we could intelligently select the best storage volume
                 # but for now any should work.
                 fetched_tensor = await pipe.get_from_storage_volume(key, request)
+
+                # If user requested a specific slice, extract it
+                if tensor_slice_spec is not None:
+                    if not isinstance(fetched_tensor, torch.Tensor):
+                        raise ValueError(
+                            "Cannot extract tensor slice from non-tensor object"
+                        )
+                    sliced_tensor = get_local_tensor(
+                        fetched_tensor,
+                        tensor_slice_spec.local_shape,
+                        tensor_slice_spec.offsets,
+                    )
+
+                    # Handle in-place operation for tensor slice
+                    if inplace_tensor is not None:
+                        inplace_tensor.copy_(sliced_tensor)
+                        return inplace_tensor
+                    return sliced_tensor
+
                 return fetched_tensor if inplace_tensor is None else inplace_tensor
 
             # else: this is the dtensor / tensor slice case
@@ -109,16 +137,25 @@ class LocalClient:
             global_offsets,
         )
 
-        fetched_tensor = get_local_tensor(
-            full_tensor,
-            request.tensor_slice.local_shape,
-            request.tensor_slice.offsets,
-        )
+        # If user requested a specific slice, extract that instead of the DTensor's local portion
+        if tensor_slice_spec is not None:
+            fetched_tensor = get_local_tensor(
+                full_tensor,
+                tensor_slice_spec.local_shape,
+                tensor_slice_spec.offsets,
+            )
+        else:
+            # Normal DTensor case - extract the local portion for this process
+            fetched_tensor = get_local_tensor(
+                full_tensor,
+                request.tensor_slice.local_shape,
+                request.tensor_slice.offsets,
+            )
+
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
         if inplace_tensor is not None:
-            assert request.tensor_val is not None
-            request.tensor_val.copy_(fetched_tensor)
+            inplace_tensor.copy_(fetched_tensor)
             return inplace_tensor
         return fetched_tensor
 
