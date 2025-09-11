@@ -23,7 +23,7 @@ from torchstore.logging import init_logging
 from torchstore.transport.pipe import TensorSlice
 from torchstore.utils import spawn_actors
 
-from .utils import main, transport_plus_strategy_params
+from .utils import DTensorActor, main, transport_plus_strategy_params
 
 init_logging()
 logger = getLogger(__name__)
@@ -396,6 +396,7 @@ async def test_tensor_slice_inplace():
     finally:
         await ts.shutdown()
 
+
 @pytest.mark.asyncio
 async def test_large_tensors():
     """Test basic put/get functionality for large tensors"""
@@ -469,6 +470,63 @@ async def test_large_tensors():
     await actor.put.call_one()
     await actor.get.call_one()
     # TODO: assert equal tensors from put/get
+
+
+@pytest.mark.asyncio
+async def test_dtensor_simple_put_get():
+    """Test basic DTensor put/get functionality with separate put and get meshes using shared DTensorActor"""
+    import tempfile
+
+    # Initialize TorchStore with 2 storage volumes and LocalRankStrategy
+    from torchstore.strategy import LocalRankStrategy
+
+    await ts.initialize(num_storage_volumes=2, strategy=LocalRankStrategy())
+
+    original_tensor = torch.arange(16).reshape(4, 4).float()
+
+    with tempfile.TemporaryDirectory() as filesystem_store_dir:
+        try:
+            put_mesh = await spawn_actors(
+                2,
+                DTensorActor,
+                "dtensor_put_mesh",
+                mesh_shape=(2,),
+                original_tensor=original_tensor,
+                placements=[Shard(0)],
+                file_store_name=os.path.join(filesystem_store_dir, "put_test"),
+                visible_devices="0,1",
+            )
+
+            await put_mesh.do_put.call()
+
+            get_mesh = await spawn_actors(
+                2,
+                DTensorActor,
+                "dtensor_get_mesh",
+                mesh_shape=(2,),
+                original_tensor=torch.zeros(4, 4).float(),
+                placements=[Shard(0)],
+                file_store_name=os.path.join(filesystem_store_dir, "get_test"),
+                visible_devices="2,3",
+            )
+
+            get_results = await get_mesh.do_get.call()
+
+            assert len(get_results) == 2
+
+            for _, val in get_results:
+                fetched_dtensor, coordinate = val
+                assert torch.equal(
+                    fetched_dtensor.to_local(), original_tensor
+                ), f"Fetched DTensor does not match original: {fetched_dtensor.to_local()} != {original_tensor}"
+
+        finally:
+            # Clean up process groups
+            await put_mesh.destroy_process_group.call()
+            await put_mesh._proc_mesh.stop()
+            await get_mesh.destroy_process_group.call()
+            await get_mesh._proc_mesh.stop()
+            await ts.shutdown()
 
 
 if __name__ == "__main__":

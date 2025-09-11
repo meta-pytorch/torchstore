@@ -162,7 +162,12 @@ class LocalClient:
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
         if inplace_tensor is not None:
-            inplace_tensor.copy_(fetched_tensor)
+            if hasattr(inplace_tensor, "_local_tensor"):
+                # DTensor case - copy to the local tensor to avoid type mismatch
+                inplace_tensor._local_tensor.copy_(fetched_tensor)
+            else:
+                # Regular tensor case
+                inplace_tensor.copy_(fetched_tensor)
             return inplace_tensor
         return fetched_tensor
 
