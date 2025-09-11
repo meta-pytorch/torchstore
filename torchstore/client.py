@@ -55,6 +55,12 @@ class LocalClient:
     ):
         logger.debug(f"Fetching {key}")
 
+        if tensor_slice_spec is not None and inplace_tensor is not None:
+            if tensor_slice_spec.local_shape != inplace_tensor.shape:
+                raise ValueError(
+                    f"Requested tensor slice shape {tensor_slice_spec.local_shape} does not match in-place tensor shape {inplace_tensor.shape}"
+                )
+
         # When slicing, don't use inplace_tensor for the request because the transport
         # layer will try to load full tensor into slice-sized buffer (size mismatch)
         request_inplace = None if tensor_slice_spec is not None else inplace_tensor
@@ -64,37 +70,38 @@ class LocalClient:
         # multinode support here
         volume_map = await self._controller.locate_volumes.call_one(key)
 
+        if object_type in (ObjectType.OBJECT, ObjectType.TENSOR):
+            # TODO: in the future, we could intelligently select the best storage volume
+            # but for now any should work.
+            volume_id, storage_info = volume_map.popitem()
+            storage_volume = self.strategy.get_storage_volume(volume_id)
+            pipe = Pipe(storage_volume)
+            fetched_tensor = await pipe.get_from_storage_volume(key, request)
+            # If user requested a specific slice, extract it
+            if tensor_slice_spec is not None:
+                if not isinstance(fetched_tensor, torch.Tensor):
+                    raise ValueError(
+                        "Cannot extract tensor slice from non-tensor object"
+                    )
+                sliced_tensor = get_local_tensor(
+                    fetched_tensor,
+                    tensor_slice_spec.local_shape,
+                    tensor_slice_spec.offsets,
+                )
+
+                # Handle in-place operation for tensor slice
+                if inplace_tensor is not None:
+                    return inplace_tensor.copy_(sliced_tensor)
+                return sliced_tensor
+
+            return fetched_tensor if inplace_tensor is None else inplace_tensor
+
+        # Handle the dtensor (slice) case
         partial_results = []
         for volume_id, storage_info in volume_map.items():
             storage_volume = self.strategy.get_storage_volume(volume_id)
             pipe = Pipe(storage_volume)
 
-            if object_type in (ObjectType.OBJECT, ObjectType.TENSOR):
-                # TODO: in the future, we could intelligently select the best storage volume
-                # but for now any should work.
-                fetched_tensor = await pipe.get_from_storage_volume(key, request)
-
-                # If user requested a specific slice, extract it
-                if tensor_slice_spec is not None:
-                    if not isinstance(fetched_tensor, torch.Tensor):
-                        raise ValueError(
-                            "Cannot extract tensor slice from non-tensor object"
-                        )
-                    sliced_tensor = get_local_tensor(
-                        fetched_tensor,
-                        tensor_slice_spec.local_shape,
-                        tensor_slice_spec.offsets,
-                    )
-
-                    # Handle in-place operation for tensor slice
-                    if inplace_tensor is not None:
-                        inplace_tensor.copy_(sliced_tensor)
-                        return inplace_tensor
-                    return sliced_tensor
-
-                return fetched_tensor if inplace_tensor is None else inplace_tensor
-
-            # else: this is the dtensor / tensor slice case
             # fetch from all storage volumes, something like this
             # TODO: fix so we can request all tensor slices from a storage volume
             # at once, this is silly
