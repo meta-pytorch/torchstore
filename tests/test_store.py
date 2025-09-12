@@ -510,15 +510,8 @@ async def test_dtensor_simple_put_get():
                 visible_devices="2,3",
             )
 
-            get_results = await get_mesh.do_get.call()
-
-            assert len(get_results) == 2
-
-            for _, val in get_results:
-                fetched_dtensor, coordinate = val
-                assert torch.equal(
-                    fetched_dtensor.to_local(), original_tensor
-                ), f"Fetched DTensor does not match original: {fetched_dtensor.to_local()} != {original_tensor}"
+            # do_get verifies the data is correct
+            await get_mesh.do_get.call()
 
         finally:
             # Clean up process groups
