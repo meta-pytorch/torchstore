@@ -122,7 +122,7 @@ class LocalClient:
             return inplace_tensor
         return fetched_tensor
 
-    async def keys(self, prefix: str | None = None):
+    async def keys(self, prefix: str | None = None) -> list[str]:
         """
         Get all keys that match the given prefix.
 

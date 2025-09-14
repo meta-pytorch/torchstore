@@ -6,7 +6,7 @@
 
 from itertools import product
 from logging import getLogger
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from monarch.actor import Actor, endpoint
@@ -87,7 +87,7 @@ class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
     def __init__(self) -> None:
-        self.kv = {}
+        self.kv: Dict[str, Any] = {}
 
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")

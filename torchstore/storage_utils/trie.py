@@ -141,24 +141,6 @@ class StringTrie(MutableMapping[str, Any]):
             return self._trie.pop(key)
         return self._trie.pop(key, default)
 
-    def popitem(self) -> Tuple[str, Any]:
-        """Remove and return an arbitrary (key, value) pair."""
-        key, value = self._trie.popitem()
-        return str(key), value
-
-    def setdefault(self, key: str, default: Any = None) -> Any:
-        """
-        Get the value for a key, setting it to default if not present.
-
-        Args:
-            key: The key to look up or set
-            default: Value to set and return if key is not present
-
-        Returns:
-            The existing value or the default value that was set
-        """
-        return self._trie.setdefault(key, default)
-
     def update(self, other: Mapping[str, Any], **kwargs: Any) -> None:  # type: ignore[override]
         """
         Update the trie with key-value pairs from another mapping.
@@ -173,60 +155,6 @@ class StringTrie(MutableMapping[str, Any]):
             self._trie.update(other)
         if kwargs:
             self._trie.update(kwargs)
-
-    # Additional trie-specific methods
-
-    def has_node(self, key: str) -> bool:
-        """
-        Check if there is a node (including intermediate nodes) for the given key.
-
-        Args:
-            key: The key to check
-
-        Returns:
-            True if node exists, False otherwise
-        """
-        return bool(self._trie.has_node(key))
-
-    def has_subtrie(self, key: str) -> bool:
-        """
-        Check if there is a subtrie at the given key.
-
-        Args:
-            key: The key to check
-
-        Returns:
-            True if subtrie exists, False otherwise
-        """
-        return self._trie.has_subtrie(key)
-
-    def longest_prefix(self, key: str) -> Tuple[str, Any]:
-        """
-        Find the longest prefix of key that exists in the trie.
-
-        Args:
-            key: The key to find the longest prefix for
-
-        Returns:
-            Tuple of (prefix_key, value) for the longest matching prefix
-
-        Raises:
-            KeyError: If no prefix is found
-        """
-        prefix, value = self._trie.longest_prefix(key)
-        return str(prefix), value
-
-    def filter_keys(self, prefix: str) -> List[str]:
-        """
-        Get all keys that start with the given prefix.
-
-        Args:
-            prefix: The prefix to filter by
-
-        Returns:
-            List of keys that start with the prefix
-        """
-        return self.keys().filter_by_prefix(prefix)
 
     def __bool__(self) -> bool:
         """Return True if the trie is not empty."""

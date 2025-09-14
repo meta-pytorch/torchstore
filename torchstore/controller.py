@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Set
 
 from monarch.actor import Actor, endpoint
 
-from torchstore.data_structures.trie import StringTrie
+from torchstore.storage_utils.trie import StringTrie
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport.pipe import Request, TensorSlice
@@ -49,9 +49,7 @@ class Controller(Actor):
     def __init__(
         self,
     ) -> None:
-        self.keys_to_storage_volumes = (
-            StringTrie()
-        )  # MutableMapping[str, Dict[str, StorageInfo]] = {}
+        self.keys_to_storage_volumes = StringTrie()
         self.is_initialized: bool = False
         self.strategy: Optional[TorchStoreStrategy] = None
         self.storage_volumes: Optional[StorageVolume] = None
