@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from logging import getLogger
-from typing import Any, Optional, Union
+from typing import Any, Union
 
 import torch
 from torch.distributed.tensor import DTensor

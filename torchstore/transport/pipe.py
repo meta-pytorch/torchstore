@@ -7,7 +7,7 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Optional, Tuple
 
 import torch
 from torch.distributed.tensor import DTensor
