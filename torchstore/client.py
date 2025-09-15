@@ -8,6 +8,7 @@ from logging import getLogger
 from typing import Any, Optional, Union
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
 
@@ -50,114 +51,40 @@ class LocalClient:
     async def get(
         self,
         key: str,
-        inplace_tensor: Optional[torch.Tensor] = None,
-        tensor_slice_spec: Optional[TensorSlice] = None,
+        inplace_tensor: torch.Tensor | DTensor | None = None,
+        tensor_slice_spec: TensorSlice | None = None,
     ):
         logger.debug(f"Fetching {key}")
 
-        if tensor_slice_spec is not None and inplace_tensor is not None:
-            if tensor_slice_spec.local_shape != inplace_tensor.shape:
-                raise ValueError(
-                    f"Requested tensor slice shape {tensor_slice_spec.local_shape} does not match in-place tensor shape {inplace_tensor.shape}"
-                )
+        stored_object_type = await self._get_stored_object_type(key)
 
-        # When slicing, don't use inplace_tensor for the request because the transport
-        # layer will try to load full tensor into slice-sized buffer (size mismatch)
-        request_inplace = None if tensor_slice_spec is not None else inplace_tensor
-        request = Request.from_any(request_inplace)
-        object_type = ObjectType.from_request(request)
+        self._verify_get_args(inplace_tensor, tensor_slice_spec, stored_object_type)
 
-        # multinode support here
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        if stored_object_type is ObjectType.OBJECT:
+            return await self._get_object(key)
 
-        if object_type in (ObjectType.OBJECT, ObjectType.TENSOR):
-            # TODO: in the future, we could intelligently select the best storage volume
-            # but for now any should work.
-            volume_id, storage_info = volume_map.popitem()
-            storage_volume = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(storage_volume)
-            fetched_tensor = await pipe.get_from_storage_volume(key, request)
-            # If user requested a specific slice, extract it
-            if tensor_slice_spec is not None:
-                if not isinstance(fetched_tensor, torch.Tensor):
-                    raise ValueError(
-                        "Cannot extract tensor slice from non-tensor object"
-                    )
-                sliced_tensor = get_local_tensor(
-                    fetched_tensor,
-                    tensor_slice_spec.local_shape,
-                    tensor_slice_spec.offsets,
-                )
+        if stored_object_type is ObjectType.TENSOR:
+            full_tensor = await self._get_tensor(key)
+        else:
+            full_tensor = await self._get_distributed_whole_tensor(key)
 
-                # Handle in-place operation for tensor slice
-                if inplace_tensor is not None:
-                    return inplace_tensor.copy_(sliced_tensor)
-                return sliced_tensor
-
-            return fetched_tensor if inplace_tensor is None else inplace_tensor
-
-        # Handle the dtensor (slice) case
-        partial_results = []
-        for volume_id, storage_info in volume_map.items():
-            storage_volume = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(storage_volume)
-
-            # fetch from all storage volumes, something like this
-            # TODO: fix so we can request all tensor slices from a storage volume
-            # at once, this is silly
-            for tensor_slice in storage_info.tensor_slices:
-                tensor_slice_request = Request.from_tensor_slice(tensor_slice)
-
-                local_tensor = await pipe.get_from_storage_volume(
-                    key, tensor_slice_request
-                )
-                partial_results.append((local_tensor, tensor_slice))
-
-        assert partial_results, "No partial results found"
-        assert request.tensor_slice is not None
-
-        # build the entire tensor.
-        # TODO: again, we should have better control over
-        # rebuilding only the portion I need, but this is a good start
-
-        local_tensors = []
-        global_offsets = []
-        global_shape = None
-        device_mesh_shape = None
-        for local_tensor, tensor_slice in partial_results:
-            local_tensors.append(local_tensor)
-
-            global_offsets.append(tensor_slice.offsets)
-            if global_shape is None:
-                global_shape = tensor_slice.global_shape
-            else:
-                assert global_shape == tensor_slice.global_shape
-
-            if device_mesh_shape is None:
-                device_mesh_shape = tensor_slice.mesh_shape
-            else:
-                assert device_mesh_shape == tensor_slice.mesh_shape
-
-        full_tensor = assemble_global_tensor(
-            local_tensors,
-            global_shape,
-            global_offsets,
-        )
-
-        # If user requested a specific slice, extract that instead of the DTensor's local portion
-        if tensor_slice_spec is not None:
+        if isinstance(inplace_tensor, DTensor):
+            request = Request.from_any(inplace_tensor)
+            fetched_tensor = get_local_tensor(
+                full_tensor,
+                request.tensor_slice.local_shape,
+                request.tensor_slice.offsets,
+            )
+        elif tensor_slice_spec is not None:
+            # User asked for a specific slice of a tensor
             fetched_tensor = get_local_tensor(
                 full_tensor,
                 tensor_slice_spec.local_shape,
                 tensor_slice_spec.offsets,
             )
         else:
-            # Normal DTensor case - extract the local portion for this process
-            fetched_tensor = get_local_tensor(
-                full_tensor,
-                request.tensor_slice.local_shape,
-                request.tensor_slice.offsets,
-            )
+            # User aasked for the whole tensor
+            fetched_tensor = full_tensor
 
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
@@ -196,3 +123,122 @@ class LocalClient:
                 return False
             # Re-raise if it's a different kind of error
             raise e
+
+    def _verify_get_args(
+        self,
+        inplace_tensor: torch.Tensor | DTensor | None,
+        tensor_slice_spec: TensorSlice | None,
+        stored_object_type: ObjectType | None,
+    ):
+        """
+        Verify that the provided arguments are valid for the get() method.
+        """
+        # Error if request a Tensor or DTensor but the stored_object_type is OBJECT
+        if stored_object_type == ObjectType.OBJECT and (
+            inplace_tensor is not None or tensor_slice_spec is not None
+        ):
+            raise ValueError(
+                "inplace_tensor or tensor_slice_spec is specified but the value stored is an object"
+            )
+
+        # inplace_tensor can only be None, Tensor, or DTensor
+        if inplace_tensor is not None and not isinstance(
+            inplace_tensor, (torch.Tensor, DTensor)
+        ):
+            raise ValueError(
+                f"Invalid type for inplace_tensor: {type(inplace_tensor)}. Must be None, torch.Tensor, or DTensor."
+            )
+
+        if isinstance(inplace_tensor, torch.Tensor):
+            if (
+                tensor_slice_spec
+                and tensor_slice_spec.local_shape != inplace_tensor.shape
+            ):
+                raise ValueError(
+                    f"Requested tensor slice shape {tensor_slice_spec.local_shape} does not match in-place tensor shape {inplace_tensor.shape}"
+                )
+
+        if isinstance(inplace_tensor, DTensor):
+            if tensor_slice_spec:
+                raise ValueError(
+                    "Cannot specify a tensor slice when fetching a DTensor"
+                )
+
+    async def _get_stored_object_type(self, key: str) -> ObjectType | None:
+        """Peek into storage info for the given key and return the stored object type."""
+        volume_map = await self._controller.locate_volumes.call_one(key)
+        for storage_info in volume_map.values():
+            return storage_info.object_type
+        raise ValueError(f"Unable to get stored object type for key `{key}`")
+
+    async def _get_object(self, key: str):
+        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_id, _ = volume_map.popitem()
+        storage_volume = self.strategy.get_storage_volume(volume_id)
+        pipe = Pipe(storage_volume)
+        request = Request.from_any(None)
+        return await pipe.get_from_storage_volume(key, request)
+
+    async def _get_tensor(self, key: str) -> torch.Tensor:
+        """Fetches the tensor which is stored in one volume storage"""
+        volume_map = await self._controller.locate_volumes.call_one(key)
+
+        # if the storage is a Tensor instead of DTensor, just fetch and return it.
+        for volume_id, _ in volume_map.items():
+            storage_volume = self.strategy.get_storage_volume(volume_id)
+            pipe = Pipe(storage_volume)
+            # TODO: consolidate the logic here - None indicates it is an object request,
+            # which is sematically inappropriate here.
+            request = Request.from_any(None)
+            return await pipe.get_from_storage_volume(key, request)
+
+    async def _get_distributed_whole_tensor(self, key: str) -> torch.Tensor:
+        """Fetches slices from all volume storages and stitch together to return the whole tensor"""
+
+        volume_map = await self._controller.locate_volumes.call_one(key)
+        # Handle the tensor case
+        partial_results = []
+        for volume_id, storage_info in volume_map.items():
+            storage_volume = self.strategy.get_storage_volume(volume_id)
+            pipe = Pipe(storage_volume)
+
+            # fetch from all storage volumes, something like this
+            # TODO: fix so we can request all tensor slices from a storage volume
+            # at once, this is silly
+            for tensor_slice in storage_info.tensor_slices:
+                tensor_slice_request = Request.from_tensor_slice(tensor_slice)
+
+                local_tensor = await pipe.get_from_storage_volume(
+                    key, tensor_slice_request
+                )
+                partial_results.append((local_tensor, tensor_slice))
+
+        assert partial_results, "No partial results found"
+
+        # build the entire tensor.
+        # TODO: again, we should have better control over
+        # rebuilding only the portion I need, but this is a good start
+
+        local_tensors = []
+        global_offsets = []
+        global_shape = None
+        device_mesh_shape = None
+        for local_tensor, tensor_slice in partial_results:
+            local_tensors.append(local_tensor)
+
+            global_offsets.append(tensor_slice.offsets)
+            if global_shape is None:
+                global_shape = tensor_slice.global_shape
+            else:
+                assert global_shape == tensor_slice.global_shape
+
+            if device_mesh_shape is None:
+                device_mesh_shape = tensor_slice.mesh_shape
+            else:
+                assert device_mesh_shape == tensor_slice.mesh_shape
+
+        return assemble_global_tensor(
+            local_tensors,
+            global_shape,
+            global_offsets,
+        )

@@ -7,7 +7,7 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -70,12 +70,13 @@ class Request:
     is_object: bool = False
 
     @classmethod
-    def from_any(cls, value: Any):
+    def from_any(cls, value: torch.Tensor | DTensor | None) -> "Request":
         if isinstance(value, DTensor):
             request = cls.from_dtensor(value)
         elif isinstance(value, torch.Tensor):
             request = cls.from_tensor(value)
         else:
+            # TODO: consolidate this path for the None case
             request = cls.from_objects(value)
 
         return request

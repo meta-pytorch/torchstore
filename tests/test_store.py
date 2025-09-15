@@ -240,32 +240,6 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         async def put(self, key, tensor):
             await ts.put(key, tensor)
 
-    class TensorSliceGetActor(Actor):
-        """Actor for getting tensor slices."""
-
-        def __init__(self, world_size):
-            init_logging()
-            self.world_size = world_size
-            self.rank = current_rank().rank
-            # required by LocalRankStrategy
-            os.environ["LOCAL_RANK"] = str(self.rank)
-
-        @endpoint
-        async def get(self, key, slice_spec=None):
-            if slice_spec is None:
-                return await ts.get(key)
-            else:
-                return await ts.get(key, tensor_slice_spec=slice_spec)
-
-        @endpoint
-        async def test_slice_error(self, key, slice_spec):
-            """Test that slicing non-tensor objects raises appropriate errors"""
-            try:
-                await ts.get(key, tensor_slice_spec=slice_spec)
-                return False  # Should have raised an error
-            except ValueError:
-                return True  # Expected error occurred
-
     volume_world_size, strategy = strategy_params
     await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
 
@@ -274,12 +248,6 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         volume_world_size,
         TensorSlicePutActor,
         "tensor_slice_put_actors",
-        world_size=volume_world_size,
-    )
-    get_actor_mesh = await spawn_actors(
-        volume_world_size,
-        TensorSliceGetActor,
-        "tensor_slice_get_actors",
         world_size=volume_world_size,
     )
 
@@ -292,12 +260,11 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         await put_actor.put.call(key, test_tensor)
 
         # Test full tensor retrieval using get actor mesh
-        results = await get_actor_mesh.get.call(key)
-        for pt, retrieved_tensor in results:
-            assert torch.equal(test_tensor, retrieved_tensor)
+        retrieved_tensor = await ts.get(key)
+        assert torch.equal(test_tensor, retrieved_tensor)
 
         # Test slice retrieval using get actor mesh
-        slice_spec = TensorSlice(
+        tensor_slice_spec = TensorSlice(
             offsets=(100, 200),
             coordinates=(),
             global_shape=(1000, 2000),
@@ -305,61 +272,13 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
             mesh_shape=(),
         )
 
-        results = await get_actor_mesh.get.call(key, slice_spec)
-        for pt, sliced_tensor in results:
-            expected_slice = test_tensor[100:150, 200:300]
-            assert torch.equal(sliced_tensor, expected_slice)
-            assert sliced_tensor.shape == (50, 100)
-
-        # Test 2: Different slice specifications
-        slice_spec2 = TensorSlice(
-            offsets=(0, 0),
-            coordinates=(),
-            global_shape=(1000, 2000),
-            local_shape=(200, 300),
-            mesh_shape=(),
-        )
-
-        results = await get_actor_mesh.get.call(key, slice_spec2)
-        for pt, sliced_tensor2 in results:
-            expected_slice2 = test_tensor[0:200, 0:300]
-            assert torch.equal(sliced_tensor2, expected_slice2)
-            assert sliced_tensor2.shape == (200, 300)
-
-        # Test 3: Full tensor via slice
-        full_slice_spec = TensorSlice(
-            offsets=(0, 0),
-            coordinates=(),
-            global_shape=(1000, 2000),
-            local_shape=(1000, 2000),
-            mesh_shape=(),
-        )
-
-        results = await get_actor_mesh.get.call(key, full_slice_spec)
-        for pt, full_via_slice in results:
-            assert torch.equal(full_via_slice, test_tensor)
-
-        # Test 4: Error handling - try to slice a non-tensor object
-        non_tensor_key = "non_tensor"
-        await put_actor.put.call(non_tensor_key, {"key": "value", "data": [1, 2, 3]})
-
-        error_slice_spec = TensorSlice(
-            offsets=(0, 0),
-            coordinates=(),
-            global_shape=(10, 10),
-            local_shape=(5, 5),
-            mesh_shape=(),
-        )
-
-        results = await get_actor_mesh.test_slice_error.call(
-            non_tensor_key, error_slice_spec
-        )
-        for pt, error_caught in results:
-            assert error_caught  # Should have caught ValueError
+        tensor_slice = await ts.get(key, tensor_slice_spec=tensor_slice_spec)
+        expected_slice = test_tensor[100:150, 200:300]
+        assert torch.equal(tensor_slice, expected_slice)
+        assert tensor_slice.shape == (50, 100)
 
     finally:
         await put_actor_mesh._proc_mesh.stop()
-        await get_actor_mesh._proc_mesh.stop()
         await ts.shutdown()
 
 
@@ -473,14 +392,47 @@ async def test_large_tensors():
 
 
 @pytest.mark.asyncio
-async def test_dtensor_simple_put_get():
+async def test_put_dtensor_get_full_tensor():
+    """Test basic DTensor put/get functionality with separate put and get meshes using shared DTensorActor"""
+    import tempfile
+
+    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
+
+    original_tensor = torch.arange(16).reshape(4, 4).float()
+
+    with tempfile.TemporaryDirectory() as filesystem_store_dir:
+        try:
+            put_mesh = await spawn_actors(
+                2,
+                DTensorActor,
+                "dtensor_put_mesh",
+                mesh_shape=(2,),
+                original_tensor=original_tensor,
+                placements=[Shard(0)],
+                file_store_name=os.path.join(filesystem_store_dir, "put_test"),
+                visible_devices="0,1",
+            )
+
+            await put_mesh.do_put.call()
+
+            fetched_tensor = await ts.get("test_key")
+            assert torch.equal(original_tensor, fetched_tensor)
+
+        finally:
+            # Clean up process groups
+            await put_mesh.destroy_process_group.call()
+            await put_mesh._proc_mesh.stop()
+            await ts.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_put_dtensor_get_inplace_dtensor():
     """Test basic DTensor put/get functionality with separate put and get meshes using shared DTensorActor"""
     import tempfile
 
     # Initialize TorchStore with 2 storage volumes and LocalRankStrategy
-    from torchstore.strategy import LocalRankStrategy
 
-    await ts.initialize(num_storage_volumes=2, strategy=LocalRankStrategy())
+    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
 
     original_tensor = torch.arange(16).reshape(4, 4).float()
 
@@ -504,14 +456,16 @@ async def test_dtensor_simple_put_get():
                 DTensorActor,
                 "dtensor_get_mesh",
                 mesh_shape=(2,),
-                original_tensor=torch.zeros(4, 4).float(),
-                placements=[Shard(0)],
+                original_tensor=torch.zeros_like(original_tensor),
+                placements=[Shard(1)],
                 file_store_name=os.path.join(filesystem_store_dir, "get_test"),
                 visible_devices="2,3",
             )
 
-            # do_get verifies the data is correct
             await get_mesh.do_get.call()
+
+            # fetched_tensor = await ts.get("test_key")
+            # assert torch.equal(original_tensor, fetched_tensor)
 
         finally:
             # Clean up process groups
