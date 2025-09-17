@@ -13,6 +13,7 @@ import torch
 try:
     from monarch.tensor_engine import is_available as monarch_rdma_available, RDMABuffer
 except ImportError:
+    print(f"xxxxx hardcoding monarch_rdma_available to False")
     monarch_rdma_available = lambda: False
 
     def RDMABuffer(*args: Any, **kwargs: Any) -> Any:
@@ -44,7 +45,8 @@ def rdma_available() -> bool:
         os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
     )  # TODO: enable on this build
     print(f"xxxxx {rdma_enabled=}, {monarch_rdma_available()=}")
-    return rdma_enabled and monarch_rdma_available()
+    return rdma_enabled
+    # return rdma_enabled and monarch_rdma_available()
 
 
 class TransportBuffer:
