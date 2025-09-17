@@ -43,6 +43,7 @@ def rdma_available() -> bool:
     rdma_enabled = (
         os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
     )  # TODO: enable on this build
+    print(f"xxxxx {rdma_enabled=}, {monarch_rdma_available()=}")
     return rdma_enabled and monarch_rdma_available()
 
 

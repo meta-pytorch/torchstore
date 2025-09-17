@@ -126,8 +126,10 @@ class Pipe:
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
         if rdma_available():
+            print(f"xxxxx using RDMATransportBuffer")
             buffer_cls = RDMATransportBuffer
         else:
+            print(f"xxxxx using MonarchTransportBuffer")
             buffer_cls = MonarchTransportBuffer
         return buffer_cls()
 
