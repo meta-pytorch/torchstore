@@ -147,9 +147,6 @@ class LocalRankStrategy(TorchStoreStrategy):
     one storage volume per local rank.
     """
 
-    def __init__(self):
-        super().__init__()
-
     @classmethod
     def get_volume_id(cls):
         # Note: this should only called at spawn, which makes this safe.
@@ -158,3 +155,50 @@ class LocalRankStrategy(TorchStoreStrategy):
     @classmethod
     def get_client_id(cls):
         return os.environ["LOCAL_RANK"]
+
+
+class ControllerStorageVolumes(TorchStoreStrategy):
+    """Strategy that creates a singleton controller as the storage volume. This is a workaround
+    for lack of support for actor -> actor comms in monarch when using remote allocations.
+    """
+
+    def __str__(self) -> str:
+        storage_vol_len = len(self.storage_volumes) if self.storage_volumes is not None else 0
+        return f"{self.__class__.__name__}(storage_volume_len={storage_vol_len})"
+
+    @classmethod
+    def get_volume_id(cls):
+        return "0"
+
+    @classmethod
+    def get_client_id(cls):
+        return "0"
+
+    async def set_storage_volumes(self, storage_volumes):
+        """Configure the storage volumes and build ID-to-coordinate mapping.
+
+        Args:
+            storage_volumes: Actor mesh of storage volume actors.
+        """
+        self.storage_volumes = storage_volumes
+        self.volume_id_to_coord = {"0"}
+
+    def select_storage_volume(self):
+        """Select the storage volume for the current client process.
+
+        Returns:
+            tuple: (StorageVolume actor, volume_id) for this client.
+        """
+        client_id = self.get_client_id()
+        if client_id not in self.volume_id_to_coord:
+            raise KeyError(
+                f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
+            )
+
+        return (
+            self.get_storage_volume(client_id),
+            client_id,
+        )  # client_id == volume_id for this strategy
+
+    def get_storage_volume(self, volume_id: str) -> StorageVolume:
+        return self.storage_volumes
