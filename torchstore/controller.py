@@ -137,6 +137,9 @@ class Controller(Actor):
             storage_volume_id (str): ID of the storage volume where the data was stored.
         """
         self.assert_initialized()
+        assert request.tensor_val is None, (
+            f"request should not contain tensor data, as this will significantly increase e2e latency"  
+        ) 
 
         if key not in self.keys_to_storage_volumes:
             self.keys_to_storage_volumes[key] = {}
@@ -158,3 +161,7 @@ class Controller(Actor):
         self.strategy = None
         self.storage_volumes = None
         self.num_storage_volumes = None
+
+    @endpoint
+    def get_keys_to_storage_volumes(self) -> Dict[str, Dict[str, StorageInfo]]:
+        return self.keys_to_storage_volumes

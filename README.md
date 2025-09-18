@@ -138,3 +138,8 @@ if __name__ == "__main__":
 2. Build the Bicycle, not the super car -- Develop value iterively, instead of trying to ship everything at once.
 
 3. Work backwards from use cases, and leave tests!
+
+# Testing
+
+Pytest is used for testing. For an examples of how to run tests (and get logs), see:
+`TORCHSTORE_LOG_LEVEL=DEBUG pytest -vs --log-cli-level=DEBUG tests/test_models.py::test_main`

@@ -13,12 +13,12 @@ from monarch.actor import get_or_spawn_controller
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
-from torchstore.strategy import SingletonStrategy, TorchStoreStrategy
+from torchstore.strategy import SingletonStrategy, TorchStoreStrategy, ControllerStorageVolumes
 from torchstore.transport.pipe import TensorSlice
 
 
 # I need to keep this somewhere, so here we go
-DEFAULT_TORCHSTORE_NAME: str = "TorchStoreController"
+DEFAULT_TORCHSTORE_NAME: str = "TorchStore"
 
 # cache for local clients
 _local_clent_map: Dict[str, LocalClient] = {}
@@ -28,6 +28,7 @@ async def initialize(
     num_storage_volumes: int = 1,
     strategy: Optional[TorchStoreStrategy] = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
+    mesh=None,
 ) -> None:
     """Initialize the TorchStore distributed storage system.
 
@@ -56,14 +57,18 @@ async def initialize(
 
     # TODO: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
     # ideally this is done in the controller.init
-    storage_volumes = await StorageVolume.spawn(
-        num_volumes=num_storage_volumes, id_func=strategy.get_volume_id
-    )
+    if isinstance(strategy, ControllerStorageVolumes):
+        storage_volumes = await get_or_spawn_controller(
+            "storage_volume_controller",
+            StorageVolume,
+            id_func=strategy.get_volume_id
+        )
+    else:
+        storage_volumes = await StorageVolume.spawn(
+            num_volumes=num_storage_volumes, mesh=mesh, id_func=strategy.get_volume_id
+        )
 
-    controller = await get_or_spawn_controller(
-        store_name,
-        Controller,
-    )
+    controller = await _controller(store_name)    
     await controller.init.call(
         strategy=strategy,
         num_storage_volumes=num_storage_volumes,
@@ -84,10 +89,21 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
         >>> await ts.shutdown()  # Shutdown default store
         >>> await ts.shutdown("my_custom_store")
     """
-    controller = await get_or_spawn_controller(store_name, Controller)
+    controller = await _controller(store_name)
     await controller.teardown.call()
     global _local_clent_map
     _local_clent_map = {}
+
+
+def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
+    """Reset the local client for a given store. Useful for refreshing client state after shutdown.
+    """
+    global _local_clent_map
+    _local_clent_map.pop(store_name, None)
+
+async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:
+    """Get a controller handle for interacting with the store."""
+    return await get_or_spawn_controller(store_name, Controller)
 
 
 async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
@@ -108,7 +124,7 @@ async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
     if store_name in _local_clent_map:
         return _local_clent_map[store_name]
 
-    controller = await get_or_spawn_controller(store_name, Controller)
+    controller = await _controller(store_name)
     controller_strategy = await controller.get_controller_strategy.call_one()
 
     local_client = LocalClient(
