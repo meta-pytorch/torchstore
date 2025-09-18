@@ -8,6 +8,7 @@ import asyncio
 import math
 import os
 import tempfile
+import time
 from logging import getLogger
 
 import torch
@@ -17,6 +18,17 @@ from torch.distributed._tensor import distribute_tensor, Shard
 from torch.distributed.device_mesh import init_device_mesh
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
+
+# ANSI escape codes for colored output
+YELLOW = "\033[93m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def print_yellow(text):
+    """Print text in yellow color"""
+    print(f"{YELLOW}{BOLD}{text}{RESET}")
+
 
 init_logging()
 logger = getLogger(__name__)
@@ -107,63 +119,95 @@ class DTensorActor(Actor):
 
 async def dtensor_put_get_example():
     """
-    Example demonstrating how to put a 4x4 tensor in a (2,) mesh
-    and then get it in another (2,) mesh.
+    Example demonstrating DTensor resharding between different mesh configurations.
+    Creates a tensor of shape (size * n_put_actors, size * n_get_actors),
+    puts it with Shard(0) and gets it with Shard(1).
     """
-    print("Starting DTensor put/get example...")
+    # Configuration variables
+    size = 1000  # 100 unit size => 2.4 MB Tensor Size
+    n_put_actors = 8
+    n_get_actors = 8
 
-    # Initialize TorchStore with 2 storage volumes
-    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
+    print(f"Starting DTensor put/get example with:")
+    print(f"  size = {size}")
+    print(f"  n_put_actors = {n_put_actors}")
+    print(f"  n_get_actors = {n_get_actors}")
 
-    # Create a 4x4 tensor to work with
-    original_tensor = torch.arange(16).reshape(4, 4).float()
-    print(f"Original tensor:\n{original_tensor}")
+    # Initialize TorchStore
+    await ts.initialize(
+        num_storage_volumes=max(n_put_actors, n_get_actors),
+        strategy=ts.LocalRankStrategy(),
+    )
+
+    # Create tensor with shape (size * n_put_actors, size * n_get_actors)
+    tensor_shape = (size * n_put_actors, size * n_get_actors)
+    original_tensor = (
+        torch.arange(tensor_shape[0] * tensor_shape[1]).reshape(tensor_shape).float()
+    )
+    print(f"Original tensor shape: {tensor_shape}")
+    print(f"Original tensor:\n{original_tensor}") if size == 1 else None
 
     with tempfile.TemporaryDirectory() as filesystem_store_dir:
         put_mesh = None
         get_mesh = None
         try:
-            print("\n--- Phase 1: Putting tensor in first (2,) mesh ---")
-            # Create first mesh for putting the tensor
+            print(
+                f"\n--- Phase 1: Putting tensor with Shard(0) in ({n_put_actors},) mesh ---"
+            )
+            # Create first mesh for putting the tensor with Shard(0)
             put_mesh = await spawn_actors(
-                2,
+                n_put_actors,
                 DTensorActor,
                 "dtensor_put_mesh",
-                mesh_shape=(2,),
+                mesh_shape=(n_put_actors,),
                 original_tensor=original_tensor,
-                placements=[Shard(0)],
+                placements=[Shard(0)],  # Shard along dimension 0
                 file_store_name=os.path.join(filesystem_store_dir, "put_test"),
-                visible_devices="0,1",
+                visible_devices=",".join(str(i) for i in range(n_put_actors)),
             )
 
-            # Put the tensor using the first mesh
+            # Put the tensor using the first mesh with timing
+            put_start_time = time.perf_counter()
             await put_mesh.do_put.call()
-            print("Successfully put tensor using first mesh")
+            put_end_time = time.perf_counter()
+            put_duration = put_end_time - put_start_time
 
-            print("\n--- Phase 2: Getting tensor in second (2,) mesh ---")
-            # Create second mesh for getting the tensor
+            print("Successfully put tensor using first mesh")
+            print_yellow(f"⏱️  PUT operation took: {put_duration:.4f} seconds")
+
+            print(
+                f"\n--- Phase 2: Getting tensor with Shard(1) in ({n_get_actors},) mesh ---"
+            )
+            # Create second mesh for getting the tensor with Shard(1)
             get_mesh = await spawn_actors(
-                2,
+                n_get_actors,
                 DTensorActor,
                 "dtensor_get_mesh",
-                mesh_shape=(2,),
+                mesh_shape=(n_get_actors,),
                 original_tensor=torch.zeros_like(original_tensor),  # Placeholder
-                placements=[Shard(1)],  # Same sharding pattern
+                placements=[Shard(1)],  # Shard along dimension 1
                 file_store_name=os.path.join(filesystem_store_dir, "get_test"),
-                visible_devices="2,3",  # Different devices to simulate different mesh
+                visible_devices=",".join(
+                    str(i) for i in range(n_put_actors, n_put_actors + n_get_actors)
+                ),
             )
 
-            # Get the tensor using the second mesh
+            # Get the tensor using the second mesh with timing
+            get_start_time = time.perf_counter()
             results = await get_mesh.do_get.call()
+            get_end_time = time.perf_counter()
+            get_duration = get_end_time - get_start_time
+
             print("Successfully retrieved tensor using second mesh")
+            print_yellow(f"⏱️  GET operation took: {get_duration:.4f} seconds")
 
             # Print results from each rank in the get mesh
             for proc_info, (fetched_tensor, mesh_coord) in results:
                 print(
                     f"Get mesh rank {proc_info.rank} (mesh coord {mesh_coord}): "
                     f"Retrieved tensor shape {fetched_tensor.shape}"
-                    f" with values {fetched_tensor}"
                 )
+                print(f" with values:\n{fetched_tensor}") if size == 1 else None
 
             print("\n--- Phase 3: Verifying full tensor ---")
             # Also verify we can get the full tensor directly
@@ -171,6 +215,19 @@ async def dtensor_put_get_example():
             assert torch.equal(original_tensor, fetched_tensor)
             print(f"Full tensor retrieved directly:\n{fetched_tensor}")
             print("✓ Full tensor matches original!")
+
+            # Calculate tensor size in MB
+            total_elements = tensor_shape[0] * tensor_shape[1]
+            tensor_size_bytes = total_elements * 4  # float32 = 4 bytes per element
+            tensor_size_mb = tensor_size_bytes / (1024 * 1024)
+
+            # Print timing summary
+            print("\n" + "=" * 50)
+            print_yellow(f"⏱️  TIMING SUMMARY:")
+            print_yellow(f"   Tensor size:   {tensor_size_mb:.4f} MB ({tensor_shape})")
+            print_yellow(f"   PUT operation: {put_duration:.4f} seconds")
+            print_yellow(f"   GET operation: {get_duration:.4f} seconds")
+            print("=" * 50)
 
         finally:
             # Clean up process groups and meshes
