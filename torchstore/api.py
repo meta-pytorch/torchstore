@@ -7,9 +7,9 @@
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from monarch.actor import get_or_spawn_controller
 
 import torchstore.state_dict_utils
+from monarch.actor import get_or_spawn_controller
 
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
@@ -169,13 +169,9 @@ async def keys(
     Get all keys that match the given prefix.
 
     This method retrieves all keys from the storage that start with the specified prefix.
-    The prefix matching follows reverse domain name notation convention.
 
     Args:
         prefix (str): The prefix to match against stored keys.
-            For example, "xyz" matches "xyz.abc.def" but "xy" does not.
-            Note: None is the prefix of all keys, while "" is the prefix of keys
-            starting with "." and "" itself.
 
 
     Returns:

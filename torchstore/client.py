@@ -127,11 +127,9 @@ class LocalClient:
         Get all keys that match the given prefix.
 
         This method retrieves all keys from the storage that start with the specified prefix.
-        The prefix matching follows reverse domain name notation convention.
 
         Args:
             prefix (str): The prefix to match against stored keys.
-                          For example, "xyz" matches "xyz.abc.def" but "xy" does not.
 
         Returns:
             List[str]: A list of keys that match the given prefix.

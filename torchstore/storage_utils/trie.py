@@ -4,18 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""A wrapper around pygtrie.StringTrie to provide a trie data structure based dictionary."""
+"""A wrapper around pygtrie.Trie to provide a trie data structure based dictionary."""
 
 from collections.abc import ItemsView, KeysView, Mapping, MutableMapping, ValuesView
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional
 
 import pygtrie
 
 
-class StringTrieKeysView(KeysView[str]):
-    """A custom KeysView implementation for StringTrie that supports prefix filtering."""
+class TrieKeysView(KeysView[str]):
+    """A custom KeysView implementation for Trie that supports prefix filtering."""
 
-    def __init__(self, trie: pygtrie.StringTrie):
+    def __init__(self, trie: pygtrie.Trie):
         self._trie = trie
 
     def __iter__(self) -> Iterator[str]:
@@ -35,7 +35,7 @@ class StringTrieKeysView(KeysView[str]):
             return []
 
 
-class StringTrie(MutableMapping[str, Any]):
+class Trie(MutableMapping[str, Any]):
     """
     A wrapper around pygtrie.StringTrie that implements the MutableMapping interface
     and provides prefix-based key filtering with consistent return types.
@@ -46,9 +46,6 @@ class StringTrie(MutableMapping[str, Any]):
 
     Args:
         mapping: Optional Mapping to initialize the trie with
-
-    Keyword Args:
-        separator: Character used to separate path elements in keys (default: ".")
 
     Example:
         trie = StringTrie({"abc.xyz": 1, "abc": 2, "xyz": 3})
@@ -92,14 +89,14 @@ class StringTrie(MutableMapping[str, Any]):
         """Delete a key from the trie."""
         del self._trie[key]
 
-    def keys(self) -> StringTrieKeysView:  # type: ignore[override]
+    def keys(self) -> TrieKeysView:  # type: ignore[override]
         """
         Return a KeysView-like object that supports prefix filtering.
 
         Returns:
             StringTrieKeysView that supports both standard iteration and prefix filtering
         """
-        return StringTrieKeysView(self._trie)
+        return TrieKeysView(self._trie)
 
     def values(self) -> ValuesView[Any]:
         """Return a view of all values in the trie."""
@@ -149,7 +146,7 @@ class StringTrie(MutableMapping[str, Any]):
             other: Mapping to update from
             **kwargs: Additional key-value pairs
         """
-        if isinstance(other, StringTrie):
+        if isinstance(other, Trie):
             self._trie.update(other._trie)
         else:
             self._trie.update(other)
@@ -162,11 +159,11 @@ class StringTrie(MutableMapping[str, Any]):
 
     def __repr__(self) -> str:
         """Return a string representation of the trie."""
-        return f"StringTrie({dict(self._trie)})"
+        return f"Trie({dict(self._trie)})"
 
     def __eq__(self, other: object) -> bool:
-        """Check equality with another StringTrie or mapping."""
-        if isinstance(other, StringTrie):
+        """Check equality with another Trie or mapping."""
+        if isinstance(other, Trie):
             return dict(self._trie) == dict(other._trie)
         elif isinstance(other, Mapping):
             return dict(self._trie) == dict(other)
