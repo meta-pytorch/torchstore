@@ -48,7 +48,7 @@ class LocalClient:
 
         await pipe.put_to_storage_volume(key, request)
         latency_tracker.track_step("put_to_storage_volume")
-        
+
         await self._controller.notify_put.call(key, request.meta_only(), volume_id)
         latency_tracker.track_step("notify_put")
         latency_tracker.track_e2e()
@@ -61,7 +61,7 @@ class LocalClient:
         inplace_tensor: torch.Tensor | DTensor | None = None,
         tensor_slice_spec: TensorSlice | None = None,
     ):
-        logger.debug(f"Fetching {key}")
+        latency_tracker = LatencyTracker(f"get:{key}")
 
         stored_object_type = await self._get_stored_object_type(key)
 
