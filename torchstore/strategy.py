@@ -32,6 +32,10 @@ class TorchStoreStrategy:
         self.storage_volumes = None
         self.volume_id_to_coord = {}
 
+    def __str__(self) -> str:
+        storage_vol_len = len(self.storage_volumes) if self.storage_volumes is not None else 0
+        return f"{self.__class__.__name__}(storage_volume_len={storage_vol_len})"
+
     @classmethod
     def get_volume_id(cls):
         """Get the unique ID for this process's storage volume. Called by volume on init.
@@ -118,6 +122,21 @@ class SingletonStrategy(TorchStoreStrategy):
             len(storage_volumes) == 1
         ), f"{self.__class__.__name__} support only one storage volume"
         await super().set_storage_volumes(storage_volumes)
+
+
+class HostStrategy(TorchStoreStrategy):
+    """Assumes one storage volume per host.
+
+    Each process uses 'HOSTNAME' to determine which storage volume to connect to.
+    """
+    @classmethod
+    def get_volume_id(cls):
+        # Note: this should only called at spawn, which makes this safe.
+        return os.environ["HOSTNAME"]
+
+    @classmethod
+    def get_client_id(cls):
+        return os.environ["HOSTNAME"]
 
 
 class LocalRankStrategy(TorchStoreStrategy):

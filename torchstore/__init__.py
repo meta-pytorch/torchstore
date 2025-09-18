@@ -9,6 +9,7 @@ from logging import getLogger
 
 from torchstore.api import (
     client,
+    reset_client,
     exists,
     get,
     get_state_dict,
@@ -44,4 +45,5 @@ __all__ = [
     "SingletonStrategy",
     "put_state_dict",
     "get_state_dict",
+    "reset_client"
 ]
