@@ -7,13 +7,14 @@
 from typing import Any, Dict, Optional, Union
 
 import torch
-from monarch.actor import get_or_spawn_controller
 
 import torchstore.state_dict_utils
+from monarch.actor import get_or_spawn_controller
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import SingletonStrategy, TorchStoreStrategy
+from torchstore.transport.pipe import TensorSlice
 
 
 # I need to keep this somewhere, so here we go
@@ -150,6 +151,7 @@ async def put(
 async def get(
     key: str,
     inplace_tensor: Optional[torch.Tensor] = None,
+    tensor_slice_spec: Optional[TensorSlice] = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> Union[torch.Tensor, Any]:
     """Retrieve a tensor or object from the distributed store.
@@ -157,17 +159,37 @@ async def get(
     Args:
         key (str): Unique identifier of the value to retrieve.
         inplace_tensor (torch.Tensor, optional): Pre-allocated tensor for in-place retrieval.
+        tensor_slice_spec (TensorSlice, optional): Specification for which slice of the tensor to retrieve.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
 
     Returns:
-        The stored tensor or object.
+        The stored tensor, tensor slice, or object.
 
     Example:
+        >>> # Get full tensor
         >>> tensor = await get("my_tensor")
-        >>> obj = await get("my_object")
+
+        >>> # Get specific slice
+        >>> from torchstore.transport.pipe import TensorSlice
+        >>> slice_spec = TensorSlice(
+        ...     offsets=(10, 20),
+        ...     coordinates=(),
+        ...     global_shape=(1000, 1000),
+        ...     local_shape=(50, 100),
+        ...     mesh_shape=()
+        ... )
+        >>> tensor_slice = await get("my_tensor", tensor_slice_spec=slice_spec)
+
+        >>> # In-place retrieval
+        >>> pre_allocated_tensor = torch.empty(100, 100)
+        >>> await get("my_tensor", inplace_tensor=pre_allocated_tensor)
+
+        >>> # In-place slice retrieval (copies slice into pre-allocated tensor)
+        >>> slice_buffer = torch.empty(50, 100)
+        >>> await get("my_tensor", inplace_tensor=slice_buffer, tensor_slice_spec=slice_spec)
     """
     cl = await client(store_name)
-    return await cl.get(key, inplace_tensor)
+    return await cl.get(key, inplace_tensor, tensor_slice_spec)
 
 
 async def exists(key: str, store_name: str = DEFAULT_TORCHSTORE_NAME) -> bool:
