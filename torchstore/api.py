@@ -13,7 +13,7 @@ import torchstore.state_dict_utils
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
-from torchstore.strategy import SingletonStrategy, TorchStoreStrategy
+from torchstore.strategy import SingletonStrategy, TorchStoreStrategy, ControllerStorageVolumes
 
 
 # I need to keep this somewhere, so here we go
@@ -56,9 +56,16 @@ async def initialize(
 
     # TODO: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
     # ideally this is done in the controller.init
-    storage_volumes = await StorageVolume.spawn(
-        num_volumes=num_storage_volumes, mesh=mesh, id_func=strategy.get_volume_id
-    )
+    if isinstance(strategy, ControllerStorageVolumes):
+        storage_volumes = await get_or_spawn_controller(
+            "storage_volume_controller",
+            StorageVolume,
+            id_func=strategy.get_volume_id
+        )
+    else:
+        storage_volumes = await StorageVolume.spawn(
+            num_volumes=num_storage_volumes, mesh=mesh, id_func=strategy.get_volume_id
+        )
 
     controller = await _controller(store_name)    
     await controller.init.call(
