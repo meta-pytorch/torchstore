@@ -11,14 +11,15 @@ import time
 from logging import getLogger
 
 import pytest
-
 import torch
 
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
+from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
+from torchstore.state_dict_utils import _state_dict_size
 
 from transformers import AutoModelForCausalLM
 
@@ -70,6 +71,7 @@ class ModelTest(Actor):
         model = AutoModelForCausalLM.from_pretrained(
             TEST_MODEL, token=os.environ["HF_TOKEN"]
         )
+        self.rlog(f"State dict size: {_state_dict_size(model.state_dict())}")
         if self.world_size > 1:
             self.initialize_distributed()
             self.rlog("sharding")
@@ -83,6 +85,8 @@ class ModelTest(Actor):
         return model, optimizer
 
     def rlog(self, msg):
+        print(f"rank: {self.rank} {msg}")
+        self.logger.info(f"rank: {self.rank} {msg}")
         logger.info(f"rank: {self.rank} {msg}")
 
     @endpoint
@@ -99,7 +103,7 @@ class ModelTest(Actor):
         self.rlog("pushing state dict")
         t = time.perf_counter()
         await ts.put_state_dict(state_dict, "v0")
-        self.rlog(f"pushed state dict in {time.perf_counter()-t} seconds")
+        self.rlog(f"pushed state dict in {time.perf_counter() - t} seconds")
 
     @endpoint
     async def do_get(self):
@@ -138,6 +142,9 @@ async def test_resharding(strategy_params, use_rdma):
 async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
+    ts.init_logging()
+    logger.info(f"Testing with strategy: {strategy}")
+
     put_world_size = math.prod(put_mesh_shape)
     await ts.initialize(
         num_storage_volumes=put_world_size if strategy is not None else 1,
@@ -163,18 +170,13 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
 
-            logger.info("pushing state dict")
-            t = time.perf_counter()
+            logger.info(f"do_push ")
             await put_world.do_push.call()
-            logger.info(f"pushing state dict took: {time.perf_counter() - t} seconds")
 
-            logger.info("fetching state dict")
-            t = time.perf_counter()
+            
             await get_world.do_get.call()
-            logger.info(f"getting state dict took: {time.perf_counter()-t} seconds")
     finally:
         await ts.shutdown()
-
 
 if __name__ == "__main__":
     main([__file__])

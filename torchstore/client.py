@@ -8,9 +8,11 @@ from logging import getLogger
 from typing import Any, Optional, Union
 
 import torch
+import time
 
 from torchstore.controller import ObjectType
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport import Pipe, Request
 from torchstore.utils import assemble_global_tensor, get_local_tensor
 
@@ -32,8 +34,7 @@ class LocalClient:
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
-        logger.debug(f"Putting {key}")
-
+        latency_tracker = LatencyTracker(f"put:{key}")
         request = Request.from_any(value)
         # for now, we only write to one storage volume.
         # we probably don't need a remote call for this case since
@@ -44,11 +45,16 @@ class LocalClient:
         pipe = Pipe(storage_volume)
 
         await pipe.put_to_storage_volume(key, request)
-        await self._controller.notify_put.call(key, request, volume_id)
+        latency_tracker.track_step("put_to_storage_volume")
+        
+        await self._controller.notify_put.call(key, request.meta_only(), volume_id)
+        latency_tracker.track_step("notify_put")
+        latency_tracker.track_e2e()
+
 
     @torch.no_grad
     async def get(self, key: str, inplace_tensor: Optional[torch.Tensor] = None):
-        logger.debug(f"Fetching {key}")
+        latency_tracker = LatencyTracker(f"get:{key}") 
         request = Request.from_any(inplace_tensor)
         object_type = ObjectType.from_request(request)
 
@@ -64,6 +70,8 @@ class LocalClient:
                 # TODO: in the future, we could intelligently select the best storage volume
                 # but for now any should work.
                 fetched_tensor = await pipe.get_from_storage_volume(key, request)
+                latency_tracker.track_step("get_from_storage_volume")
+                latency_tracker.track_e2e()
                 return fetched_tensor if inplace_tensor is None else inplace_tensor
 
             # else: this is the dtensor / tensor slice case
@@ -80,6 +88,8 @@ class LocalClient:
 
         assert partial_results, "No partial results found"
         assert request.tensor_slice is not None
+
+        latency_tracker.track_step("get_from_storage_volume")
 
         # build the entire tensor.
         # TODO: again, we should have better control over
@@ -114,12 +124,19 @@ class LocalClient:
             request.tensor_slice.local_shape,
             request.tensor_slice.offsets,
         )
+
+        latency_tracker.track_step("assemble_tensor")
+        t = time.perf_counter()
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
         if inplace_tensor is not None:
             assert request.tensor_val is not None
             request.tensor_val.copy_(fetched_tensor)
+            latency_tracker.track_step("copy")
+            latency_tracker.track_e2e()
             return inplace_tensor
+
+        latency_tracker.track_e2e()
         return fetched_tensor
 
     async def keys(self, prefix: str | None = None) -> list[str]:

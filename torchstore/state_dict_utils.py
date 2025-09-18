@@ -55,8 +55,7 @@ async def get_state_dict(
         else ({}, None)
     )
     if strict and user_mapping is not None:
-        pass
-        # assert user_mapping == fetched_mapping
+        assert user_mapping == fetched_mapping
 
     fetched_state_dict = {}
     for flattened_key in fetched_mapping.keys():
@@ -84,3 +83,14 @@ async def get_state_dict(
     # fetched_state_dict = dict(zip(keys, results))
 
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
+
+def _state_dict_size(state_dict):
+    """Returns the size of the state dict in MBs"""
+    size = 0
+    sd, _ = flatten_state_dict(state_dict)
+    for tensor in sd.values():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+
+        size += tensor.numel() * tensor.element_size()
+    return size // (1024 * 1024)  

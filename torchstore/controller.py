@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass, field
 from enum import auto, Enum
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Mapping, Optional, Set
 
 from monarch.actor import Actor, endpoint
 
@@ -137,6 +137,9 @@ class Controller(Actor):
             storage_volume_id (str): ID of the storage volume where the data was stored.
         """
         self.assert_initialized()
+        assert (
+            request.tensor_val is None
+        ), f"request should not contain tensor data, as this will significantly increase e2e latency"
 
         if key not in self.keys_to_storage_volumes:
             self.keys_to_storage_volumes[key] = {}
@@ -164,3 +167,6 @@ class Controller(Actor):
         if prefix is None:
             return list(self.keys_to_storage_volumes.keys())
         return self.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
+
+    def get_keys_to_storage_volumes(self) -> Mapping[str, Dict[str, StorageInfo]]:
+        return self.keys_to_storage_volumes
