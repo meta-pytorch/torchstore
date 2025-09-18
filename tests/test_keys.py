@@ -62,9 +62,9 @@ async def test_keys_multi_process():
         @endpoint
         async def put(self):
             t1 = torch.tensor([self.rank + 1] * 10)
-            await ts.put(f"key_{self.rank}.t1", t1)
+            await ts.put(f"key_{self.rank:05d}.t1", t1)
             t2 = torch.tensor([self.rank + 2] * 10)
-            await ts.put(f"key_{self.rank}.t2", t2)
+            await ts.put(f"key_{self.rank:05d}.t2", t2)
 
     volume_world_size, strategy = 4, ts.LocalRankStrategy()
     await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
@@ -75,8 +75,8 @@ async def test_keys_multi_process():
     await actor_mesh.put.call()
     assert len(await ts.keys()) == volume_world_size * 2
     for rank in range(volume_world_size):
-        assert await ts.keys(f"key_{rank}") == unordered(
-            [f"key_{rank}.t1", f"key_{rank}.t2"]
+        assert await ts.keys(f"key_{rank: 05d}") == unordered(
+            [f"key_{rank:05d}.t1", f"key_{rank:05d}.t2"]
         )
 
     await ts.shutdown()
