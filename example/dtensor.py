@@ -122,11 +122,11 @@ async def dtensor_put_get_example():
     puts it with Shard(0) and gets it with Shard(1).
     """
     # Configuration variables
-    size = 3000  # 100 unit size => 2.4 MB Tensor Size
+    size = 3  # 100 unit size => 2.4 MB Tensor Size
     n_put_actors = 8
     n_get_actors = 8
 
-    print(f"Starting DTensor put/get example with:")
+    print("Starting DTensor put/get example with:")
     print(f"  size = {size}")
     print(f"  n_put_actors = {n_put_actors}")
     print(f"  n_get_actors = {n_get_actors}")
@@ -221,7 +221,7 @@ async def dtensor_put_get_example():
 
             # Print timing summary
             print("\n" + "=" * 50)
-            print_yellow(f"⏱️  TIMING SUMMARY:")
+            print_yellow("⏱️  TIMING SUMMARY:")
             print_yellow(f"   Tensor size:   {tensor_size_mb:.4f} MB ({tensor_shape})")
             print_yellow(f"   PUT operation: {put_duration:.4f} seconds")
             print_yellow(f"   GET operation: {get_duration:.4f} seconds")
