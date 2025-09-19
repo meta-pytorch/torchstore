@@ -19,7 +19,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = [] #todo: add toml
+dependencies = [
+    "pygtrie",
+] #todo: add toml
 
 [project.urls]
 "Homepage" = "https://github.com/meta-pytorch/torchstore"
@@ -31,6 +33,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "pytest-timeout",
+    "pytest-unordered",
     "expecttest",
     "anyio",
     "pytest-asyncio",

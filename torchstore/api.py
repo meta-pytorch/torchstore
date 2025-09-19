@@ -4,11 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
 import torchstore.state_dict_utils
+
 from monarch.actor import get_or_spawn_controller
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
@@ -197,6 +198,28 @@ async def get(
     """
     cl = await client(store_name)
     return await cl.get(key, inplace_tensor, tensor_slice_spec)
+
+
+async def keys(
+    prefix: str | None = None,
+) -> List[str]:
+    """
+    Get all keys that match the given prefix.
+
+    This method retrieves all keys from the storage that start with the specified prefix.
+
+    Args:
+        prefix (str): The prefix to match against stored keys.
+
+
+    Returns:
+        List[str]: A list of keys that match the given prefix.
+
+    Example:
+        >>> keys = await keys("my_prefix")
+    """
+    cl = await client()
+    return await cl.keys(prefix)
 
 
 async def exists(key: str, store_name: str = DEFAULT_TORCHSTORE_NAME) -> bool:

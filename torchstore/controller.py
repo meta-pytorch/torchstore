@@ -6,12 +6,12 @@
 
 from dataclasses import dataclass, field
 from enum import auto, Enum
-from typing import Dict, Optional, Set
+from typing import Dict, List, Mapping, Optional, Set
 
 from monarch.actor import Actor, endpoint
 
+from torchstore.storage_utils.trie import Trie
 from torchstore.storage_volume import StorageVolume
-
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport.pipe import Request, TensorSlice
 
@@ -49,7 +49,7 @@ class Controller(Actor):
     def __init__(
         self,
     ) -> None:
-        self.keys_to_storage_volumes: Dict[str, Dict[str, StorageInfo]] = {}
+        self.keys_to_storage_volumes = Trie()
         self.is_initialized: bool = False
         self.strategy: Optional[TorchStoreStrategy] = None
         self.storage_volumes: Optional[StorageVolume] = None
@@ -137,9 +137,9 @@ class Controller(Actor):
             storage_volume_id (str): ID of the storage volume where the data was stored.
         """
         self.assert_initialized()
-        assert request.tensor_val is None, (
-            f"request should not contain tensor data, as this will significantly increase e2e latency"  
-        ) 
+        assert (
+            request.tensor_val is None
+        ), f"request should not contain tensor data, as this will significantly increase e2e latency"
 
         if key not in self.keys_to_storage_volumes:
             self.keys_to_storage_volumes[key] = {}
@@ -157,11 +157,16 @@ class Controller(Actor):
     @endpoint
     def teardown(self) -> None:
         self.is_initialized = False
-        self.keys_to_storage_volumes = {}
+        self.keys_to_storage_volumes = Trie()
         self.strategy = None
         self.storage_volumes = None
         self.num_storage_volumes = None
 
     @endpoint
-    def get_keys_to_storage_volumes(self) -> Dict[str, Dict[str, StorageInfo]]:
+    def keys(self, prefix=None) -> List[str]:
+        if prefix is None:
+            return list(self.keys_to_storage_volumes.keys())
+        return self.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
+
+    def get_keys_to_storage_volumes(self) -> Mapping[str, Dict[str, StorageInfo]]:
         return self.keys_to_storage_volumes
