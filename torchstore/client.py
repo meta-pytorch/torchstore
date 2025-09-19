@@ -17,6 +17,22 @@ from torchstore.utils import assemble_global_tensor, get_local_tensor
 
 logger = getLogger(__name__)
 
+# ANSI escape codes for colored output
+BLUE = "\033[94m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def print_blue(text):
+    """Print text in blue color"""
+    print(f"{BLUE}{BOLD}{text}{RESET}")
+
+
+def print_cyan(text):
+    """Print text in cyan color"""
+    print(f"{CYAN}{BOLD}{text}{RESET}")
+
 
 class LocalClient:
     """This class represents the local store, which exists on every process. Remote storage
@@ -55,7 +71,9 @@ class LocalClient:
         tensor_slice_spec: TensorSlice | None = None,
     ):
         logger.debug(f"Fetching {key}")
+        import time
 
+        start = time.perf_counter()
         stored_object_type = await self._get_stored_object_type(key)
 
         self._verify_get_args(inplace_tensor, tensor_slice_spec, stored_object_type)
@@ -66,7 +84,12 @@ class LocalClient:
         if stored_object_type is ObjectType.TENSOR:
             full_tensor = await self._get_tensor(key)
         else:
-            full_tensor = await self._get_distributed_whole_tensor(key)
+            # What we stored is a DTensor. Assume we also want to get a TensorSlice for distributed tensor here.
+            # TODO: may need consolidation.
+            request = Request.from_any(inplace_tensor)
+            full_tensor = await self._get_distributed_whole_tensor(
+                key, request.tensor_slice
+            )
 
         if isinstance(inplace_tensor, DTensor):
             request = Request.from_any(inplace_tensor)
@@ -85,6 +108,8 @@ class LocalClient:
         else:
             # User aasked for the whole tensor
             fetched_tensor = full_tensor
+        fetch_finish_time = time.perf_counter()
+        print_cyan(f"duration before copy:{fetch_finish_time - start}")
 
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
@@ -95,6 +120,7 @@ class LocalClient:
             else:
                 # Regular tensor case
                 inplace_tensor.copy_(fetched_tensor)
+
             return inplace_tensor
         return fetched_tensor
 
@@ -192,12 +218,19 @@ class LocalClient:
             request = Request.from_any(None)
             return await pipe.get_from_storage_volume(key, request)
 
-    async def _get_distributed_whole_tensor(self, key: str) -> torch.Tensor:
+    async def _get_distributed_whole_tensor(
+        self, key: str, dtensor_slice: TensorSlice | None = None
+    ) -> torch.Tensor:
         """Fetches slices from all volume storages and stitch together to return the whole tensor"""
 
+        # dtensor_slice = None
         volume_map = await self._controller.locate_volumes.call_one(key)
+
         # Handle the tensor case
         partial_results = []
+        import time
+
+        start_time = time.perf_counter()
         for volume_id, storage_info in volume_map.items():
             storage_volume = self.strategy.get_storage_volume(volume_id)
             pipe = Pipe(storage_volume)
@@ -205,7 +238,18 @@ class LocalClient:
             # fetch from all storage volumes, something like this
             # TODO: fix so we can request all tensor slices from a storage volume
             # at once, this is silly
-            for tensor_slice in storage_info.tensor_slices:
+            for i, tensor_slice in enumerate(storage_info.tensor_slices):
+                # Intersect the tensor slice with the DTensor slice to optimize fetching
+                if dtensor_slice is not None:
+                    # Check if stored tensor_slice overlaps with requested dtensor_slice
+                    tensor_slice = self._compute_slice_intersection(
+                        tensor_slice, dtensor_slice
+                    )
+
+                    if tensor_slice is None:
+                        # No overlap, skip fetching this slice
+                        continue
+
                 tensor_slice_request = Request.from_tensor_slice(tensor_slice)
 
                 local_tensor = await pipe.get_from_storage_volume(
@@ -213,6 +257,10 @@ class LocalClient:
                 )
                 partial_results.append((local_tensor, tensor_slice))
 
+        duration = time.perf_counter() - start_time
+        print_blue(
+            f"number of partial results:{len(partial_results)}, size of partial results: {partial_results[0][0].shape}, size of volume_map:{len(volume_map)}, duration:{duration}"
+        )
         assert partial_results, "No partial results found"
 
         # build the entire tensor.
@@ -237,8 +285,60 @@ class LocalClient:
             else:
                 assert device_mesh_shape == tensor_slice.mesh_shape
 
-        return assemble_global_tensor(
+        assembled_tensor = assemble_global_tensor(
             local_tensors,
             global_shape,
             global_offsets,
+        )
+
+        return assembled_tensor
+
+    def _compute_slice_intersection(
+        self, tensor_slice: TensorSlice, dtensor_slice: TensorSlice
+    ) -> TensorSlice | None:
+        """
+        Compute the intersection of two tensor slices.
+
+        Args:
+            tensor_slice: The stored tensor slice (what's available)
+            dtensor_slice: The requested DTensor slice (what we want)
+
+        Returns:
+            TensorSlice representing the intersection, or None if no overlap
+        """
+        # Ensure both slices have the same global shape
+        if tensor_slice.global_shape != dtensor_slice.global_shape:
+            return None
+
+        # Compute intersection for each dimension
+        new_offsets = []
+        new_local_shape = []
+
+        for dim in range(len(tensor_slice.global_shape)):
+            # Stored slice boundaries
+            stored_start = tensor_slice.offsets[dim]
+            stored_end = stored_start + tensor_slice.local_shape[dim]
+
+            # Requested slice boundaries
+            requested_start = dtensor_slice.offsets[dim]
+            requested_end = requested_start + dtensor_slice.local_shape[dim]
+
+            # Compute intersection
+            intersect_start = max(stored_start, requested_start)
+            intersect_end = min(stored_end, requested_end)
+
+            # Check if there's actually an intersection
+            if intersect_start >= intersect_end:
+                return None  # No overlap in this dimension
+
+            new_offsets.append(intersect_start)
+            new_local_shape.append(intersect_end - intersect_start)
+
+        # Create intersection slice
+        return TensorSlice(
+            offsets=tuple(new_offsets),
+            coordinates=tensor_slice.coordinates,  # Keep original coordinates
+            global_shape=tensor_slice.global_shape,
+            local_shape=tuple(new_local_shape),
+            mesh_shape=tensor_slice.mesh_shape,  # Keep original mesh shape
         )

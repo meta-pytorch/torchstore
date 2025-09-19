@@ -199,18 +199,85 @@ class InMemoryStore(StorageImpl):
             await transport_buffer.write_from(self.kv[key])
             return transport_buffer
 
-        # TODO:
-        # for now, we're only going to support requesting the entire tensor_slice,
-        # but this goes entire the value prop of torchstore. StorageVolume must
-        # support requesting a subset of the regions which exist locally in the
-        # store.
-
         for shard in self.kv[key].values():
-            if shard["slice"] == request.tensor_slice:
-                await transport_buffer.write_from(shard["tensor"])
+            stored_slice = shard["slice"]
+            stored_tensor = shard["tensor"]
+
+            # Check if requested slice is contained within or intersects with stored slice
+            extracted_tensor = self._extract_tensor_subset(
+                stored_tensor, stored_slice, request.tensor_slice
+            )
+
+            if extracted_tensor is not None:
+                await transport_buffer.write_from(extracted_tensor)
                 return transport_buffer
 
-        raise RuntimeError(f"Tensor slice {request.tensor_slice} not found in {key}")
+        raise RuntimeError(
+            f"Tensor slice {request.tensor_slice} not found in any stored shards for {key}"
+        )
+
+    def _extract_tensor_subset(
+        self,
+        stored_tensor: torch.Tensor,
+        stored_slice: TensorSlice,
+        requested_slice: TensorSlice,
+    ) -> torch.Tensor | None:
+        """
+        Extract the intersection between stored slice and requested slice from the stored tensor.
+
+        Args:
+            stored_tensor: The tensor data that's stored locally
+            stored_slice: The slice metadata for the stored tensor (describes what region it covers)
+            requested_slice: The slice metadata for what the client wants
+
+        Returns:
+            The extracted tensor subset representing the intersection, or None if no overlap
+        """
+        # Ensure both slices have the same global shape
+        if stored_slice.global_shape != requested_slice.global_shape:
+            raise ValueError(
+                f"Global shapes don't match: {stored_slice.global_shape=} (Stored) {requested_slice.global_shape=} (Requested)"
+            )
+
+        # Compute intersection bounds and extraction indices
+        extract_indices = []
+        intersection_shape = []
+
+        for dim in range(len(stored_slice.global_shape)):
+            # Stored slice boundaries in global coordinates
+            stored_start = stored_slice.offsets[dim]
+            stored_end = stored_start + stored_slice.local_shape[dim]
+
+            # Requested slice boundaries in global coordinates
+            requested_start = requested_slice.offsets[dim]
+            requested_end = requested_start + requested_slice.local_shape[dim]
+
+            # Compute intersection boundaries in global coordinates
+            intersection_start = max(stored_start, requested_start)
+            intersection_end = min(stored_end, requested_end)
+
+            # Check if there's actually an intersection in this dimension
+            if intersection_start >= intersection_end:
+                return None  # No overlap
+
+            # Convert intersection to local indices within the stored tensor
+            local_start = intersection_start - stored_start
+            local_end = intersection_end - stored_start
+
+            extract_indices.append(slice(local_start, local_end))
+            intersection_shape.append(local_end - local_start)
+
+        # Extract the intersection portion from the stored tensor
+        extracted_tensor = stored_tensor[tuple(extract_indices)]
+
+        # Verify the extracted tensor has the expected intersection shape
+        expected_shape = tuple(intersection_shape)
+        if extracted_tensor.shape != expected_shape:
+            raise RuntimeError(
+                f"Extracted tensor shape {extracted_tensor.shape} doesn't match expected intersection shape {expected_shape}"
+            )
+
+        return extracted_tensor
 
     async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
         if key not in self.kv:

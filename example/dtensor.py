@@ -105,9 +105,7 @@ class DTensorActor(Actor):
         tensor = self.original_tensor.to("cpu")
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 
-        self.rlog(f"calling get with {dtensor=}")
         fetched_tensor = await ts.get(self.shared_key, dtensor)
-        self.rlog(f"after fetch: {dtensor=}")
         assert torch.equal(dtensor, fetched_tensor)
 
         return fetched_tensor, device_mesh.get_coordinate()
@@ -124,7 +122,7 @@ async def dtensor_put_get_example():
     puts it with Shard(0) and gets it with Shard(1).
     """
     # Configuration variables
-    size = 1000  # 100 unit size => 2.4 MB Tensor Size
+    size = 3000  # 100 unit size => 2.4 MB Tensor Size
     n_put_actors = 8
     n_get_actors = 8
 
