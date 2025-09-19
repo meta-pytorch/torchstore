@@ -267,8 +267,9 @@ async def test_delete(strategy_params, use_rdma):
         # Test 1: Store tensors, verify they exist, then delete them
         tensor = torch.tensor([1, 2, 3, 4, 5])
         for rank in range(volume_world_size):
-            actor = actor_mesh.slice(**{"hosts": 0, "gpus": rank})
-            await actor.put.call(f"tensor_key_{rank}", tensor)
+            # actor = actor_mesh.slice(**{"hosts": 0, "gpus": rank})
+            # await actor.put.call(f"tensor_key_{rank}", tensor)
+            await actor_mesh.put.choose(f"tensor_key_{rank}", tensor)
 
         # Verify all tensors exist
         for rank in range(volume_world_size):
@@ -279,8 +280,9 @@ async def test_delete(strategy_params, use_rdma):
         # Delete tensors one at a time and verify each deletion
         for rank in range(volume_world_size):
             # Delete this specific tensor
-            actor = actor_mesh.slice(**{"hosts": 0, "gpus": rank})
-            await actor.delete.call(f"tensor_key_{rank}")
+            # actor = actor_mesh.slice(**{"host": 0, "gpus": rank})
+            # await actor.delete.call(f"tensor_key_{rank}")
+            await actor_mesh.delete.choose(f"tensor_key_{rank}")
 
             # Verify this specific tensor no longer exists
             results = await actor_mesh.exists.call(f"tensor_key_{rank}")
