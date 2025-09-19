@@ -139,6 +139,21 @@ class LocalClient:
         latency_tracker.track_e2e()
         return fetched_tensor
 
+    async def keys(self, prefix: str | None = None) -> list[str]:
+        """
+        Get all keys that match the given prefix.
+
+        This method retrieves all keys from the storage that start with the specified prefix.
+
+        Args:
+            prefix (str): The prefix to match against stored keys.
+
+        Returns:
+            List[str]: A list of keys that match the given prefix.
+        """
+        # Keys are synced across all storage volumes, so we just call one.
+        return await self._controller.keys.call_one(prefix)
+
     async def exists(self, key: str) -> bool:
         """Check if a key exists in the distributed store.
 
