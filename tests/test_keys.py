@@ -75,7 +75,7 @@ async def test_keys_multi_process():
     await actor_mesh.put.call()
     assert len(await ts.keys()) == volume_world_size * 2
     for rank in range(volume_world_size):
-        assert await ts.keys(f"key_{rank: 05d}") == unordered(
+        assert await ts.keys(f"key_{rank:05d}") == unordered(
             [f"key_{rank:05d}.t1", f"key_{rank:05d}.t2"]
         )
 
