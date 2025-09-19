@@ -29,15 +29,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "anyio",
+    "expecttest",
     "pre-commit",
     "pytest",
+    "pytest-asyncio",
     "pytest-cov",
     "pytest-timeout",
     "pytest-unordered",
-    "expecttest",
-    "anyio",
-    "pytest-asyncio",
     "transformers",
+    "ufmt",
 ]
 
 [tool.setuptools.packages.find]

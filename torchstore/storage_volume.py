@@ -36,7 +36,11 @@ class StorageVolume(Actor):
 
     @classmethod
     async def spawn(
-        cls, num_volumes: int, mesh, *init_args: Any, **init_kwargs: Any, 
+        cls,
+        num_volumes: int,
+        mesh,
+        *init_args: Any,
+        **init_kwargs: Any,
     ) -> "StorageVolume":
         actors = await spawn_actors(
             num_volumes, cls, cls.actor_name, mesh, *init_args, **init_kwargs

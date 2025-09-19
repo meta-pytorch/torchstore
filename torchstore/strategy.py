@@ -33,7 +33,9 @@ class TorchStoreStrategy:
         self.volume_id_to_coord = {}
 
     def __str__(self) -> str:
-        storage_vol_len = len(self.storage_volumes) if self.storage_volumes is not None else 0
+        storage_vol_len = (
+            len(self.storage_volumes) if self.storage_volumes is not None else 0
+        )
         return f"{self.__class__.__name__}(storage_volume_len={storage_vol_len})"
 
     @classmethod
@@ -129,6 +131,7 @@ class HostStrategy(TorchStoreStrategy):
 
     Each process uses 'HOSTNAME' to determine which storage volume to connect to.
     """
+
     @classmethod
     def get_volume_id(cls):
         # Note: this should only called at spawn, which makes this safe.
@@ -163,7 +166,9 @@ class ControllerStorageVolumes(TorchStoreStrategy):
     """
 
     def __str__(self) -> str:
-        storage_vol_len = len(self.storage_volumes) if self.storage_volumes is not None else 0
+        storage_vol_len = (
+            len(self.storage_volumes) if self.storage_volumes is not None else 0
+        )
         return f"{self.__class__.__name__}(storage_volume_len={storage_vol_len})"
 
     @classmethod

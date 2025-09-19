@@ -8,13 +8,17 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-import torchstore.state_dict_utils
-
 from monarch.actor import get_or_spawn_controller
+
+import torchstore.state_dict_utils
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
-from torchstore.strategy import SingletonStrategy, TorchStoreStrategy, ControllerStorageVolumes
+from torchstore.strategy import (
+    ControllerStorageVolumes,
+    SingletonStrategy,
+    TorchStoreStrategy,
+)
 from torchstore.transport.pipe import TensorSlice
 
 
@@ -60,16 +64,14 @@ async def initialize(
     # ideally this is done in the controller.init
     if isinstance(strategy, ControllerStorageVolumes):
         storage_volumes = await get_or_spawn_controller(
-            "storage_volume_controller",
-            StorageVolume,
-            id_func=strategy.get_volume_id
+            "storage_volume_controller", StorageVolume, id_func=strategy.get_volume_id
         )
     else:
         storage_volumes = await StorageVolume.spawn(
             num_volumes=num_storage_volumes, mesh=mesh, id_func=strategy.get_volume_id
         )
 
-    controller = await _controller(store_name)    
+    controller = await _controller(store_name)
     await controller.init.call(
         strategy=strategy,
         num_storage_volumes=num_storage_volumes,
@@ -97,10 +99,10 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
 
 def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
-    """Reset the local client for a given store. Useful for refreshing client state after shutdown.
-    """
+    """Reset the local client for a given store. Useful for refreshing client state after shutdown."""
     global _local_clent_map
     _local_clent_map.pop(store_name, None)
+
 
 async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:
     """Get a controller handle for interacting with the store."""
