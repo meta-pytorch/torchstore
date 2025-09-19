@@ -168,5 +168,24 @@ class Controller(Actor):
             return list(self.keys_to_storage_volumes.keys())
         return self.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
 
+    @endpoint
+    def notify_delete(self, key: str, storage_volume_id: str) -> None:
+        """
+        Notify the controller that data has been deleted from a storage volume.
+
+        This should called after a successful delete operation to
+        maintain the distributed storage index.
+        """
+        self.assert_initialized()
+        if key not in self.keys_to_storage_volumes:
+            raise KeyError(f"Unable to locate {key} in any storage volumes.")
+        if storage_volume_id not in self.keys_to_storage_volumes[key]:
+            raise KeyError(
+                f"Unable to locate {key} in storage volume {storage_volume_id}."
+            )
+        del self.keys_to_storage_volumes[key][storage_volume_id]
+        if len(self.keys_to_storage_volumes[key]) == 0:
+            del self.keys_to_storage_volumes[key]
+
     def get_keys_to_storage_volumes(self) -> Mapping[str, Dict[str, StorageInfo]]:
         return self.keys_to_storage_volumes

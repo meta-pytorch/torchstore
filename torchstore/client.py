@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 from logging import getLogger
 from typing import Any, Union
 
@@ -117,6 +118,33 @@ class LocalClient:
         """
         # Keys are synced across all storage volumes, so we just call one.
         return await self._controller.keys.call_one(prefix)
+
+    async def delete(self, key: str) -> None:
+        """
+        Delete a key from the distributed store.
+
+        Args:
+            key (str): The key to delete.
+
+        Returns:
+            None
+
+        Raises:
+            KeyError: If the key does not exist in the store.
+        """
+        latency_tracker = LatencyTracker(f"delete:{key}")
+        volume_map = await self._controller.locate_volumes.call_one(key)
+
+        async def delete_from_volume(volume_id: str):
+            volume = self.strategy.get_storage_volume(volume_id)
+            await volume.delete.call(key)
+            await self._controller.notify_delete.call_one(key, volume_id)
+
+        await asyncio.gather(
+            *[delete_from_volume(volume_id) for volume_id in volume_map]
+        )
+
+        latency_tracker.track_e2e()
 
     async def exists(self, key: str) -> bool:
         """Check if a key exists in the distributed store.

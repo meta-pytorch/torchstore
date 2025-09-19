@@ -65,6 +65,10 @@ class StorageVolume(Actor):
         return await self.store.get(key, transport_buffer, request)
 
     @endpoint
+    async def delete(self, key: str) -> None:
+        await self.store.delete(key)
+
+    @endpoint
     async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
         return await self.store.get_meta(key)
 
@@ -86,6 +90,10 @@ class StorageImpl:
 
     async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
         """Get metadata about stored data."""
+        raise NotImplementedError()
+
+    async def delete(self, key: str) -> None:
+        """Delete data from the storage backend."""
         raise NotImplementedError()
 
 
@@ -234,3 +242,8 @@ class InMemoryStore(StorageImpl):
             return val["tensor"].shape, val["tensor"].dtype
 
         raise RuntimeError(f"Unknown type for {key} type={type(val)}")
+
+    async def delete(self, key: str) -> None:
+        if key not in self.kv:
+            raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
+        del self.kv[key]

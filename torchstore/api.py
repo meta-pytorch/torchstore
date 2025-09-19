@@ -8,9 +8,9 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-from monarch.actor import get_or_spawn_controller
-
 import torchstore.state_dict_utils
+
+from monarch.actor import get_or_spawn_controller
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
@@ -200,6 +200,26 @@ async def get(
     """
     cl = await client(store_name)
     return await cl.get(key, inplace_tensor, tensor_slice_spec)
+
+
+async def delete(
+    key: str,
+    *,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> None:
+    """Delete a key from the distributed store.
+
+    Args:
+        key (str): Unique identifier of the value to delete.
+
+    Keyword Args:
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Example:
+        >>> await delete("my_tensor")
+    """
+    cl = await client(store_name=store_name)
+    return await cl.delete(key)
 
 
 async def keys(
