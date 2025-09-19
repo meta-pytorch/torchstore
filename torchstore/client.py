@@ -11,7 +11,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
-
+from torchstore.logging import LatencyTracker
 from torchstore.transport import Pipe, Request, TensorSlice
 from torchstore.utils import assemble_global_tensor, get_local_tensor
 
@@ -49,8 +49,7 @@ class LocalClient:
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
-        logger.debug(f"Putting {key}")
-
+        latency_tracker = LatencyTracker(f"put:{key}")
         request = Request.from_any(value)
         # for now, we only write to one storage volume.
         # we probably don't need a remote call for this case since
@@ -61,7 +60,11 @@ class LocalClient:
         pipe = Pipe(storage_volume)
 
         await pipe.put_to_storage_volume(key, request)
-        await self._controller.notify_put.call(key, request, volume_id)
+        latency_tracker.track_step("put_to_storage_volume")
+
+        await self._controller.notify_put.call(key, request.meta_only(), volume_id)
+        latency_tracker.track_step("notify_put")
+        latency_tracker.track_e2e()
 
     @torch.no_grad
     async def get(
@@ -72,6 +75,8 @@ class LocalClient:
     ):
         logger.debug(f"Fetching {key}")
         import time
+
+        latency_tracker = LatencyTracker(f"get:{key}")
 
         start = time.perf_counter()
         stored_object_type = await self._get_stored_object_type(key)
@@ -122,7 +127,24 @@ class LocalClient:
                 inplace_tensor.copy_(fetched_tensor)
 
             return inplace_tensor
+
+        latency_tracker.track_e2e()
         return fetched_tensor
+
+    async def keys(self, prefix: str | None = None) -> list[str]:
+        """
+        Get all keys that match the given prefix.
+
+        This method retrieves all keys from the storage that start with the specified prefix.
+
+        Args:
+            prefix (str): The prefix to match against stored keys.
+
+        Returns:
+            List[str]: A list of keys that match the given prefix.
+        """
+        # Keys are synced across all storage volumes, so we just call one.
+        return await self._controller.keys.call_one(prefix)
 
     async def exists(self, key: str) -> bool:
         """Check if a key exists in the distributed store.
@@ -181,7 +203,8 @@ class LocalClient:
                 and tensor_slice_spec.local_shape != inplace_tensor.shape
             ):
                 raise ValueError(
-                    f"Requested tensor slice shape {tensor_slice_spec.local_shape} does not match in-place tensor shape {inplace_tensor.shape}"
+                    f"Requested tensor slice shape {tensor_slice_spec.local_shape} "
+                    f"does not match in-place tensor shape {inplace_tensor.shape}"
                 )
 
         if isinstance(inplace_tensor, DTensor):
@@ -259,7 +282,9 @@ class LocalClient:
 
         duration = time.perf_counter() - start_time
         print_blue(
-            f"number of partial results:{len(partial_results)}, size of partial results: {partial_results[0][0].shape}, size of volume_map:{len(volume_map)}, duration:{duration}"
+            f"number of partial results:{len(partial_results)}, "
+            f"size of partial results: {partial_results[0][0].shape}, "
+            f"size of volume_map:{len(volume_map)}, duration:{duration}"
         )
         assert partial_results, "No partial results found"
 

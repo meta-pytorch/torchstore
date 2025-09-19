@@ -32,7 +32,8 @@ class TensorSlice:
     mesh_shape: Tuple
 
     def __post_init__(self):
-        self.coordinates = tuple(self.coordinates)
+        if self.coordinates is not None:
+            self.coordinates = tuple(self.coordinates)
 
     def __hash__(self):
         # Hash all fields as a tuple, converting local_shape to tuple if it's a torch.Size
@@ -115,6 +116,15 @@ class Request:
     def from_tensor_slice(cls, tensor_slice: TensorSlice) -> "Request":
         return cls(tensor_slice=copy.deepcopy(tensor_slice))
 
+    def meta_only(self) -> "Request":
+        """Returns a copy of this request with tensor_val set to None."""
+        return Request(
+            tensor_val=None,
+            tensor_slice=self.tensor_slice,
+            objects=self.objects,
+            is_object=self.is_object,
+        )
+
 
 class Pipe:
     """
@@ -141,15 +151,8 @@ class Pipe:
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
-        request_without_tensor = Request(
-            tensor_val=None,
-            tensor_slice=request.tensor_slice,
-            objects=request.objects,
-            is_object=request.is_object,
-        )
-
         await self.storage_volume.put.call_one(
-            key, transport_buffer, request_without_tensor
+            key, transport_buffer, request.meta_only()
         )
 
     async def get_from_storage_volume(self, key, request: Request):
@@ -167,12 +170,9 @@ class Pipe:
             transport_buffer.allocate(request.tensor_val)
 
         # TODO: consider placing the buffer inside the request or vice versa
-        request_without_tensor = Request(
-            tensor_val=None, tensor_slice=request.tensor_slice, objects=request.objects
-        )
         transport_buffer.update(
             await self.storage_volume.get.call_one(
-                key, transport_buffer, request_without_tensor
+                key, transport_buffer, request.meta_only()
             )
         )
 

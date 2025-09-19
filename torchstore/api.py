@@ -4,21 +4,26 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-import torchstore.state_dict_utils
 from monarch.actor import get_or_spawn_controller
+
+import torchstore.state_dict_utils
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
-from torchstore.strategy import SingletonStrategy, TorchStoreStrategy
+from torchstore.strategy import (
+    ControllerStorageVolumes,
+    SingletonStrategy,
+    TorchStoreStrategy,
+)
 from torchstore.transport.pipe import TensorSlice
 
 
 # I need to keep this somewhere, so here we go
-DEFAULT_TORCHSTORE_NAME: str = "TorchStoreController"
+DEFAULT_TORCHSTORE_NAME: str = "TorchStore"
 
 # cache for local clients
 _local_clent_map: Dict[str, LocalClient] = {}
@@ -28,6 +33,7 @@ async def initialize(
     num_storage_volumes: int = 1,
     strategy: Optional[TorchStoreStrategy] = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
+    mesh=None,
 ) -> None:
     """Initialize the TorchStore distributed storage system.
 
@@ -56,14 +62,16 @@ async def initialize(
 
     # TODO: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
     # ideally this is done in the controller.init
-    storage_volumes = await StorageVolume.spawn(
-        num_volumes=num_storage_volumes, id_func=strategy.get_volume_id
-    )
+    if isinstance(strategy, ControllerStorageVolumes):
+        storage_volumes = await get_or_spawn_controller(
+            "storage_volume_controller", StorageVolume, id_func=strategy.get_volume_id
+        )
+    else:
+        storage_volumes = await StorageVolume.spawn(
+            num_volumes=num_storage_volumes, mesh=mesh, id_func=strategy.get_volume_id
+        )
 
-    controller = await get_or_spawn_controller(
-        store_name,
-        Controller,
-    )
+    controller = await _controller(store_name)
     await controller.init.call(
         strategy=strategy,
         num_storage_volumes=num_storage_volumes,
@@ -84,10 +92,21 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
         >>> await ts.shutdown()  # Shutdown default store
         >>> await ts.shutdown("my_custom_store")
     """
-    controller = await get_or_spawn_controller(store_name, Controller)
+    controller = await _controller(store_name)
     await controller.teardown.call()
     global _local_clent_map
     _local_clent_map = {}
+
+
+def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
+    """Reset the local client for a given store. Useful for refreshing client state after shutdown."""
+    global _local_clent_map
+    _local_clent_map.pop(store_name, None)
+
+
+async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:
+    """Get a controller handle for interacting with the store."""
+    return await get_or_spawn_controller(store_name, Controller)
 
 
 async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
@@ -108,7 +127,7 @@ async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
     if store_name in _local_clent_map:
         return _local_clent_map[store_name]
 
-    controller = await get_or_spawn_controller(store_name, Controller)
+    controller = await _controller(store_name)
     controller_strategy = await controller.get_controller_strategy.call_one()
 
     local_client = LocalClient(
@@ -181,6 +200,28 @@ async def get(
     """
     cl = await client(store_name)
     return await cl.get(key, inplace_tensor, tensor_slice_spec)
+
+
+async def keys(
+    prefix: str | None = None,
+) -> List[str]:
+    """
+    Get all keys that match the given prefix.
+
+    This method retrieves all keys from the storage that start with the specified prefix.
+
+    Args:
+        prefix (str): The prefix to match against stored keys.
+
+
+    Returns:
+        List[str]: A list of keys that match the given prefix.
+
+    Example:
+        >>> keys = await keys("my_prefix")
+    """
+    cl = await client()
+    return await cl.keys(prefix)
 
 
 async def exists(key: str, store_name: str = DEFAULT_TORCHSTORE_NAME) -> bool:

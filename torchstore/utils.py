@@ -5,28 +5,35 @@
 # LICENSE file in the root directory of this source tree.
 
 import uuid
+from logging import getLogger
 from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from monarch.actor import proc_mesh  # , this_host
+from monarch.actor import ProcMesh, this_host
 
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
 
+logger = getLogger(__name__)
 
-async def spawn_actors(num_processes, actor_cls, name, **init_args):
+
+async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
     """Actors are essentially processes wrapped in a class."""
-    mesh = await proc_mesh(gpus=num_processes)
-    # once monarch updates
-    # mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
 
-    # await mesh.initialized
-    await mesh.logging_option(True, None)
+    if mesh is None:
+        logger.debug("Spawning actors on the local host")
+        mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
+        await mesh.initialized
+        actors = await mesh.spawn(
+            f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args
+        )
+        return actors
 
-    # uuid is to try to help with log spew from monarch.
-    actors = await mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
+    assert isinstance(mesh, ProcMesh)
+    actors = mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
+
     return actors
 
 
