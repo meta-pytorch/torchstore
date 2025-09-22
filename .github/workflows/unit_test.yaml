@@ -24,7 +24,7 @@ jobs:
       - name: Update pip
         run: python -m pip install --upgrade pip
       - name: Install monarch
-        run: python -m pip install monarch-no-torch==0.1.0.dev20250826 --find-links assets/ci
+        run: python -m pip install monarch==0.0.1 --find-links assets/ci
       - name: Install dependencies
         run: python -m pip install -e ".[dev]"
       - name: Run unit tests with coverage
