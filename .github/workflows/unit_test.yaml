@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -e ".[dev]"
       - name: Run unit tests with coverage
-        # TorchStore RDMA will not run on CPU-only machines
-        run: TORCHSTORE_RDMA_ENABLED=0 pytest tests --cov=. --cov-report=xml --durations=20 -vv
+        # TorchStore RDMA will not run on CPU-only machines, resharding tests are too slow.
+        run: TORCHSTORE_RDMA_ENABLED=0 pytest tests --cov=. --cov-report=xml --durations=20 -vv --ignore=tests/test_resharding.py
       - name: Upload Coverage to Codecov
         uses: codecov/codecov-action@v3
