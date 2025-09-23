@@ -21,6 +21,13 @@ jobs:
           miniconda-version: "latest"
           activate-environment: test
           python-version: ${{ matrix.python-version }}
+          environment-file: false
+          create-args: >-
+            python=${{ matrix.python-version }}
+      - name: Verify Python version
+        run: |
+          python --version
+          python -c "import sys; print(f'Python version: {sys.version_info.major}.{sys.version_info.minor}')"
       - name: Update pip
         run: python -m pip install --upgrade pip
       - name: Install torch
