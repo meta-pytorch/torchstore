@@ -23,8 +23,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Update pip
         run: python -m pip install --upgrade pip
+      - name: Install torch
+        run: python -m pip install torch
       - name: Install monarch
-        run: python -m pip install monarch==0.0.1 --find-links assets/ci
+        run: python -m pip install monarch==0.0.1 --find-links assets/ci --prefer-binary --force-reinstall
       - name: Install dependencies
         run: python -m pip install -e ".[dev]"
       - name: Run unit tests with coverage
