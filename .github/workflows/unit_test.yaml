@@ -14,16 +14,10 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-      - name: Setup conda env
-        uses: conda-incubator/setup-miniconda@v2
+      - name: Setup Python
+        uses: actions/setup-python@v4
         with:
-          auto-update-conda: true
-          miniconda-version: "latest"
-          activate-environment: test
           python-version: ${{ matrix.python-version }}
-          environment-file: false
-          create-args: >-
-            python=${{ matrix.python-version }}
       - name: Verify Python version
         run: |
           python --version
