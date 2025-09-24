@@ -231,13 +231,23 @@ class InMemoryStore(StorageImpl):
         """
         Extract the intersection between stored slice and requested slice from the stored tensor.
 
+        This method enables efficient partial tensor retrieval by computing the overlap
+        between what's stored locally and what the client actually needs, then extracting
+        only that portion from the stored tensor data.
+
         Args:
-            stored_tensor: The tensor data that's stored locally
-            stored_slice: The slice metadata for the stored tensor (describes what region it covers)
-            requested_slice: The slice metadata for what the client wants
+            stored_tensor: The actual tensor data stored in this storage volume
+            stored_slice: Metadata describing what global region the stored_tensor represents
+            requested_slice: Metadata describing what global region the client wants
 
         Returns:
-            The extracted tensor subset representing the intersection, or None if no overlap
+            The extracted tensor subset representing the intersection, or None if no overlap.
+            The returned tensor contains only the data that overlaps between the stored
+            and requested regions.
+
+        Raises:
+            ValueError: If global shapes don't match between slices
+            RuntimeError: If extracted tensor shape doesn't match expected intersection shape
         """
         # Ensure both slices have the same global shape
         if stored_slice.global_shape != requested_slice.global_shape:

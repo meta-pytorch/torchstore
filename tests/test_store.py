@@ -429,5 +429,90 @@ async def test_put_dtensor_get_full_tensor():
             await ts.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_dtensor_fetch_slice():
+    """
+    Test DTensor slice optimization by storing a DTensor across multiple volumes
+    and requesting slices that test both cross-volume and single-volume scenarios.
+
+    This test validates that the slice optimization:
+    1. Only fetches from relevant storage volumes when requesting slices
+    2. Works correctly for slices that span multiple volumes
+    3. Works correctly for slices contained within a single volume
+    4. Maintains correctness while providing performance benefits
+    """
+    import tempfile
+
+    # Use LocalRankStrategy with 2 storage volumes (no RDMA, no parametrization)
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
+    os.environ["LOCAL_RANK"] = "0"  # Required by LocalRankStrategy
+
+    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
+
+    # Create a tensor that will be sharded across 2 volumes
+    # 8x6 tensor, when sharded by 2 actors along dim 0 gives 4x6 slices per volume
+    # Volume 0: rows 0-3, Volume 1: rows 4-7
+    original_tensor = torch.arange(48).reshape(8, 6).float()
+
+    with tempfile.TemporaryDirectory() as filesystem_store_dir:
+        put_mesh = None
+        try:
+            # Store DTensor across 2 volumes using Shard(0)
+            put_mesh = await spawn_actors(
+                2,
+                DTensorActor,
+                "slice_test_mesh",
+                mesh_shape=(2,),
+                original_tensor=original_tensor,
+                placements=[Shard(0)],
+                file_store_name=os.path.join(filesystem_store_dir, "slice_test"),
+                visible_devices="0,1",
+            )
+
+            await put_mesh.do_put.call()
+
+            # Test 1: Cross-volume slice (spans both volumes)
+            # Request rows 2-5 (spans volume boundary at row 4)
+            cross_volume_slice = TensorSlice(
+                offsets=(2, 1),
+                coordinates=(),
+                global_shape=(8, 6),
+                local_shape=(4, 4),  # 4 rows, 4 cols
+                mesh_shape=(),
+            )
+
+            cross_volume_result = await ts.get("test_key", tensor_slice_spec=cross_volume_slice)
+            expected_cross_volume = original_tensor[2:6, 1:5]
+
+            assert torch.equal(cross_volume_result, expected_cross_volume)
+            assert cross_volume_result.shape == (4, 4)
+
+            # Test 2: Single-volume slice (contained within volume 0)
+            # Request rows 1-2 (only from volume 0)
+            single_volume_slice = TensorSlice(
+                offsets=(1, 0),
+                coordinates=(),
+                global_shape=(8, 6),
+                local_shape=(2, 3),  # 2 rows, 3 cols
+                mesh_shape=(),
+            )
+
+            single_volume_result = await ts.get("test_key", tensor_slice_spec=single_volume_slice)
+            expected_single_volume = original_tensor[1:3, 0:3]
+
+            assert torch.equal(single_volume_result, expected_single_volume)
+            assert single_volume_result.shape == (2, 3)
+
+            # Test 3: Verify full tensor retrieval still works
+            full_tensor = await ts.get("test_key")
+            assert torch.equal(original_tensor, full_tensor)
+
+        finally:
+            if put_mesh is not None:
+                await put_mesh.destroy_process_group.call()
+                await put_mesh._proc_mesh.stop()
+            await ts.shutdown()
+
+
 if __name__ == "__main__":
     main(__file__)
