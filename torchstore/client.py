@@ -18,8 +18,6 @@ from torchstore.utils import assemble_global_tensor, get_local_tensor
 logger = getLogger(__name__)
 
 
-
-
 class LocalClient:
     """This class represents the local store, which exists on every process. Remote storage
     is handled by the client.
@@ -71,8 +69,9 @@ class LocalClient:
         if stored_object_type is ObjectType.TENSOR:
             full_tensor = await self._get_tensor(key)
         else:
-            # What we stored is a DTensor. Assume we also want to get a TensorSlice for distributed tensor here.
-            # TODO: may need consolidation.
+            # Strored object is a DTensor. Return full tensor if
+            # inplace_tensor is None, or return DTensor if inplace_tensor
+            # is DTensor.
             request = Request.from_any(inplace_tensor)
             full_tensor = await self._get_distributed_whole_tensor(
                 key, request.tensor_slice
@@ -264,7 +263,9 @@ class LocalClient:
                 )
                 partial_results.append((local_tensor, tensor_slice))
         if not partial_results:
-            raise RuntimeError(f"No tensor slices found for key '{key}' that intersect with the requested slice")
+            raise RuntimeError(
+                f"No tensor slices found for key '{key}' that intersect with the requested slice"
+            )
 
         # build the entire tensor.
         # TODO: again, we should have better control over

@@ -481,7 +481,9 @@ async def test_dtensor_fetch_slice():
                 mesh_shape=(),
             )
 
-            cross_volume_result = await ts.get("test_key", tensor_slice_spec=cross_volume_slice)
+            cross_volume_result = await ts.get(
+                "test_key", tensor_slice_spec=cross_volume_slice
+            )
             expected_cross_volume = original_tensor[2:6, 1:5]
 
             assert torch.equal(cross_volume_result, expected_cross_volume)
@@ -497,7 +499,9 @@ async def test_dtensor_fetch_slice():
                 mesh_shape=(),
             )
 
-            single_volume_result = await ts.get("test_key", tensor_slice_spec=single_volume_slice)
+            single_volume_result = await ts.get(
+                "test_key", tensor_slice_spec=single_volume_slice
+            )
             expected_single_volume = original_tensor[1:3, 0:3]
 
             assert torch.equal(single_volume_result, expected_single_volume)
