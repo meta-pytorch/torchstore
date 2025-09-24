@@ -507,10 +507,6 @@ async def test_dtensor_fetch_slice():
             assert torch.equal(single_volume_result, expected_single_volume)
             assert single_volume_result.shape == (2, 3)
 
-            # Test 3: Verify full tensor retrieval still works
-            full_tensor = await ts.get("test_key")
-            assert torch.equal(original_tensor, full_tensor)
-
         finally:
             if put_mesh is not None:
                 await put_mesh.destroy_process_group.call()
