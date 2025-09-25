@@ -136,7 +136,7 @@ async def test_objects(strategy_params, use_rdma):
 
     try:
         for idx in range(volume_world_size):
-            actor = actor_mesh_0.slice(**{"hosts": 0, "gpus": idx})
+            actor = actor_mesh_0.slice(gpus=idx)
             await actor.put.call(MyTestObject(idx))
 
         for rank_offset in (0, 1):
@@ -196,7 +196,7 @@ async def test_exists(strategy_params, use_rdma):
         # Test 2: Store tensors and check existence
         tensor = torch.tensor([1, 2, 3, 4, 5])
         for rank in range(volume_world_size):
-            actor = actor_mesh.slice(**{"hosts": 0, "gpus": rank})
+            actor = actor_mesh.slice(gpus=rank)
             await actor.put.call(f"tensor_key_{rank}", tensor)
 
         for rank in range(volume_world_size):
@@ -207,7 +207,7 @@ async def test_exists(strategy_params, use_rdma):
         # Test 3: Store objects and check existence
         obj = {"rank": 0, "data": [1, 2, 3]}
         for rank in range(volume_world_size):
-            actor = actor_mesh.slice(**{"hosts": 0, "gpus": rank})
+            actor = actor_mesh.slice(gpus=rank)
             await actor.put.call(f"object_key_{rank}", obj)
 
         for rank in range(volume_world_size):
@@ -340,7 +340,7 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         key = "test_tensor"
 
         # Store the tensor using put actor mesh
-        put_actor = put_actor_mesh.slice(**{"hosts": 0, "gpus": 0})
+        put_actor = put_actor_mesh.slice(gpus=0)
         await put_actor.put.call(key, test_tensor)
 
         # Test full tensor retrieval using get actor mesh
@@ -470,9 +470,13 @@ async def test_large_tensors():
     # controller code
     await ts.initialize()
     actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
-    await actor.put.call_one()
-    await actor.get.call_one()
-    # TODO: assert equal tensors from put/get
+    try:
+        await actor.put.call_one()
+        await actor.get.call_one()
+        # TODO: assert equal tensors from put/get
+    finally:
+        await actor._proc_mesh.stop()
+        await ts.shutdown()
 
 
 @pytest.mark.asyncio
