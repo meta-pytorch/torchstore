@@ -171,7 +171,7 @@ class Controller(Actor):
     @endpoint
     def notify_delete(self, key: str, storage_volume_id: str) -> None:
         """
-        Notify the controller that data has been deleted from a storage volume.
+        Notify the controller that deletion of data is initiated in a storage volume.
 
         This should called after a successful delete operation to
         maintain the distributed storage index.

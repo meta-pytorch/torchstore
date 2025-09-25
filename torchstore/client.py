@@ -137,8 +137,10 @@ class LocalClient:
 
         async def delete_from_volume(volume_id: str):
             volume = self.strategy.get_storage_volume(volume_id)
-            await volume.delete.call(key)
+            # Notify should come before the actual delete, so that the controller
+            # doesn't think the key is still in the store when delete is happening.
             await self._controller.notify_delete.call_one(key, volume_id)
+            await volume.delete.call(key)
 
         await asyncio.gather(
             *[delete_from_volume(volume_id) for volume_id in volume_map]
