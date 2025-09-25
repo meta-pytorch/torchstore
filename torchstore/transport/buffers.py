@@ -208,9 +208,7 @@ class RDMATransportBuffer(TransportBuffer):
         # TODO: gather instead of reading sequentially
         try:
             for idx, chunk in enumerate(chunked_byte_view):
-                c = chunk.clone()
-                await self.rdma_buffers[idx].write_from(c)
-                print(c)
+                await self.rdma_buffers[idx].write_from(chunk)
         except Exception as e:
             logging.exception(
                 f"Failed write_from, {tensor.shape=}, {tensor.dtype=}", exc_info=e
