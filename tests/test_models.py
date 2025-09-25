@@ -91,10 +91,14 @@ class ModelTest(Actor):
 
     @endpoint
     async def do_push(self):
-        model, optimizer = self.build_model()
+        # model, optimizer = self.build_model()
+        # state_dict = {
+        #     "model": model.state_dict(),
+        #     "optimizer": optimizer.state_dict(),
+        # }
+
         state_dict = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "T": torch.rand((151936, 2048), dtype=torch.float32)
         }
 
         if self.world_size > 1:
@@ -107,10 +111,14 @@ class ModelTest(Actor):
 
     @endpoint
     async def do_get(self):
-        model, optimizer = self.build_model()
+        # model, optimizer = self.build_model()
+        # state_dict = {
+        #     "model": model.state_dict(),
+        #     "optimizer": optimizer.state_dict(),
+        # }
+
         state_dict = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "T": torch.rand((151936, 2048), dtype=torch.float32)
         }
 
         if self.world_size > 1:

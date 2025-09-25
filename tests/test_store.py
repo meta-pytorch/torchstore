@@ -336,7 +336,7 @@ async def test_large_tensors():
                 size_mbytes = (
                     math.prod(shape) * 4 // (1024 * 1024)
                 )  # float32 is 4 bytes, // mb
-                tensor = torch.randn(shape, dtype=torch.float32)
+                tensor = torch.randn(shape, dtype=torch.float32, requires_grad=False)
 
                 logger.info(f"Put {n=} {size_mbytes=}")
                 t = time.perf_counter()

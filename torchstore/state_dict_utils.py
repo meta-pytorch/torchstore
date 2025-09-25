@@ -65,23 +65,6 @@ async def get_state_dict(
             inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
         )
 
-    # # Prepare all the coroutines first
-    # coros = []
-    # keys = []
-    # for flattened_key in fetched_mapping.keys():
-    #     inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
-    #     keys.append(flattened_key)
-    #     coros.append(
-    #         store.get(
-    #             f"{key}{DELIM}{flattened_key}",
-    #             inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
-    #         )
-    #     )
-    # # Run all requests concurrently
-    # results = await asyncio.gather(*coros)
-    # # Build the result dictionary
-    # fetched_state_dict = dict(zip(keys, results))
-
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
 
 def _state_dict_size(state_dict):

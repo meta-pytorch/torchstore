@@ -181,6 +181,7 @@ class InMemoryStore(StorageImpl):
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
 
+        print("tensor")
         self.kv[key] = tensor
 
     async def get(
@@ -229,4 +230,4 @@ class InMemoryStore(StorageImpl):
         if "tensor" in val:
             return val["tensor"].shape, val["tensor"].dtype
 
-        raise RuntimeError(f"Unknown type for {key} type={type(val)}")
+        raise RuntimeError(f"Unknown type for {key} type={type(val)} {val=}")

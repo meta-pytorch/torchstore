@@ -34,7 +34,7 @@ class LocalClient:
         self._controller = controller
         self.strategy = strategy
 
-    @torch.no_grad
+    # @torch.no_grad()
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
         latency_tracker = LatencyTracker(f"put:{key}")
         request = Request.from_any(value)
@@ -54,7 +54,7 @@ class LocalClient:
         latency_tracker.track_e2e()
 
 
-    @torch.no_grad
+    # @torch.no_grad()
     async def get(
         self,
         key: str,

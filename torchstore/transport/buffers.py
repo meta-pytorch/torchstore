@@ -27,21 +27,14 @@ except ImportError:
 
 # Check for misspelled environment variable for backward compatibility
 rdma_chunk_size_env = os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB")
-if rdma_chunk_size_env is not None:
-    logging.warning(
-        "Using deprecated environment variable 'TORCHSTORE_RDMDA_CHUNK_SIZE_MB'. "
-        "Please use 'TORCHSTORE_RDMA_CHUNK_SIZE_MB' instead."
-    )
-    RDMA_CHUNK_SIZE_MB: int = int(rdma_chunk_size_env)
-else:
-    RDMA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "4"))
 
+RDMA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "512"))
 assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
 
 def rdma_available() -> bool:
     rdma_enabled = (
-        os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
+        os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
     )  # TODO: enable on this build
     return rdma_enabled and monarch_rdma_available()
 
@@ -60,7 +53,7 @@ class TransportBuffer:
 
     def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
         """Allocates internal buffers based on either an existing tensor
-        or a Tuple of (shape, dtype)
+            or a Tuple of (shape, dtype)
         """
         raise NotImplementedError()
 
@@ -113,8 +106,8 @@ class RDMATransportBuffer(TransportBuffer):
         """Allocates internal buffers based on either an existing tensor
         or a Tuple of (shape, dtype)
         """
-        logging.debug("Allocating rdma buffer")
 
+        #TODO: why is tensor_like a 
         if isinstance(tensor_like, str) or tensor_like is None:
             # tensor is just an object, nothing to allocte
             return
@@ -124,7 +117,9 @@ class RDMATransportBuffer(TransportBuffer):
         else:
             # we have an inplace tensor, allocate a copy
             assert isinstance(tensor_like, torch.Tensor)
-            tensor = torch.empty_like(tensor_like)
+            tensor = torch.empty_like(tensor_like, memory_format=torch.torch.contiguous_format)
+
+        #TODO: do we need this tensor???
 
         # store tensor meta
         self.shape = tensor.shape
@@ -133,12 +128,19 @@ class RDMATransportBuffer(TransportBuffer):
 
         self._assert_valid_tensor(tensor)
 
+        
         byte_view_chunks = self._create_byte_views_from_tensor(tensor)
-        self.tensor_refs = [torch.empty_like(chunk) for chunk in byte_view_chunks]
+        self.tensor_refs = [
+            torch.empty_like(chunk, memory_format=torch.torch.contiguous_format) for chunk in byte_view_chunks
+        ]
+        
         self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
 
         chunk_sizes = set()
-        for chunk in self.tensor_refs:
+        for idx, chunk in enumerate(self.tensor_refs):
+            chunk_size = chunk.numel() * chunk.element_size()
+            buffer_size = self.rdma_buffers[idx].size()          
+            assert chunk_size == buffer_size, f"{chunk_size=} != {buffer_size=}"
             chunk_sizes.add(chunk.shape)
         logging.debug(f"Allocted {len(self.rdma_buffers)} rdma buffers {chunk_sizes=}")
 
@@ -155,6 +157,12 @@ class RDMATransportBuffer(TransportBuffer):
         assert self.rdma_buffers is not None
 
         chunked_byte_view = self._create_byte_views_from_tensor(tensor)
+        chunk_sizes = set()
+        for chunk in chunked_byte_view:
+            chunk_sizes.add(chunk.shape)
+        logging.debug(
+            f"Read side allocs: {len(self.rdma_buffers)} rdma buffers {chunk_sizes=}"
+        )
 
         # if we have tensor refs locally, we're still in the local case,
         # and we're just copying over our chunks into the tensor from
@@ -168,6 +176,7 @@ class RDMATransportBuffer(TransportBuffer):
         # TODO: gather instead of reading sequentially
         try:
             for idx, chunk in enumerate(chunked_byte_view):
+                assert chunk.numel() * chunk.element_size() == self.rdma_buffers[idx].size()
                 await self.rdma_buffers[idx].read_into(chunk)
         except Exception as e:
             logging.exception(
@@ -185,6 +194,7 @@ class RDMATransportBuffer(TransportBuffer):
         self._assert_valid_tensor(tensor)
         assert self.rdma_buffers is not None
 
+    
         chunked_byte_view = self._create_byte_views_from_tensor(tensor)
 
         # if we have tensor refs locally, we're still in the local case,
@@ -196,8 +206,16 @@ class RDMATransportBuffer(TransportBuffer):
         # else: we are in the remote case (in a different process), and must read from
         # the rdma buffer
         # TODO: gather instead of reading sequentially
-        for idx, chunk in enumerate(chunked_byte_view):
-            await self.rdma_buffers[idx].write_from(chunk)
+        try:
+            for idx, chunk in enumerate(chunked_byte_view):
+                c = chunk.clone()
+                await self.rdma_buffers[idx].write_from(c)
+                print(c)
+        except Exception as e:
+            logging.exception(
+                f"Failed write_from, {tensor.shape=}, {tensor.dtype=}", exc_info=e
+            )
+            raise e
 
 
 class MonarchTransportBuffer(TransportBuffer):
