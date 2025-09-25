@@ -8,6 +8,7 @@ from logging import getLogger
 from typing import Any, Union
 
 import torch
+from monarch._src.actor.actor_mesh import ActorError
 from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
@@ -30,6 +31,22 @@ class LocalClient:
     ):
         self._controller = controller
         self.strategy = strategy
+
+    async def _locate_volumes(self, key: str):
+        """Helper method to call locate_volumes and convert ActorError to KeyError for missing keys."""
+        try:
+            return await self._controller.locate_volumes.call_one(key)
+        except ActorError as e:
+            # Check if the wrapped exception contains KeyError and convert it to KeyError with the content after
+            error_str = str(e)
+            if "KeyError: " in error_str:
+                # Extract the content after "KeyError: " and re-raise as plain KeyError
+                keyerror_content = error_str.split("KeyError: ", 1)[-1]
+                # Remove surrounding quotes and whitespace more explicitly
+                keyerror_content = keyerror_content.strip()
+                raise KeyError(keyerror_content) from e  # Use exception chaining
+            # Re-raise if it's not a KeyError
+            raise e
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
@@ -187,13 +204,13 @@ class LocalClient:
 
     async def _get_stored_object_type(self, key: str) -> ObjectType | None:
         """Peek into storage info for the given key and return the stored object type."""
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_map = await self._locate_volumes(key)
         for storage_info in volume_map.values():
             return storage_info.object_type
         raise ValueError(f"Unable to get stored object type for key `{key}`")
 
     async def _get_object(self, key: str):
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_map = await self._locate_volumes(key)
         volume_id, _ = volume_map.popitem()
         storage_volume = self.strategy.get_storage_volume(volume_id)
         pipe = Pipe(storage_volume)
@@ -202,7 +219,7 @@ class LocalClient:
 
     async def _get_tensor(self, key: str) -> torch.Tensor:
         """Fetches the tensor which is stored in one volume storage"""
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_map = await self._locate_volumes(key)
 
         # if the storage is a Tensor instead of DTensor, just fetch and return it.
         for volume_id, _ in volume_map.items():
@@ -216,7 +233,7 @@ class LocalClient:
     async def _get_distributed_whole_tensor(self, key: str) -> torch.Tensor:
         """Fetches slices from all volume storages and stitch together to return the whole tensor"""
 
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_map = await self._locate_volumes(key)
         # Handle the tensor case
         partial_results = []
         for volume_id, storage_info in volume_map.items():
