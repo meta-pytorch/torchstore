@@ -258,7 +258,7 @@ async def test_exists(strategy_params, use_rdma):
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_get_tensor_slice(strategy_params, use_rdma):
-    """Test tensor slice API functionality"""
+    """Test tensor slice API functionality including in-place operations"""
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
     class TensorSlicePutActor(Actor):
@@ -312,42 +312,28 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         assert torch.equal(tensor_slice, expected_slice)
         assert tensor_slice.shape == (50, 100)
 
-    finally:
-        await put_actor_mesh._proc_mesh.stop()
-        await ts.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_tensor_slice_inplace():
-    """Test tensor slice API with in-place operations"""
-    await ts.initialize(num_storage_volumes=1)
-
-    try:
-        # Store a test tensor
-        test_tensor = torch.randn(100, 200)
-        await ts.put("inplace_test", test_tensor)
-
         # Test in-place retrieval with slice
-        slice_spec = TensorSlice(
-            offsets=(10, 20),
+        inplace_slice_spec = TensorSlice(
+            offsets=(200, 300),
             coordinates=(),
-            global_shape=(100, 200),
-            local_shape=(30, 40),
+            global_shape=(1000, 2000),
+            local_shape=(80, 120),
             mesh_shape=(),
         )
 
         # Create pre-allocated buffer
-        slice_buffer = torch.empty(30, 40)
+        slice_buffer = torch.empty(80, 120)
         result = await ts.get(
-            "inplace_test", inplace_tensor=slice_buffer, tensor_slice_spec=slice_spec
+            key, inplace_tensor=slice_buffer, tensor_slice_spec=inplace_slice_spec
         )
 
         # Verify in-place operation
         assert result is slice_buffer
-        expected_slice = test_tensor[10:40, 20:60]
-        assert torch.equal(slice_buffer, expected_slice)
+        expected_inplace_slice = test_tensor[200:280, 300:420]
+        assert torch.equal(slice_buffer, expected_inplace_slice)
 
     finally:
+        await put_actor_mesh._proc_mesh.stop()
         await ts.shutdown()
 
 
