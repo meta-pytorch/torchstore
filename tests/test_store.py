@@ -222,6 +222,87 @@ async def test_exists(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
+async def test_delete(strategy_params, use_rdma):
+    """Test the delete() API functionality"""
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+
+    class DeleteTestActor(Actor):
+        """Actor for testing delete functionality."""
+
+        def __init__(self, world_size):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            # required by LocalRankStrategy
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def put(self, key, value):
+            await ts.put(key, value)
+
+        @endpoint
+        async def delete(self, key):
+            await ts.delete(key)
+
+        @endpoint
+        async def exists(self, key):
+            return await ts.exists(key)
+
+        @endpoint
+        async def get(self, key):
+            return await ts.get(key)
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+
+    # Spawn test actors
+    actor_mesh = await spawn_actors(
+        volume_world_size,
+        DeleteTestActor,
+        "delete_test_actors",
+        world_size=volume_world_size,
+    )
+
+    try:
+        # Test 1: Store tensors, verify they exist, then delete them
+        tensor = torch.tensor([1, 2, 3, 4, 5])
+        for rank in range(volume_world_size):
+            actor = actor_mesh.slice(gpus=rank)
+            await actor.put.call(f"tensor_key_{rank}", tensor)
+
+        # Verify all tensors exist
+        for rank in range(volume_world_size):
+            results = await actor_mesh.exists.call(f"tensor_key_{rank}")
+            for _, exists_result in results:
+                assert exists_result
+
+        # Delete tensors one at a time and verify each deletion
+        for rank in range(volume_world_size):
+            actor = actor_mesh.slice(gpus=rank)
+            await actor.delete.call(f"tensor_key_{rank}")
+
+            # Verify this specific tensor no longer exists
+            results = await actor_mesh.exists.call(f"tensor_key_{rank}")
+            for _, exists_result in results:
+                assert not exists_result
+
+            # Verify other tensors still exist (if any remain)
+            for other_rank in range(rank + 1, volume_world_size):
+                results = await actor_mesh.exists.call(f"tensor_key_{other_rank}")
+                for _, exists_result in results:
+                    assert exists_result
+
+        # Test 2: Try to get deleted tensor (should raise exception)
+        with pytest.raises(Exception):
+            await actor_mesh.get.call("tensor_key_0")
+
+    finally:
+        await actor_mesh._proc_mesh.stop()
+        await ts.shutdown()
+
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
 async def test_get_tensor_slice(strategy_params, use_rdma):
     """Test tensor slice API functionality including in-place operations"""
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
