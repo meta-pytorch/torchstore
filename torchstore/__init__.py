@@ -9,6 +9,7 @@ from logging import getLogger
 
 from torchstore.api import (
     client,
+    delete,
     exists,
     get,
     get_state_dict,
@@ -43,6 +44,7 @@ __all__ = [
     "init_logging",
     "put",
     "get",
+    "delete",
     "keys",
     "exists",
     "client",
