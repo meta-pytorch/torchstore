@@ -18,6 +18,8 @@ from torchstore.transport.buffers import (
     rdma_available,
     RDMATransportBuffer,
     TransportBuffer,
+    TorchCommsTransportBuffer,
+    torchcomms_available
 )
 
 logger = getLogger(__name__)
@@ -138,6 +140,8 @@ class Pipe:
 
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
+        if torch_comms_ab
+        
         if rdma_available():
             buffer_cls = RDMATransportBuffer
         else:

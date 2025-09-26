@@ -20,6 +20,17 @@ except ImportError:
             "RDMABuffer is not available. This environemnt was likely not built with tensor_engine supoprt."
         )
 
+try:
+    from torchcomms import new_comm
+    torchcomms_available = lambda: True
+except ImportError:
+    torchcomms_available = lambda: False
+
+    def new_comm(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError(
+            "Torchcomms not available, please install torchcomms to use torchcomms transport"
+        )
+
 
 # TODO: for some reason, RDMABuffer is breaking for certain tensors on the HF models (qwen, llama)
 # but setting this chunk size works around the issue until we can fix it
@@ -28,7 +39,7 @@ except ImportError:
 # Check for misspelled environment variable for backward compatibility
 rdma_chunk_size_env = os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB")
 
-RDMA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "512"))
+RDMA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "4"))
 assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
 
@@ -62,6 +73,24 @@ class TransportBuffer:
 
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
         raise NotImplementedError()
+
+
+class TorchCommsTransportBuffer(TransportBuffer):    
+
+    finalize: bool = True
+
+    @classmethod
+    def setup(cls,):
+        from torchcomms import new_comm
+        torchcomm = new_comm("ncclx", device, name="main_comm")
+
+
+
+    def __init__(self) -> None:
+        self.tensor: Optional[torch.Tensor] = None
+
+    def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
+        """In the case of using torch comms, we don't
 
 
 class RDMATransportBuffer(TransportBuffer):
@@ -143,6 +172,7 @@ class RDMATransportBuffer(TransportBuffer):
             assert chunk_size == buffer_size, f"{chunk_size=} != {buffer_size=}"
             chunk_sizes.add(chunk.shape)
         logging.debug(f"Allocted {len(self.rdma_buffers)} rdma buffers {chunk_sizes=}")
+        print(f"Allocted {len(self.rdma_buffers)} rdma buffers {chunk_sizes=}")
 
     def update(self, other_buffer: "TransportBuffer") -> None:
         super().update(other_buffer)

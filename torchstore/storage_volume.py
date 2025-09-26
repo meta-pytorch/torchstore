@@ -183,10 +183,8 @@ class InMemoryStore(StorageImpl):
         tensor = await transport_buffer.read_into(tensor=None)
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
-            print(f"{key=} dtensor")
             return
 
-        print(f"{key=} tensor")
         self.kv[key] = tensor
 
     async def get(

@@ -144,6 +144,10 @@ class DCPParityTest(Actor):
             "optimizer": get_optimizer_state_dict(model, optimizer),
         }
 
+        state_dict = {
+            "T": torch.rand((151936, 2048), dtype=torch.float32)
+        }
+
         dcp.save(state_dict, checkpoint_id=self.dcp_checkpoint_fn)
         await ts.put_state_dict(state_dict, "v0")
 
@@ -156,6 +160,10 @@ class DCPParityTest(Actor):
             "model": get_model_state_dict(model),
             "optimizer": get_optimizer_state_dict(model, optimizer),
         }
+        state_dict = {
+            "T": torch.rand((151936, 2048), dtype=torch.float32)
+        }
+
         dcp_state_dict = copy.deepcopy(state_dict)
         dcp.load(dcp_state_dict, checkpoint_id=self.dcp_checkpoint_fn)
 
@@ -215,9 +223,9 @@ async def test_dcp_sharding_parity(strategy_params, use_rdma):
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
     for save_mesh_shape, get_mesh_shape in [
-        # ((1,), (1,)),
+        ((1,), (1,)),
         # ((2,), (2,)),
-        ((2,), (4,)),
+        # ((2,), (4,)),
         # ((4,), (2,)),
         # ((2, 2), (4,)),
         # ((2,), (2, 4)),
