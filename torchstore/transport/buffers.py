@@ -6,6 +6,8 @@
 
 import logging
 import os
+import uuid
+
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -20,6 +22,7 @@ except ImportError:
             "RDMABuffer is not available. This environemnt was likely not built with tensor_engine supoprt."
         )
 
+logger = logging.getLogger(__name__)
 
 # TODO: for some reason, RDMABuffer is breaking for certain tensors on the HF models (qwen, llama)
 # but setting this chunk size works around the issue until we can fix it
@@ -62,6 +65,99 @@ class TransportBuffer:
 
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
         raise NotImplementedError()
+
+
+
+local_pgs = {}
+
+class TorchDistributedBuffer(TransportBuffer):
+
+    requires_meta: bool = True
+    def __init__(self) -> None:
+        self.shape: Optional[torch.Size] = None
+        self.dtype: Optional[torch.dtype] = None
+        self.fut: Optional[torch.futures.Future] = None
+        self.pg: Optional[torch.distributed.ProcessGroup] = None
+
+    def __getstate__(self) -> Dict[str, Any]:
+        # Any time that we serialize the transport buffer, the idea is
+        # that tensors will be transported via tensor_enginer.RDMABuffer, so it makes
+        # no sense to hold this reference when we are serializing
+        state = self.__dict__.copy()
+        state["fut"] = None
+        state["pg"] = None
+        return state
+
+    async def handshake(self, storage_volume):
+        if storage_volume.volume_id not in local_pgs:
+            #TODO: TCPStore
+            file_store_name = f"/tmp/lpasqualin/comms_test{str(uuid.uuid4())[:8]}"
+            self.file_store_name = file_store_name
+            logger.info(
+                f"Initiating pg handshake between {storage_volume.volume_id}"
+                f" and {storage_volume.client_id} using id={file_store_name}"
+            )
+            
+            handshake_fut = storage_volume.handshake.call(file_store_name)
+            try:
+                pg = torch.distributed.init_process_group(
+                    backend="gloo",
+                    init_method=f"file://{file_store_name}",
+                    group_name=file_store_name,
+                    rank=0,
+                    world_size=2,
+                )
+                local_pgs[storage_volume.volume_id] = pg
+            finally:
+                await handshake_fut
+
+        self.pg = local_pgs[storage_volume.volume_id]
+
+    def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
+        """Allocates internal buffers based on either an existing tensor
+        or a Tuple of (shape, dtype)
+        """
+        if isinstance(tensor_like, str) or tensor_like is None:
+            # tensor is just an object, nothing to allocte
+            return
+        elif isinstance(tensor_like, Tuple):
+            # we know the size of the tensor from fetching metadata
+            self.shape = tensor_like[0]
+            self.dtype = tensor_like[1]
+        else:
+            # we have an inplace tensor, allocate a copy
+            assert isinstance(tensor_like, torch.Tensor)
+            self.shape = tensor_like.shape   
+            self.dtype = tensor_like.dtype
+        
+
+    # send
+    async def read_into(self, tensor: Optional[torch.Tensor] = None, pg=None) -> torch.Tensor:
+        if tensor is None:
+            tensor = torch.empty(self.shape, dtype=self.dtype)
+        
+        assert self.fut is None
+        pg = pg or self.pg
+        self.fut = torch.distributed.irecv(tensor, src=0, group=pg)
+        
+        return tensor            
+
+    # recv
+    async def write_from(self, tensor: Optional[torch.Tensor],pg=None) -> None:
+        assert self.fut is None
+        pg = pg or self.pg
+        self.fut = torch.distributed.isend(tensor, dst=1, group=pg)
+        
+    def finish(self):
+        assert self.fut is not None
+        self.fut.wait()
+
+    # def update(self, other_buffer: "TransportBuffer") -> None:
+    #     super().update(other_buffer)
+    #     self.tensor = other_buffer.tensor
+
+
+    
 
 
 class RDMATransportBuffer(TransportBuffer):
@@ -142,7 +238,7 @@ class RDMATransportBuffer(TransportBuffer):
             buffer_size = self.rdma_buffers[idx].size()          
             assert chunk_size == buffer_size, f"{chunk_size=} != {buffer_size=}"
             chunk_sizes.add(chunk.shape)
-        logging.debug(f"Allocted {len(self.rdma_buffers)} rdma buffers {chunk_sizes=}")
+        logger.debug(f"Allocted {len(self.rdma_buffers)} rdma buffers {chunk_sizes=}")
 
     def update(self, other_buffer: "TransportBuffer") -> None:
         super().update(other_buffer)
@@ -160,7 +256,7 @@ class RDMATransportBuffer(TransportBuffer):
         chunk_sizes = set()
         for chunk in chunked_byte_view:
             chunk_sizes.add(chunk.shape)
-        logging.debug(
+        logger.debug(
             f"Read side allocs: {len(self.rdma_buffers)} rdma buffers {chunk_sizes=}"
         )
 
@@ -179,7 +275,7 @@ class RDMATransportBuffer(TransportBuffer):
                 assert chunk.numel() * chunk.element_size() == self.rdma_buffers[idx].size()
                 await self.rdma_buffers[idx].read_into(chunk)
         except Exception as e:
-            logging.exception(
+            logger.exception(
                 f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e
             )
             raise e
@@ -210,7 +306,7 @@ class RDMATransportBuffer(TransportBuffer):
             for idx, chunk in enumerate(chunked_byte_view):
                 await self.rdma_buffers[idx].write_from(chunk)
         except Exception as e:
-            logging.exception(
+            logger.exception(
                 f"Failed write_from, {tensor.shape=}, {tensor.dtype=}", exc_info=e
             )
             raise e

@@ -18,6 +18,7 @@ from torchstore.transport.buffers import (
     rdma_available,
     RDMATransportBuffer,
     TransportBuffer,
+    TorchDistributedBuffer
 )
 
 logger = getLogger(__name__)
@@ -136,16 +137,22 @@ class Pipe:
     def __init__(self, storage_volume) -> None:
         self.storage_volume = storage_volume
 
-    def create_transport_buffer(self) -> TransportBuffer:
+    async def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
+        
+        #TODO:
+        if True:
+            buffer = TorchDistributedBuffer()
+            await buffer.handshake(self.storage_volume)
+            return buffer
         if rdma_available():
-            buffer_cls = RDMATransportBuffer
-        else:
-            buffer_cls = MonarchTransportBuffer
-        return buffer_cls()
+            return RDMATransportBuffer()
+        
+        return MonarchTransportBuffer()
+
 
     async def put_to_storage_volume(self, key, request: Request):
-        transport_buffer = self.create_transport_buffer()
+        transport_buffer = await self.create_transport_buffer()
         tensor = request.tensor_val
 
         transport_buffer.allocate(tensor)
@@ -156,10 +163,11 @@ class Pipe:
         await self.storage_volume.put.call_one(
             key, transport_buffer, request.meta_only()
         )
+        transport_buffer.finish()
 
     async def get_from_storage_volume(self, key, request: Request):
 
-        transport_buffer = self.create_transport_buffer()
+        transport_buffer = await self.create_transport_buffer()
 
         # Certain buffers (RDMA) need to know the size of the tensor
         # so we can allocate the right amount of memory locally.
@@ -171,6 +179,9 @@ class Pipe:
         else:
             transport_buffer.allocate(request.tensor_val)
 
+        if isinstance(transport_buffer, TorchDistributedBuffer):
+            t = await transport_buffer.read_into(request.tensor_val)
+
         # TODO: consider placing the buffer inside the request or vice versa
         transport_buffer.update(
             await self.storage_volume.get.call_one(
@@ -180,5 +191,9 @@ class Pipe:
 
         if transport_buffer.is_object:
             return transport_buffer.objects
+
+        if isinstance(transport_buffer, TorchDistributedBuffer):
+            transport_buffer.finish()
+            return t
 
         return await transport_buffer.read_into(request.tensor_val)

@@ -92,7 +92,10 @@ class TorchStoreStrategy:
             StorageVolume: The storage volume actor for the given ID.
         """
         volume_coord = self.volume_id_to_coord[volume_id]
-        return self.storage_volumes.slice(**volume_coord)
+        storage_volume = self.storage_volumes.slice(**volume_coord)
+        storage_volume.volume_id = volume_id
+        storage_volume.client_id = self.get_client_id()
+        return storage_volume
 
 
 class SingletonStrategy(TorchStoreStrategy):

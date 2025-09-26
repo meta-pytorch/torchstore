@@ -64,7 +64,6 @@ class LocalClient:
         latency_tracker = LatencyTracker(f"get:{key}")
 
         stored_object_type = await self._get_stored_object_type(key)
-
         self._verify_get_args(inplace_tensor, tensor_slice_spec, stored_object_type)
 
         if stored_object_type is ObjectType.OBJECT:
@@ -193,6 +192,7 @@ class LocalClient:
         volume_map = await self._controller.locate_volumes.call_one(key)
         for storage_info in volume_map.values():
             return storage_info.object_type
+
         raise ValueError(f"Unable to get stored object type for key `{key}`")
 
     async def _get_object(self, key: str):
@@ -201,6 +201,7 @@ class LocalClient:
         storage_volume = self.strategy.get_storage_volume(volume_id)
         pipe = Pipe(storage_volume)
         request = Request.from_any(None)
+        
         return await pipe.get_from_storage_volume(key, request)
 
     async def _get_tensor(self, key: str) -> torch.Tensor:

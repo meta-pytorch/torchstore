@@ -31,7 +31,8 @@ class StorageVolume(Actor):
         self,
         id_func,
     ) -> None:
-        self.store: StorageImpl = InMemoryStore()
+        self.pgs = {}
+        self.store: StorageImpl = InMemoryStore(self.pgs)
         self.volume_id: str = id_func()
 
     @classmethod
@@ -68,6 +69,19 @@ class StorageVolume(Actor):
     ) -> Union[Tuple[torch.Size, torch.dtype], str]:
         return await self.store.get_meta(key, request)
 
+    @endpoint
+    async def handshake(self, file_store_name):
+        if file_store_name in self.pgs:
+            return 
+        logger.info(f"Finalizing handshake from {file_store_name}")
+        self.pgs[file_store_name] = torch.distributed.init_process_group(
+            backend="gloo",
+            init_method=f"file://{file_store_name}",
+            group_name=file_store_name,
+            rank=1,
+            world_size=2,
+        )
+        logger.info(f"Handshake succesful {file_store_name}")
 
 class StorageImpl:
     """Abstract base class for storage implementations."""
@@ -92,8 +106,9 @@ class StorageImpl:
 class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
-    def __init__(self) -> None:
+    def __init__(self, pgs) -> None:
         self.kv: Dict[str, Any] = {}
+        self.pgs = pgs
 
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")
@@ -180,13 +195,17 @@ class InMemoryStore(StorageImpl):
 
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
-        tensor = await transport_buffer.read_into(tensor=None)
+        
+        pg = self.pgs[transport_buffer.file_store_name]
+
+        tensor = await transport_buffer.read_into(tensor=None, pg=pg)
+        transport_buffer.finish()
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
             print(f"{key=} dtensor")
             return
 
-        print(f"{key=} tensor")
+        print(f"storage volume {key=} tensor {tensor}")
         self.kv[key] = tensor
 
     async def get(
@@ -204,7 +223,8 @@ class InMemoryStore(StorageImpl):
             return transport_buffer
 
         if request.tensor_slice is None:
-            await transport_buffer.write_from(self.kv[key])
+            await transport_buffer.write_from(self.kv[key], pg=self.pgs[transport_buffer.file_store_name])
+            transport_buffer.finalize()
             return transport_buffer
 
         # TODO:
