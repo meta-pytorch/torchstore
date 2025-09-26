@@ -156,7 +156,7 @@ class Pipe:
         tensor = request.tensor_val
 
         transport_buffer.allocate(tensor)
-        await transport_buffer.write_from(tensor)
+        await transport_buffer.write_from(tensor, r=1)
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
@@ -180,7 +180,7 @@ class Pipe:
             transport_buffer.allocate(request.tensor_val)
 
         if isinstance(transport_buffer, TorchDistributedBuffer):
-            t = await transport_buffer.read_into(request.tensor_val)
+            t = await transport_buffer.read_into(request.tensor_val, r=1)
 
         # TODO: consider placing the buffer inside the request or vice versa
         transport_buffer.update(

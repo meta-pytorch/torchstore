@@ -8,9 +8,12 @@ import logging
 import os
 import uuid
 
+from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+
 import torch
+from torchstore.utils import _gloo_factory
 
 try:
     from monarch.tensor_engine import is_available as monarch_rdma_available, RDMABuffer
@@ -100,12 +103,15 @@ class TorchDistributedBuffer(TransportBuffer):
             
             handshake_fut = storage_volume.handshake.call(file_store_name)
             try:
-                pg = torch.distributed.init_process_group(
-                    backend="gloo",
-                    init_method=f"file://{file_store_name}",
-                    group_name=file_store_name,
+                
+
+                file_store = torch.distributed.FileStore(file_store_name, 2)
+                pg = _gloo_factory(
+                    store=file_store,
                     rank=0,
                     world_size=2,
+                    timeout=timedelta(seconds=120),
+                    device=torch.device("cpu"),
                 )
                 local_pgs[storage_volume.volume_id] = pg
             finally:
@@ -132,21 +138,22 @@ class TorchDistributedBuffer(TransportBuffer):
         
 
     # send
-    async def read_into(self, tensor: Optional[torch.Tensor] = None, pg=None) -> torch.Tensor:
+    async def read_into(self,tensor: Optional[torch.Tensor] = None, pg=None,r=0) -> torch.Tensor:
         if tensor is None:
             tensor = torch.empty(self.shape, dtype=self.dtype)
         
         assert self.fut is None
         pg = pg or self.pg
-        self.fut = torch.distributed.irecv(tensor, src=0, group=pg)
+        self.fut = pg.recv([tensor], srcRank=r, tag=0)
+        # self.fut = torch.distributed.irecv(tensor, src=0, group=pg)
         
         return tensor            
 
     # recv
-    async def write_from(self, tensor: Optional[torch.Tensor],pg=None) -> None:
+    async def write_from(self, tensor: Optional[torch.Tensor],pg=None,r=0) -> None:
         assert self.fut is None
         pg = pg or self.pg
-        self.fut = torch.distributed.isend(tensor, dst=1, group=pg)
+        self.fut = pg.send([tensor], dstRank=r, tag=0)
         
     def finish(self):
         assert self.fut is not None

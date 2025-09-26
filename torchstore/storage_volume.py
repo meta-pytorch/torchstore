@@ -6,11 +6,14 @@
 
 from itertools import product
 from logging import getLogger
+from datetime import timedelta
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
+
 from monarch.actor import Actor, endpoint
 
+from torchstore.utils import _gloo_factory
 from torchstore.transport.buffers import TransportBuffer
 
 from torchstore.transport.pipe import Request, TensorSlice
@@ -74,13 +77,17 @@ class StorageVolume(Actor):
         if file_store_name in self.pgs:
             return 
         logger.info(f"Finalizing handshake from {file_store_name}")
-        self.pgs[file_store_name] = torch.distributed.init_process_group(
-            backend="gloo",
-            init_method=f"file://{file_store_name}",
-            group_name=file_store_name,
+
+        file_store = torch.distributed.FileStore(file_store_name, 2)
+        pg = _gloo_factory(
+            store=file_store,
             rank=1,
             world_size=2,
+            timeout=timedelta(seconds=120),
+            device=torch.device("cpu"),
         )
+        self.pgs[file_store_name] = pg
+
         logger.info(f"Handshake succesful {file_store_name}")
 
 class StorageImpl:
@@ -198,7 +205,7 @@ class InMemoryStore(StorageImpl):
         
         pg = self.pgs[transport_buffer.file_store_name]
 
-        tensor = await transport_buffer.read_into(tensor=None, pg=pg)
+        tensor = await transport_buffer.read_into(tensor=None, pg=pg, r=0)
         transport_buffer.finish()
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
@@ -223,8 +230,12 @@ class InMemoryStore(StorageImpl):
             return transport_buffer
 
         if request.tensor_slice is None:
-            await transport_buffer.write_from(self.kv[key], pg=self.pgs[transport_buffer.file_store_name])
-            transport_buffer.finalize()
+            await transport_buffer.write_from(
+                self.kv[key], 
+                pg=self.pgs[transport_buffer.file_store_name],
+                r=0
+            )
+            transport_buffer.finish()
             return transport_buffer
 
         # TODO:
