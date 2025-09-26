@@ -282,6 +282,41 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         await ts.shutdown()
 
 
+@pytest.mark.timeout(60)
+@pytest.mark.asyncio
+async def test_put_dtensor_get_full_tensor():
+    """Test basic DTensor put/get functionality with separate put and get meshes using shared DTensorActor"""
+    import tempfile
+
+    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
+
+    original_tensor = torch.arange(16).reshape(4, 4).float()
+
+    with tempfile.TemporaryDirectory() as filesystem_store_dir:
+        try:
+            put_mesh = await spawn_actors(
+                2,
+                DTensorActor,
+                "dtensor_put_mesh",
+                mesh_shape=(2,),
+                original_tensor=original_tensor,
+                placements=[Shard(0)],
+                file_store_name=os.path.join(filesystem_store_dir, "put_test"),
+                visible_devices="0,1",
+            )
+
+            await put_mesh.do_put.call()
+
+            fetched_tensor = await ts.get("test_key")
+            assert torch.equal(original_tensor, fetched_tensor)
+
+        finally:
+            # Clean up process groups
+            await put_mesh.destroy_process_group.call()
+            await put_mesh._proc_mesh.stop()
+            await ts.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_tensor_slice_inplace():
     """Test tensor slice API with in-place operations"""
@@ -393,40 +428,6 @@ async def test_large_tensors():
     finally:
         await actor._proc_mesh.stop()
         await ts.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_put_dtensor_get_full_tensor():
-    """Test basic DTensor put/get functionality with separate put and get meshes using shared DTensorActor"""
-    import tempfile
-
-    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
-
-    original_tensor = torch.arange(16).reshape(4, 4).float()
-
-    with tempfile.TemporaryDirectory() as filesystem_store_dir:
-        try:
-            put_mesh = await spawn_actors(
-                2,
-                DTensorActor,
-                "dtensor_put_mesh",
-                mesh_shape=(2,),
-                original_tensor=original_tensor,
-                placements=[Shard(0)],
-                file_store_name=os.path.join(filesystem_store_dir, "put_test"),
-                visible_devices="0,1",
-            )
-
-            await put_mesh.do_put.call()
-
-            fetched_tensor = await ts.get("test_key")
-            assert torch.equal(original_tensor, fetched_tensor)
-
-        finally:
-            # Clean up process groups
-            await put_mesh.destroy_process_group.call()
-            await put_mesh._proc_mesh.stop()
-            await ts.shutdown()
 
 
 if __name__ == "__main__":
