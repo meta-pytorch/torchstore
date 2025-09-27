@@ -136,7 +136,7 @@ async def test_objects(strategy_params, use_rdma):
 
     try:
         for idx in range(volume_world_size):
-            actor = actor_mesh_0.slice(**{"hosts": 0, "gpus": idx})
+            actor = actor_mesh_0.slice(gpus=idx)
             await actor.put.call(MyTestObject(idx))
 
         for rank_offset in (0, 1):
@@ -196,7 +196,7 @@ async def test_exists(strategy_params, use_rdma):
         # Test 2: Store tensors and check existence
         tensor = torch.tensor([1, 2, 3, 4, 5])
         for rank in range(volume_world_size):
-            actor = actor_mesh.slice(**{"hosts": 0, "gpus": rank})
+            actor = actor_mesh.slice(gpus=rank)
             await actor.put.call(f"tensor_key_{rank}", tensor)
 
         for rank in range(volume_world_size):
@@ -207,13 +207,94 @@ async def test_exists(strategy_params, use_rdma):
         # Test 3: Store objects and check existence
         obj = {"rank": 0, "data": [1, 2, 3]}
         for rank in range(volume_world_size):
-            actor = actor_mesh.slice(**{"hosts": 0, "gpus": rank})
+            actor = actor_mesh.slice(gpus=rank)
             await actor.put.call(f"object_key_{rank}", obj)
 
         for rank in range(volume_world_size):
             results = await actor_mesh.exists.call(f"object_key_{rank}")
             for pt, exists_result in results:
                 assert exists_result
+
+    finally:
+        await actor_mesh._proc_mesh.stop()
+        await ts.shutdown()
+
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_delete(strategy_params, use_rdma):
+    """Test the delete() API functionality"""
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+
+    class DeleteTestActor(Actor):
+        """Actor for testing delete functionality."""
+
+        def __init__(self, world_size):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            # required by LocalRankStrategy
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def put(self, key, value):
+            await ts.put(key, value)
+
+        @endpoint
+        async def delete(self, key):
+            await ts.delete(key)
+
+        @endpoint
+        async def exists(self, key):
+            return await ts.exists(key)
+
+        @endpoint
+        async def get(self, key):
+            return await ts.get(key)
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+
+    # Spawn test actors
+    actor_mesh = await spawn_actors(
+        volume_world_size,
+        DeleteTestActor,
+        "delete_test_actors",
+        world_size=volume_world_size,
+    )
+
+    try:
+        # Test 1: Store tensors, verify they exist, then delete them
+        tensor = torch.tensor([1, 2, 3, 4, 5])
+        for rank in range(volume_world_size):
+            actor = actor_mesh.slice(gpus=rank)
+            await actor.put.call(f"tensor_key_{rank}", tensor)
+
+        # Verify all tensors exist
+        for rank in range(volume_world_size):
+            results = await actor_mesh.exists.call(f"tensor_key_{rank}")
+            for _, exists_result in results:
+                assert exists_result
+
+        # Delete tensors one at a time and verify each deletion
+        for rank in range(volume_world_size):
+            actor = actor_mesh.slice(gpus=rank)
+            await actor.delete.call(f"tensor_key_{rank}")
+
+            # Verify this specific tensor no longer exists
+            results = await actor_mesh.exists.call(f"tensor_key_{rank}")
+            for _, exists_result in results:
+                assert not exists_result
+
+            # Verify other tensors still exist (if any remain)
+            for other_rank in range(rank + 1, volume_world_size):
+                results = await actor_mesh.exists.call(f"tensor_key_{other_rank}")
+                for _, exists_result in results:
+                    assert exists_result
+
+        # Test 2: Try to get deleted tensor (should raise exception)
+        with pytest.raises(Exception):
+            await actor_mesh.get.call("tensor_key_0")
 
     finally:
         await actor_mesh._proc_mesh.stop()
@@ -256,7 +337,7 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         key = "test_tensor"
 
         # Store the tensor using put actor mesh
-        put_actor = put_actor_mesh.slice(**{"hosts": 0, "gpus": 0})
+        put_actor = put_actor_mesh.slice(gpus=0)
         await put_actor.put.call(key, test_tensor)
 
         # Test full tensor retrieval using get actor mesh
@@ -336,7 +417,7 @@ async def test_large_tensors():
                 size_mbytes = (
                     math.prod(shape) * 4 // (1024 * 1024)
                 )  # float32 is 4 bytes, // mb
-                tensor = torch.randn(shape, dtype=torch.float32, requires_grad=False)
+                tensor = torch.randn(shape, dtype=torch.float32)
 
                 logger.info(f"Put {n=} {size_mbytes=}")
                 t = time.perf_counter()
@@ -386,9 +467,13 @@ async def test_large_tensors():
     # controller code
     await ts.initialize()
     actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
-    await actor.put.call_one()
-    await actor.get.call_one()
-    # TODO: assert equal tensors from put/get
+    try:
+        await actor.put.call_one()
+        await actor.get.call_one()
+        # TODO: assert equal tensors from put/get
+    finally:
+        await actor._proc_mesh.stop()
+        await ts.shutdown()
 
 
 @pytest.mark.asyncio

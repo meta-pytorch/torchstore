@@ -17,9 +17,8 @@ import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from torchstore.logging import init_logging
-from torchstore.utils import spawn_actors
 from torchstore.state_dict_utils import _state_dict_size
+from torchstore.utils import spawn_actors
 
 from transformers import AutoModelForCausalLM
 
@@ -91,14 +90,10 @@ class ModelTest(Actor):
 
     @endpoint
     async def do_push(self):
-        # model, optimizer = self.build_model()
-        # state_dict = {
-        #     "model": model.state_dict(),
-        #     "optimizer": optimizer.state_dict(),
-        # }
-
+        model, optimizer = self.build_model()
         state_dict = {
-            "T": torch.rand((151936, 2048), dtype=torch.float32)
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
         }
 
         if self.world_size > 1:
@@ -111,14 +106,10 @@ class ModelTest(Actor):
 
     @endpoint
     async def do_get(self):
-        # model, optimizer = self.build_model()
-        # state_dict = {
-        #     "model": model.state_dict(),
-        #     "optimizer": optimizer.state_dict(),
-        # }
-
+        model, optimizer = self.build_model()
         state_dict = {
-            "T": torch.rand((151936, 2048), dtype=torch.float32)
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
         }
 
         if self.world_size > 1:
@@ -178,13 +169,13 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
 
-            logger.info(f"do_push ")
+            logger.info("do_push ")
             await put_world.do_push.call()
 
-            
             await get_world.do_get.call()
     finally:
         await ts.shutdown()
+
 
 if __name__ == "__main__":
     main([__file__])

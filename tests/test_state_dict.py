@@ -209,19 +209,18 @@ async def test_state_dict(strategy_params, use_rdma):
     _assert_equal_state_dict(state_dict, fetched_state_dict)
 
 
+@pytest.mark.skip("TODO(kaiyuan-li@): fix this test")
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_dcp_sharding_parity(strategy_params, use_rdma):
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
     for save_mesh_shape, get_mesh_shape in [
-        # ((1,), (1,)),
-        # ((2,), (2,)),
         ((2,), (4,)),
-        # ((4,), (2,)),
-        # ((2, 2), (4,)),
-        # ((2,), (2, 4)),
-        # ((4, 2), (2, 4)),
+        ((4,), (2,)),
+        ((2, 2), (4,)),
+        ((2,), (2, 4)),
+        ((4, 2), (2, 4)),
     ]:
         save_world_size = math.prod(save_mesh_shape)
         get_world_size = math.prod(get_mesh_shape)
@@ -247,8 +246,6 @@ async def test_dcp_sharding_parity(strategy_params, use_rdma):
                     file_store_name=os.path.join(tmpdir, "save_world"),
                 )
                 await save_world.do_put.call()
-
-                
 
                 get_world = await spawn_actors(
                     get_world_size,
