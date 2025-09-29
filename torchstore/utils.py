@@ -26,9 +26,7 @@ async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
         logger.debug("Spawning actors on the local host")
         mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
         await mesh.initialized
-        actors = await mesh.spawn(
-            f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args
-        )
+        actors = mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
         return actors
 
     assert isinstance(mesh, ProcMesh)

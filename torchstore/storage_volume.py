@@ -12,9 +12,10 @@ import torch
 from monarch.actor import Actor, endpoint
 
 from torchstore.transport.buffers import TransportBuffer
-
 from torchstore.transport.pipe import Request, TensorSlice
+
 from torchstore.utils import assemble_global_tensor, spawn_actors
+
 
 logger = getLogger(__name__)
 
@@ -31,8 +32,10 @@ class StorageVolume(Actor):
         self,
         id_func,
     ) -> None:
+        init_logging()
         self.store: StorageImpl = InMemoryStore()
         self.volume_id: str = id_func()
+        self.transport_context = {}
 
     @classmethod
     async def spawn(
@@ -56,12 +59,19 @@ class StorageVolume(Actor):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
+        # something like
+        # transport_buffer.set_context(self.transport_context)
+        transport_buffer.transport_context = self.transport_context
+        transport_buffer.remote_rank = 0
         await self.store.put(key, transport_buffer, request)
 
     @endpoint
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> TransportBuffer:
+        # transport_buffer.set_context(self.transport_context)
+        transport_buffer.transport_context = self.transport_context
+        transport_buffer.remote_rank = 0
         return await self.store.get(key, transport_buffer, request)
 
     @endpoint
@@ -72,8 +82,15 @@ class StorageVolume(Actor):
     ) -> Union[Tuple[torch.Size, torch.dtype], str]:
         return await self.store.get_meta(key, request)
 
+    @endpoint
     async def delete(self, key: str) -> None:
         await self.store.delete(key)
+
+    @endpoint
+    async def setup_comms(self, transport_buffer) -> None:
+        logger.info("Initiating handshake on volume side")
+        await transport_buffer.storage_volume_setup_comms(self.transport_context)
+        logger.info("Finished initiating handshake on volume side")
 
 
 class StorageImpl:
@@ -194,6 +211,7 @@ class InMemoryStore(StorageImpl):
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
         tensor = await transport_buffer.read_into(tensor=None)
+        transport_buffer.finish()
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
@@ -216,6 +234,7 @@ class InMemoryStore(StorageImpl):
 
         if request.tensor_slice is None:
             await transport_buffer.write_from(self.kv[key])
+            transport_buffer.finish()
             return transport_buffer
 
         # TODO:
@@ -227,6 +246,7 @@ class InMemoryStore(StorageImpl):
         for shard in self.kv[key].values():
             if shard["slice"] == request.tensor_slice:
                 await transport_buffer.write_from(shard["tensor"])
+                transport_buffer.finish()
                 return transport_buffer
 
         raise RuntimeError(f"Tensor slice {request.tensor_slice} not found in {key}")
@@ -264,7 +284,6 @@ class InMemoryStore(StorageImpl):
                 f"Could not find shard slice with {request.tensor_slice=}  Slices:{stored_object}"
             )
 
-        raise RuntimeError(f"Unknown type for {key} type={type(val)} {val=}")
         raise RuntimeError(f"Unknown type for {key} type={type(val)}")
 
     async def delete(self, key: str) -> None:

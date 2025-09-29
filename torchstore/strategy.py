@@ -11,10 +11,34 @@ multiple storage volumes. Strategies map client processes to storage volumes.
 """
 
 import os
+from typing import Any, Dict, TYPE_CHECKING
 
 from monarch.actor import current_rank
 
-from torchstore.storage_volume import StorageVolume
+from torchstore.transport import TransportType
+
+if TYPE_CHECKING:
+    from torchstore.storage_volume import StorageVolume
+
+
+class StorageVolumeRef:
+    def __init__(
+        self,
+        volume: "StorageVolume",
+        volume_id: str,
+        transport_type: "TransportType",
+        transport_context: Dict,
+    ):
+        self.volume = volume
+        self.volume_id = volume_id
+        self.transport_type = transport_type
+        # useful for caching transport objects that should survive the lifetime of the client/volume
+        self.transport_context = transport_context
+
+    def __getattr__(self, name: str) -> Any:
+        if name not in ("volume_id", "transport_type"):
+            return getattr(self.volume, name)
+        return super().__getattribute__(name)
 
 
 class TorchStoreStrategy:
@@ -28,9 +52,11 @@ class TorchStoreStrategy:
     Subclasses must implement get_volume_id() and get_client_id() methods.
     """
 
-    def __init__(self):
+    def __init__(self, transport_type: TransportType = TransportType.TorchDistributed):
         self.storage_volumes = None
         self.volume_id_to_coord = {}
+        self.transport_type = transport_type
+        self.transport_context = {}
 
     def __str__(self) -> str:
         storage_vol_len = (
@@ -84,7 +110,7 @@ class TorchStoreStrategy:
             client_id,
         )  # client_id == volume_id for this strategy
 
-    def get_storage_volume(self, volume_id: str) -> StorageVolume:
+    def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
         """Retrieves storage volume actor for a given volume ID.
 
         Args:
@@ -94,7 +120,12 @@ class TorchStoreStrategy:
             StorageVolume: The storage volume actor for the given ID.
         """
         volume_coord = self.volume_id_to_coord[volume_id]
-        return self.storage_volumes.slice(**volume_coord)
+        return StorageVolumeRef(
+            self.storage_volumes.slice(**volume_coord),
+            volume_id,
+            self.transport_type,
+            self.transport_context,
+        )
 
 
 class SingletonStrategy(TorchStoreStrategy):
@@ -205,5 +236,10 @@ class ControllerStorageVolumes(TorchStoreStrategy):
             client_id,
         )  # client_id == volume_id for this strategy
 
-    def get_storage_volume(self, volume_id: str) -> StorageVolume:
-        return self.storage_volumes
+    def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
+        return StorageVolumeRef(
+            self.storage_volumes,
+            volume_id,
+            self.transport_type,
+            self.transport_context,
+        )

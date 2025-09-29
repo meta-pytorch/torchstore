@@ -405,7 +405,7 @@ async def test_large_tensors():
         step_size: int = 100  # -> 400mb
         max_step: int = 600  # 4mb -> 2gb
 
-        def __init__(self, generate_benchmark=False) -> None:
+        def __init__(self, generate_benchmark=True) -> None:
             self.generate_benchmark = generate_benchmark
             init_logging()
 
