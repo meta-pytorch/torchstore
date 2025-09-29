@@ -36,7 +36,11 @@ class StorageVolume(Actor):
 
     @classmethod
     async def spawn(
-        cls, num_volumes: int, mesh, *init_args: Any, **init_kwargs: Any, 
+        cls,
+        num_volumes: int,
+        mesh,
+        *init_args: Any,
+        **init_kwargs: Any,
     ) -> "StorageVolume":
         actors = await spawn_actors(
             num_volumes, cls, cls.actor_name, mesh, *init_args, **init_kwargs
@@ -68,6 +72,9 @@ class StorageVolume(Actor):
     ) -> Union[Tuple[torch.Size, torch.dtype], str]:
         return await self.store.get_meta(key, request)
 
+    async def delete(self, key: str) -> None:
+        await self.store.delete(key)
+
 
 class StorageImpl:
     """Abstract base class for storage implementations."""
@@ -84,8 +91,14 @@ class StorageImpl:
         """Retrieve data from the storage backend."""
         raise NotImplementedError()
 
-    async def get_meta(self, key: str, request: Optional[Request]=None) -> Union[Tuple[torch.Size, torch.dtype], str]:
+    async def get_meta(
+        self, key: str, request: Optional[Request] = None
+    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
         """Get metadata about stored data."""
+        raise NotImplementedError()
+
+    async def delete(self, key: str) -> None:
+        """Delete data from the storage backend."""
         raise NotImplementedError()
 
 
@@ -238,14 +251,23 @@ class InMemoryStore(StorageImpl):
             return stored_object["tensor"].shape, stored_object["tensor"].dtype
 
         if request is not None and request.tensor_slice is not None:
-            #TODO: makes this an object
+            # TODO: makes this an object
             for shard in stored_object.values():
                 shard_slice = shard["slice"]
-                if shard_slice.local_shape == request.tensor_slice.local_shape and shard_slice.offsets == request.tensor_slice.offsets:
+                if (
+                    shard_slice.local_shape == request.tensor_slice.local_shape
+                    and shard_slice.offsets == request.tensor_slice.offsets
+                ):
                     return shard["tensor"].shape, shard["tensor"].dtype
-                    
+
             raise KeyError(
                 f"Could not find shard slice with {request.tensor_slice=}  Slices:{stored_object}"
             )
 
         raise RuntimeError(f"Unknown type for {key} type={type(val)} {val=}")
+        raise RuntimeError(f"Unknown type for {key} type={type(val)}")
+
+    async def delete(self, key: str) -> None:
+        if key not in self.kv:
+            raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
+        del self.kv[key]

@@ -117,15 +117,13 @@ class Request:
         return cls(tensor_slice=copy.deepcopy(tensor_slice))
 
     def meta_only(self) -> "Request":
-        """Returns a copy of this request with tensor_val set to None.
-        """
+        """Returns a copy of this request with tensor_val set to None."""
         return Request(
             tensor_val=None,
             tensor_slice=self.tensor_slice,
             objects=self.objects,
             is_object=self.is_object,
         )
-        
 
 
 class Pipe:

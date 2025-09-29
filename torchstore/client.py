@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import time
+import asyncio
 from logging import getLogger
 from typing import Any, Union
 
@@ -12,10 +12,8 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
-from torchstore.transport import Pipe, Request, TensorSlice
-from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
-from torchstore.transport import Pipe, Request
+from torchstore.transport import Pipe, Request, TensorSlice
 from torchstore.utils import assemble_global_tensor, get_local_tensor
 
 logger = getLogger(__name__)
@@ -52,7 +50,6 @@ class LocalClient:
         await self._controller.notify_put.call(key, request.meta_only(), volume_id)
         latency_tracker.track_step("notify_put")
         latency_tracker.track_e2e()
-
 
     @torch.no_grad
     async def get(
@@ -122,6 +119,35 @@ class LocalClient:
         # Keys are synced across all storage volumes, so we just call one.
         return await self._controller.keys.call_one(prefix)
 
+    async def delete(self, key: str) -> None:
+        """
+        Delete a key from the distributed store.
+
+        Args:
+            key (str): The key to delete.
+
+        Returns:
+            None
+
+        Raises:
+            KeyError: If the key does not exist in the store.
+        """
+        latency_tracker = LatencyTracker(f"delete:{key}")
+        volume_map = await self._controller.locate_volumes.call_one(key)
+
+        async def delete_from_volume(volume_id: str):
+            volume = self.strategy.get_storage_volume(volume_id)
+            # Notify should come before the actual delete, so that the controller
+            # doesn't think the key is still in the store when delete is happening.
+            await self._controller.notify_delete.call_one(key, volume_id)
+            await volume.delete.call(key)
+
+        await asyncio.gather(
+            *[delete_from_volume(volume_id) for volume_id in volume_map]
+        )
+
+        latency_tracker.track_e2e()
+
     async def exists(self, key: str) -> bool:
         """Check if a key exists in the distributed store.
 
@@ -179,7 +205,8 @@ class LocalClient:
                 and tensor_slice_spec.local_shape != inplace_tensor.shape
             ):
                 raise ValueError(
-                    f"Requested tensor slice shape {tensor_slice_spec.local_shape} does not match in-place tensor shape {inplace_tensor.shape}"
+                    f"Requested tensor slice shape {tensor_slice_spec.local_shape} "
+                    f"does not match in-place tensor shape {inplace_tensor.shape}"
                 )
 
         if isinstance(inplace_tensor, DTensor):

@@ -9,7 +9,7 @@ from logging import getLogger
 
 from torchstore.api import (
     client,
-    reset_client,
+    delete,
     exists,
     get,
     get_state_dict,
@@ -17,15 +17,16 @@ from torchstore.api import (
     keys,
     put,
     put_state_dict,
+    reset_client,
     shutdown,
 )
 
 from torchstore.logging import init_logging
 from torchstore.strategy import (
+    ControllerStorageVolumes,
     LocalRankStrategy,
     SingletonStrategy,
-    ControllerStorageVolumes,
-    TorchStoreStrategy
+    TorchStoreStrategy,
 )
 
 if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
@@ -43,6 +44,7 @@ __all__ = [
     "init_logging",
     "put",
     "get",
+    "delete",
     "keys",
     "exists",
     "client",
@@ -53,5 +55,5 @@ __all__ = [
     "ControllerStorageVolumes",
     "put_state_dict",
     "get_state_dict",
-    "reset_client"
+    "reset_client",
 ]

@@ -45,6 +45,9 @@ cd torchstore
 
 # Install in development mode
 pip install -e .
+
+# Install development dependencies
+pip install -e '.[dev]'
 ```
 
 ### Regular Installation

@@ -17,9 +17,8 @@ import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from torchstore.logging import init_logging
-from torchstore.utils import spawn_actors
 from torchstore.state_dict_utils import _state_dict_size
+from torchstore.utils import spawn_actors
 
 from transformers import AutoModelForCausalLM
 
@@ -170,13 +169,13 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
 
-            logger.info(f"do_push ")
+            logger.info("do_push ")
             await put_world.do_push.call()
 
-            
             await get_world.do_get.call()
     finally:
         await ts.shutdown()
+
 
 if __name__ == "__main__":
     main([__file__])

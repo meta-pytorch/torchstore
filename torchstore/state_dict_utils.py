@@ -84,6 +84,7 @@ async def get_state_dict(
 
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
 
+
 def _state_dict_size(state_dict):
     """Returns the size of the state dict in MBs"""
     size = 0
@@ -93,4 +94,4 @@ def _state_dict_size(state_dict):
             continue
 
         size += tensor.numel() * tensor.element_size()
-    return size // (1024 * 1024)  
+    return size // (1024 * 1024)

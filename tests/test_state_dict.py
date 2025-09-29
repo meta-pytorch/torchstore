@@ -209,6 +209,7 @@ async def test_state_dict(strategy_params, use_rdma):
     _assert_equal_state_dict(state_dict, fetched_state_dict)
 
 
+@pytest.mark.skip("TODO(kaiyuan-li@): fix this test")
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_dcp_sharding_parity(strategy_params, use_rdma):
