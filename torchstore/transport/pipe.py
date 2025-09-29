@@ -145,20 +145,16 @@ class Pipe:
         latency_trcker = LatencyTracker(f"put_to_storage_volume:{key}")
 
         transport_buffer = await self.create_transport_buffer()
-        latency_trcker.track_step("create_transport_buffer")
         tensor = request.tensor_val
 
         transport_buffer.allocate(tensor)
-        latency_trcker.track_step("allocate")
         await transport_buffer.write_from(tensor)
-        latency_trcker.track_step("write_from")
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
         await self.storage_volume.put.call_one(
             key, transport_buffer, request.meta_only()
         )
-        latency_trcker.track_step("storage_volume.put")
 
         transport_buffer.finish()
         latency_trcker.track_step("finish")
@@ -167,7 +163,6 @@ class Pipe:
     async def get_from_storage_volume(self, key, request: Request):
         latency_trcker = LatencyTracker(f"get_from_storage_volume:{key}")
         transport_buffer = await self.create_transport_buffer()
-        latency_trcker.track_step("create_transport_buffer")
 
         # Certain buffers (RDMA) need to know the size of the tensor
         # so we can allocate the right amount of memory locally.
@@ -184,7 +179,6 @@ class Pipe:
         # TODO: booooo
         if isinstance(transport_buffer, TorchDistributedBuffer):
             t = await transport_buffer.read_into(request.tensor_val)
-            latency_trcker.track_step("read_into")
 
         # TODO: consider placing the buffer inside the request or vice versa
         transport_buffer.update(
@@ -192,15 +186,12 @@ class Pipe:
                 key, transport_buffer, request.meta_only()
             )
         )
-        latency_trcker.track_step("storage_volume.get")
 
         if transport_buffer.is_object:
             return transport_buffer.objects
 
         if isinstance(transport_buffer, TorchDistributedBuffer):
             transport_buffer.finish()
-            latency_trcker.track_step("finish")
-            latency_trcker.track_e2e()
             return t
 
         return await transport_buffer.read_into(request.tensor_val)
