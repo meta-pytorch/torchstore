@@ -65,12 +65,15 @@ class StorageVolume(Actor):
         return await self.store.get(key, transport_buffer, request)
 
     @endpoint
+    async def get_meta(
+        self,
+        key: str,
+        request: Optional[Request] = None,
+    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
+        return await self.store.get_meta(key, request)
+
     async def delete(self, key: str) -> None:
         await self.store.delete(key)
-
-    @endpoint
-    async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
-        return await self.store.get_meta(key)
 
 
 class StorageImpl:
@@ -88,7 +91,9 @@ class StorageImpl:
         """Retrieve data from the storage backend."""
         raise NotImplementedError()
 
-    async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
+    async def get_meta(
+        self, key: str, request: Optional[Request] = None
+    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
         """Get metadata about stored data."""
         raise NotImplementedError()
 
@@ -226,21 +231,40 @@ class InMemoryStore(StorageImpl):
 
         raise RuntimeError(f"Tensor slice {request.tensor_slice} not found in {key}")
 
-    async def get_meta(self, key: str) -> Union[Tuple[torch.Size, torch.dtype], str]:
+    async def get_meta(
+        self,
+        key: str,
+        request: Optional[Request] = None,
+    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
-        val = self.kv[key]
-        if isinstance(val, torch.Tensor):
-            return val.shape, val.dtype
+        stored_object = self.kv[key]
+        if isinstance(stored_object, torch.Tensor):
+            return stored_object.shape, stored_object.dtype
 
-        assert isinstance(val, dict)
-        if "obj" in val:
+        assert isinstance(stored_object, dict)
+        if "obj" in stored_object:
             return "obj"
 
-        if "tensor" in val:
-            return val["tensor"].shape, val["tensor"].dtype
+        if "tensor" in stored_object:
+            return stored_object["tensor"].shape, stored_object["tensor"].dtype
 
+        if request is not None and request.tensor_slice is not None:
+            # TODO: makes this an object
+            for shard in stored_object.values():
+                shard_slice = shard["slice"]
+                if (
+                    shard_slice.local_shape == request.tensor_slice.local_shape
+                    and shard_slice.offsets == request.tensor_slice.offsets
+                ):
+                    return shard["tensor"].shape, shard["tensor"].dtype
+
+            raise KeyError(
+                f"Could not find shard slice with {request.tensor_slice=}  Slices:{stored_object}"
+            )
+
+        raise RuntimeError(f"Unknown type for {key} type={type(val)} {val=}")
         raise RuntimeError(f"Unknown type for {key} type={type(val)}")
 
     async def delete(self, key: str) -> None:

@@ -164,7 +164,7 @@ class Pipe:
         # This can be avoided if the request contains a tensor slice.
         # Could likely be optimized away in the future.
         if transport_buffer.requires_meta and request.tensor_val is None:
-            meta = await self.storage_volume.get_meta.call_one(key)
+            meta = await self.storage_volume.get_meta.call_one(key, request.meta_only())
             transport_buffer.allocate(meta)
         else:
             transport_buffer.allocate(request.tensor_val)
