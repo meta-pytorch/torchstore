@@ -72,6 +72,7 @@ class TransportBuffer:
 
 
 local_pgs = {}
+file_store_names = {}
 
 class TorchDistributedBuffer(TransportBuffer):
 
@@ -102,8 +103,7 @@ class TorchDistributedBuffer(TransportBuffer):
             )
             
             handshake_fut = storage_volume.handshake.call(file_store_name)
-            try:
-                
+            try:                
 
                 file_store = torch.distributed.FileStore(file_store_name, 2)
                 pg = _gloo_factory(
@@ -113,11 +113,15 @@ class TorchDistributedBuffer(TransportBuffer):
                     timeout=timedelta(seconds=120),
                     device=torch.device("cpu"),
                 )
+                file_store_names[storage_volume.volume_id] = file_store_name
                 local_pgs[storage_volume.volume_id] = pg
+                
             finally:
                 await handshake_fut
 
         self.pg = local_pgs[storage_volume.volume_id]
+        self.file_store_name = file_store_names[storage_volume.volume_id]
+
 
     def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
         """Allocates internal buffers based on either an existing tensor
