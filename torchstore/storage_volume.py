@@ -72,6 +72,7 @@ class StorageVolume(Actor):
     ) -> Union[Tuple[torch.Size, torch.dtype], str]:
         return await self.store.get_meta(key, request)
 
+    @endpoint
     async def delete(self, key: str) -> None:
         await self.store.delete(key)
 
