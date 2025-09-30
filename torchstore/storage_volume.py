@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 
+from torchstore.logging import init_logging
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.pipe import Request, TensorSlice
 

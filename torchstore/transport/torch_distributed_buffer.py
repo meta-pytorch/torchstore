@@ -164,10 +164,12 @@ class TorchDistributedBuffer(TransportBuffer):
 
     # recv
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+        if tensor is None:
+            return
         assert self.fut is None
         pg = self.transport_context[self.file_store_name]
         self.fut = pg.send([tensor], dstRank=self.remote_rank, tag=0)
 
     def finish(self):
-        assert self.fut is not None
-        self.fut.wait()
+        if self.fut is not None:
+            self.fut.wait()

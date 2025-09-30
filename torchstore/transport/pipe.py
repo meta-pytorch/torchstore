@@ -177,7 +177,10 @@ class Pipe:
         latency_trcker.track_step("allocate")
 
         # TODO: booooo
-        if isinstance(transport_buffer, TorchDistributedBuffer):
+        if (
+            isinstance(transport_buffer, TorchDistributedBuffer)
+            and not request.is_object
+        ):
             t = await transport_buffer.read_into(request.tensor_val)
 
         # TODO: consider placing the buffer inside the request or vice versa
