@@ -6,15 +6,16 @@
 
 from dataclasses import dataclass, field
 from enum import auto, Enum
-from typing import Dict, List, Mapping, Optional, Set
+from typing import Dict, List, Mapping, Optional, Set, TYPE_CHECKING
 
 from monarch.actor import Actor, endpoint
 
 from torchstore.storage_utils.trie import Trie
-from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport.pipe import Request, TensorSlice
 
+if TYPE_CHECKING:
+    from torchstore.storage_volume import StorageVolume
 
 # TODO: move this into request as a field
 class ObjectType(Enum):
@@ -52,7 +53,7 @@ class Controller(Actor):
         self.keys_to_storage_volumes = Trie()
         self.is_initialized: bool = False
         self.strategy: Optional[TorchStoreStrategy] = None
-        self.storage_volumes: Optional[StorageVolume] = None
+        self.storage_volumes: Optional["StorageVolume"] = None
         self.num_storage_volumes: Optional[int] = None
         self.strategy: Optional[TorchStoreStrategy] = None
 
@@ -66,7 +67,7 @@ class Controller(Actor):
         self,
         strategy: TorchStoreStrategy,
         num_storage_volumes: int,
-        storage_volumes: StorageVolume,
+        storage_volumes: "StorageVolume",
     ) -> None:
         if self.is_initialized:
             raise RuntimeError("TorchStore is already initialized")

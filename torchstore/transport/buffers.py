@@ -51,12 +51,23 @@ class TransportBuffer:
     is_object: bool = False
     objects: Optional[Any] = None
     requires_meta: bool = False
+    read_ahead: bool = False
 
     def update(self, other_buffer: "TransportBuffer") -> None:
         self.finalize = other_buffer.finalize
         self.is_object = other_buffer.is_object
         self.objects = other_buffer.objects
         self.requires_meta = other_buffer.requires_meta
+
+    async def setup_comms(self, storage_volume) -> None:
+        """Initiate comms handshake with storage_volume"""
+        pass
+
+    async def storage_volume_setup_comms(
+        self, transport_context: Dict[str, Any]
+    ) -> None:
+        """Mirror of setup_comms, but run on the storage volume side"""
+        raise NotImplementedError("Must implement storage_volume_setup_comms")
 
     def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
         """Allocates internal buffers based on either an existing tensor
@@ -69,6 +80,10 @@ class TransportBuffer:
 
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
         raise NotImplementedError()
+
+    def finish(self) -> None:
+        """Finalize the transport buffer"""
+        pass
 
 
 class RDMATransportBuffer(TransportBuffer):

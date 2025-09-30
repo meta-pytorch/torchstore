@@ -11,8 +11,9 @@ from typing import Any, Union
 import torch
 from torch.distributed.tensor import DTensor
 
-from torchstore.controller import ObjectType
+from torchstore.controller import Controller, ObjectType
 from torchstore.logging import LatencyTracker
+from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import Pipe, Request, TensorSlice
 from torchstore.utils import assemble_global_tensor, get_local_tensor
 
@@ -24,11 +25,7 @@ class LocalClient:
     is handled by the client.
     """
 
-    def __init__(
-        self,
-        controller,
-        strategy,
-    ):
+    def __init__(self, controller: Controller, strategy: TorchStoreStrategy):
         self._controller = controller
         self.strategy = strategy
 
@@ -41,7 +38,6 @@ class LocalClient:
         # it will never be dynamic. e.g. it's always based on the
         # TorchstoreStrategy defined during intiailization
         storage_volume, volume_id = self.strategy.select_storage_volume()
-
         pipe = Pipe(storage_volume)
 
         await pipe.put_to_storage_volume(key, request)
@@ -220,14 +216,17 @@ class LocalClient:
         volume_map = await self._controller.locate_volumes.call_one(key)
         for storage_info in volume_map.values():
             return storage_info.object_type
+
         raise ValueError(f"Unable to get stored object type for key `{key}`")
 
     async def _get_object(self, key: str):
         volume_map = await self._controller.locate_volumes.call_one(key)
         volume_id, _ = volume_map.popitem()
+
         storage_volume = self.strategy.get_storage_volume(volume_id)
         pipe = Pipe(storage_volume)
         request = Request.from_any(None)
+
         return await pipe.get_from_storage_volume(key, request)
 
     async def _get_tensor(self, key: str) -> torch.Tensor:
@@ -242,6 +241,8 @@ class LocalClient:
             # which is sematically inappropriate here.
             request = Request.from_any(None)
             return await pipe.get_from_storage_volume(key, request)
+
+        raise ValueError(f"Unable to get tensor for key `{key}`")
 
     async def _get_distributed_whole_tensor(self, key: str) -> torch.Tensor:
         """Fetches slices from all volume storages and stitch together to return the whole tensor"""

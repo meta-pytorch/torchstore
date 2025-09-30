@@ -13,12 +13,8 @@ import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
-from torchstore.transport.buffers import (
-    MonarchTransportBuffer,
-    rdma_available,
-    RDMATransportBuffer,
-    TransportBuffer,
-)
+from torchstore.logging import LatencyTracker
+from torchstore.transport.buffers import TransportBuffer
 
 logger = getLogger(__name__)
 
@@ -134,16 +130,19 @@ class Pipe:
     def __init__(self, storage_volume) -> None:
         self.storage_volume = storage_volume
 
-    def create_transport_buffer(self) -> TransportBuffer:
+    async def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
-        if rdma_available():
-            buffer_cls = RDMATransportBuffer
-        else:
-            buffer_cls = MonarchTransportBuffer
-        return buffer_cls()
 
-    async def put_to_storage_volume(self, key, request: Request):
-        transport_buffer = self.create_transport_buffer()
+        buffer_cls = self.storage_volume.transport_type.buffer_cls()
+        buffer = buffer_cls()
+        await buffer.setup_comms(self.storage_volume)
+
+        return buffer
+
+    async def put_to_storage_volume(self, key, request: Request) -> None:
+        latency_trcker = LatencyTracker(f"put_to_storage_volume:{key}")
+
+        transport_buffer = await self.create_transport_buffer()
         tensor = request.tensor_val
 
         transport_buffer.allocate(tensor)
@@ -155,9 +154,13 @@ class Pipe:
             key, transport_buffer, request.meta_only()
         )
 
-    async def get_from_storage_volume(self, key, request: Request):
+        transport_buffer.finish()
+        latency_trcker.track_step("finish")
+        latency_trcker.track_e2e()
 
-        transport_buffer = self.create_transport_buffer()
+    async def get_from_storage_volume(self, key, request: Request):
+        latency_trcker = LatencyTracker(f"get_from_storage_volume:{key}")
+        transport_buffer = await self.create_transport_buffer()
 
         # Certain buffers (RDMA) need to know the size of the tensor
         # so we can allocate the right amount of memory locally.
@@ -169,6 +172,13 @@ class Pipe:
         else:
             transport_buffer.allocate(request.tensor_val)
 
+        latency_trcker.track_step("allocate")
+
+        # TODO: re-evaluate thiss logic for better polymorphism
+        t = None
+        if transport_buffer.read_ahead:
+            t = await transport_buffer.read_into(request.tensor_val)
+
         # TODO: consider placing the buffer inside the request or vice versa
         transport_buffer.update(
             await self.storage_volume.get.call_one(
@@ -178,5 +188,12 @@ class Pipe:
 
         if transport_buffer.is_object:
             return transport_buffer.objects
+
+        if transport_buffer.read_ahead:
+            assert (
+                t is not None
+            ), "transport_buffer read ahead is true but no tensor to return"
+            transport_buffer.finish()
+            return t
 
         return await transport_buffer.read_into(request.tensor_val)
