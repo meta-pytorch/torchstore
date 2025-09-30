@@ -13,10 +13,8 @@ import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
-# from torchstore.strategy import StorageVolumeRef
 from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.torch_distributed_buffer import TorchDistributedBuffer
 
 logger = getLogger(__name__)
 
@@ -176,11 +174,9 @@ class Pipe:
 
         latency_trcker.track_step("allocate")
 
-        # TODO: booooo
-        if (
-            isinstance(transport_buffer, TorchDistributedBuffer)
-            and not request.is_object
-        ):
+        # TODO: re-evaluate thiss logic for better polymorphism
+        t = None
+        if transport_buffer.read_ahead:
             t = await transport_buffer.read_into(request.tensor_val)
 
         # TODO: consider placing the buffer inside the request or vice versa
@@ -193,7 +189,10 @@ class Pipe:
         if transport_buffer.is_object:
             return transport_buffer.objects
 
-        if isinstance(transport_buffer, TorchDistributedBuffer):
+        if transport_buffer.read_ahead:
+            assert (
+                t is not None
+            ), "transport_buffer read ahead is true but no tensor to return"
             transport_buffer.finish()
             return t
 

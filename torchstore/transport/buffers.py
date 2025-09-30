@@ -51,6 +51,7 @@ class TransportBuffer:
     is_object: bool = False
     objects: Optional[Any] = None
     requires_meta: bool = False
+    read_ahead: bool = False
 
     def update(self, other_buffer: "TransportBuffer") -> None:
         self.finalize = other_buffer.finalize

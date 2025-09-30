@@ -243,7 +243,6 @@ class InMemoryStore(StorageImpl):
         # but this goes entire the value prop of torchstore. StorageVolume must
         # support requesting a subset of the regions which exist locally in the
         # store.
-
         for shard in self.kv[key].values():
             if shard["slice"] == request.tensor_slice:
                 await transport_buffer.write_from(shard["tensor"])

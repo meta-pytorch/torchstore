@@ -59,8 +59,8 @@ def _gloo_factory(
 
 
 class TorchDistributedBuffer(TransportBuffer):
-
     requires_meta: bool = True
+    read_ahead: bool = True
 
     def __init__(self) -> None:
         self.shape: Optional[torch.Size] = None
@@ -138,7 +138,8 @@ class TorchDistributedBuffer(TransportBuffer):
         or a Tuple of (shape, dtype)
         """
         if isinstance(tensor_like, str) or tensor_like is None:
-            # tensor is just an object, nothing to allocte
+            # tensor is just an object, nothing to alloctest
+            self.is_object = True
             return
         elif isinstance(tensor_like, Tuple):
             # we know the size of the tensor from fetching metadata
@@ -152,6 +153,8 @@ class TorchDistributedBuffer(TransportBuffer):
 
     # send
     async def read_into(self, tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if self.is_object:
+            return
 
         if tensor is None:
             tensor = torch.empty(self.shape, dtype=self.dtype)
@@ -164,8 +167,9 @@ class TorchDistributedBuffer(TransportBuffer):
 
     # recv
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
-        if tensor is None:
+        if self.is_object:
             return
+
         assert self.fut is None
         pg = self.transport_context[self.file_store_name]
         self.fut = pg.send([tensor], dstRank=self.remote_rank, tag=0)
