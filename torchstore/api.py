@@ -202,6 +202,26 @@ async def get(
     return await cl.get(key, inplace_tensor, tensor_slice_spec)
 
 
+async def delete(
+    key: str,
+    *,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> None:
+    """Delete a key from the distributed store.
+
+    Args:
+        key (str): Unique identifier of the value to delete.
+
+    Keyword Args:
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Example:
+        >>> await delete("my_tensor")
+    """
+    cl = await client(store_name=store_name)
+    return await cl.delete(key)
+
+
 async def keys(
     prefix: str | None = None,
 ) -> List[str]:
