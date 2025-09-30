@@ -4,9 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import math
 import os
-import time
 from logging import getLogger
 
 import pytest
@@ -17,13 +15,10 @@ import torchstore as ts
 
 from monarch.actor import Actor, current_rank, endpoint
 
-# DTensor imports for DTensor slice testing
-from torch.distributed._tensor import Shard
 from torchstore.logging import init_logging
-from torchstore.transport.pipe import TensorSlice
 from torchstore.utils import spawn_actors
 
-from .utils import DTensorActor, main, transport_plus_strategy_params
+from .utils import main, transport_plus_strategy_params
 
 init_logging()
 logger = getLogger(__name__)
