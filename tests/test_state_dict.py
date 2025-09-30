@@ -167,9 +167,7 @@ class DCPParityTest(Actor):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_state_dict(strategy_params, use_rdma):
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
-
+async def test_state_dict(strategy_params, transport_type):
     class Trainer(Actor):
         # Monarch RDMA does not work outside of an actor, so we need
         # to wrapp this test first
@@ -200,7 +198,12 @@ async def test_state_dict(strategy_params, use_rdma):
             return state_dict, fetched_state_dict
 
     _, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=1, strategy=strategy)
+    await ts.initialize(
+        num_storage_volumes=1,
+        strategy=strategy(transport_type=transport_type)
+        if strategy is not None
+        else None,
+    )
     trainer = await spawn_actors(1, Trainer, "trainer")
     try:
         state_dict, fetched_state_dict = await trainer.do_test.call_one()
@@ -212,8 +215,7 @@ async def test_state_dict(strategy_params, use_rdma):
 @pytest.mark.skip("TODO(kaiyuan-li@): fix this test")
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_dcp_sharding_parity(strategy_params, use_rdma):
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+async def test_dcp_sharding_parity(strategy_params, transport_type):
 
     for save_mesh_shape, get_mesh_shape in [
         ((2,), (4,)),

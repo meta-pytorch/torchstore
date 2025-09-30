@@ -31,9 +31,8 @@ logger = getLogger(__name__)
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_basic(strategy_params, use_rdma):
+async def test_basic(strategy_params, transport_type):
     """Test basic put/get functionality for multiple processes"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
     class PutGetActor(Actor):
         """Each instance of this actor represents a single process."""
@@ -60,7 +59,12 @@ async def test_basic(strategy_params, use_rdma):
             return await ts.get(f"key_{other_rank}")
 
     volume_world_size, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+    await ts.initialize(
+        num_storage_volumes=volume_world_size,
+        strategy=strategy(transport_type=transport_type)
+        if strategy is not None
+        else None,
+    )
     # each actor mesh represents a group of processes.
     actor_mesh_0 = await spawn_actors(
         volume_world_size, PutGetActor, "actor_mesh_0", world_size=volume_world_size
@@ -91,9 +95,8 @@ async def test_basic(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_objects(strategy_params, use_rdma):
+async def test_objects(strategy_params, transport_type):
     """Test put/get on arbitrary object"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
     class ObjectActor(Actor):
         """Each instance of this actor represents a single process."""
@@ -118,7 +121,12 @@ async def test_objects(strategy_params, use_rdma):
             return await ts.get(f"key_{other_rank}")
 
     volume_world_size, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+    await ts.initialize(
+        num_storage_volumes=volume_world_size,
+        strategy=strategy(transport_type=transport_type)
+        if strategy is not None
+        else None,
+    )
     # each actor mesh represents a group of processes.
     actor_mesh_0 = await spawn_actors(
         volume_world_size, ObjectActor, "actor_mesh_0", world_size=volume_world_size
@@ -154,9 +162,8 @@ async def test_objects(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_exists(strategy_params, use_rdma):
+async def test_exists(strategy_params, transport_type):
     """Test the exists() API functionality"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
     class ExistsTestActor(Actor):
         """Actor for testing exists functionality."""
@@ -177,7 +184,12 @@ async def test_exists(strategy_params, use_rdma):
             return await ts.exists(key)
 
     volume_world_size, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+    await ts.initialize(
+        num_storage_volumes=volume_world_size,
+        strategy=strategy(transport_type=transport_type)
+        if strategy is not None
+        else None,
+    )
 
     # Spawn test actors
     actor_mesh = await spawn_actors(
@@ -222,9 +234,8 @@ async def test_exists(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_delete(strategy_params, use_rdma):
+async def test_delete(strategy_params, transport_type):
     """Test the delete() API functionality"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
     class DeleteTestActor(Actor):
         """Actor for testing delete functionality."""
@@ -253,7 +264,12 @@ async def test_delete(strategy_params, use_rdma):
             return await ts.get(key)
 
     volume_world_size, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+    await ts.initialize(
+        num_storage_volumes=volume_world_size,
+        strategy=strategy(transport_type=transport_type)
+        if strategy is not None
+        else None,
+    )
 
     # Spawn test actors
     actor_mesh = await spawn_actors(
@@ -303,9 +319,8 @@ async def test_delete(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_get_tensor_slice(strategy_params, use_rdma):
+async def test_get_tensor_slice(strategy_params, transport_type):
     """Test tensor slice API functionality"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
     class TensorSlicePutActor(Actor):
         """Actor for putting tensors."""
@@ -322,7 +337,12 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
             await ts.put(key, tensor)
 
     volume_world_size, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+    await ts.initialize(
+        num_storage_volumes=volume_world_size,
+        strategy=strategy(transport_type=transport_type)
+        if strategy is not None
+        else None,
+    )
 
     # Spawn test actors - separate meshes for put and get to test cross-process communication
     put_actor_mesh = await spawn_actors(

@@ -15,6 +15,8 @@ import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
+from torchstore.transport import TransportType
+from torchstore.transport.buffers import monarch_rdma_available
 
 logger = getLogger(__name__)
 
@@ -26,17 +28,17 @@ def main(file):
 
 def transport_plus_strategy_params():
     strategies = [
-        (2, ts.LocalRankStrategy()),
+        (2, ts.LocalRankStrategy),
         (1, None),  # ts.SingletonStrategy
-        (1, ts.ControllerStorageVolumes()),
+        (1, ts.ControllerStorageVolumes),
     ]
-    rdma_options = (
-        [True, False]
-        if os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
-        else [False]
-    )
 
-    return "strategy_params, use_rdma", list(product(strategies, rdma_options))
+    transport_types = list(TransportType)
+    if not monarch_rdma_available():
+        print("Removing rdma tests since rdma is not available")
+        transport_types.remove(TransportType.MonarchRDMA)
+
+    return "strategy_params, transport_type", list(product(strategies, transport_types))
 
 
 class DTensorActor(Actor):
