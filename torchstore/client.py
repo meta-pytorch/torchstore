@@ -9,7 +9,6 @@ from logging import getLogger
 from typing import Any, Union
 
 import torch
-from monarch._src.actor.actor_mesh import ActorError
 from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
@@ -34,20 +33,11 @@ class LocalClient:
         self.strategy = strategy
 
     async def _locate_volumes(self, key: str):
-        """Helper method to call locate_volumes and convert ActorError to KeyError for missing keys."""
+        """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""
         try:
             return await self._controller.locate_volumes.call_one(key)
-        except ActorError as e:
-            # Check if the wrapped exception contains KeyError and convert it to KeyError with the content after
-            error_str = str(e)
-            if "KeyError: " in error_str:
-                # Extract the content after "KeyError: " and re-raise as plain KeyError
-                keyerror_content = error_str.split("KeyError: ", 1)[-1]
-                # Remove surrounding quotes and whitespace more explicitly
-                keyerror_content = keyerror_content.strip()
-                raise KeyError(keyerror_content) from e  # Use exception chaining
-            # Re-raise if it's not a KeyError
-            raise e
+        except Exception as e:
+            raise KeyError(str(e)) from e
 
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
