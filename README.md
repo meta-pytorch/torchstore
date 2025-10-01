@@ -14,6 +14,13 @@ Key Features:
 - Multiple transport backends (RDMA, regular TCP) for optimal performance
 - Flexible storage volume management and sharding strategies
 
+> ⚠️ **Early Development Warning** TorchStore is currently in an experimental
+> stage. You should expect bugs, incomplete features, and APIs that may change
+> in future versions. The project welcomes bugfixes, but to make sure things are
+> well coordinated you should discuss any significant change before starting the
+> work. It's recommended that you signal your intention to contribute in the
+> issue tracker, either by filing a new issue or by claiming an existing one.
+
 ## Installation
 
 ### Env Setup
@@ -135,4 +142,4 @@ Pytest is used for testing. For an examples of how to run tests (and get logs), 
 
 ## License
 
-Monarch is BSD-3 licensed, as found in the [LICENSE](LICENSE) file.
+Torchstore is BSD-3 licensed, as found in the [LICENSE](LICENSE) file.
