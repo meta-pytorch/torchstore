@@ -14,7 +14,7 @@ from monarch.actor import Actor, endpoint
 from torchstore.transport.buffers import TransportBuffer
 
 from torchstore.transport.pipe import Request, TensorSlice
-from torchstore.utils import assemble_global_tensor, spawn_actors
+from torchstore.utils import assemble_tensor, spawn_actors
 
 logger = getLogger(__name__)
 
@@ -146,7 +146,7 @@ class InMemoryStore(StorageImpl):
         assert local_tensors and global_offsets and global_shape
 
         # TODO: doing it this way has peek 2x tensor size in memory :(
-        full_tensor = assemble_global_tensor(
+        full_tensor = assemble_tensor(
             local_tensors,
             global_shape,
             global_offsets,

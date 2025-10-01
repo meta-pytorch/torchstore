@@ -14,7 +14,7 @@ from torch.distributed.tensor import DTensor
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.transport import Pipe, Request, TensorSlice
-from torchstore.utils import assemble_global_tensor, get_local_tensor
+from torchstore.utils import assemble_tensor, get_local_tensor
 
 logger = getLogger(__name__)
 
@@ -88,7 +88,7 @@ class LocalClient:
                 Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
             )
             # Here full tensor should be the part of interest.
-            fetched_tensor = await self._get_distributed_whole_tensor(key, tensor_slice)
+            fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
 
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
@@ -244,7 +244,7 @@ class LocalClient:
             request = Request.from_any(None)
             return await pipe.get_from_storage_volume(key, request)
 
-    async def _get_distributed_whole_tensor(
+    async def _get_and_assemble_tensor(
         self, key: str, tensor_slice_spec: TensorSlice | None = None
     ) -> torch.Tensor:
         """Fetches slices from all volume storages and stitch together to return the whole tensor.
@@ -313,7 +313,7 @@ class LocalClient:
             else:
                 assert device_mesh_shape == tensor_slice.mesh_shape
 
-        assembled_tensor = assemble_global_tensor(
+        assembled_tensor = assemble_tensor(
             local_tensors,
             global_shape,
             global_offsets,

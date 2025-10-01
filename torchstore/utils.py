@@ -56,7 +56,7 @@ def get_local_tensor(
     return local_tensor
 
 
-def assemble_global_tensor(
+def assemble_tensor(
     local_tensors: List[torch.Tensor],
     global_shape: "ShapeType",  # TODO: unused, cleanup
     global_offsets: List["ShapeType"],

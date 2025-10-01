@@ -10,7 +10,7 @@ import pytest
 
 import torch
 
-from torchstore.utils import assemble_global_tensor, get_local_tensor
+from torchstore.utils import assemble_tensor, get_local_tensor
 
 
 logger = getLogger(__name__)
@@ -61,12 +61,8 @@ async def test_2d_get_local_tensor():
     _test_get_local_tensor(global_tensor, test_cases)
 
 
-def _test_assemble_global_tensor(
-    local_tensors, global_shape, global_offsets, expected_output
-):
-    assembled_tensor = assemble_global_tensor(
-        local_tensors, global_shape, global_offsets
-    )
+def _test_assemble_tensor(local_tensors, global_shape, global_offsets, expected_output):
+    assembled_tensor = assemble_tensor(local_tensors, global_shape, global_offsets)
     assert torch.equal(
         assembled_tensor,
         expected_output,
@@ -74,8 +70,8 @@ def _test_assemble_global_tensor(
 
 
 @pytest.mark.asyncio
-async def test_1d_assemble_global_tensor():
-    _test_assemble_global_tensor(
+async def test_1d_assemble_tensor():
+    _test_assemble_tensor(
         local_tensors=[
             torch.tensor([0]),
             torch.tensor([1]),
@@ -89,8 +85,8 @@ async def test_1d_assemble_global_tensor():
 
 
 @pytest.mark.asyncio
-async def test_1d_assemble_global_tensor_slice():
-    _test_assemble_global_tensor(
+async def test_1d_assemble_tensor_slice():
+    _test_assemble_tensor(
         local_tensors=[
             torch.tensor([1]),
             torch.tensor([2]),
@@ -102,8 +98,8 @@ async def test_1d_assemble_global_tensor_slice():
 
 
 @pytest.mark.asyncio
-async def test_2d_assemble_global_tensor():
-    _test_assemble_global_tensor(
+async def test_2d_assemble_tensor():
+    _test_assemble_tensor(
         local_tensors=[
             torch.tensor([[0, 1], [10, 11]]),
             torch.tensor([[2], [12]]),
@@ -117,8 +113,8 @@ async def test_2d_assemble_global_tensor():
 
 
 @pytest.mark.asyncio
-async def test_2d_assemble_global_tensor_slice():
-    _test_assemble_global_tensor(
+async def test_2d_assemble_tensor_slice():
+    _test_assemble_tensor(
         local_tensors=[
             torch.tensor([[0, 1], [10, 11]]),
             torch.tensor([[2], [12]]),
