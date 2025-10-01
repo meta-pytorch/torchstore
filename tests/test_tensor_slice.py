@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import multiprocessing as mp
 import os
 import tempfile
 
@@ -153,6 +154,17 @@ async def test_put_dtensor_get_full_tensor():
 
 @pytest.mark.asyncio
 async def test_partial_put():
+    """
+    Verify the behavior when a dtensor is partially put.
+    1. Create two put actors. Each of them will put half of a DTensor.
+    2. Put actor 0 should be able to put the DTensor, but Put actor 1 will wait for
+       a signal to do the put.
+    3. We wait for Put actor 0 to finish its work and call get(). At this moment,
+       get() should receive an error because DTensor is not fully committed.
+    4. Then we release the signal so that Put actor 1 also continues to finish put
+       and release a signal of finish.
+    5. We call get() again to verify that now tensor can be fetched.
+    """
 
     await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
 
@@ -160,6 +172,11 @@ async def test_partial_put():
 
     with tempfile.TemporaryDirectory() as filesystem_store_dir:
         try:
+            # Use multiprocessing events for cross-process synchronization
+            actor_1_put_event = mp.Event()
+            rank_0_done_event = mp.Event()
+            rank_1_done_event = mp.Event()
+
             put_mesh = await spawn_actors(
                 2,
                 DTensorActor,
@@ -169,16 +186,27 @@ async def test_partial_put():
                 placements=[Shard(0)],
                 file_store_name=os.path.join(filesystem_store_dir, "put_test"),
                 visible_devices="0,1",
+                put_events=[None, actor_1_put_event],
+                get_events=[rank_0_done_event, rank_1_done_event],
             )
-            # Create an event for signaling between coroutines
-            signal_event = asyncio.Event()
 
             async def put():
                 await put_mesh.do_put.call()
-                signal_event.set()  # Signal to get() coroutine
 
             async def get():
-                await signal_event.wait()  # Wait for signal from put()
+                loop = asyncio.get_event_loop()
+                print("waiting for rank 0 to complete")
+                # Wait for rank 0 to complete
+                await loop.run_in_executor(None, rank_0_done_event.wait)
+                print("starting get after rank 0")
+                fetched_tensor = await ts.get("test_key")
+                print(f"fetched tensor after partial commit: {fetched_tensor}")
+                # Signal actor 1 to continue
+                actor_1_put_event.set()
+                print("waiting for rank 1 to complete")
+                # Wait for rank 1 to complete
+                await loop.run_in_executor(None, rank_1_done_event.wait)
+                print("both ranks completed, getting final tensor")
                 return await ts.get("test_key")
 
             tasks = [

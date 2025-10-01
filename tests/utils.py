@@ -5,9 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+import multiprocessing as mp
 import os
 from itertools import product
 from logging import getLogger
+
+from typing import List
 
 import pytest
 import torch
@@ -53,6 +56,10 @@ class DTensorActor(Actor):
         placements,
         file_store_name,
         visible_devices="0,1,2,3,4,5,6,7",
+        put_events: List[mp.Event] | None = None,  # signal for each rank to commit put
+        get_events: (
+            List[mp.Event] | None
+        ) = None,  # signal for reader when each rank completes
     ):
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape
@@ -60,6 +67,8 @@ class DTensorActor(Actor):
         self.original_tensor = original_tensor
         self.placements = placements
         self.file_store_name = file_store_name
+        self.put_events = put_events
+        self.get_events = get_events
 
         # torchstore will fail without this (see LocalRankStrategy)
         os.environ["LOCAL_RANK"] = str(self.rank)
@@ -96,7 +105,17 @@ class DTensorActor(Actor):
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 
         self.rlog(f"calling put with {dtensor=}")
+        if self.put_events and self.put_events[self.rank]:
+            print(f"rank: {self.rank} waiting")
+            # Use executor to wait for multiprocessing event
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self.put_events[self.rank].wait)
         await ts.put(self.shared_key, dtensor)
+        if self.get_events and self.get_events[self.rank]:
+            print(f"rank: {self.rank} setting get event")
+            self.get_events[self.rank].set()
 
     @endpoint
     async def do_get(self):
