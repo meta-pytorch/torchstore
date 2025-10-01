@@ -17,18 +17,7 @@ from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor, Shard
 from torch.distributed.device_mesh import init_device_mesh
 from torchstore.logging import init_logging
-from torchstore.utils import spawn_actors
-
-# ANSI escape codes for colored output
-YELLOW = "\033[93m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
-
-
-def print_yellow(text):
-    """Print text in yellow color"""
-    print(f"{YELLOW}{BOLD}{text}{RESET}")
-
+from torchstore.utils import color_print, spawn_actors
 
 init_logging()
 logger = getLogger(__name__)
@@ -122,9 +111,9 @@ async def dtensor_put_get_example():
     puts it with Shard(0) and gets it with Shard(1).
     """
     # Configuration variables
-    size = 3  # 100 unit size => 2.4 MB Tensor Size
-    n_put_actors = 8
-    n_get_actors = 8
+    size = 1  # 100 unit size => 2.4 MB Tensor Size
+    n_put_actors = 4
+    n_get_actors = 4
 
     print("Starting DTensor put/get example with:")
     print(f"  size = {size}")
@@ -171,7 +160,7 @@ async def dtensor_put_get_example():
             put_duration = put_end_time - put_start_time
 
             print("Successfully put tensor using first mesh")
-            print_yellow(f"⏱️  PUT operation took: {put_duration:.4f} seconds")
+            color_print(f"⏱️  PUT operation took: {put_duration:.4f} seconds")
 
             print(
                 f"\n--- Phase 2: Getting tensor with Shard(1) in ({n_get_actors},) mesh ---"
@@ -197,7 +186,7 @@ async def dtensor_put_get_example():
             get_duration = get_end_time - get_start_time
 
             print("Successfully retrieved tensor using second mesh")
-            print_yellow(f"⏱️  GET operation took: {get_duration:.4f} seconds")
+            color_print(f"⏱️  GET operation took: {get_duration:.4f} seconds", "y")
 
             # Print results from each rank in the get mesh
             for proc_info, (fetched_tensor, mesh_coord) in results:
@@ -221,10 +210,12 @@ async def dtensor_put_get_example():
 
             # Print timing summary
             print("\n" + "=" * 50)
-            print_yellow("⏱️  TIMING SUMMARY:")
-            print_yellow(f"   Tensor size:   {tensor_size_mb:.4f} MB ({tensor_shape})")
-            print_yellow(f"   PUT operation: {put_duration:.4f} seconds")
-            print_yellow(f"   GET operation: {get_duration:.4f} seconds")
+            color_print("⏱️  TIMING SUMMARY:", "y")
+            color_print(
+                f"   Tensor size:   {tensor_size_mb:.4f} MB ({tensor_shape})", "y"
+            )
+            color_print(f"   PUT operation: {put_duration:.4f} seconds", "y")
+            color_print(f"   GET operation: {get_duration:.4f} seconds", "y")
             print("=" * 50)
 
         finally:

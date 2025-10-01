@@ -186,6 +186,79 @@ def get_slice_intersection(
     )
 
 
+def extract_tensor_slice(
+    stored_tensor: torch.Tensor,
+    stored_slice: TensorSlice,
+    requested_slice: TensorSlice,
+) -> torch.Tensor | None:
+    """
+    Extract the intersection between stored slice and requested slices from the stored tensor.
+
+    This method enables efficient partial tensor retrieval by computing the overlap
+    between what's stored locally and what the client actually needs, then extracting
+    only that portion from the stored tensor data.
+
+    Args:
+        stored_tensor: The actual tensor data stored in this storage volume
+        stored_slice: Metadata describing what global region the stored_tensor represents
+        requested_slice: Metadata describing what global region the client wants
+
+    Returns:
+        The extracted tensor subset representing the intersection, or None if no overlap.
+        The returned tensor contains only the data that overlaps between the stored
+        and requested regions.
+
+    Raises:
+        ValueError: If global shapes don't match between slices
+        RuntimeError: If extracted tensor shape doesn't match expected intersection shape
+    """
+    # Ensure both slices have the same global shape
+    if stored_slice.global_shape != requested_slice.global_shape:
+        raise ValueError(
+            f"Global shapes don't match: {stored_slice.global_shape=} (Stored) {requested_slice.global_shape=} (Requested)"
+        )
+
+    # Compute intersection bounds and extraction indices
+    extract_indices = []
+    intersection_shape = []
+
+    for dim in range(len(stored_slice.global_shape)):
+        # Stored slice boundaries in global coordinates
+        stored_start = stored_slice.offsets[dim]
+        stored_end = stored_start + stored_slice.local_shape[dim]
+
+        # Requested slice boundaries in global coordinates
+        requested_start = requested_slice.offsets[dim]
+        requested_end = requested_start + requested_slice.local_shape[dim]
+
+        # Compute intersection boundaries in global coordinates
+        intersection_start = max(stored_start, requested_start)
+        intersection_end = min(stored_end, requested_end)
+
+        # Check if there's actually an intersection in this dimension
+        if intersection_start >= intersection_end:
+            return None  # No overlap
+
+        # Convert intersection to local indices within the stored tensor
+        local_start = intersection_start - stored_start
+        local_end = intersection_end - stored_start
+
+        extract_indices.append(slice(local_start, local_end))
+        intersection_shape.append(local_end - local_start)
+
+    # Extract the intersection portion from the stored tensor
+    extracted_tensor = stored_tensor[tuple(extract_indices)]
+
+    # Verify the extracted tensor has the expected intersection shape
+    expected_shape = tuple(intersection_shape)
+    if extracted_tensor.shape != expected_shape:
+        raise RuntimeError(
+            f"Extracted tensor shape {extracted_tensor.shape} doesn't match expected intersection shape {expected_shape}"
+        )
+
+    return extracted_tensor
+
+
 # A dev print util.
 def color_print(s, color=None, **kwargs):
     """

@@ -7,7 +7,7 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -59,14 +59,14 @@ class Request:
     Attributes:
         tensor_val (Optional[torch.Tensor]): The actual tensor data to store/retrieve.
             For DTensors, this contains the local tensor shard.
-        tensor_slice (Optional[TensorSlice]): Metadata about distributed tensor sharding,
+        tensor_slices (List[TensorSlice]): Metadata about distributed tensor sharding,
             including offsets, coordinates, and shape information.
         objects (Optional[Any]): Arbitrary Python objects that must be pickleable.
         is_object (bool): Flag indicating whether this request contains a non-tensor object.
     """
 
     tensor_val: Optional[torch.Tensor] = None
-    tensor_slice: Optional[TensorSlice] = None
+    tensor_slices: List[TensorSlice] = []
     objects: Optional[Any] = None  # Any, but must be pickleable.
     is_object: bool = False
 
@@ -101,7 +101,7 @@ class Request:
         )
         return cls(
             tensor_val=dtensor._local_tensor,
-            tensor_slice=tensor_slice,
+            tensor_slices=[tensor_slice],
         )
 
     @classmethod
@@ -113,14 +113,14 @@ class Request:
         return cls(objects=objects, is_object=True)
 
     @classmethod
-    def from_tensor_slice(cls, tensor_slice: TensorSlice) -> "Request":
-        return cls(tensor_slice=copy.deepcopy(tensor_slice))
+    def from_tensor_slices(cls, tensor_slices: List[TensorSlice]) -> "Request":
+        return cls(tensor_slices=copy.deepcopy(tensor_slices))
 
     def meta_only(self) -> "Request":
         """Returns a copy of this request with tensor_val set to None."""
         return Request(
             tensor_val=None,
-            tensor_slice=self.tensor_slice,
+            tensor_slices=self.tensor_slices,
             objects=self.objects,
             is_object=self.is_object,
         )

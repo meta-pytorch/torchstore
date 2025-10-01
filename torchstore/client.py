@@ -258,6 +258,9 @@ class LocalClient:
             The assembled tensor from all storage volumes
         """
         volume_map = await self._controller.locate_volumes.call_one(key)
+        from torchstore.utils import color_print
+
+        color_print(f"volume_map: {volume_map}", "b")
 
         # Handle the tensor case
         partial_results = []
@@ -265,9 +268,9 @@ class LocalClient:
             storage_volume = self.strategy.get_storage_volume(volume_id)
             pipe = Pipe(storage_volume)
 
-            # fetch from all storage volumes, something like this
-            # TODO: fix so we can request all tensor slices from a storage volume
-            # at once, this is silly
+            # Batch all of the tensor slices of interest in the volume
+            # so we can fetch with one request.
+            tensor_slices = []
             for tensor_slice in storage_info.tensor_slices:
                 # Intersect the tensor slice with the DTensor slice to optimize fetching
                 if tensor_slice_spec is not None:
@@ -279,13 +282,14 @@ class LocalClient:
                     if tensor_slice is None:
                         # No overlap, skip fetching this slice
                         continue
+                    tensor_slices.append(tensor_slice)
 
-                tensor_slice_request = Request.from_tensor_slice(tensor_slice)
+            tensor_slices_request = Request.from_tensor_slices(tensor_slices)
 
-                local_tensor = await pipe.get_from_storage_volume(
-                    key, tensor_slice_request
-                )
-                partial_results.append((local_tensor, tensor_slice))
+            local_tensors = await pipe.get_from_storage_volume(
+                key, tensor_slices_request
+            )
+            partial_results.extend(*local_tensors)
         if not partial_results:
             raise RuntimeError(
                 f"No tensor slices found for key '{key}' that intersect with the requested slice"

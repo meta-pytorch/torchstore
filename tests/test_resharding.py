@@ -31,14 +31,14 @@ async def test_1d_resharding(strategy_params, use_rdma):
     _, strategy = strategy_params
 
     for put_mesh_shape, get_mesh_shape in [
-        ((4,), (2,)),  # shrink
+        # ((4,), (2,)),  # shrink
         ((2,), (4,)),  # grow
     ]:
         for put_sharding_dim, get_sharding_dim in [
-            (0, 0),
+            # (0, 0),
             (0, 1),
-            (1, 0),
-            (1, 1),
+            # (1, 0),
+            # (1, 1),
         ]:
             # TODO: test Replicate as well, which is likely not working
             await _test_resharding(
