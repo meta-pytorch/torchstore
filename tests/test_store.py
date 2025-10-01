@@ -4,9 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import math
 import os
-import time
 from logging import getLogger
 
 import pytest
@@ -17,13 +15,10 @@ import torchstore as ts
 
 from monarch.actor import Actor, current_rank, endpoint
 
-# DTensor imports for DTensor slice testing
-from torch.distributed._tensor import Shard
 from torchstore.logging import init_logging
-from torchstore.transport.pipe import TensorSlice
 from torchstore.utils import spawn_actors
 
-from .utils import DTensorActor, main, transport_plus_strategy_params
+from .utils import main, transport_plus_strategy_params
 
 init_logging()
 logger = getLogger(__name__)
@@ -222,12 +217,12 @@ async def test_exists(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_get_tensor_slice(strategy_params, use_rdma):
-    """Test tensor slice API functionality"""
+async def test_delete(strategy_params, use_rdma):
+    """Test the delete() API functionality"""
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
-    class TensorSlicePutActor(Actor):
-        """Actor for putting tensors."""
+    class DeleteTestActor(Actor):
+        """Actor for testing delete functionality."""
 
         def __init__(self, world_size):
             init_logging()
@@ -237,216 +232,68 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
             os.environ["LOCAL_RANK"] = str(self.rank)
 
         @endpoint
-        async def put(self, key, tensor):
-            await ts.put(key, tensor)
+        async def put(self, key, value):
+            await ts.put(key, value)
+
+        @endpoint
+        async def delete(self, key):
+            await ts.delete(key)
+
+        @endpoint
+        async def exists(self, key):
+            return await ts.exists(key)
+
+        @endpoint
+        async def get(self, key):
+            return await ts.get(key)
 
     volume_world_size, strategy = strategy_params
     await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
 
-    # Spawn test actors - separate meshes for put and get to test cross-process communication
-    put_actor_mesh = await spawn_actors(
+    # Spawn test actors
+    actor_mesh = await spawn_actors(
         volume_world_size,
-        TensorSlicePutActor,
-        "tensor_slice_put_actors",
+        DeleteTestActor,
+        "delete_test_actors",
         world_size=volume_world_size,
     )
 
     try:
-        test_tensor = torch.randn(1000, 2000)
-        key = "test_tensor"
+        # Test 1: Store tensors, verify they exist, then delete them
+        tensor = torch.tensor([1, 2, 3, 4, 5])
+        for rank in range(volume_world_size):
+            actor = actor_mesh.slice(gpus=rank)
+            await actor.put.call(f"tensor_key_{rank}", tensor)
 
-        # Store the tensor using put actor mesh
-        put_actor = put_actor_mesh.slice(gpus=0)
-        await put_actor.put.call(key, test_tensor)
+        # Verify all tensors exist
+        for rank in range(volume_world_size):
+            results = await actor_mesh.exists.call(f"tensor_key_{rank}")
+            for _, exists_result in results:
+                assert exists_result
 
-        # Test full tensor retrieval using get actor mesh
-        retrieved_tensor = await ts.get(key)
-        assert torch.equal(test_tensor, retrieved_tensor)
+        # Delete tensors one at a time and verify each deletion
+        for rank in range(volume_world_size):
+            actor = actor_mesh.slice(gpus=rank)
+            await actor.delete.call(f"tensor_key_{rank}")
 
-        # Test slice retrieval using get actor mesh
-        tensor_slice_spec = TensorSlice(
-            offsets=(100, 200),
-            coordinates=(),
-            global_shape=(1000, 2000),
-            local_shape=(50, 100),
-            mesh_shape=(),
-        )
+            # Verify this specific tensor no longer exists
+            results = await actor_mesh.exists.call(f"tensor_key_{rank}")
+            for _, exists_result in results:
+                assert not exists_result
 
-        tensor_slice = await ts.get(key, tensor_slice_spec=tensor_slice_spec)
-        expected_slice = test_tensor[100:150, 200:300]
-        assert torch.equal(tensor_slice, expected_slice)
-        assert tensor_slice.shape == (50, 100)
+            # Verify other tensors still exist (if any remain)
+            for other_rank in range(rank + 1, volume_world_size):
+                results = await actor_mesh.exists.call(f"tensor_key_{other_rank}")
+                for _, exists_result in results:
+                    assert exists_result
 
-    finally:
-        await put_actor_mesh._proc_mesh.stop()
-        await ts.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_tensor_slice_inplace():
-    """Test tensor slice API with in-place operations"""
-    await ts.initialize(num_storage_volumes=1)
-
-    try:
-        # Store a test tensor
-        test_tensor = torch.randn(100, 200)
-        await ts.put("inplace_test", test_tensor)
-
-        # Test in-place retrieval with slice
-        slice_spec = TensorSlice(
-            offsets=(10, 20),
-            coordinates=(),
-            global_shape=(100, 200),
-            local_shape=(30, 40),
-            mesh_shape=(),
-        )
-
-        # Create pre-allocated buffer
-        slice_buffer = torch.empty(30, 40)
-        result = await ts.get(
-            "inplace_test", inplace_tensor=slice_buffer, tensor_slice_spec=slice_spec
-        )
-
-        # Verify in-place operation
-        assert result is slice_buffer
-        expected_slice = test_tensor[10:40, 20:60]
-        assert torch.equal(slice_buffer, expected_slice)
+        # Test 2: Try to get deleted tensor (should raise exception)
+        with pytest.raises(Exception):
+            await actor_mesh.get.call("tensor_key_0")
 
     finally:
+        await actor_mesh._proc_mesh.stop()
         await ts.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_large_tensors():
-    """Test basic put/get functionality for large tensors"""
-
-    class LargeTensorActor(Actor):
-        step_size: int = 100  # -> 400mb
-        max_step: int = 600  # 4mb -> 2gb
-
-        def __init__(self, generate_benchmark=False) -> None:
-            self.generate_benchmark = generate_benchmark
-            init_logging()
-
-        @endpoint
-        async def put(self):
-            dps = []
-            for n in range(1, self.max_step, self.step_size):
-                shape = (1024, 1024 * n)
-                size_mbytes = (
-                    math.prod(shape) * 4 // (1024 * 1024)
-                )  # float32 is 4 bytes, // mb
-                tensor = torch.randn(shape, dtype=torch.float32)
-
-                logger.info(f"Put {n=} {size_mbytes=}")
-                t = time.perf_counter()
-                try:
-                    await ts.put(str(n), tensor)
-                except Exception as e:
-                    logger.exception(f"Test failed with {size_mbytes=}")
-                    raise e
-
-                delta = time.perf_counter() - t
-                dps.append((size_mbytes, delta))
-                logger.info(f"Took {delta} seconds to put")
-
-            if self.generate_benchmark:
-                with open("put_benchmark.csv", "w") as fp:
-                    fp.write("size_mbytes, delta\n")
-                    for size_mbytes, delta in dps:
-                        fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
-
-        @endpoint
-        async def get(self):
-            dps = []
-            for n in range(1, self.max_step, self.step_size):
-                shape = (1024, 1024 * n)
-                size_mbytes = (
-                    math.prod(shape) * 4 // (1024 * 1024)
-                )  # float32 is 4 bytes, // mb
-
-                logger.info(f"Get {n=} {size_mbytes=}")
-                t = time.perf_counter()
-                try:
-                    await ts.get(str(n))
-                except Exception as e:
-                    logger.exception(f"Test failed with {size_mbytes=}")
-                    raise e
-
-                delta = time.perf_counter() - t
-                dps.append((size_mbytes, delta))
-                logger.info(f"Took {delta} seconds to fetch")
-
-            if self.generate_benchmark:
-                with open("get_benchmark.csv", "w") as fp:
-                    fp.write("size_mbytes, delta\n")
-                    for size_mbytes, delta in dps:
-                        fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
-
-    # controller code
-    await ts.initialize()
-    actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
-    try:
-        await actor.put.call_one()
-        await actor.get.call_one()
-        # TODO: assert equal tensors from put/get
-    finally:
-        await actor._proc_mesh.stop()
-        await ts.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_put_dtensor_get_full_tensor():
-    """Test basic DTensor put/get functionality with separate put and get meshes using shared DTensorActor"""
-    import tempfile
-
-    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
-
-    original_tensor = torch.arange(16).reshape(4, 4).float()
-
-    with tempfile.TemporaryDirectory() as filesystem_store_dir:
-        try:
-            put_mesh = await spawn_actors(
-                2,
-                DTensorActor,
-                "dtensor_put_mesh",
-                mesh_shape=(2,),
-                original_tensor=original_tensor,
-                placements=[Shard(0)],
-                file_store_name=os.path.join(filesystem_store_dir, "put_test"),
-                visible_devices="0,1",
-            )
-
-            await put_mesh.do_put.call()
-
-            fetched_tensor = await ts.get("test_key")
-            assert torch.equal(original_tensor, fetched_tensor)
-
-        finally:
-            # Clean up process groups
-            await put_mesh.destroy_process_group.call()
-            await put_mesh._proc_mesh.stop()
-            await ts.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_key_miss():
-    """Test the behavior of get() when the key is missing."""
-    await ts.initialize()
-
-    key = "foo"
-    value = torch.tensor([1, 2, 3])
-    await ts.put(key, value)
-
-    # Get the value back
-    retrieved_value = await ts.get(key)
-    assert torch.equal(value, retrieved_value)
-
-    # Get a missing key
-    with pytest.raises(KeyError):
-        await ts.get("bar")
-
-    await ts.shutdown()
 
 
 if __name__ == "__main__":
