@@ -239,7 +239,6 @@ async def test_partial_put():
                 print("starting get after rank 0")
 
                 # Try to get the tensor - should raise KeyError because only rank 0 has committed
-                # With PR #40, KeyError is properly raised instead of being wrapped in ActorError
                 partial_commit_error_raised = False
                 try:
                     fetched_tensor = await ts.get("test_key")
