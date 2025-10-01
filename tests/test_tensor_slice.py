@@ -189,7 +189,7 @@ async def test_partial_put():
     2. Put actor 0 should be able to put the DTensor, but Put actor 1 will wait for
        a signal to do the put.
     3. We wait for Put actor 0 to finish its work and call get(). At this moment,
-       get() should receive an error because DTensor is not fully committed.
+       get() should raise a KeyError because DTensor is not fully committed.
     4. Then we release the signal so that Put actor 1 also continues to finish put
        and release a signal of finish.
     5. We call get() again to verify that now tensor can be fetched.
@@ -237,8 +237,21 @@ async def test_partial_put():
                 # Wait for rank 0 to complete
                 await loop.run_in_executor(None, rank_0_sync.wait)
                 print("starting get after rank 0")
-                fetched_tensor = await ts.get("test_key")
-                print(f"fetched tensor after partial commit: {fetched_tensor}")
+
+                # Try to get the tensor - should raise KeyError because only rank 0 has committed
+                # With PR #40, KeyError is properly raised instead of being wrapped in ActorError
+                partial_commit_error_raised = False
+                try:
+                    fetched_tensor = await ts.get("test_key")
+                    print(f"ERROR: Should not have succeeded! Got tensor: {fetched_tensor}")
+                except KeyError as e:
+                    print(f"Expected KeyError raised: {e}")
+                    partial_commit_error_raised = True
+                    # Check that the error message mentions partial commit
+                    assert "partially committed" in str(e), f"Error message should mention partial commit: {e}"
+
+                assert partial_commit_error_raised, "KeyError should be raised for partially committed DTensor"
+
                 # Signal actor 1 to continue
                 await loop.run_in_executor(None, actor_1_sync.signal)
                 print("waiting for rank 1 to complete")

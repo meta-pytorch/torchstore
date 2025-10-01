@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass, field
 from enum import auto, Enum
+from itertools import product
 from typing import Dict, List, Mapping, Optional, Set
 
 from monarch.actor import Actor, endpoint
@@ -60,6 +61,51 @@ class Controller(Actor):
         assert (
             self.is_initialized
         ), "Please call torchstore.initialize before attempting to use store."
+
+    def _is_dtensor_fully_committed(
+        self, key: str, volume_map: Dict[str, StorageInfo]
+    ) -> bool:
+        """
+        Check if all shards of a DTensor have been committed.
+
+        For a DTensor to be fully committed, we need all coordinates in the mesh
+        to have been stored. The mesh_shape tells us the total number of shards,
+        and coordinates tell us which shards we have.
+
+        Args:
+            key (str): The key to check.
+            volume_map (Dict[str, StorageInfo]): Mapping from storage volume IDs to StorageInfo.
+
+        Returns:
+            bool: True if fully committed, False if partial.
+        """
+        # Collect all tensor slices across all storage volumes
+        all_slices = set()
+        mesh_shape = None
+
+        for storage_info in volume_map.values():
+            if storage_info.object_type != ObjectType.TENSOR_SLICE:
+                return True  # Not a DTensor, so it's "fully committed"
+
+            for tensor_slice in storage_info.tensor_slices:
+                if tensor_slice is None:
+                    continue
+                all_slices.add(tensor_slice.coordinates)
+                if mesh_shape is None:
+                    mesh_shape = tensor_slice.mesh_shape
+                else:
+                    assert (
+                        mesh_shape == tensor_slice.mesh_shape
+                    ), "Inconsistent mesh shapes in stored slices"
+
+        if mesh_shape is None:
+            return False
+
+        # Generate all expected coordinates for the mesh
+        expected_coords = set(product(*(range(s) for s in mesh_shape)))
+
+        # Check if we have all coordinates
+        return all_slices == expected_coords
 
     @endpoint
     async def init(
@@ -116,13 +162,25 @@ class Controller(Actor):
                 objects containing metadata about the stored data shards.
 
         Raises:
-            KeyError: If the key is not found in any storage volumes.
+            KeyError: If the key is not found in any storage volumes, or if the key
+                is a DTensor that is only partially committed.
         """
         self.assert_initialized()
 
         if key not in self.keys_to_storage_volumes:
             raise KeyError(f"Unable to locate {key} in any storage volumes.")
-        return self.keys_to_storage_volumes[key]
+
+        volume_map = self.keys_to_storage_volumes[key]
+
+        # Check if this is a DTensor and if it's fully committed
+        if not self._is_dtensor_fully_committed(key, volume_map):
+            raise KeyError(
+                f"DTensor '{key}' is only partially committed. "
+                f"Not all shards have been stored yet. "
+                f"Please ensure all ranks complete their put() operations."
+            )
+
+        return volume_map
 
     @endpoint
     def notify_put(self, key: str, request: Request, storage_volume_id: str) -> None:
