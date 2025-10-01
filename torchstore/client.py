@@ -332,7 +332,6 @@ class LocalClient:
             local_tensors,
             global_shape,
             global_offsets,
-            tensor_slice_spec,
         )
 
         return assembled_tensor
