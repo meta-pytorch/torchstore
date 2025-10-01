@@ -4,7 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 import os
+import tempfile
 
 import pytest
 import torch
@@ -120,8 +122,6 @@ async def test_tensor_slice_inplace():
 @pytest.mark.asyncio
 async def test_put_dtensor_get_full_tensor():
     """Test basic DTensor put/get functionality with separate put and get meshes using shared DTensorActor"""
-    import tempfile
-
     await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
 
     original_tensor = torch.arange(16).reshape(4, 4).float()
@@ -142,6 +142,52 @@ async def test_put_dtensor_get_full_tensor():
             await put_mesh.do_put.call()
 
             fetched_tensor = await ts.get("test_key")
+            assert torch.equal(original_tensor, fetched_tensor)
+
+        finally:
+            # Clean up process groups
+            await put_mesh.destroy_process_group.call()
+            await put_mesh._proc_mesh.stop()
+            await ts.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_partial_put():
+
+    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
+
+    original_tensor = torch.arange(16).reshape(4, 4).float()
+
+    with tempfile.TemporaryDirectory() as filesystem_store_dir:
+        try:
+            put_mesh = await spawn_actors(
+                2,
+                DTensorActor,
+                "dtensor_put_mesh",
+                mesh_shape=(2,),
+                original_tensor=original_tensor,
+                placements=[Shard(0)],
+                file_store_name=os.path.join(filesystem_store_dir, "put_test"),
+                visible_devices="0,1",
+            )
+            # Create an event for signaling between coroutines
+            signal_event = asyncio.Event()
+
+            async def put():
+                await put_mesh.do_put.call()
+                signal_event.set()  # Signal to get() coroutine
+
+            async def get():
+                await signal_event.wait()  # Wait for signal from put()
+                return await ts.get("test_key")
+
+            tasks = [
+                put(),
+                get(),
+            ]
+
+            _, fetched_tensor = await asyncio.gather(*tasks)
+
             assert torch.equal(original_tensor, fetched_tensor)
 
         finally:
