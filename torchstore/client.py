@@ -71,7 +71,13 @@ class LocalClient:
 
         if stored_object_type is ObjectType.TENSOR:
             # TODO: we should get the part of interest in this branch.
-            full_tensor = await self._get_tensor(key)
+            fetched_tensor = await self._get_tensor(key)
+            if tensor_slice_spec is not None:
+                fetched_tensor = get_local_tensor(
+                    fetched_tensor,
+                    tensor_slice_spec.local_shape,
+                    tensor_slice_spec.offsets,
+                )
         else:
             # Strored object is a DTensor. Return full tensor if
             # inplace_tensor is None, or return DTensor if inplace_tensor
@@ -82,28 +88,7 @@ class LocalClient:
                 Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
             )
             # Here full tensor should be the part of interest.
-            full_tensor = await self._get_distributed_whole_tensor(key, tensor_slice)
-
-        # If this is DTensor, chop the tensor to the requested slice
-        if isinstance(inplace_tensor, DTensor):
-            request = Request.from_any(inplace_tensor)
-            fetched_tensor = get_local_tensor(
-                full_tensor,
-                request.tensor_slice.local_shape,
-                request.tensor_slice.offsets,
-            )
-        # Inplace tensor is not DTensor, check if there's tensor slice spec
-        elif tensor_slice_spec is not None:
-            # User asked for a specific slice of a tensor
-            fetched_tensor = get_local_tensor(
-                full_tensor,
-                tensor_slice_spec.local_shape,
-                tensor_slice_spec.offsets,
-            )
-        # Not DTensor nor tensor slice, user asked for the whole tensor
-        else:
-            # User asked for the whole tensor
-            fetched_tensor = full_tensor
+            fetched_tensor = await self._get_distributed_whole_tensor(key, tensor_slice)
 
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy

@@ -58,7 +58,7 @@ def get_local_tensor(
 
 def assemble_global_tensor(
     local_tensors: List[torch.Tensor],
-    global_shape: "ShapeType",
+    global_shape: "ShapeType",  # TODO: unused, cleanup
     global_offsets: List["ShapeType"],
 ) -> torch.Tensor:
     """
@@ -122,3 +122,51 @@ def get_target_tensor_shape_and_offset(
     ), f"Local tensors cannot fill the target tensor. Local tensors total size: {local_tensor_total_size}, Target tensor size: {target_tensor_size}"
 
     return target_shape, target_offset
+
+
+# A dev print util.
+def color_print(s, color=None, **kwargs):
+    """
+    Print text in specified color to the console.
+
+    Args:
+        s: Text to print
+        color: Single character color code:
+            'k' or 'black' - Black
+            'r' or 'red' - Red
+            'g' or 'green' - Green
+            'y' or 'yellow' - Yellow
+            'b' or 'blue' - Blue
+            'm' or 'magenta' - Magenta
+            'c' or 'cyan' - Cyan
+            'w' or 'white' - White
+        **kwargs: Additional arguments passed to print()
+    """
+    # ANSI color code mapping
+    color_codes = {
+        "k": "\033[30m",  # black
+        "black": "\033[30m",
+        "r": "\033[31m",  # red
+        "red": "\033[31m",
+        "g": "\033[32m",  # green
+        "green": "\033[32m",
+        "y": "\033[33m",  # yellow
+        "yellow": "\033[33m",
+        "b": "\033[34m",  # blue
+        "blue": "\033[34m",
+        "m": "\033[35m",  # magenta
+        "magenta": "\033[35m",
+        "c": "\033[36m",  # cyan
+        "cyan": "\033[36m",
+        "w": "\033[37m",  # white
+        "white": "\033[37m",
+    }
+
+    reset_code = "\033[0m"
+
+    if color and color.lower() in color_codes:
+        color_code = color_codes[color.lower()]
+        print(f"{color_code}{s}{reset_code}", **kwargs)
+    else:
+        # No color or invalid color, print normally
+        print(s, **kwargs)

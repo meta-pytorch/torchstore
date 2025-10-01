@@ -53,7 +53,8 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
     )
 
     try:
-        test_tensor = torch.randn(1000, 2000)
+        # Create a 100x100 tensor filled with sequential values 0-9999
+        test_tensor = torch.arange(10000).reshape(100, 100).float()
         key = "test_tensor"
 
         # Store the tensor using put actor mesh
@@ -66,17 +67,17 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
 
         # Test slice retrieval using get actor mesh
         tensor_slice_spec = TensorSlice(
-            offsets=(100, 200),
+            offsets=(10, 20),
             coordinates=(),
-            global_shape=(1000, 2000),
-            local_shape=(50, 100),
+            global_shape=(100, 100),
+            local_shape=(5, 10),
             mesh_shape=(),
         )
 
         tensor_slice = await ts.get(key, tensor_slice_spec=tensor_slice_spec)
-        expected_slice = test_tensor[100:150, 200:300]
+        expected_slice = test_tensor[10:15, 20:30]
         assert torch.equal(tensor_slice, expected_slice)
-        assert tensor_slice.shape == (50, 100)
+        assert tensor_slice.shape == (5, 10)
 
     finally:
         await put_actor_mesh._proc_mesh.stop()
