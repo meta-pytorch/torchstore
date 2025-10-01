@@ -56,10 +56,10 @@ class DTensorActor(Actor):
         placements,
         file_store_name,
         visible_devices="0,1,2,3,4,5,6,7",
-        put_events: List[mp.Event] | None = None,  # signal for each rank to commit put
+        put_events: List[str] | None = None,  # file paths for each rank to wait before put
         get_events: (
-            List[mp.Event] | None
-        ) = None,  # signal for reader when each rank completes
+            List[str] | None
+        ) = None,  # file paths for each rank to signal completion
     ):
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape
@@ -106,16 +106,38 @@ class DTensorActor(Actor):
 
         self.rlog(f"calling put with {dtensor=}")
         if self.put_events and self.put_events[self.rank]:
-            print(f"rank: {self.rank} waiting")
-            # Use executor to wait for multiprocessing event
+            print(f"rank: {self.rank} waiting on file {self.put_events[self.rank]}")
+            # Wait for signal via file
             import asyncio
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.put_events[self.rank].wait)
+            await loop.run_in_executor(None, self._wait_on_file, self.put_events[self.rank])
         await ts.put(self.shared_key, dtensor)
         if self.get_events and self.get_events[self.rank]:
-            print(f"rank: {self.rank} setting get event")
-            self.get_events[self.rank].set()
+            print(f"rank: {self.rank} signaling on file {self.get_events[self.rank]}")
+            # Signal completion via file
+            import asyncio
+
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._signal_file, self.get_events[self.rank])
+
+    def _wait_on_file(self, file_path, timeout=30):
+        """Wait for file to be created (blocking)."""
+        import time
+
+        start_time = time.time()
+        while not os.path.exists(file_path):
+            if time.time() - start_time > timeout:
+                raise TimeoutError(f"Timeout waiting for file: {file_path}")
+            time.sleep(0.01)  # Poll every 10ms
+
+    def _signal_file(self, file_path):
+        """Create file to signal completion."""
+        # Create parent directory if it doesn't exist
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        # Create an empty file
+        with open(file_path, 'w') as f:
+            f.write('1')
 
     @endpoint
     async def do_get(self):

@@ -8,6 +8,7 @@ import asyncio
 import multiprocessing as mp
 import os
 import tempfile
+import time
 
 import pytest
 import torch
@@ -22,6 +23,34 @@ from torchstore.transport.pipe import TensorSlice
 from torchstore.utils import spawn_actors
 
 from .utils import DTensorActor, main, transport_plus_strategy_params
+
+
+class FileSync:
+    """Simple synchronization using file existence checks."""
+
+    def __init__(self, file_path):
+        self.file_path = file_path
+
+    def wait(self, timeout=30):
+        """Wait for a file to be created (blocking)."""
+        start_time = time.time()
+        while not os.path.exists(self.file_path):
+            if time.time() - start_time > timeout:
+                raise TimeoutError(f"Timeout waiting for file: {self.file_path}")
+            time.sleep(0.01)  # Poll every 10ms
+
+    def signal(self):
+        """Create the file to signal completion."""
+        # Create parent directory if it doesn't exist
+        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        # Create an empty file
+        with open(self.file_path, 'w') as f:
+            f.write('1')
+
+    def cleanup(self):
+        """Clean up the file."""
+        if os.path.exists(self.file_path):
+            os.remove(self.file_path)
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -171,12 +200,21 @@ async def test_partial_put():
     original_tensor = torch.arange(16).reshape(4, 4).float()
 
     with tempfile.TemporaryDirectory() as filesystem_store_dir:
-        try:
-            # Use multiprocessing events for cross-process synchronization
-            actor_1_put_event = mp.Event()
-            rank_0_done_event = mp.Event()
-            rank_1_done_event = mp.Event()
+        # Use file-based synchronization for cross-process communication
+        sync_dir = os.path.join(filesystem_store_dir, "sync")
+        os.makedirs(sync_dir, exist_ok=True)
 
+        # File paths for synchronization
+        actor_1_put_file = os.path.join(sync_dir, "actor_1_put.txt")
+        rank_0_done_file = os.path.join(sync_dir, "rank_0_done.txt")
+        rank_1_done_file = os.path.join(sync_dir, "rank_1_done.txt")
+
+        # Create sync objects for waiting
+        rank_0_sync = FileSync(rank_0_done_file)
+        rank_1_sync = FileSync(rank_1_done_file)
+        actor_1_sync = FileSync(actor_1_put_file)
+
+        try:
             put_mesh = await spawn_actors(
                 2,
                 DTensorActor,
@@ -186,8 +224,8 @@ async def test_partial_put():
                 placements=[Shard(0)],
                 file_store_name=os.path.join(filesystem_store_dir, "put_test"),
                 visible_devices="0,1",
-                put_events=[None, actor_1_put_event],
-                get_events=[rank_0_done_event, rank_1_done_event],
+                put_events=[None, actor_1_put_file],
+                get_events=[rank_0_done_file, rank_1_done_file],
             )
 
             async def put():
@@ -197,15 +235,15 @@ async def test_partial_put():
                 loop = asyncio.get_event_loop()
                 print("waiting for rank 0 to complete")
                 # Wait for rank 0 to complete
-                await loop.run_in_executor(None, rank_0_done_event.wait)
+                await loop.run_in_executor(None, rank_0_sync.wait)
                 print("starting get after rank 0")
                 fetched_tensor = await ts.get("test_key")
                 print(f"fetched tensor after partial commit: {fetched_tensor}")
                 # Signal actor 1 to continue
-                actor_1_put_event.set()
+                await loop.run_in_executor(None, actor_1_sync.signal)
                 print("waiting for rank 1 to complete")
                 # Wait for rank 1 to complete
-                await loop.run_in_executor(None, rank_1_done_event.wait)
+                await loop.run_in_executor(None, rank_1_sync.wait)
                 print("both ranks completed, getting final tensor")
                 return await ts.get("test_key")
 
@@ -223,6 +261,10 @@ async def test_partial_put():
             await put_mesh.destroy_process_group.call()
             await put_mesh._proc_mesh.stop()
             await ts.shutdown()
+            # Clean up sync files
+            rank_0_sync.cleanup()
+            rank_1_sync.cleanup()
+            actor_1_sync.cleanup()
 
 
 if __name__ == "__main__":
