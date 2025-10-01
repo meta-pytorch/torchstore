@@ -13,7 +13,6 @@ import numpy as np
 import torch
 
 from monarch.actor import ProcMesh, this_host
-from torchstore.transport import TensorSlice
 
 
 if TYPE_CHECKING:
@@ -119,7 +118,8 @@ def get_target_tensor_shape_and_offset(
     target_tensor_size = np.prod(target_shape)
     assert (
         local_tensor_total_size <= target_tensor_size
-    ), f"Local tensors cannot fill the target tensor. Local tensors total size: {local_tensor_total_size}, Target tensor size: {target_tensor_size}"
+    ), "Local tensors cannot fill the target tensor. "
+    f"Local tensors total size: {local_tensor_total_size}, Target tensor size: {target_tensor_size}"
 
     return target_shape, target_offset
 
