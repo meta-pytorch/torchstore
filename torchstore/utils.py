@@ -84,7 +84,7 @@ def assemble_global_tensor(
     # Iterate over each local tensor and place it in the correct position in the global tensor
     for local_tensor, offset in zip(local_tensors, global_offsets, strict=True):
         slices = tuple(
-            slice(o - to, o + s)
+            slice(o - to, o - to + s)
             for o, to, s in zip(offset, target_offset, local_tensor.shape, strict=True)
         )
         tensor[slices] = local_tensor

@@ -89,6 +89,19 @@ async def test_1d_assemble_global_tensor():
 
 
 @pytest.mark.asyncio
+async def test_1d_assemble_global_tensor_slice():
+    _test_assemble_global_tensor(
+        local_tensors=[
+            torch.tensor([1]),
+            torch.tensor([2]),
+        ],
+        global_shape=(4,),
+        global_offsets=[(1,), (2,)],
+        expected_output=torch.tensor([1, 2]),
+    )
+
+
+@pytest.mark.asyncio
 async def test_2d_assemble_global_tensor():
     _test_assemble_global_tensor(
         local_tensors=[
@@ -100,4 +113,18 @@ async def test_2d_assemble_global_tensor():
         global_shape=(2, 5),
         global_offsets=[(0, 0), (0, 2), (0, 3), (0, 4)],
         expected_output=torch.tensor([[0, 1, 2, 3, 4], [10, 11, 12, 13, 14]]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_2d_assemble_global_tensor_slice():
+    _test_assemble_global_tensor(
+        local_tensors=[
+            torch.tensor([[0, 1], [10, 11]]),
+            torch.tensor([[2], [12]]),
+            torch.tensor([[20, 21, 22]]),
+        ],
+        global_shape=(100, 100),
+        global_offsets=[(1, 1), (1, 3), (3, 1)],
+        expected_output=torch.tensor([[0, 1, 2], [10, 11, 12], [20, 21, 22]]),
     )
