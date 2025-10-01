@@ -26,7 +26,7 @@ class ObjectType(Enum):
     def from_request(cls, request: Request) -> "ObjectType":
         if request.is_object:
             return cls.OBJECT
-        elif request.tensor_slice is not None:
+        elif request.tensor_slices:
             return cls.TENSOR_SLICE
         else:
             return cls.TENSOR
@@ -146,7 +146,7 @@ class Controller(Actor):
 
         storage_info = StorageInfo(
             object_type=ObjectType.from_request(request),
-            tensor_slices=set([request.tensor_slice]),
+            tensor_slices=set(request.tensor_slices),
         )
 
         if storage_volume_id not in self.keys_to_storage_volumes[key]:

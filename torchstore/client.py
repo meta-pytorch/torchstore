@@ -84,8 +84,9 @@ class LocalClient:
             # is DTensor.
             # Here we abused request a bit to get tensor_slice from inplace DTensor. Otherwise
             # Request.from_any(inplace_tensor) will return None, and we use the tensor_slice_spec.
+            request = Request.from_any(inplace_tensor)
             tensor_slice = (
-                Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
+                request.tensor_slices[0] if request.tensor_slices else tensor_slice_spec
             )
             # Here full tensor should be the part of interest.
             fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
@@ -282,14 +283,18 @@ class LocalClient:
                     if tensor_slice is None:
                         # No overlap, skip fetching this slice
                         continue
-                    tensor_slices.append(tensor_slice)
+                tensor_slices.append(tensor_slice)
 
-            tensor_slices_request = Request.from_tensor_slices(tensor_slices)
+            if tensor_slices:  # Only make request if we have slices to fetch
+                tensor_slices_request = Request.from_tensor_slices(tensor_slices)
 
-            local_tensors = await pipe.get_from_storage_volume(
-                key, tensor_slices_request
-            )
-            partial_results.extend(*local_tensors)
+                local_tensors = await pipe.get_from_storage_volume(
+                    key, tensor_slices_request
+                )
+                # Pair each tensor with its corresponding slice
+                if local_tensors is not None:
+                    for local_tensor, tensor_slice in zip(local_tensors, tensor_slices):
+                        partial_results.append((local_tensor, tensor_slice))
         if not partial_results:
             raise RuntimeError(
                 f"No tensor slices found for key '{key}' that intersect with the requested slice"

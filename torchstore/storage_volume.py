@@ -216,12 +216,13 @@ class InMemoryStore(StorageImpl):
             transport_buffer.objects = val["obj"]
             return transport_buffer
 
-        if request.tensor_slices is None:
+        if not request.tensor_slices:
             await transport_buffer.write_from(self.kv[key])
             return transport_buffer
 
         tensors: List[Tensor] = []
         for request_tensor_slice in request.tensor_slices:
+            found_tensor = False
             for shard in self.kv[key].values():
                 stored_slice = shard["slice"]
                 stored_tensor = shard["tensor"]
@@ -232,12 +233,15 @@ class InMemoryStore(StorageImpl):
                 )
                 if extracted_tensor is not None:
                     tensors.append(extracted_tensor)
+                    found_tensor = True
                     # We have found the requested slice, no need to continue searching
                     break
+
             # The requested slice was not found in any stored shards
-            raise RuntimeError(
-                f"Tensor slice {request.tensor_slices} not found in any stored shards for {key}"
-            )
+            if not found_tensor:
+                raise RuntimeError(
+                    f"Tensor slice [{request_tensor_slice}] not found in any stored shards for {key}"
+                )
 
         await transport_buffer.write_from(tensors)
         return transport_buffer
@@ -278,7 +282,6 @@ class InMemoryStore(StorageImpl):
         raise RuntimeError(
             f"Unknown type for {key} type={type(stored_object)} {stored_object=}"
         )
-        raise RuntimeError(f"Unknown type for {key} type={type(val)}")
 
     async def delete(self, key: str) -> None:
         if key not in self.kv:

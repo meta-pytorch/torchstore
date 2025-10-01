@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging import getLogger
 from typing import Any, List, Optional, Tuple
 
@@ -66,7 +66,7 @@ class Request:
     """
 
     tensor_val: Optional[torch.Tensor] = None
-    tensor_slices: List[TensorSlice] = []
+    tensor_slices: List[TensorSlice] = field(default_factory=list)
     objects: Optional[Any] = None  # Any, but must be pickleable.
     is_object: bool = False
 
