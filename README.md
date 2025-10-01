@@ -14,10 +14,6 @@ Key Features:
 - Multiple transport backends (RDMA, regular TCP) for optimal performance
 - Flexible storage volume management and sharding strategies
 
-# Under Construction!
-
-Nothing to see here yet, but check back soon
-
 ## Installation
 
 ### Env Setup
@@ -64,9 +60,7 @@ Once installed, you can import it in your Python code:
 import torchstore
 ```
 
-Note: Setup currently assumes you have a working conda environment with both torch & monarch (this is currently a todo). For now the fastest way of setting up is going through [this](https://www.internalfb.com/wiki/Monarch/Monarch_xlformers_integration/Running_Monarch_on_Conda/#how-to-run-monarch) guide.
-
-Protop: Install finetine conda & use the 'local' option for the latest packges
+Note: Setup currently assumes you have a working conda environment with both torch & monarch (this is currently a todo).
 
 ## Usage
 
@@ -134,15 +128,11 @@ if __name__ == "__main__":
 # checkout out tests/test_resharding.py for more e2e examples with resharding DTensor.
 ```
 
-# Contributing Guidelines
-
-1. Build in public -- TorchStore should be OSS first, giving users a clear vision on where we want to go and how to help us get there.
-
-2. Build the Bicycle, not the super car -- Develop value iterively, instead of trying to ship everything at once.
-
-3. Work backwards from use cases, and leave tests!
-
 # Testing
 
 Pytest is used for testing. For an examples of how to run tests (and get logs), see:
 `TORCHSTORE_LOG_LEVEL=DEBUG pytest -vs --log-cli-level=DEBUG tests/test_models.py::test_main`
+
+## License
+
+Monarch is BSD-3 licensed, as found in the [LICENSE](LICENSE) file.
