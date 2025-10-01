@@ -8,9 +8,12 @@ import uuid
 from logging import getLogger
 from typing import List, Tuple, TYPE_CHECKING
 
+import numpy as np
+
 import torch
 
 from monarch.actor import ProcMesh, this_host
+from torchstore.transport import TensorSlice
 
 
 if TYPE_CHECKING:
@@ -57,9 +60,10 @@ def assemble_global_tensor(
     local_tensors: List[torch.Tensor],
     global_shape: "ShapeType",
     global_offsets: List["ShapeType"],
-):
+) -> torch.Tensor:
     """
-    Assemble a global tensor from local tensors based on their shapes and offsets.
+    Assemble a global tensor from local tensors based on their shapes and offsets. The final shape of the returned
+    tensor is the union of local tensors.
 
     :param local_tensors: List of local tensors
     :param global_shape: Shape of the final global tensor
@@ -69,16 +73,52 @@ def assemble_global_tensor(
     # Create an empty global tensor of the specified shape
     assert local_tensors
 
-    global_tensor = torch.empty(
-        global_shape,
+    target_shape, target_offset = get_target_tensor_shape_and_offset(
+        [local_tensor.shape for local_tensor in local_tensors], global_offsets
+    )
+    tensor = torch.empty(
+        target_shape,
         dtype=local_tensors[0].dtype,
     )
 
     # Iterate over each local tensor and place it in the correct position in the global tensor
     for local_tensor, offset in zip(local_tensors, global_offsets, strict=True):
         slices = tuple(
-            slice(o, o + s) for o, s in zip(offset, local_tensor.shape, strict=True)
+            slice(o - to, o + s)
+            for o, to, s in zip(offset, target_offset, local_tensor.shape, strict=True)
         )
-        global_tensor[slices] = local_tensor
+        tensor[slices] = local_tensor
 
-    return global_tensor
+    return tensor
+
+
+def get_target_tensor_shape_and_offset(
+    local_tensor_shapes: List["ShapeType"],
+    global_offsets: List["ShapeType"],
+) -> Tuple["ShapeType", "ShapeType"]:
+    """
+    Get the target tensor shape and offset based on the local tensor shapes and global offsets.
+
+    :param local_tensor_shapes: List of shapes of local tensors
+    :param global_offsets: List of offsets for each local tensor in the global tensor
+    :return: Tuple of target tensor shape and offset
+    """
+    target_offset = min(global_offsets)
+    target_ends = tuple(
+        max(
+            offset[i] + shape[i]
+            for offset, shape in zip(global_offsets, local_tensor_shapes)
+        )
+        for i in range(len(global_offsets[0]))
+    )
+    target_shape = [max(0, e - o) for o, e in zip(target_offset, target_ends)]
+
+    # Verify that local tensors can fill the target tensor, this verification is only necessary but not
+    # sufficient to guarantee that the target tensor can be filled by local tensors.
+    local_tensor_total_size = sum([np.prod(shape) for shape in local_tensor_shapes])
+    target_tensor_size = np.prod(target_shape)
+    assert (
+        local_tensor_total_size <= target_tensor_size
+    ), f"Local tensors cannot fill the target tensor. Local tensors total size: {local_tensor_total_size}, Target tensor size: {target_tensor_size}"
+
+    return target_shape, target_offset

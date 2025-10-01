@@ -64,20 +64,27 @@ class LocalClient:
 
         self._verify_get_args(inplace_tensor, tensor_slice_spec, stored_object_type)
 
+        # Get a spec of the shape and offset of the tensor slice to fetch. Fetch the whole tensor otherwise
+
         if stored_object_type is ObjectType.OBJECT:
             return await self._get_object(key)
 
         if stored_object_type is ObjectType.TENSOR:
+            # TODO: we should get the part of interest in this branch.
             full_tensor = await self._get_tensor(key)
         else:
             # Strored object is a DTensor. Return full tensor if
             # inplace_tensor is None, or return DTensor if inplace_tensor
             # is DTensor.
-            request = Request.from_any(inplace_tensor)
-            full_tensor = await self._get_distributed_whole_tensor(
-                key, request.tensor_slice
+            # Here we abused request a bit to get tensor_slice from inplace DTensor. Otherwise
+            # Request.from_any(inplace_tensor) will return None, and we use the tensor_slice_spec.
+            tensor_slice = (
+                Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
             )
+            # Here full tensor should be the part of interest.
+            full_tensor = await self._get_distributed_whole_tensor(key, tensor_slice)
 
+        # If this is DTensor, chop the tensor to the requested slice
         if isinstance(inplace_tensor, DTensor):
             request = Request.from_any(inplace_tensor)
             fetched_tensor = get_local_tensor(
@@ -85,6 +92,7 @@ class LocalClient:
                 request.tensor_slice.local_shape,
                 request.tensor_slice.offsets,
             )
+        # Inplace tensor is not DTensor, check if there's tensor slice spec
         elif tensor_slice_spec is not None:
             # User asked for a specific slice of a tensor
             fetched_tensor = get_local_tensor(
@@ -92,6 +100,7 @@ class LocalClient:
                 tensor_slice_spec.local_shape,
                 tensor_slice_spec.offsets,
             )
+        # Not DTensor nor tensor slice, user asked for the whole tensor
         else:
             # User asked for the whole tensor
             fetched_tensor = full_tensor
@@ -251,14 +260,14 @@ class LocalClient:
             return await pipe.get_from_storage_volume(key, request)
 
     async def _get_distributed_whole_tensor(
-        self, key: str, dtensor_slice: TensorSlice | None = None
+        self, key: str, tensor_slice_spec: TensorSlice | None = None
     ) -> torch.Tensor:
         """Fetches slices from all volume storages and stitch together to return the whole tensor.
 
         Args:
             key: The key to fetch from storage
-            dtensor_slice: Optional tensor slice to optimize fetching by only retrieving
-                          intersecting portions from storage volumes
+            tensor_slice_spec: Optional tensor slice to optimize fetching by only retrieving
+                          intersecting portions from storage volumes. If None, fetches the whole tensor.
 
         Returns:
             The assembled tensor from all storage volumes
@@ -276,10 +285,10 @@ class LocalClient:
             # at once, this is silly
             for tensor_slice in storage_info.tensor_slices:
                 # Intersect the tensor slice with the DTensor slice to optimize fetching
-                if dtensor_slice is not None:
+                if tensor_slice_spec is not None:
                     # Check if stored tensor_slice overlaps with requested dtensor_slice
                     tensor_slice = self._compute_slice_intersection(
-                        tensor_slice, dtensor_slice
+                        tensor_slice, tensor_slice_spec
                     )
 
                     if tensor_slice is None:
@@ -323,6 +332,7 @@ class LocalClient:
             local_tensors,
             global_shape,
             global_offsets,
+            tensor_slice_spec,
         )
 
         return assembled_tensor
