@@ -14,6 +14,8 @@ import torch
 
 from monarch.actor import ProcMesh, this_host
 
+from torchstore.transport import TensorSlice
+
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
@@ -122,6 +124,66 @@ def get_target_tensor_shape_and_offset(
     f"Local tensors total size: {local_tensor_total_size}, Target tensor size: {target_tensor_size}"
 
     return target_shape, target_offset
+
+
+def get_slice_intersection(
+    tensor_slice: TensorSlice, dtensor_slice: TensorSlice
+) -> TensorSlice | None:
+    """
+    Compute the intersection of two tensor slices for optimized fetching.
+
+    This method is used to optimize DTensor retrieval by computing the overlap
+    between what's stored in a storage volume and what's actually needed by
+    the requesting DTensor. Only the intersecting portion needs to be fetched.
+
+    Args:
+        tensor_slice: The stored tensor slice metadata (what's available in storage)
+        dtensor_slice: The requested DTensor slice metadata (what we want to retrieve)
+
+    Returns:
+        TensorSlice representing the intersection region, or None if no overlap exists.
+        The returned slice has the same coordinates and mesh_shape as the original
+        tensor_slice but with updated offsets and local_shape for the intersection.
+
+    Raises:
+        None: Returns None instead of raising when slices don't intersect
+    """
+    # Ensure both slices have the same global shape
+    if tensor_slice.global_shape != dtensor_slice.global_shape:
+        return None
+
+    # Compute intersection for each dimension
+    new_offsets = []
+    new_local_shape = []
+
+    for dim in range(len(tensor_slice.global_shape)):
+        # Stored slice boundaries
+        stored_start = tensor_slice.offsets[dim]
+        stored_end = stored_start + tensor_slice.local_shape[dim]
+
+        # Requested slice boundaries
+        requested_start = dtensor_slice.offsets[dim]
+        requested_end = requested_start + dtensor_slice.local_shape[dim]
+
+        # Compute intersection
+        intersect_start = max(stored_start, requested_start)
+        intersect_end = min(stored_end, requested_end)
+
+        # Check if there's actually an intersection
+        if intersect_start >= intersect_end:
+            return None  # No overlap in this dimension
+
+        new_offsets.append(intersect_start)
+        new_local_shape.append(intersect_end - intersect_start)
+
+    # Create intersection slice
+    return TensorSlice(
+        offsets=tuple(new_offsets),
+        coordinates=tensor_slice.coordinates,  # Keep original coordinates
+        global_shape=tensor_slice.global_shape,
+        local_shape=tuple(new_local_shape),
+        mesh_shape=tensor_slice.mesh_shape,  # Keep original mesh shape
+    )
 
 
 # A dev print util.
