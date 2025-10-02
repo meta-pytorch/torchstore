@@ -88,8 +88,6 @@ class Controller(Actor):
                 return True  # Not a DTensor, so it's "fully committed"
 
             for tensor_slice in storage_info.tensor_slices:
-                if tensor_slice is None:
-                    continue
                 all_slices.add(tensor_slice.coordinates)
                 if mesh_shape is None:
                     mesh_shape = tensor_slice.mesh_shape
@@ -97,9 +95,6 @@ class Controller(Actor):
                     assert (
                         mesh_shape == tensor_slice.mesh_shape
                     ), "Inconsistent mesh shapes in stored slices"
-
-        if mesh_shape is None:
-            return False
 
         # Generate all expected coordinates for the mesh
         expected_coords = set(product(*(range(s) for s in mesh_shape)))
