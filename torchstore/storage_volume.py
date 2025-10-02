@@ -235,7 +235,7 @@ class InMemoryStore(StorageImpl):
 
         if request.tensor_slice is None:
             await transport_buffer.write_from(self.kv[key])
-            transport_buffer.finish()
+            await transport_buffer.finish()
             return transport_buffer
 
         # TODO:
