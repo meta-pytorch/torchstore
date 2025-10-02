@@ -183,6 +183,7 @@ async def test_partial_put():
             # Execute the put - rank 0 will put, rank 1 will skip
             await put_mesh.do_put.call()
 
+            assert not await ts.exists("test_key")
             # Try to get the tensor - should raise KeyError because only rank 0 has committed
             with pytest.raises(KeyError) as exc_info:
                 await ts.get("test_key")
