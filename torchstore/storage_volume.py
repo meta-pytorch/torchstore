@@ -212,7 +212,7 @@ class InMemoryStore(StorageImpl):
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
         tensor = await transport_buffer.read_into(tensor=None)
-        transport_buffer.finish()
+        await transport_buffer.finish()
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
