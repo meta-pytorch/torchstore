@@ -81,7 +81,7 @@ class TransportBuffer:
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
         raise NotImplementedError()
 
-    def finish(self) -> None:
+    await def finish(self) -> None:
         """Finalize the transport buffer"""
         pass
 
