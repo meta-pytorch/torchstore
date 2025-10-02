@@ -21,22 +21,11 @@ except ImportError:
         )
 
 
-# TODO: for some reason, RDMABuffer is breaking for certain tensors on the HF models (qwen, llama)
-# but setting this chunk size works around the issue until we can fix it
-# N.B. from benchmarking, we know the ideal size is any size >=256mb.
-
-# Check for misspelled environment variable for backward compatibility
-rdma_chunk_size_env = os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB")
-if rdma_chunk_size_env is not None:
-    logging.warning(
-        "Using deprecated environment variable 'TORCHSTORE_RDMDA_CHUNK_SIZE_MB'. "
-        "Please use 'TORCHSTORE_RDMA_CHUNK_SIZE_MB' instead."
-    )
-    RDMA_CHUNK_SIZE_MB: int = int(rdma_chunk_size_env)
-else:
-    RDMA_CHUNK_SIZE_MB: int = int(
-        os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "2048")
-    )
+# TODO: we no longer need to chunk with monararch rdma buffer. Setting large chunk size for now,
+# but we should remove all chunking code
+RDMA_CHUNK_SIZE_MB: int = int(
+    os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", str(1024 * 32))
+)
 
 # assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
@@ -202,10 +191,7 @@ class RDMATransportBuffer(TransportBuffer):
             self.rdma_buffers[0].size() == tensor.numel() * tensor.element_size()
         ), f"{self.rdma_buffers[0].size()=} != {tensor.numel() * tensor.element_size()=}"
         for idx, chunk in enumerate(chunked_byte_view):
-            assert tensor.is_contiguous()
-            tensor = tensor.clone()
-            await self.rdma_buffers[idx].write_from(tensor.view(torch.uint8).flatten())
-            break
+            await self.rdma_buffers[idx].write_from(chunk)
 
 
 class MonarchTransportBuffer(TransportBuffer):
