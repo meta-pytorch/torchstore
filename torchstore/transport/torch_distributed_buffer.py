@@ -76,6 +76,7 @@ class TorchDistributedBuffer(TransportBuffer):
         state["transport_context"] = None
         return state
 
+    # TODO: ensure this is only called once
     async def setup_comms(self, storage_volume):
 
         # transport context is actually stored in the strategy,
