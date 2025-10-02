@@ -174,6 +174,7 @@ class TorchDistributedBuffer(TransportBuffer):
         pg = self.transport_context[self.file_store_name]
         self.fut = pg.send([tensor], dstRank=self.remote_rank, tag=0)
 
-    def finish(self):
+    async def finish(self):
         if self.fut is not None:
-            self.fut.wait()
+            while not self.fut.done():
+                await asyncio.sleep(0.005)
