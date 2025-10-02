@@ -246,7 +246,7 @@ class InMemoryStore(StorageImpl):
         for shard in self.kv[key].values():
             if shard["slice"] == request.tensor_slice:
                 await transport_buffer.write_from(shard["tensor"])
-                transport_buffer.finish()
+                await transport_buffer.finish()
                 return transport_buffer
 
         raise RuntimeError(f"Tensor slice {request.tensor_slice} not found in {key}")
