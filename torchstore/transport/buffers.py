@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 try:
-    from monarch.tensor_engine import is_available as monarch_rdma_available, RDMABuffer
+    from monarch.rdma import is_rdma_available as monarch_rdma_available, RDMABuffer
 except ImportError:
     monarch_rdma_available = lambda: False
 
@@ -34,9 +34,11 @@ if rdma_chunk_size_env is not None:
     )
     RDMA_CHUNK_SIZE_MB: int = int(rdma_chunk_size_env)
 else:
-    RDMA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "4"))
+    RDMA_CHUNK_SIZE_MB: int = int(
+        os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "2048")
+    )
 
-assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
+# assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
 
 def rdma_available() -> bool:
@@ -196,8 +198,14 @@ class RDMATransportBuffer(TransportBuffer):
         # else: we are in the remote case (in a different process), and must read from
         # the rdma buffer
         # TODO: gather instead of reading sequentially
+        assert (
+            self.rdma_buffers[0].size() == tensor.numel() * tensor.element_size()
+        ), f"{self.rdma_buffers[0].size()=} != {tensor.numel() * tensor.element_size()=}"
         for idx, chunk in enumerate(chunked_byte_view):
-            await self.rdma_buffers[idx].write_from(chunk)
+            assert tensor.is_contiguous()
+            tensor = tensor.clone()
+            await self.rdma_buffers[idx].write_from(tensor.view(torch.uint8).flatten())
+            break
 
 
 class MonarchTransportBuffer(TransportBuffer):
