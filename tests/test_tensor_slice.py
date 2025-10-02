@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import asyncio
-import multiprocessing as mp
 import os
 import tempfile
 
@@ -189,8 +187,9 @@ async def test_partial_put():
                 await ts.get("test_key")
 
             # Verify the error message mentions partial commit
-            assert "partially committed" in str(exc_info.value), \
-                f"Error message should mention partial commit: {exc_info.value}"
+            assert "partially committed" in str(
+                exc_info.value
+            ), f"Error message should mention partial commit: {exc_info.value}"
 
         finally:
             # Clean up process groups
