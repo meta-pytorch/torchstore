@@ -18,7 +18,7 @@ import torchstore as ts
 
 from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
-from torchstore.utils import color_print, get_local_tensor, spawn_actors
+from torchstore.utils import get_local_tensor, spawn_actors
 
 from .utils import DTensorActor, main, transport_plus_strategy_params
 
@@ -208,11 +208,6 @@ async def _test_resharding(
     assert len(get_mesh_shape) == len(
         get_placements
     ), f"{get_mesh_shape=}, {get_placements=}"
-
-    color_print(
-        f"Testing {put_mesh_shape=} {put_placements=} {get_mesh_shape=} {get_placements=}",
-        "y",
-    )
 
     original_tensor = torch.arange(8**2).reshape(
         8, 8

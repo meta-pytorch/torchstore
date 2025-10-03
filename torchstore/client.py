@@ -14,12 +14,7 @@ from torch.distributed.tensor import DTensor
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.transport import Pipe, Request, TensorSlice
-from torchstore.utils import (
-    assemble_tensor,
-    color_print,
-    get_local_tensor,
-    get_slice_intersection,
-)
+from torchstore.utils import assemble_tensor, get_local_tensor, get_slice_intersection
 
 logger = getLogger(__name__)
 
@@ -47,7 +42,6 @@ class LocalClient:
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
         latency_tracker = LatencyTracker(f"put:{key}")
-        color_print(f"Storing {key=} - {value=}", "g")
         request = Request.from_any(value)
         # for now, we only write to one storage volume.
         # we probably don't need a remote call for this case since
@@ -102,7 +96,6 @@ class LocalClient:
             )
             # Here full tensor should be the part of interest.
             fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
-            color_print(f"Fetched {key=} - {fetched_tensor=} \n {tensor_slice=}", "b")
 
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
@@ -287,9 +280,6 @@ class LocalClient:
                     # Check if stored tensor_slice overlaps with requested dtensor_slice
                     tensor_slice = get_slice_intersection(
                         tensor_slice, tensor_slice_spec
-                    )
-                    color_print(
-                        f"intersect with {tensor_slice_spec=} : {tensor_slice=}", "r"
                     )
 
                     if tensor_slice is None:
