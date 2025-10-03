@@ -14,7 +14,12 @@ from monarch.actor import Actor, endpoint
 from torchstore.transport.buffers import TransportBuffer
 
 from torchstore.transport.pipe import Request, TensorSlice
-from torchstore.utils import assemble_tensor, color_print, spawn_actors
+from torchstore.utils import (
+    assemble_tensor,
+    color_print,
+    get_slice_intersection,
+    spawn_actors,
+)
 
 logger = getLogger(__name__)
 
@@ -230,10 +235,30 @@ class InMemoryStore(StorageImpl):
             stored_slice = shard["slice"]
             stored_tensor = shard["tensor"]
 
-            # Check if requested slice is contained within or intersects with stored slice
-            extracted_tensor = self._extract_tensor_subset(
-                stored_tensor, stored_slice, request.tensor_slice
+            intersection_slice = get_slice_intersection(
+                stored_slice, request.tensor_slice
             )
+
+            # We don't want to visit the shard where requested tensor slice is not completely contained
+            # in the stored tensor slice.
+            if (
+                intersection_slice is None
+                or intersection_slice.local_shape != request.tensor_slice.local_shape
+                or intersection_slice.offsets != request.tensor_slice.offsets
+            ):
+                continue
+
+            # Extract the intersection from the stored tensor
+            indices = []
+            for dim in range(len(stored_slice.global_shape)):
+                start = intersection_slice.offsets[dim] - stored_slice.offsets[dim]
+                indices.append(
+                    slice(
+                        start,
+                        start + intersection_slice.local_shape[dim],
+                    )
+                )
+            extracted_tensor = stored_tensor[tuple(indices)]
 
             if extracted_tensor is not None:
 
@@ -247,79 +272,6 @@ class InMemoryStore(StorageImpl):
         raise RuntimeError(
             f"Tensor slice {request.tensor_slice} not found in any stored shards for {key}"
         )
-
-    def _extract_tensor_subset(
-        self,
-        stored_tensor: torch.Tensor,
-        stored_slice: TensorSlice,
-        requested_slice: TensorSlice,
-    ) -> torch.Tensor | None:
-        """
-        Extract the intersection between stored slice and requested slice from the stored tensor.
-
-        This method enables efficient partial tensor retrieval by computing the overlap
-        between what's stored locally and what the client actually needs, then extracting
-        only that portion from the stored tensor data.
-
-        Args:
-            stored_tensor: The actual tensor data stored in this storage volume
-            stored_slice: Metadata describing what global region the stored_tensor represents
-            requested_slice: Metadata describing what global region the client wants
-
-        Returns:
-            The extracted tensor subset representing the intersection, or None if no overlap.
-            The returned tensor contains only the data that overlaps between the stored
-            and requested regions.
-
-        Raises:
-            ValueError: If global shapes don't match between slices
-            RuntimeError: If extracted tensor shape doesn't match expected intersection shape
-        """
-        # Ensure both slices have the same global shape
-        if stored_slice.global_shape != requested_slice.global_shape:
-            raise ValueError(
-                f"Global shapes don't match: {stored_slice.global_shape=} (Stored) {requested_slice.global_shape=} (Requested)"
-            )
-
-        # Compute intersection bounds and extraction indices
-        extract_indices = []
-        intersection_shape = []
-
-        for dim in range(len(stored_slice.global_shape)):
-            # Stored slice boundaries in global coordinates
-            stored_start = stored_slice.offsets[dim]
-            stored_end = stored_start + stored_slice.local_shape[dim]
-
-            # Requested slice boundaries in global coordinates
-            requested_start = requested_slice.offsets[dim]
-            requested_end = requested_start + requested_slice.local_shape[dim]
-
-            # Compute intersection boundaries in global coordinates
-            intersection_start = max(stored_start, requested_start)
-            intersection_end = min(stored_end, requested_end)
-
-            # Check if there's actually an intersection in this dimension
-            if intersection_start >= intersection_end:
-                return None  # No overlap
-
-            # Convert intersection to local indices within the stored tensor
-            local_start = intersection_start - stored_start
-            local_end = intersection_end - stored_start
-
-            extract_indices.append(slice(local_start, local_end))
-            intersection_shape.append(local_end - local_start)
-
-        # Extract the intersection portion from the stored tensor
-        extracted_tensor = stored_tensor[tuple(extract_indices)]
-
-        # Verify the extracted tensor has the expected intersection shape
-        expected_shape = tuple(intersection_shape)
-        if extracted_tensor.shape != expected_shape:
-            raise RuntimeError(
-                f"Extracted tensor shape {extracted_tensor.shape} doesn't match expected intersection shape {expected_shape}"
-            )
-
-        return extracted_tensor
 
     async def get_meta(
         self,
