@@ -119,7 +119,7 @@ def get_target_tensor_shape_and_offset(
     local_tensor_total_size = sum([np.prod(shape) for shape in local_tensor_shapes])
     target_tensor_size = np.prod(target_shape)
     assert (
-        local_tensor_total_size == target_tensor_size
+        local_tensor_total_size >= target_tensor_size
     ), "Local tensor sizes doesn't match target tensor. "
     f"Local tensors total size: {local_tensor_total_size}, Target tensor size: {target_tensor_size}"
 

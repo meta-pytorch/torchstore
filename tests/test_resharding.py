@@ -18,7 +18,7 @@ import torchstore as ts
 
 from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
-from torchstore.utils import get_local_tensor, spawn_actors
+from torchstore.utils import color_print, get_local_tensor, spawn_actors
 
 from .utils import DTensorActor, main, transport_plus_strategy_params
 
@@ -26,29 +26,41 @@ logger = getLogger(__name__)
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.parametrize(
+    "put_mesh_shape,get_mesh_shape,put_sharding_dim,get_sharding_dim",
+    [
+        # shrink
+        ((4,), (2,), 0, 0),
+        ((4,), (2,), 0, 1),
+        ((4,), (2,), 1, 0),
+        ((4,), (2,), 1, 1),
+        # grow
+        ((2,), (4,), 0, 0),
+        ((2,), (4,), 0, 1),
+        ((2,), (4,), 1, 0),
+        ((2,), (4,), 1, 1),
+    ],
+)
 @pytest.mark.asyncio
-async def test_1d_resharding(strategy_params, use_rdma):
+async def test_1d_resharding(
+    strategy_params,
+    use_rdma,
+    put_mesh_shape,
+    get_mesh_shape,
+    put_sharding_dim,
+    get_sharding_dim,
+):
     _, strategy = strategy_params
 
-    for put_mesh_shape, get_mesh_shape in [
-        ((4,), (2,)),  # shrink
-        ((2,), (4,)),  # grow
-    ]:
-        for put_sharding_dim, get_sharding_dim in [
-            (0, 0),
-            (0, 1),
-            (1, 0),
-            (1, 1),
-        ]:
-            # TODO: test Replicate as well, which is likely not working
-            await _test_resharding(
-                put_mesh_shape=put_mesh_shape,
-                put_placements=[Shard(put_sharding_dim)],
-                get_mesh_shape=get_mesh_shape,
-                get_placements=[Shard(get_sharding_dim)],
-                strategy=strategy,
-                use_rdma=use_rdma,
-            )
+    # TODO: test Replicate as well, which is likely not working
+    await _test_resharding(
+        put_mesh_shape=put_mesh_shape,
+        put_placements=[Shard(put_sharding_dim)],
+        get_mesh_shape=get_mesh_shape,
+        get_placements=[Shard(get_sharding_dim)],
+        strategy=strategy,
+        use_rdma=use_rdma,
+    )
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -197,8 +209,9 @@ async def _test_resharding(
         get_placements
     ), f"{get_mesh_shape=}, {get_placements=}"
 
-    logger.warn(
-        f"Testing {put_mesh_shape=} {put_placements=} {get_mesh_shape=} {get_placements=}"
+    color_print(
+        f"Testing {put_mesh_shape=} {put_placements=} {get_mesh_shape=} {get_placements=}",
+        "y",
     )
 
     original_tensor = torch.arange(8**2).reshape(

@@ -35,6 +35,14 @@ jobs:
           TORCHSTORE_RDMA_ENABLED=0 \
           pytest tests/test_tensor_slice.py \
             --cov=. --cov-report=xml -vv -s
+      - name: Run test_resharding tests with coverage
+        # TorchStore RDMA will not run on CPU-only machines
+        # resharding tests runs for too long.
+        # test_large_tensors.py can OOM.
+        run: |
+          TORCHSTORE_RDMA_ENABLED=0 \
+          pytest tests/test_resharding.py \
+            --cov=. --cov-report=xml -vv -s
       - name: Run remaining tests with coverage
         # TorchStore RDMA will not run on CPU-only machines
         # resharding tests runs for too long.

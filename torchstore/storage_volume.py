@@ -14,7 +14,7 @@ from monarch.actor import Actor, endpoint
 from torchstore.transport.buffers import TransportBuffer
 
 from torchstore.transport.pipe import Request, TensorSlice
-from torchstore.utils import assemble_tensor, spawn_actors
+from torchstore.utils import assemble_tensor, color_print, spawn_actors
 
 logger = getLogger(__name__)
 
@@ -31,6 +31,7 @@ class StorageVolume(Actor):
         self,
         id_func,
     ) -> None:
+        color_print("setting up storage volume", color="m")
         self.store: StorageImpl = InMemoryStore()
         self.volume_id: str = id_func()
 
@@ -75,6 +76,10 @@ class StorageVolume(Actor):
     @endpoint
     async def delete(self, key: str) -> None:
         await self.store.delete(key)
+
+    @endpoint
+    async def reset(self) -> None:
+        self.store.reset()
 
 
 class StorageImpl:
@@ -177,6 +182,7 @@ class InMemoryStore(StorageImpl):
     def _handle_dtensor(
         self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
     ) -> None:
+        color_print(f"putting dtensor {key=}, {tensor_slice=}, {tensor=}", color="c")
         if key not in self.kv:
             self.kv[key] = {}
 
@@ -204,6 +210,7 @@ class InMemoryStore(StorageImpl):
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> TransportBuffer:
+        color_print(f"{self.kv=}", "c")
 
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
@@ -229,6 +236,11 @@ class InMemoryStore(StorageImpl):
             )
 
             if extracted_tensor is not None:
+
+                color_print(
+                    f"extracted tensor for {request=}: {extracted_tensor=}, {stored_slice=}",
+                    color="c",
+                )
                 await transport_buffer.write_from(extracted_tensor)
                 return transport_buffer
 
@@ -349,3 +361,6 @@ class InMemoryStore(StorageImpl):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
         del self.kv[key]
+
+    def reset(self) -> None:
+        self.kv = {}
