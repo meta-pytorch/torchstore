@@ -296,5 +296,25 @@ async def test_delete(strategy_params, use_rdma):
         await ts.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_key_miss():
+    """Test the behavior of get() when the key is missing."""
+    await ts.initialize()
+
+    key = "foo"
+    value = torch.tensor([1, 2, 3])
+    await ts.put(key, value)
+
+    # Get the value back
+    retrieved_value = await ts.get(key)
+    assert torch.equal(value, retrieved_value)
+
+    # Get a missing key
+    with pytest.raises(KeyError):
+        await ts.get("bar")
+
+    await ts.shutdown()
+
+
 if __name__ == "__main__":
     main(__file__)
