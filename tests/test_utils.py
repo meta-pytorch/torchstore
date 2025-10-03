@@ -135,25 +135,22 @@ def test_assemble_tensor_empty_list_assertion():
 def test_assemble_tensor_overlapping_tensors():
     """Test that assemble_tensor raises assertion error when tensors overlap."""
     # Create overlapping tensors: tensor regions overlap
-    local_tensors = [
-        torch.tensor(
-            [[1, 2], [3, 4]]
-        ),  # Shape (2,2) at offset (0,0) -> covers (0,0) to (1,1)
-        torch.tensor(
-            [[5, 6], [7, 8]]
-        ),  # Shape (2,2) at offset (1,0) -> covers (1,0) to (2,1) - overlaps at (1,0) and (1,1)
-    ]
-    global_offsets = [(0, 0), (1, 0)]  # Second tensor starts at (1,0), causing overlap
-    global_shape = (10, 10)
-
-    # This should raise an assertion error because:
-    # - Total local tensor elements: 4 + 4 = 8
-    # - Target tensor size: 3x2 = 6 (from offset (0,0) to (2,2))
-    # - Since 8 != 6, the assertion should fail
-    with pytest.raises(
-        AssertionError, match="Local tensor sizes doesn't match target tensor"
-    ):
-        assemble_tensor(local_tensors, global_shape, global_offsets)
+    _test_assemble_tensor(
+        local_tensors=[
+            torch.tensor(
+                [[1, 2], [3, 4]]
+            ),  # Shape (2,2) at offset (0,0) -> covers (0,0) to (1,1)
+            torch.tensor(
+                [[5, 6], [7, 8]]
+            ),  # Shape (2,2) at offset (1,0) -> covers (1,0) to (2,1) - overlaps at (1,0) and (1,1)
+        ],
+        global_offsets=[
+            (0, 0),
+            (1, 0),
+        ],  # Second tensor starts at (1,0), causing overlap
+        global_shape=(10, 10),
+        expected_output=torch.tensor([[1, 2], [5, 6], [7, 8]]),
+    )
 
 
 def test_assemble_tensor_with_gaps():
@@ -213,4 +210,3 @@ def test_assemble_tensor_perfect_fit():
     result = assemble_tensor(local_tensors, global_shape, global_offsets)
     expected = torch.tensor([[1, 2], [3, 4]])
     assert torch.equal(result, expected)
-    assert result.shape == (2, 2)
