@@ -294,7 +294,6 @@ class InMemoryStore(StorageImpl):
             )
 
         raise RuntimeError(f"Unknown type for {key} type={type(val)} {val=}")
-        raise RuntimeError(f"Unknown type for {key} type={type(val)}")
 
     async def delete(self, key: str) -> None:
         if key not in self.kv:
