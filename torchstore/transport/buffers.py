@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 try:
-    from monarch.tensor_engine import is_available as monarch_rdma_available, RDMABuffer
+    from monarch.rdma import is_rdma_available as monarch_rdma_available, RDMABuffer
 except ImportError:
     monarch_rdma_available = lambda: False
 
@@ -21,22 +21,13 @@ except ImportError:
         )
 
 
-# TODO: for some reason, RDMABuffer is breaking for certain tensors on the HF models (qwen, llama)
-# but setting this chunk size works around the issue until we can fix it
-# N.B. from benchmarking, we know the ideal size is any size >=256mb.
+# TODO: we no longer need to chunk with monararch rdma buffer. Setting large chunk size for now,
+# but we should remove all chunking code
+RDMA_CHUNK_SIZE_MB: int = int(
+    os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", str(1024 * 32))
+)
 
-# Check for misspelled environment variable for backward compatibility
-rdma_chunk_size_env = os.environ.get("TORCHSTORE_RDMDA_CHUNK_SIZE_MB")
-if rdma_chunk_size_env is not None:
-    logging.warning(
-        "Using deprecated environment variable 'TORCHSTORE_RDMDA_CHUNK_SIZE_MB'. "
-        "Please use 'TORCHSTORE_RDMA_CHUNK_SIZE_MB' instead."
-    )
-    RDMA_CHUNK_SIZE_MB: int = int(rdma_chunk_size_env)
-else:
-    RDMA_CHUNK_SIZE_MB: int = int(os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", "4"))
-
-assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
+# assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
 
 def rdma_available() -> bool:
