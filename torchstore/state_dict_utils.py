@@ -158,9 +158,13 @@ def generate_tensor_blob(state_dict: Dict[str, Any]):
     if not tensor_list:
         return modified_state_dict, torch.empty(0, dtype=torch.uint8)
 
-    total_bytes = sum([ref.size for _, ref in tensor_list])
+    # Calculate total size and update offsets
+    current_offset = 0
+    for tensor, ref in tensor_list:
+        ref.offset = current_offset
+        current_offset += ref.size
 
-    blob = torch.empty(total_bytes, dtype=torch.uint8)
+    blob = torch.empty(current_offset, dtype=torch.uint8)
 
     # Copy tensor data using your efficient approach
     for tensor, ref in tensor_list:
