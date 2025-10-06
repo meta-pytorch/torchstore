@@ -484,9 +484,5 @@ def test_generate_tensor_blob_edge_cases():
 
 
 if __name__ == "__main__":
-    # Run our new tests
-    test_generate_tensor_blob()
-    test_generate_tensor_blob_edge_cases()
-
     # Run existing tests
     main(__file__)
