@@ -108,110 +108,110 @@ class TensorReference:
     size: int  # Size in bytes
 
 
-def generate_tensor_blob(state_dict: Dict[str, Any]):
+class TorchStoreStateDict:
     """
-    Extract all tensors from state_dict and create a blob. Replace the tensors
-    with corresponding references and returns a state_dict with only tensor references,
-    and the tensor blob.
-
-    Args:
-      state_dict: Dictionary that may contain tensors at any level
-
-    Returns:
-      - Modified dictionary with tensors replaced by TensorReference objects
-      - 1D uint8 tensor blob containing all serialized tensor data
+    A torchstore representation of a state dict. It contains a flattened state dict and a tensor blob.
+    All of the tensors in the flattened state dict are replaced with TensorReference objects.
     """
 
-    def _extract_recursive(
-        obj: Dict[str, Any],
-        tensor_list: List[Tuple[torch.Tensor, TensorReference]],
-        path: str = "",
+    def __init__(
+        self,
+        tensor_blob: torch.Tensor,
+        flattened_state_dict: Dict[str, Any],
+        mapping: Dict[str, Any],
     ):
-        """Recursively extract tensors and replace with TensorReference objects"""
-        if isinstance(obj, torch.Tensor):
-            # Create placeholder reference (offset will be filled later)
-            ref = TensorReference(
-                shape=tuple(obj.shape),
-                dtype=obj.dtype,
-                offset=-1,  # Will be updated when building blob
-                size=obj.numel() * obj.element_size(),
-            )
-            tensor_list.append((obj, ref))
-            return ref  # Replace tensor with TensorReference
-        elif isinstance(obj, dict):
-            return {
-                k: _extract_recursive(v, tensor_list, f"{path}.{k}")
-                for k, v in obj.items()
-            }
-        elif isinstance(obj, (list, tuple)):
-            return type(obj)(
-                _extract_recursive(item, tensor_list, f"{path}[{i}]")
-                for i, item in enumerate(obj)
-            )
-        else:
-            return obj  # Non-tensor data stays as-is
+        """
+        Create a TorchStoreStateDict from a tensor blob, flattened state_dict, and mapping.
+        """
+        self.tensor_blob = tensor_blob
+        self.flattened_state_dict = flattened_state_dict
+        self.mapping = mapping
 
-    tensor_list: List[Tuple[torch.Tensor, TensorReference]] = []
+    @classmethod
+    def from_state_dict(cls, state_dict: Dict[str, Any]) -> "TorchStoreStateDict":
+        """
+        Create a TorchStoreStateDict from a state_dict. All tensors in the state_dict are replaced with
+        TensorReference objects. The tensor blob is created by concatenating all tensors in the state_dict.
+        """
+        # 1. flatten the state dict
+        flattened_state_dict, mapping = flatten_state_dict(state_dict)
 
-    modified_state_dict = _extract_recursive(state_dict, tensor_list)
+        # 2. iterate through the flattened state dict, collect all tensors and replace them with TensorReference objects
+        tensor_list: List[Tuple[torch.Tensor, TensorReference]] = []
+        modified_flattened_state_dict = {}
+        current_offset = 0
 
-    if not tensor_list:
-        return modified_state_dict, torch.empty(0, dtype=torch.uint8)
-
-    # Calculate total size and update offsets
-    current_offset = 0
-    for tensor, ref in tensor_list:
-        ref.offset = current_offset
-        current_offset += ref.size
-
-    blob = torch.empty(current_offset, dtype=torch.uint8)
-
-    # Copy tensor data using your efficient approach
-    for tensor, ref in tensor_list:
-        # Handle scalar tensors
-        tensor_cpu = tensor.detach().cpu()
-        if tensor_cpu.dim() == 0:
-            tensor_cpu = tensor_cpu.unsqueeze(0)
-
-        byte_view = tensor_cpu.view(torch.uint8).flatten()
-
-        # Copy to blob
-        blob[ref.offset : ref.offset + ref.size] = byte_view
-
-    return modified_state_dict, blob
-
-
-def reconstruct_state_dict_from_tensor_blob(
-    state_dict_with_tensor_refs: Dict[str, Any], blob: torch.Tensor
-) -> Dict[str, Any]:
-    """
-    Reconstruct a state_dict which only contains tensor references by
-    reconstructing the tensors using the tensor blob and the tensor references.
-    Returns the reconstructed state dict.
-    """
-
-    def _reconstruct_recursive(obj):
-        if isinstance(obj, TensorReference):
-            # Pre-allocate tensor with correct shape and dtype (TorchStore approach)
-            tensor = torch.empty(obj.shape, dtype=obj.dtype)
-
-            # Get byte view of the allocated tensor
-            if tensor.dim() == 0:
-                tensor_unsqueezed = tensor.unsqueeze(0)
-                byte_view = tensor_unsqueezed.view(torch.uint8).flatten()
+        for key, value in flattened_state_dict.items():
+            if isinstance(value, torch.Tensor):
+                # Calculate size and create reference with correct offset
+                tensor_size = value.numel() * value.element_size()
+                ref = TensorReference(
+                    shape=tuple(value.shape),
+                    dtype=value.dtype,
+                    offset=current_offset,
+                    size=tensor_size,
+                )
+                tensor_list.append((value, ref))
+                modified_flattened_state_dict[key] = ref
+                current_offset += tensor_size
             else:
-                byte_view = tensor.view(torch.uint8).flatten()
+                modified_flattened_state_dict[key] = value
 
-            # Copy bytes from blob into tensor's byte view
-            tensor_bytes = blob[obj.offset : obj.offset + obj.size]
-            byte_view.copy_(tensor_bytes)
-
-            return tensor
-        elif isinstance(obj, dict):
-            return {k: _reconstruct_recursive(v) for k, v in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return type(obj)(_reconstruct_recursive(item) for item in obj)
+        # 3. create the tensor blob by concatenating all tensors
+        if not tensor_list:
+            blob = torch.empty(0, dtype=torch.uint8)
         else:
-            return obj
+            blob = torch.empty(current_offset, dtype=torch.uint8)
 
-    return _reconstruct_recursive(state_dict_with_tensor_refs)
+            # Copy tensor data
+            for tensor, ref in tensor_list:
+                # Handle scalar tensors
+                tensor_cpu = tensor.detach().cpu()
+                if tensor_cpu.dim() == 0:
+                    tensor_cpu = tensor_cpu.unsqueeze(0)
+
+                byte_view = tensor_cpu.view(torch.uint8).flatten()
+
+                # Copy to blob
+                blob[ref.offset : ref.offset + ref.size] = byte_view
+
+        # 4. return the TorchStoreStateDict object
+        return cls(blob, modified_flattened_state_dict, mapping)
+
+    def to_state_dict(self) -> Dict[str, Any]:
+        """
+        Convert the TorchStoreStateDict back to a state_dict. All TensorReference objects are replaced with
+        the corresponding tensors from the tensor blob.
+        """
+        # 1. iterate through the flattened state dict, replace TensorReference objects with tensors from the tensor blob
+        reconstructed_flattened_state_dict = {}
+
+        for key, value in self.flattened_state_dict.items():
+            if isinstance(value, TensorReference):
+                # Pre-allocate tensor with correct shape and dtype (TorchStore approach)
+                tensor = torch.empty(value.shape, dtype=value.dtype)
+
+                # Get byte view of the allocated tensor
+                if tensor.dim() == 0:
+                    tensor_unsqueezed = tensor.unsqueeze(0)
+                    byte_view = tensor_unsqueezed.view(torch.uint8).flatten()
+                else:
+                    byte_view = tensor.view(torch.uint8).flatten()
+
+                # Copy bytes from blob into tensor's byte view
+                tensor_bytes = self.tensor_blob[
+                    value.offset : value.offset + value.size
+                ]
+                byte_view.copy_(tensor_bytes)
+
+                reconstructed_flattened_state_dict[key] = tensor
+            else:
+                reconstructed_flattened_state_dict[key] = value
+
+        # 2. unflatten the state dict
+        state_dict = unflatten_state_dict(
+            reconstructed_flattened_state_dict, self.mapping
+        )
+
+        # 3. return the state dict
+        return state_dict
