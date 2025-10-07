@@ -9,6 +9,8 @@ import os
 from itertools import product
 from logging import getLogger
 
+from typing import List
+
 import pytest
 import torch
 import torchstore as ts
@@ -53,6 +55,9 @@ class DTensorActor(Actor):
         placements,
         file_store_name,
         visible_devices="0,1,2,3,4,5,6,7",
+        ranks_to_skip_put: (
+            List[int] | None
+        ) = None,  # ranks that should skip put operation
     ):
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape
@@ -60,6 +65,7 @@ class DTensorActor(Actor):
         self.original_tensor = original_tensor
         self.placements = placements
         self.file_store_name = file_store_name
+        self.ranks_to_skip_put = ranks_to_skip_put or []
 
         # torchstore will fail without this (see LocalRankStrategy)
         os.environ["LOCAL_RANK"] = str(self.rank)
@@ -94,6 +100,11 @@ class DTensorActor(Actor):
         self.rlog("distributing dtensor")
         tensor = self.original_tensor.to("cpu")
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
+
+        # Skip put if this rank is in the skip list
+        if self.rank in self.ranks_to_skip_put:
+            self.rlog(f"Skipping put for rank {self.rank}")
+            return
 
         self.rlog(f"calling put with {dtensor=}")
         await ts.put(self.shared_key, dtensor)
