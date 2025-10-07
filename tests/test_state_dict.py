@@ -29,7 +29,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Replicate
 from torchstore.state_dict_utils import TensorReference, TorchStoreStateDict
 from torchstore.utils import spawn_actors
 
@@ -486,37 +486,8 @@ def test_torchstore_state_dict():
         reconstructed_flattened.keys()
     ), "Flattened keys don't match"
 
-    # Compare each tensor/value
-    for key in original_flattened.keys():
-        original_value = original_flattened[key]
-        reconstructed_value = reconstructed_flattened[key]
-
-        if isinstance(original_value, torch.Tensor):
-            assert isinstance(
-                reconstructed_value, torch.Tensor
-            ), f"Expected tensor for key {key}"
-            assert (
-                original_value.shape == reconstructed_value.shape
-            ), f"Shape mismatch for key {key}"
-            assert (
-                original_value.dtype == reconstructed_value.dtype
-            ), f"Dtype mismatch for key {key}"
-            assert torch.equal(
-                original_value, reconstructed_value
-            ), f"Values mismatch for key {key}"
-        else:
-            assert (
-                original_value == reconstructed_value
-            ), f"Non-tensor value mismatch for key {key}"
-
-    print("✅ test_torchstore_state_dict passed!")
-    tensor_count = sum(
-        1
-        for v in torchstore_state_dict.flattened_state_dict.values()
-        if isinstance(v, TensorReference)
-    )
-    print(f"   Processed {tensor_count} tensors")
-    print(f"   Blob size: {len(blob)} bytes ({len(blob) / 1024:.1f} KB)")
+    # Verify reconstruction using utility function
+    _verify_reconstructed_state_dict(original_flattened, reconstructed_flattened)
 
 
 def test_torchstore_state_dict_edge_cases():
