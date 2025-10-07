@@ -13,6 +13,10 @@ from torch.distributed.checkpoint._nested_dict import (
     flatten_state_dict,
     unflatten_state_dict,
 )
+from torch.distributed.tensor import DTensor
+
+from torchstore.dtensor_utils import create_tensor_slice_from_dtensor
+from torchstore.transport.pipe import TensorSlice
 
 DELIM = "/"
 MAPPING = "MAPPING"
@@ -106,6 +110,11 @@ class TensorReference:
     dtype: torch.dtype
     offset: int  # Byte offset in the blob
     size: int  # Size in bytes
+    tensor_slice: Optional[TensorSlice] = None  # TensorSlice for DTensor reconstruction
+    device_mesh: Optional[Any] = None  # DeviceMesh for DTensor reconstruction
+    placements: Optional[Tuple[Any, ...]] = (
+        None  # Placements for DTensor reconstruction
+    )
 
 
 class TorchStoreStateDict:
@@ -142,8 +151,26 @@ class TorchStoreStateDict:
         current_offset = 0
 
         for key, value in flattened_state_dict.items():
-            if isinstance(value, torch.Tensor):
-                # Calculate size and create reference with correct offset
+            if isinstance(value, DTensor):
+                # Handle DTensor: store local tensor and add TensorSlice metadata
+                local_tensor = value._local_tensor
+                tensor_size = local_tensor.numel() * local_tensor.element_size()
+                tensor_slice = create_tensor_slice_from_dtensor(value)
+
+                ref = TensorReference(
+                    shape=tuple(local_tensor.shape),
+                    dtype=local_tensor.dtype,
+                    offset=current_offset,
+                    size=tensor_size,
+                    tensor_slice=tensor_slice,
+                    device_mesh=value.device_mesh,
+                    placements=value.placements,
+                )
+                tensor_list.append((local_tensor, ref))
+                modified_flattened_state_dict[key] = ref
+                current_offset += tensor_size
+            elif isinstance(value, torch.Tensor):
+                # Handle regular tensor
                 tensor_size = value.numel() * value.element_size()
                 ref = TensorReference(
                     shape=tuple(value.shape),
@@ -181,8 +208,10 @@ class TorchStoreStateDict:
     def to_state_dict(self) -> Dict[str, Any]:
         """
         Convert the TorchStoreStateDict back to a state_dict. All TensorReference objects are replaced with
-        the corresponding tensors from the tensor blob.
+        the corresponding tensors from the tensor blob. DTensors are reconstructed using stored metadata.
         """
+        from torchstore.dtensor_utils import reconstruct_dtensor_from_local_tensor
+
         # 1. iterate through the flattened state dict, replace TensorReference objects with tensors from the tensor blob
         reconstructed_flattened_state_dict = {}
 
@@ -203,6 +232,19 @@ class TorchStoreStateDict:
                     value.offset : value.offset + value.size
                 ]
                 byte_view.copy_(tensor_bytes)
+
+                # Check if this should be reconstructed as a DTensor
+                if (
+                    value.tensor_slice is not None
+                    and value.device_mesh is not None
+                    and value.placements is not None
+                ):
+                    tensor = reconstruct_dtensor_from_local_tensor(
+                        local_tensor=tensor,
+                        tensor_slice=value.tensor_slice,
+                        device_mesh=value.device_mesh,
+                        placements=value.placements,
+                    )
 
                 reconstructed_flattened_state_dict[key] = tensor
             else:
