@@ -110,11 +110,9 @@ class TensorReference:
     dtype: torch.dtype
     offset: int  # Byte offset in the blob
     size: int  # Size in bytes
-    tensor_slice: Optional[TensorSlice] = None  # TensorSlice for DTensor reconstruction
-    device_mesh: Optional[Any] = None  # DeviceMesh for DTensor reconstruction
-    placements: Optional[Tuple[Any, ...]] = (
-        None  # Placements for DTensor reconstruction
-    )
+    tensor_slice: TensorSlice | None = None  # TensorSlice for DTensor reconstruction
+    device_mesh: Any | None = None  # DeviceMesh for DTensor reconstruction
+    placements: Tuple[Any, ...] | None = None  # Placements for DTensor reconstruction
 
 
 class TorchStoreStateDict:
@@ -129,9 +127,6 @@ class TorchStoreStateDict:
         flattened_state_dict: Dict[str, Any],
         mapping: Dict[str, Any],
     ):
-        """
-        Create a TorchStoreStateDict from a tensor blob, flattened state_dict, and mapping.
-        """
         self.tensor_blob = tensor_blob
         self.flattened_state_dict = flattened_state_dict
         self.mapping = mapping
