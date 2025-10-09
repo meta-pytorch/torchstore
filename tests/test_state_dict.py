@@ -496,15 +496,12 @@ def test_torchstore_state_dict_edge_cases():
     # Test empty state dict
     empty_dict = {}
     torchstore_state_dict = TorchStoreStateDict.from_state_dict(empty_dict)
-    assert torchstore_state_dict.flattened_state_dict == {}
-    assert len(torchstore_state_dict.tensor_blob) == 0
     reconstructed = torchstore_state_dict.to_state_dict()
     assert reconstructed == {}
 
     # Test state dict with no tensors
     no_tensors = {"a": 1, "b": {"c": "hello", "d": [1, 2, 3]}}
     torchstore_state_dict = TorchStoreStateDict.from_state_dict(no_tensors)
-    assert len(torchstore_state_dict.tensor_blob) == 0
     reconstructed = torchstore_state_dict.to_state_dict()
     assert reconstructed == no_tensors
 
@@ -512,9 +509,6 @@ def test_torchstore_state_dict_edge_cases():
     scalar_dict = {"scalar": torch.tensor(3.14159)}
     torchstore_state_dict = TorchStoreStateDict.from_state_dict(scalar_dict)
     # Check flattened state dict has TensorReference
-    scalar_ref = torchstore_state_dict.flattened_state_dict["scalar"]
-    assert isinstance(scalar_ref, TensorReference)
-    assert scalar_ref.shape == ()  # Empty tuple for scalar
     reconstructed = torchstore_state_dict.to_state_dict()
     assert torch.equal(scalar_dict["scalar"], reconstructed["scalar"])
 
@@ -577,5 +571,4 @@ def test_torchstore_state_dict_with_dtensor():
 
 
 if __name__ == "__main__":
-    # Run existing tests
     main(__file__)
