@@ -13,6 +13,7 @@ from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
+from torchstore.state_dict_utils import DELIM, FLATTENED_STATE_DICT, get_state_dict_key
 from torchstore.transport import Pipe, Request, TensorSlice
 from torchstore.utils import assemble_global_tensor, get_local_tensor
 
@@ -54,7 +55,18 @@ class LocalClient:
         await pipe.put_to_storage_volume(key, request)
         latency_tracker.track_step("put_to_storage_volume")
 
-        await self._controller.notify_put.call(key, request.meta_only(), volume_id)
+        if key.endswith(FLATTENED_STATE_DICT):
+            state_dict_key = get_state_dict_key(key)
+            for flattened_key in value.keys():
+                flattened_key = f"{state_dict_key}{DELIM}{flattened_key}"
+                await self._controller.notify_put.call(
+                    flattened_key,
+                    request.meta_only(),
+                    volume_id,
+                )
+        else:
+            await self._controller.notify_put.call(key, request.meta_only(), volume_id)
+
         latency_tracker.track_step("notify_put")
         latency_tracker.track_e2e()
 
