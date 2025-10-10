@@ -32,7 +32,7 @@ RDMA_CHUNK_SIZE_MB: int = int(
 
 def rdma_available() -> bool:
     rdma_enabled = (
-        os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
+        os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
     )  # TODO: enable on this build
     return rdma_enabled and monarch_rdma_available()
 
@@ -111,11 +111,11 @@ class RDMATransportBuffer(TransportBuffer):
             return
         elif isinstance(tensor_like, Tuple):
             # we know the size of the tensor from fetching metadata
-            tensor = torch.empty(tensor_like[0], dtype=tensor_like[1])
+            tensor = torch.zeros(tensor_like[0], dtype=tensor_like[1])
         else:
             # we have an inplace tensor, allocate a copy
             assert isinstance(tensor_like, torch.Tensor)
-            tensor = torch.empty_like(tensor_like)
+            tensor = torch.zeros_like(tensor_like)
 
         # store tensor meta
         self.shape = tensor.shape
@@ -125,7 +125,7 @@ class RDMATransportBuffer(TransportBuffer):
         self._assert_valid_tensor(tensor)
 
         byte_view_chunks = self._create_byte_views_from_tensor(tensor)
-        self.tensor_refs = [torch.empty_like(chunk) for chunk in byte_view_chunks]
+        self.tensor_refs = [torch.zeros_like(chunk) for chunk in byte_view_chunks]
         self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
 
         chunk_sizes = set()
@@ -140,7 +140,7 @@ class RDMATransportBuffer(TransportBuffer):
     async def read_into(self, tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
         if tensor is None:
             # allocate a tensor to return
-            tensor = torch.empty(self.shape, dtype=self.dtype)
+            tensor = torch.zeros(self.shape, dtype=self.dtype)
 
         self._assert_valid_tensor(tensor)
         assert self.rdma_buffers is not None

@@ -67,7 +67,7 @@ def assemble_global_tensor(
     # Create an empty global tensor of the specified shape
     assert local_tensors
 
-    global_tensor = torch.empty(
+    global_tensor = torch.zeros(
         global_shape,
         dtype=local_tensors[0].dtype,
     )

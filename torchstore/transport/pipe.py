@@ -137,9 +137,11 @@ class Pipe:
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
         if rdma_available():
+            logger.info("Creating RDMATransport Buffer")
             buffer_cls = RDMATransportBuffer
         else:
             buffer_cls = MonarchTransportBuffer
+            logger.info("Creating MonarchTransport Buffer")
         return buffer_cls()
 
     async def put_to_storage_volume(self, key, request: Request):
