@@ -76,7 +76,8 @@ def assemble_global_tensor(
         if expected_size_along_shard_dim != global_shape[shard_dim]:
             raise RuntimeError(
                 f"Shard sizes don't sum to global size along dim {shard_dim}: "
-                f"got {expected_size_along_shard_dim}, expected {global_shape[shard_dim]}"
+                f"got {expected_size_along_shard_dim}, expected {global_shape[shard_dim]}, "
+                f"global_shape={global_shape}, global_offsets={global_offsets}"
             )
         return torch.cat(sorted_tensors, dim=shard_dim)
     else:
