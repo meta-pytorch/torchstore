@@ -62,6 +62,22 @@ def assemble_global_tensor(
     if not local_tensors:
         raise ValueError("local_tensors cannot be empty")
 
+    # Check if tensor is replicated (all offsets are the same)
+    if len(set(global_offsets)) == 1:
+        # All offsets identical = replicated tensor
+        # Just return the first one (they should all be identical)
+        result = local_tensors[0]
+
+        # Validate shape
+        expected_shape = tuple(global_shape)
+        if result.shape != expected_shape:
+            raise RuntimeError(
+                f"Replicated tensor shape mismatch: got {result.shape}, "
+                f"expected {expected_shape}"
+            )
+
+        return result
+
     # Detect which dimension is sharded
     shard_dim = _detect_shard_dimension(local_tensors, global_offsets, global_shape)
 
