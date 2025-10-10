@@ -32,7 +32,7 @@ RDMA_CHUNK_SIZE_MB: int = int(
 
 def rdma_available() -> bool:
     rdma_enabled = (
-        os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
+        os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
     )  # TODO: enable on this build
     return rdma_enabled and monarch_rdma_available()
 
