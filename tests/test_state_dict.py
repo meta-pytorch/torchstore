@@ -30,7 +30,11 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate
-from torchstore.state_dict_utils import TensorReference, TorchStoreStateDict
+from torchstore.state_dict_utils import (
+    TensorReference,
+    TORCHSTORE_TSSD_ENABLED_FLAG,
+    TorchStoreStateDict,
+)
 from torchstore.utils import spawn_actors
 
 from .utils import main, transport_plus_strategy_params
@@ -264,8 +268,9 @@ class DCPParityTest(Actor):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_state_dict(strategy_params, use_rdma):
+async def test_state_dict_lky(strategy_params, use_rdma):
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+    os.environ[TORCHSTORE_TSSD_ENABLED_FLAG] = "1"
 
     class Trainer(Actor):
         # Monarch RDMA does not work outside of an actor, so we need

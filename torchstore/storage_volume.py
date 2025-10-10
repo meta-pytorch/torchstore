@@ -11,6 +11,17 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 
+from torchstore.state_dict_utils import (
+    DELIM,
+    deref_flattened_state_dict,
+    FLATTENED_STATE_DICT,
+    get_state_dict_key,
+    is_tssd_key,
+    TENSOR_BLOB,
+    tssd_enabled,
+    tssd_keys,
+)
+
 from torchstore.transport.buffers import TransportBuffer
 
 from torchstore.transport.pipe import Request, TensorSlice
@@ -174,7 +185,7 @@ class InMemoryStore(StorageImpl):
 
         return True
 
-    def _handle_dtensor(
+    def _handle_put_dtensor(
         self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
     ) -> None:
         if key not in self.kv:
@@ -185,9 +196,58 @@ class InMemoryStore(StorageImpl):
             "tensor": tensor,
         }
 
+    async def _handle_put_tssd(
+        self, key: str, transport_buffer: TransportBuffer, request: Request
+    ) -> None:
+        # 1. verify again that this is a tssd key
+        if not is_tssd_key(key):
+            raise ValueError(
+                f"{key} is not an internal key for Torchstore state dict handling"
+            )
+
+        # 2. early return if not all necessary parts are available
+        state_dict_key = get_state_dict_key(key)
+        if not tssd_keys(state_dict_key).issubset(self.kv.keys()):
+            return
+
+        # 3. update flattened state dict by replacing tensor ref with actual tensor
+        tensor_blob_key = f"{state_dict_key}{DELIM}{TENSOR_BLOB}"
+        flattened_state_dict_key = f"{state_dict_key}{DELIM}{FLATTENED_STATE_DICT}"
+        derefed_flattened_state_dict = deref_flattened_state_dict(
+            # TODO consolidate "obj"
+            self.kv[flattened_state_dict_key]["obj"],
+            self.kv[tensor_blob_key],
+        )
+
+        # 4. clean up blob and state dict with tensor refs
+        del self.kv[tensor_blob_key]
+        del self.kv[flattened_state_dict_key]
+
+        # 5. put every flattened key entry into the kv store
+        subkeys = list(derefed_flattened_state_dict.keys())
+        for subkey in subkeys:
+            value = derefed_flattened_state_dict.pop(subkey)
+            subkey = f"{state_dict_key}{DELIM}{subkey}"
+            self.kv[subkey] = value
+
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
+        print(f"putting {key} {request=}")
+
+        await self.put_impl(key=key, transport_buffer=transport_buffer, request=request)
+
+        # handle state dict put with tensor blob.
+        if tssd_enabled() and is_tssd_key(key):
+            await self._handle_put_tssd(key, transport_buffer, request)
+            return
+
+    async def put_impl(
+        self, key: str, transport_buffer: TransportBuffer, request: Request
+    ) -> None:
+        """
+        Put object / tensor / dtensor into kv store.
+        """
         if request.is_object:
             self.kv[key] = {"obj": request.objects}
             return
@@ -196,7 +256,7 @@ class InMemoryStore(StorageImpl):
         # we allocate on the fly
         tensor = await transport_buffer.read_into(tensor=None)
         if request.tensor_slice is not None:
-            self._handle_dtensor(key, request.tensor_slice, tensor)
+            self._handle_put_dtensor(key, request.tensor_slice, tensor)
             return
 
         self.kv[key] = tensor
