@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-from monarch.actor import get_or_spawn_controller
+# from monarch.actor import get_or_spawn_controller
+from monarch._src.actor.v1.proc_mesh import get_or_spawn_controller
 
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient

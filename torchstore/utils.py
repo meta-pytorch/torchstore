@@ -29,7 +29,7 @@ async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
         actors = mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
         return actors
 
-    assert isinstance(mesh, ProcMesh)
+    assert hasattr(mesh, "spawn")
     actors = mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
 
     return actors

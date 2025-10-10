@@ -136,6 +136,8 @@ class Pipe:
 
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
+
+        assert rdma_available()
         if rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
