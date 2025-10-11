@@ -137,17 +137,16 @@ class Pipe:
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
         if rdma_available():
-            buffer_cls = RDMATransportBuffer
+            return RDMATransportBuffer()
         else:
-            buffer_cls = MonarchTransportBuffer
-        return buffer_cls()
+            return MonarchTransportBuffer()
 
-    async def put_to_storage_volume(self, key, request: Request):
+    async def put_to_storage_volume(self, key, request: Request, *, executor=None):
         transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
 
         transport_buffer.allocate(tensor)
-        await transport_buffer.write_from(tensor)
+        await transport_buffer.write_from(tensor, executor=executor)
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
@@ -155,7 +154,9 @@ class Pipe:
             key, transport_buffer, request.meta_only()
         )
 
-    async def get_from_storage_volume(self, key, request: Request):
+        await transport_buffer.drop(executor=executor)
+
+    async def get_from_storage_volume(self, key, request: Request, *, executor=None):
 
         transport_buffer = self.create_transport_buffer()
 
@@ -179,4 +180,6 @@ class Pipe:
         if transport_buffer.is_object:
             return transport_buffer.objects
 
-        return await transport_buffer.read_into(request.tensor_val)
+        ret = await transport_buffer.read_into(request.tensor_val, executor=executor)
+        await transport_buffer.drop(executor=executor)
+        return ret

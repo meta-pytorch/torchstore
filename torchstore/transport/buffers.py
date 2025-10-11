@@ -32,7 +32,7 @@ RDMA_CHUNK_SIZE_MB: int = int(
 
 def rdma_available() -> bool:
     rdma_enabled = (
-        os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
+        os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
     )  # TODO: enable on this build
     return rdma_enabled and monarch_rdma_available()
 
@@ -55,10 +55,17 @@ class TransportBuffer:
         """
         raise NotImplementedError()
 
-    async def read_into(self, tensor: Optional[torch.Tensor]) -> torch.Tensor:
+    async def read_into(
+        self, tensor: Optional[torch.Tensor], *, executor=None
+    ) -> torch.Tensor:
         raise NotImplementedError()
 
-    async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+    async def write_from(
+        self, tensor: Optional[torch.Tensor], *, executor=None
+    ) -> None:
+        raise NotImplementedError()
+
+    async def drop(self, *, executor=None) -> None:
         raise NotImplementedError()
 
 
@@ -137,7 +144,10 @@ class RDMATransportBuffer(TransportBuffer):
         super().update(other_buffer)
 
     # send
-    async def read_into(self, tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    async def read_into(
+        self, tensor: Optional[torch.Tensor] = None, *, executor=None
+    ) -> torch.Tensor:
+        assert executor is not None, "RDMATransportBuffer requires an executor"
         if tensor is None:
             # allocate a tensor to return
             tensor = torch.empty(self.shape, dtype=self.dtype)
@@ -159,7 +169,7 @@ class RDMATransportBuffer(TransportBuffer):
         # TODO: gather instead of reading sequentially
         try:
             for idx, chunk in enumerate(chunked_byte_view):
-                await self.rdma_buffers[idx].read_into(chunk)
+                await executor.submit(self.rdma_buffers[idx].read_into, chunk)
         except Exception as e:
             logging.exception(
                 f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e
@@ -169,7 +179,10 @@ class RDMATransportBuffer(TransportBuffer):
         return tensor
 
     # recv
-    async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+    async def write_from(
+        self, tensor: Optional[torch.Tensor], *, executor=None
+    ) -> None:
+        assert executor is not None, "RDMATransportBuffer requires an executor"
         if tensor is None:
             return
 
@@ -188,7 +201,14 @@ class RDMATransportBuffer(TransportBuffer):
         # the rdma buffer
         # TODO: gather instead of reading sequentially
         for idx, chunk in enumerate(chunked_byte_view):
-            await self.rdma_buffers[idx].write_from(chunk)
+            await executor.submit(self.rdma_buffers[idx].write_from, chunk)
+
+    async def drop(self, *, executor=None) -> None:
+        assert executor is not None, "RDMATransportBuffer requires an executor"
+        if self.rdma_buffers is None:
+            return
+        for buffer in self.rdma_buffers:
+            await executor.submit(buffer.drop)
 
 
 class MonarchTransportBuffer(TransportBuffer):
@@ -206,7 +226,12 @@ class MonarchTransportBuffer(TransportBuffer):
         return None
 
     # send
-    async def read_into(self, tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    async def read_into(
+        self, tensor: Optional[torch.Tensor] = None, *, executor=None
+    ) -> torch.Tensor:
+
+        _ = executor
+
         if tensor is not None:
             # if there is a tensor here, likely this is the 'inplace' case,
             # and we should return back a ptr to the original tensor
@@ -218,9 +243,19 @@ class MonarchTransportBuffer(TransportBuffer):
         return self.tensor
 
     # recv
-    async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+    async def write_from(
+        self, tensor: Optional[torch.Tensor], *, executor=None
+    ) -> None:
+
+        _ = executor
+
         self.tensor = tensor
 
     def update(self, other_buffer: "TransportBuffer") -> None:
         super().update(other_buffer)
         self.tensor = other_buffer.tensor
+
+    async def drop(self, *, executor=None) -> None:
+        # no-op
+        _ = executor
+        pass

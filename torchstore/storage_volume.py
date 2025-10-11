@@ -11,8 +11,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 
-from torchstore.transport.buffers import TransportBuffer
+from torchstore._async_utils import OnceCell, SequentialExecutor
 
+from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.utils import assemble_global_tensor, spawn_actors
 
@@ -33,6 +34,15 @@ class StorageVolume(Actor):
     ) -> None:
         self.store: StorageImpl = InMemoryStore()
         self.volume_id: str = id_func()
+        self._executor = OnceCell[SequentialExecutor]()
+
+    async def get_executor(self) -> SequentialExecutor:
+        async def initializer() -> SequentialExecutor:
+            executor = SequentialExecutor()
+            await executor.start_worker()
+            return executor
+
+        return await self._executor.get_or_init(initializer=initializer)
 
     @classmethod
     async def spawn(
@@ -56,13 +66,17 @@ class StorageVolume(Actor):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
-        await self.store.put(key, transport_buffer, request)
+        await self.store.put(
+            key, transport_buffer, request, executor=await self.get_executor()
+        )
 
     @endpoint
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> TransportBuffer:
-        return await self.store.get(key, transport_buffer, request)
+        return await self.store.get(
+            key, transport_buffer, request, executor=await self.get_executor()
+        )
 
     @endpoint
     async def get_meta(
@@ -81,13 +95,23 @@ class StorageImpl:
     """Abstract base class for storage implementations."""
 
     async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        key: str,
+        transport_buffer: TransportBuffer,
+        request: Request,
+        *,
+        executor=None,
     ) -> Optional[TransportBuffer]:
         """Store data in the storage backend."""
         raise NotImplementedError()
 
     async def get(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        key: str,
+        transport_buffer: TransportBuffer,
+        request: Request,
+        *,
+        executor=None,
     ) -> TransportBuffer:
         """Retrieve data from the storage backend."""
         raise NotImplementedError()
@@ -112,7 +136,7 @@ class InMemoryStore(StorageImpl):
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")
         # we can also consider in the future not requiring the full tensor to be
-        # assembled, and instead only that the requested offsets are available
+        # assembled, and instead only that the requested offs are available
         # this is a performance optimization, but could be tricky to implement.
         assert self._has_full_tensor(key)
 
@@ -186,7 +210,12 @@ class InMemoryStore(StorageImpl):
         }
 
     async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        key: str,
+        transport_buffer: TransportBuffer,
+        request: Request,
+        *,
+        executor=None,
     ) -> None:
         if request.is_object:
             self.kv[key] = {"obj": request.objects}
@@ -194,7 +223,7 @@ class InMemoryStore(StorageImpl):
 
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
-        tensor = await transport_buffer.read_into(tensor=None)
+        tensor = await transport_buffer.read_into(tensor=None, executor=executor)
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
@@ -202,7 +231,12 @@ class InMemoryStore(StorageImpl):
         self.kv[key] = tensor
 
     async def get(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        key: str,
+        transport_buffer: TransportBuffer,
+        request: Request,
+        *,
+        executor=None,
     ) -> TransportBuffer:
 
         if key not in self.kv:
@@ -216,7 +250,7 @@ class InMemoryStore(StorageImpl):
             return transport_buffer
 
         if request.tensor_slice is None:
-            await transport_buffer.write_from(self.kv[key])
+            await transport_buffer.write_from(self.kv[key], executor=executor)
             return transport_buffer
 
         # TODO:
