@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
-import time
 from typing import Callable, cast, Generic, TypeVar
 
 T = TypeVar("T")
@@ -37,25 +36,6 @@ class OnceCell(Generic[T]):
         return cast(T, self._value)
 
 
-class Interval:
-    """Poor man's version of tokio::time::Interval"""
-
-    def __init__(self, period: float):
-        self.period = period
-        self.next_tick = time.monotonic() + period
-
-    async def tick(self):
-        """Wait until the next tick instant"""
-        sleep_duration = self.next_tick - time.monotonic()
-
-        if sleep_duration < 0:
-            sleep_duration = 0
-
-        await asyncio.sleep(sleep_duration)
-
-        self.next_tick += time.monotonic() + self.period
-
-
 class SequentialExecutor:
     """A simple executor that runs tasks sequentially in the current event loop.
     This is mainly needed for RDMA operations, which will panic if concurrent requests are made (what the heck?).
@@ -69,7 +49,6 @@ class SequentialExecutor:
         self._worker_task = asyncio.create_task(self._worker())
 
     async def _worker(self):
-        interval = Interval(0.001)  # 1ms
         while True:
             try:
                 func, args, kwargs, response = await self._queue.get()
@@ -87,7 +66,7 @@ class SequentialExecutor:
                 # Log or handle the error
                 print(f"[SequentialExecutor] Worker crashed: {outer_err}")
 
-            await interval.tick()
+            await asyncio.sleep(0.001)  # 1ms
 
     async def submit(self, func: Callable, *args, **kwargs) -> asyncio.Future:
         fut = asyncio.Future()
