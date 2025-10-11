@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 import copy
 from dataclasses import dataclass
 from logging import getLogger
@@ -145,7 +146,7 @@ class Pipe:
         transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
 
-        transport_buffer.allocate(tensor)
+        await asyncio.to_thread(transport_buffer.allocate, tensor)
         await transport_buffer.write_from(tensor, executor=executor)
 
         # transporting tensors is handled by the buffer, so we don't want to send it

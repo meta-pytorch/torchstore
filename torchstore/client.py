@@ -45,7 +45,7 @@ class LocalClient:
         strategy,
         *,
         rdma_executor: SequentialExecutor | None = None,
-        max_concurrent_requests: int = 16,
+        max_concurrent_requests: int = 4,
     ):
         self._controller = controller
         self.strategy = strategy

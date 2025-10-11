@@ -66,8 +66,6 @@ class SequentialExecutor:
                 # Log or handle the error
                 print(f"[SequentialExecutor] Worker crashed: {outer_err}")
 
-            await asyncio.sleep(0.001)  # 1ms
-
     async def submit(self, func: Callable, *args, **kwargs) -> asyncio.Future:
         fut = asyncio.Future()
         await self._queue.put((func, args, kwargs, fut))
