@@ -70,7 +70,7 @@ class LocalClient:
         # TorchstoreStrategy defined during intiailization
         storage_volume, volume_id = self.strategy.select_storage_volume()
 
-        pipe = Pipe(storage_volume, executor=self.rdma_executor)
+        pipe = Pipe(storage_volume)
 
         await pipe.put_to_storage_volume(key, request, executor=self.rdma_executor)
         latency_tracker.track_step("put_to_storage_volume")
@@ -255,7 +255,7 @@ class LocalClient:
         volume_map = await self._locate_volumes(key)
         volume_id, _ = volume_map.popitem()
         storage_volume = self.strategy.get_storage_volume(volume_id)
-        pipe = Pipe(storage_volume, executor=self.rdma_executor)
+        pipe = Pipe(storage_volume)
         request = Request.from_any(None)
         return await pipe.get_from_storage_volume(
             key, request, executor=self.rdma_executor
@@ -268,7 +268,7 @@ class LocalClient:
         # if the storage is a Tensor instead of DTensor, just fetch and return it.
         for volume_id, _ in volume_map.items():
             storage_volume = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(storage_volume, executor=self.rdma_executor)
+            pipe = Pipe(storage_volume)
             # TODO: consolidate the logic here - None indicates it is an object request,
             # which is sematically inappropriate here.
             request = Request.from_any(None)
@@ -284,7 +284,7 @@ class LocalClient:
         partial_results = []
         for volume_id, storage_info in volume_map.items():
             storage_volume = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(storage_volume, executor=self.rdma_executor)
+            pipe = Pipe(storage_volume)
 
             # fetch from all storage volumes, something like this
             # TODO: fix so we can request all tensor slices from a storage volume

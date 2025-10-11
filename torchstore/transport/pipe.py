@@ -131,9 +131,8 @@ class Pipe:
     Transport wrapper for communicating from local clients to storage volumes.
     """
 
-    def __init__(self, storage_volume, *, executor=None) -> None:
+    def __init__(self, storage_volume) -> None:
         self.storage_volume = storage_volume
-        self._executor = executor
 
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
