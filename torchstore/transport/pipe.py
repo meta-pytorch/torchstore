@@ -154,6 +154,8 @@ class Pipe:
             key, transport_buffer, request.meta_only()
         )
 
+        await transport_buffer.drop(executor=executor)
+
     async def get_from_storage_volume(self, key, request: Request, *, executor=None):
 
         transport_buffer = self.create_transport_buffer()
@@ -178,4 +180,6 @@ class Pipe:
         if transport_buffer.is_object:
             return transport_buffer.objects
 
-        return await transport_buffer.read_into(request.tensor_val, executor=executor)
+        ret = await transport_buffer.read_into(request.tensor_val, executor=executor)
+        await transport_buffer.drop(executor=executor)
+        return ret

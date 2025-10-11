@@ -65,6 +65,9 @@ class TransportBuffer:
     ) -> None:
         raise NotImplementedError()
 
+    async def drop(self, *, executor=None) -> None:
+        raise NotImplementedError()
+
 
 class RDMATransportBuffer(TransportBuffer):
     # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
@@ -200,6 +203,13 @@ class RDMATransportBuffer(TransportBuffer):
         for idx, chunk in enumerate(chunked_byte_view):
             await executor.submit(self.rdma_buffers[idx].write_from, chunk)
 
+    async def drop(self, *, executor=None) -> None:
+        assert executor is not None, "RDMATransportBuffer requires an executor"
+        if self.rdma_buffers is None:
+            return
+        for buffer in self.rdma_buffers:
+            await executor.submit(buffer.drop)
+
 
 class MonarchTransportBuffer(TransportBuffer):
     """This interface is mostly a noop, intended to be used with Monarch's regular RPC.
@@ -244,3 +254,8 @@ class MonarchTransportBuffer(TransportBuffer):
     def update(self, other_buffer: "TransportBuffer") -> None:
         super().update(other_buffer)
         self.tensor = other_buffer.tensor
+
+    async def drop(self, *, executor=None) -> None:
+        # no-op
+        _ = executor
+        pass
