@@ -54,7 +54,7 @@ class Interval:
 
         await asyncio.sleep(sleep_duration)
 
-        self.next_tick += self.period
+        self.next_tick += now + self.period
 
 
 class SequentialExecutor:
