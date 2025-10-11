@@ -46,15 +46,14 @@ class Interval:
 
     async def tick(self):
         """Wait until the next tick instant"""
-        now = time.monotonic()
-        sleep_duration = self.next_tick - now
+        sleep_duration = self.next_tick - time.monotonic()
 
         if sleep_duration < 0:
             sleep_duration = 0
 
         await asyncio.sleep(sleep_duration)
 
-        self.next_tick += now + self.period
+        self.next_tick += time.monotonic() + self.period
 
 
 class SequentialExecutor:
