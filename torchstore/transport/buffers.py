@@ -216,7 +216,12 @@ class MonarchTransportBuffer(TransportBuffer):
         return None
 
     # send
-    async def read_into(self, tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    async def read_into(
+        self, tensor: Optional[torch.Tensor] = None, *, executor=None
+    ) -> torch.Tensor:
+
+        _ = executor
+
         if tensor is not None:
             # if there is a tensor here, likely this is the 'inplace' case,
             # and we should return back a ptr to the original tensor
@@ -228,7 +233,12 @@ class MonarchTransportBuffer(TransportBuffer):
         return self.tensor
 
     # recv
-    async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+    async def write_from(
+        self, tensor: Optional[torch.Tensor], *, executor=None
+    ) -> None:
+
+        _ = executor
+
         self.tensor = tensor
 
     def update(self, other_buffer: "TransportBuffer") -> None:
