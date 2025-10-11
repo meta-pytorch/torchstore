@@ -154,8 +154,7 @@ class Pipe:
             key, transport_buffer, request.meta_only()
         )
 
-        # TODO: figure out why this hangs
-        # await transport_buffer.drop(executor=executor)
+        await transport_buffer.drop(executor=executor)
 
     async def get_from_storage_volume(self, key, request: Request, *, executor=None):
 
@@ -182,6 +181,5 @@ class Pipe:
             return transport_buffer.objects
 
         ret = await transport_buffer.read_into(request.tensor_val, executor=executor)
-        # TODO: figure out why this hangs
-        # await transport_buffer.drop(executor=executor)
+        await transport_buffer.drop(executor=executor)
         return ret
