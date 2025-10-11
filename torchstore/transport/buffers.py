@@ -55,10 +55,14 @@ class TransportBuffer:
         """
         raise NotImplementedError()
 
-    async def read_into(self, tensor: Optional[torch.Tensor]) -> torch.Tensor:
+    async def read_into(
+        self, tensor: Optional[torch.Tensor], *, executor=None
+    ) -> torch.Tensor:
         raise NotImplementedError()
 
-    async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+    async def write_from(
+        self, tensor: Optional[torch.Tensor], *, executor=None
+    ) -> None:
         raise NotImplementedError()
 
 
@@ -137,7 +141,10 @@ class RDMATransportBuffer(TransportBuffer):
         super().update(other_buffer)
 
     # send
-    async def read_into(self, tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    async def read_into(
+        self, tensor: Optional[torch.Tensor] = None, *, executor=None
+    ) -> torch.Tensor:
+        assert executor is not None, "RDMATransportBuffer requires an executor"
         if tensor is None:
             # allocate a tensor to return
             tensor = torch.empty(self.shape, dtype=self.dtype)
@@ -159,7 +166,7 @@ class RDMATransportBuffer(TransportBuffer):
         # TODO: gather instead of reading sequentially
         try:
             for idx, chunk in enumerate(chunked_byte_view):
-                await self.rdma_buffers[idx].read_into(chunk)
+                await executor.submit(self.rdma_buffers[idx].read_into, chunk)
         except Exception as e:
             logging.exception(
                 f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e
@@ -169,7 +176,10 @@ class RDMATransportBuffer(TransportBuffer):
         return tensor
 
     # recv
-    async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+    async def write_from(
+        self, tensor: Optional[torch.Tensor], *, executor=None
+    ) -> None:
+        assert executor is not None, "RDMATransportBuffer requires an executor"
         if tensor is None:
             return
 
@@ -188,7 +198,7 @@ class RDMATransportBuffer(TransportBuffer):
         # the rdma buffer
         # TODO: gather instead of reading sequentially
         for idx, chunk in enumerate(chunked_byte_view):
-            await self.rdma_buffers[idx].write_from(chunk)
+            await executor.submit(self.rdma_buffers[idx].write_from, chunk)
 
 
 class MonarchTransportBuffer(TransportBuffer):

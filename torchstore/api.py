@@ -7,10 +7,10 @@
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-
 from monarch.actor import get_or_spawn_controller
 
 import torchstore.state_dict_utils
+from torchstore._async_utils import OnceCell, SequentialExecutor
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
@@ -26,7 +26,7 @@ from torchstore.transport.pipe import TensorSlice
 DEFAULT_TORCHSTORE_NAME: str = "TorchStore"
 
 # cache for local clients
-_local_clent_map: Dict[str, LocalClient] = {}
+_local_client_map: Dict[str, OnceCell[LocalClient]] = {}
 
 
 async def initialize(
@@ -94,14 +94,14 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     """
     controller = await _controller(store_name)
     await controller.teardown.call()
-    global _local_clent_map
-    _local_clent_map = {}
+    global _local_client_map
+    _local_client_map = {}
 
 
 def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     """Reset the local client for a given store. Useful for refreshing client state after shutdown."""
-    global _local_clent_map
-    _local_clent_map.pop(store_name, None)
+    global _local_client_map
+    _local_client_map.pop(store_name, None)
 
 
 async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:
@@ -124,19 +124,23 @@ async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
         >>> store_client = await client()
         >>> await store_client.put("my_key", tensor)
     """
-    if store_name in _local_clent_map:
-        return _local_clent_map[store_name]
+    if store_name not in _local_client_map:
+        _local_client_map[store_name] = OnceCell()
 
-    controller = await _controller(store_name)
-    controller_strategy = await controller.get_controller_strategy.call_one()
+    async def initializer():
+        controller = await _controller(store_name)
+        controller_strategy = await controller.get_controller_strategy.call_one()
 
-    local_client = LocalClient(
-        controller=controller,
-        strategy=controller_strategy,
-    )
-    _local_clent_map[store_name] = local_client
+        executor = SequentialExecutor()
+        await executor.start_worker()
+        local_client = LocalClient(
+            controller=controller,
+            strategy=controller_strategy,
+            rdma_executor=executor,
+        )
+        return local_client
 
-    return local_client
+    return await _local_client_map[store_name].get_or_init(initializer)
 
 
 async def put(
