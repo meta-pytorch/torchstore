@@ -196,9 +196,6 @@ class InMemoryStore(StorageImpl):
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
-        print(
-            f"putting {key} {tensor.shape=}, {tensor.dtype=}, is tensor zero? {torch.allclose(tensor, torch.zeros_like(tensor))}"
-        )
 
         self.kv[key] = tensor
 

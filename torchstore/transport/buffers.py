@@ -200,13 +200,14 @@ class RDMATransportBuffer(TransportBuffer):
             await self.rdma_buffers[idx].write_from(chunk)
 
     def from_contiguous_tensor(self, tensor: torch.Tensor) -> None:
-        """It is the caller's responsibility to ensure that the tensor lives long enough until the buffer is used."""
+        """The caller must ensure that the tensor lives long enough until the buffer is used."""
         assert tensor.is_contiguous(), "Tensor must be contiguous"
         self.shape = tensor.shape
         self.dtype = tensor.dtype
         self.dim = tensor.dim()
-        tensor_refs = self._create_byte_views_from_tensor(tensor)
-        self.rdma_buffers = [RDMABuffer(chunk) for chunk in tensor_refs]
+        self.rdma_buffers = [
+            RDMABuffer(chunk) for chunk in self._create_byte_views_from_tensor(tensor)
+        ]
 
 
 class MonarchTransportBuffer(TransportBuffer):
