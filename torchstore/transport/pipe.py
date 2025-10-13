@@ -146,6 +146,8 @@ class Pipe:
         transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
         if tensor is not None:
+            # TODO: investigate why RDMA fails on CUDA tensors
+            tensor = tensor.cpu()
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
             transport_buffer.from_contiguous_tensor(tensor)
