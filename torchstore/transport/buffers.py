@@ -201,6 +201,9 @@ class RDMATransportBuffer(TransportBuffer):
 
     def from_contiguous_tensor(self, tensor: torch.Tensor) -> None:
         assert tensor.is_contiguous(), "Tensor must be contiguous"
+        self.shape = tensor.shape
+        self.dtype = tensor.dtype
+        self.dim = tensor.dim()
         byte_view_chunks = self._create_byte_views_from_tensor(tensor)
         self.tensor_refs = [torch.empty_like(chunk) for chunk in byte_view_chunks]
         self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
