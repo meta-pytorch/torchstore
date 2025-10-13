@@ -27,8 +27,6 @@ RDMA_CHUNK_SIZE_MB: int = int(
     os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", str(1024 * 32))
 )
 
-# assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
-
 
 def rdma_available() -> bool:
     rdma_enabled = (
