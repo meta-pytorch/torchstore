@@ -145,9 +145,10 @@ class Pipe:
     async def put_to_storage_volume(self, key, request: Request):
         transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
-        if not tensor.is_contiguous():
-            tensor = tensor.contiguous()
-        transport_buffer.from_contiguous_tensor(tensor)
+        if tensor is not None:
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            transport_buffer.from_contiguous_tensor(tensor)
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
