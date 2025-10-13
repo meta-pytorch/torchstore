@@ -4,20 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-# 
-
-if os.environ.get("MONARCH_HOSTMESH_V1", "0") == "1": 
-    from monarch._src.actor.v1.proc_mesh import get_or_spawn_controller
-else:
-    from monarch.actor import get_or_spawn_controller
-
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient
+
+from torchstore.constants import MONARCH_HOSTMESH_V1
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import (
@@ -26,6 +20,11 @@ from torchstore.strategy import (
     TorchStoreStrategy,
 )
 from torchstore.transport.pipe import TensorSlice
+
+if MONARCH_HOSTMESH_V1:
+    from monarch._src.actor.v1.proc_mesh import get_or_spawn_controller
+else:
+    from monarch.actor import get_or_spawn_controller
 
 
 # I need to keep this somewhere, so here we go

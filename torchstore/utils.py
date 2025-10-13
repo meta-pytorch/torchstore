@@ -10,7 +10,12 @@ from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from monarch.actor import ProcMesh, this_host
+from torchstore.constants import MONARCH_HOSTMESH_V1
+
+if MONARCH_HOSTMESH_V1:
+    from monarch._src.actor.v1.host_mesh import this_host
+else:
+    from monarch.actor import this_host
 
 
 if TYPE_CHECKING:
