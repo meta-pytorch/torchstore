@@ -32,6 +32,13 @@ class LocalClient:
         self._controller = controller
         self.strategy = strategy
 
+    async def _locate_volumes(self, key: str):
+        """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""
+        try:
+            return await self._controller.locate_volumes.call_one(key)
+        except Exception as e:
+            raise KeyError(str(e)) from e
+
     @torch.no_grad
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
         latency_tracker = LatencyTracker(f"put:{key}")
@@ -217,13 +224,13 @@ class LocalClient:
 
     async def _get_stored_object_type(self, key: str) -> ObjectType | None:
         """Peek into storage info for the given key and return the stored object type."""
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_map = await self._locate_volumes(key)
         for storage_info in volume_map.values():
             return storage_info.object_type
         raise ValueError(f"Unable to get stored object type for key `{key}`")
 
     async def _get_object(self, key: str):
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_map = await self._locate_volumes(key)
         volume_id, _ = volume_map.popitem()
         storage_volume = self.strategy.get_storage_volume(volume_id)
         pipe = Pipe(storage_volume)
@@ -232,7 +239,7 @@ class LocalClient:
 
     async def _get_tensor(self, key: str) -> torch.Tensor:
         """Fetches the tensor which is stored in one volume storage"""
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_map = await self._locate_volumes(key)
 
         # if the storage is a Tensor instead of DTensor, just fetch and return it.
         for volume_id, _ in volume_map.items():
@@ -246,7 +253,7 @@ class LocalClient:
     async def _get_distributed_whole_tensor(self, key: str) -> torch.Tensor:
         """Fetches slices from all volume storages and stitch together to return the whole tensor"""
 
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_map = await self._locate_volumes(key)
         # Handle the tensor case
         partial_results = []
         for volume_id, storage_info in volume_map.items():
