@@ -204,8 +204,7 @@ class RDMATransportBuffer(TransportBuffer):
         self.shape = tensor.shape
         self.dtype = tensor.dtype
         self.dim = tensor.dim()
-        byte_view_chunks = self._create_byte_views_from_tensor(tensor)
-        self.tensor_refs = [torch.empty_like(chunk) for chunk in byte_view_chunks]
+        self.tensor_refs = self._create_byte_views_from_tensor(tensor)
         self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
 
 
