@@ -5,12 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchstore.constants import MONARCH_HOSTMESH_V1
+
 if MONARCH_HOSTMESH_V1:
-    from monarch._rust_bindings.monarch_hyperactor.config import configure
     from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
+    from monarch._rust_bindings.monarch_hyperactor.config import configure
+
     configure(
         default_transport=ChannelTransport.MetaTlsWithHostname,
-)
+    )
 
 import math
 import os
