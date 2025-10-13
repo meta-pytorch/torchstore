@@ -11,8 +11,10 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 
-from torchstore.transport.buffers import TransportBuffer
-
+from torchstore.transport.buffers import (
+    create_default_transport_buffer,
+    TransportBuffer,
+)
 from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.utils import assemble_global_tensor, spawn_actors
 
@@ -59,10 +61,8 @@ class StorageVolume(Actor):
         await self.store.put(key, transport_buffer, request)
 
     @endpoint
-    async def get(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
-    ) -> TransportBuffer:
-        return await self.store.get(key, transport_buffer, request)
+    async def get(self, key: str, request: Request) -> TransportBuffer:
+        return await self.store.get(key, request)
 
     @endpoint
     async def get_meta(
@@ -86,9 +86,7 @@ class StorageImpl:
         """Store data in the storage backend."""
         raise NotImplementedError()
 
-    async def get(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
-    ) -> TransportBuffer:
+    async def get(self, key: str, request: Request) -> TransportBuffer:
         """Retrieve data from the storage backend."""
         raise NotImplementedError()
 
@@ -201,12 +199,12 @@ class InMemoryStore(StorageImpl):
 
         self.kv[key] = tensor
 
-    async def get(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
-    ) -> TransportBuffer:
+    async def get(self, key: str, request: Request) -> TransportBuffer:
 
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
+
+        transport_buffer = create_default_transport_buffer()
 
         # TODO: clean up
         val = self.kv[key]
@@ -216,7 +214,7 @@ class InMemoryStore(StorageImpl):
             return transport_buffer
 
         if request.tensor_slice is None:
-            await transport_buffer.write_from(self.kv[key])
+            transport_buffer.from_contiguous_tensor(self.kv[key])
             return transport_buffer
 
         # TODO:

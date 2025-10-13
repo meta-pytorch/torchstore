@@ -4,6 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
+import functools
+
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -30,11 +34,19 @@ RDMA_CHUNK_SIZE_MB: int = int(
 # assert RDMA_CHUNK_SIZE_MB <= 1024, "Monarch does not support 1gb chunks via rdma"
 
 
+@functools.cache
 def rdma_available() -> bool:
     rdma_enabled = (
         os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
     )  # TODO: enable on this build
     return rdma_enabled and monarch_rdma_available()
+
+
+def create_default_transport_buffer() -> TransportBuffer:
+    if rdma_available():
+        return RDMATransportBuffer()
+    else:
+        return MonarchTransportBuffer()
 
 
 class TransportBuffer:
@@ -49,10 +61,7 @@ class TransportBuffer:
         self.objects = other_buffer.objects
         self.requires_meta = other_buffer.requires_meta
 
-    def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
-        """Allocates internal buffers based on either an existing tensor
-        or a Tuple of (shape, dtype)
-        """
+    def from_contiguous_tensor(self, tensor: torch.Tensor) -> None:
         raise NotImplementedError()
 
     async def read_into(self, tensor: Optional[torch.Tensor]) -> torch.Tensor:
@@ -190,6 +199,12 @@ class RDMATransportBuffer(TransportBuffer):
         for idx, chunk in enumerate(chunked_byte_view):
             await self.rdma_buffers[idx].write_from(chunk)
 
+    def from_contiguous_tensor(self, tensor: torch.Tensor) -> None:
+        assert tensor.is_contiguous(), "Tensor must be contiguous"
+        byte_view_chunks = self._create_byte_views_from_tensor(tensor)
+        self.tensor_refs = [torch.empty_like(chunk) for chunk in byte_view_chunks]
+        self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
+
 
 class MonarchTransportBuffer(TransportBuffer):
     """This interface is mostly a noop, intended to be used with Monarch's regular RPC.
@@ -224,3 +239,6 @@ class MonarchTransportBuffer(TransportBuffer):
     def update(self, other_buffer: "TransportBuffer") -> None:
         super().update(other_buffer)
         self.tensor = other_buffer.tensor
+
+    def from_contiguous_tensor(self, tensor: torch.Tensor) -> None:
+        self.tensor = tensor

@@ -145,9 +145,9 @@ class Pipe:
     async def put_to_storage_volume(self, key, request: Request):
         transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
-
-        transport_buffer.allocate(tensor)
-        await transport_buffer.write_from(tensor)
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        transport_buffer.from_contiguous_tensor(tensor)
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
@@ -156,24 +156,8 @@ class Pipe:
         )
 
     async def get_from_storage_volume(self, key, request: Request):
-
-        transport_buffer = self.create_transport_buffer()
-
-        # Certain buffers (RDMA) need to know the size of the tensor
-        # so we can allocate the right amount of memory locally.
-        # This can be avoided if the request contains a tensor slice.
-        # Could likely be optimized away in the future.
-        if transport_buffer.requires_meta and request.tensor_val is None:
-            meta = await self.storage_volume.get_meta.call_one(key, request.meta_only())
-            transport_buffer.allocate(meta)
-        else:
-            transport_buffer.allocate(request.tensor_val)
-
-        # TODO: consider placing the buffer inside the request or vice versa
-        transport_buffer.update(
-            await self.storage_volume.get.call_one(
-                key, transport_buffer, request.meta_only()
-            )
+        transport_buffer = await self.storage_volume.get.call_one(
+            key, request.meta_only()
         )
 
         if transport_buffer.is_object:
