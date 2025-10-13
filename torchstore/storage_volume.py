@@ -188,6 +188,7 @@ class InMemoryStore(StorageImpl):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
+
         if request.is_object:
             self.kv[key] = {"obj": request.objects}
             return

@@ -10,7 +10,12 @@ from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from monarch.actor import ProcMesh, this_host
+from torchstore.constants import MONARCH_HOSTMESH_V1
+
+if MONARCH_HOSTMESH_V1:
+    from monarch._src.actor.v1.host_mesh import this_host
+else:
+    from monarch.actor import this_host
 
 
 if TYPE_CHECKING:
@@ -29,7 +34,7 @@ async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
         actors = mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
         return actors
 
-    assert isinstance(mesh, ProcMesh)
+    assert hasattr(mesh, "spawn")
     actors = mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
 
     return actors
