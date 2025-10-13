@@ -17,7 +17,7 @@ except ImportError:
 
     def RDMABuffer(*args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(
-            "RDMABuffer is not available. This environemnt was likely not built with tensor_engine supoprt."
+            "RDMABuffer is not available. This environemnt was likely not built with rdma supoprt."
         )
 
 
