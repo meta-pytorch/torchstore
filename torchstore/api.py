@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-from monarch.actor import get_or_spawn_controller
-
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient
+
+from torchstore.constants import MONARCH_HOSTMESH_V1
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import (
@@ -20,6 +20,11 @@ from torchstore.strategy import (
     TorchStoreStrategy,
 )
 from torchstore.transport.pipe import TensorSlice
+
+if MONARCH_HOSTMESH_V1:
+    from monarch._src.actor.v1.proc_mesh import get_or_spawn_controller
+else:
+    from monarch.actor import get_or_spawn_controller
 
 
 # I need to keep this somewhere, so here we go
