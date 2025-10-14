@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import tempfile
 
 import pytest
 import torch
@@ -121,8 +122,6 @@ async def test_tensor_slice_inplace():
 @pytest.mark.asyncio
 async def test_put_dtensor_get_full_tensor():
     """Test basic DTensor put/get functionality with separate put and get meshes using shared DTensorActor"""
-    import tempfile
-
     await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
 
     original_tensor = torch.arange(16).reshape(4, 4).float()
@@ -234,6 +233,50 @@ async def test_dtensor_fetch_slice():
             if put_mesh is not None:
                 await put_mesh.destroy_process_group.call()
                 await put_mesh._proc_mesh.stop()
+async def test_partial_put():
+    """
+    Verify the behavior when a dtensor is partially put.
+    1. Create two put actors. Each of them should put half of a DTensor.
+    2. Rank 1 will skip the put operation (using ranks_to_skip_put=[1]).
+    3. After rank 0 completes its put, we call get() which should raise a KeyError
+       because the DTensor is not fully committed (only rank 0's shard is stored).
+    """
+
+    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
+
+    original_tensor = torch.arange(16).reshape(4, 4).float()
+
+    with tempfile.TemporaryDirectory() as filesystem_store_dir:
+        try:
+            put_mesh = await spawn_actors(
+                2,
+                DTensorActor,
+                "dtensor_put_mesh",
+                mesh_shape=(2,),
+                original_tensor=original_tensor,
+                placements=[Shard(0)],
+                file_store_name=os.path.join(filesystem_store_dir, "put_test"),
+                visible_devices="0,1",
+                ranks_to_skip_put=[1],  # Rank 1 will skip the put
+            )
+
+            # Execute the put - rank 0 will put, rank 1 will skip
+            await put_mesh.do_put.call()
+
+            assert not await ts.exists("test_key")
+            # Try to get the tensor - should raise KeyError because only rank 0 has committed
+            with pytest.raises(KeyError) as exc_info:
+                await ts.get("test_key")
+
+            # Verify the error message mentions partial commit
+            assert "partially committed" in str(
+                exc_info.value
+            ), f"Error message should mention partial commit: {exc_info.value}"
+
+        finally:
+            # Clean up process groups
+            await put_mesh.destroy_process_group.call()
+            await put_mesh._proc_mesh.stop()
             await ts.shutdown()
 
 
