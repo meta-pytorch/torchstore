@@ -233,6 +233,10 @@ async def test_dtensor_fetch_slice():
             if put_mesh is not None:
                 await put_mesh.destroy_process_group.call()
                 await put_mesh._proc_mesh.stop()
+            await ts.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_partial_put():
     """
     Verify the behavior when a dtensor is partially put.
