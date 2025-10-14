@@ -208,10 +208,14 @@ class Controller(Actor):
             self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
 
     @endpoint
-    def teardown(self) -> None:
+    async def teardown(self) -> None:
         self.is_initialized = False
         self.keys_to_storage_volumes = Trie()
         self.strategy = None
+        # StorageVolume in ControllerStrategy can be reused because it was spawned with get_or_spawn_controller.
+        # So we have to reset it, otherwise new TensorSlice values for the same key will get piled up in the set.
+        if self.storage_volumes is not None:
+            await self.storage_volumes.reset.call()
         self.storage_volumes = None
         self.num_storage_volumes = None
 

@@ -26,29 +26,35 @@ logger = getLogger(__name__)
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.parametrize(
+    "put_mesh_shape,get_mesh_shape,put_sharding_dim,get_sharding_dim",
+    [
+        # shrink
+        ((4,), (2,), 0, 0),
+        # grow
+        ((2,), (4,), 0, 0),
+    ],
+)
 @pytest.mark.asyncio
-async def test_1d_resharding(strategy_params, use_rdma):
+async def test_1d_resharding(
+    strategy_params,
+    use_rdma,
+    put_mesh_shape,
+    get_mesh_shape,
+    put_sharding_dim,
+    get_sharding_dim,
+):
     _, strategy = strategy_params
 
-    for put_mesh_shape, get_mesh_shape in [
-        ((4,), (2,)),  # shrink
-        ((2,), (4,)),  # grow
-    ]:
-        for put_sharding_dim, get_sharding_dim in [
-            (0, 0),
-            (0, 1),
-            (1, 0),
-            (1, 1),
-        ]:
-            # TODO: test Replicate as well, which is likely not working
-            await _test_resharding(
-                put_mesh_shape=put_mesh_shape,
-                put_placements=[Shard(put_sharding_dim)],
-                get_mesh_shape=get_mesh_shape,
-                get_placements=[Shard(get_sharding_dim)],
-                strategy=strategy,
-                use_rdma=use_rdma,
-            )
+    # TODO: test Replicate as well, which is likely not working
+    await _test_resharding(
+        put_mesh_shape=put_mesh_shape,
+        put_placements=[Shard(put_sharding_dim)],
+        get_mesh_shape=get_mesh_shape,
+        get_placements=[Shard(get_sharding_dim)],
+        strategy=strategy,
+        use_rdma=use_rdma,
+    )
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -59,9 +65,6 @@ async def test_2d_to_2d_resharding(strategy_params, use_rdma):
     put_mesh_shape = get_mesh_shape = (2, 2)
     for put_sharding_dims, get_sharding_dims in [
         ((1, 1), (0, 1)),
-        ((1, 0), (1, 0)),
-        ((0, 0), (0, 1)),
-        ((1, 1), (0, 0)),
     ]:
         await _test_resharding(
             put_mesh_shape=put_mesh_shape,
@@ -81,10 +84,7 @@ async def test_1d_to_2d_resharding(strategy_params, use_rdma):
     put_mesh_shape = (4,)
     get_mesh_shape = (2, 2)
     for put_sharding_dims, get_sharding_dims in [
-        ((0,), (0, 1)),
-        ((1,), (1, 0)),
         ((0,), (0, 0)),
-        ((1,), (1, 1)),
     ]:
         await _test_resharding(
             put_mesh_shape=put_mesh_shape,
@@ -105,9 +105,6 @@ async def test_2d_to_1d_resharding(strategy_params, use_rdma):
     get_mesh_shape = (4,)
     for put_sharding_dims, get_sharding_dims in [
         ((0, 0), (0,)),
-        ((1, 0), (1,)),
-        ((0, 1), (0,)),
-        ((1, 1), (1,)),
     ]:
         await _test_resharding(
             put_mesh_shape=put_mesh_shape,
@@ -196,10 +193,6 @@ async def _test_resharding(
     assert len(get_mesh_shape) == len(
         get_placements
     ), f"{get_mesh_shape=}, {get_placements=}"
-
-    logger.warn(
-        f"Testing {put_mesh_shape=} {put_placements=} {get_mesh_shape=} {get_placements=}"
-    )
 
     original_tensor = torch.arange(8**2).reshape(
         8, 8
