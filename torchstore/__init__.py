@@ -28,6 +28,7 @@ from torchstore.strategy import (
     SingletonStrategy,
     TorchStoreStrategy,
 )
+from torchstore.transport.buffers import TransportBufferCache
 
 if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
     init_logging()
@@ -56,4 +57,5 @@ __all__ = [
     "put_state_dict",
     "get_state_dict",
     "reset_client",
+    "TransportBufferCache",
 ]

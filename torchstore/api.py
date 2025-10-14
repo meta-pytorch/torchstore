@@ -19,6 +19,7 @@ from torchstore.strategy import (
     SingletonStrategy,
     TorchStoreStrategy,
 )
+from torchstore.transport.buffers import TransportBufferCache
 from torchstore.transport.pipe import TensorSlice
 
 if MONARCH_HOSTMESH_V1:
@@ -145,28 +146,37 @@ async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
 
 
 async def put(
-    key: str, value: Union[torch.Tensor, Any], store_name: str = DEFAULT_TORCHSTORE_NAME
+    key: str,
+    value: Union[torch.Tensor, Any],
+    cache: Optional[TransportBufferCache] = None,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> None:
     """Store a tensor or object in the distributed store.
 
     Args:
         key (str): Unique identifier for the stored value.
         value (torch.Tensor or Any): Tensor or object to store.
+        cache (TransportBufferCache, optional): Cache for reusing transport buffers.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
 
     Example:
         >>> tensor = torch.randn(100, 100)
         >>> await put("my_tensor", tensor)
         >>> await put("my_object", {"data": [1, 2, 3]})
+        
+        >>> # With caching
+        >>> cache = TransportBufferCache()
+        >>> await put("my_tensor", tensor, cache=cache)
     """
     cl = await client(store_name)
-    return await cl.put(key, value)
+    return await cl.put(key, value, cache=cache)
 
 
 async def get(
     key: str,
     inplace_tensor: Optional[torch.Tensor] = None,
     tensor_slice_spec: Optional[TensorSlice] = None,
+    cache: Optional[TransportBufferCache] = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> Union[torch.Tensor, Any]:
     """Retrieve a tensor or object from the distributed store.
@@ -204,7 +214,7 @@ async def get(
         >>> await get("my_tensor", inplace_tensor=slice_buffer, tensor_slice_spec=slice_spec)
     """
     cl = await client(store_name)
-    return await cl.get(key, inplace_tensor, tensor_slice_spec)
+    return await cl.get(key, inplace_tensor, tensor_slice_spec, cache=cache)
 
 
 async def delete(
@@ -272,22 +282,33 @@ async def exists(key: str, store_name: str = DEFAULT_TORCHSTORE_NAME) -> bool:
 
 
 async def put_state_dict(
-    state_dict: Dict[str, Any], key: str, store_name: str = DEFAULT_TORCHSTORE_NAME
+    state_dict: Dict[str, Any],
+    key: str,
+    cache: Optional[TransportBufferCache] = None,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> None:
     """Store a PyTorch model state_dict in the distributed store.
 
     Args:
         state_dict (dict): Model state_dict to store.
         key (str): Unique identifier for the state_dict.
+        cache (TransportBufferCache, optional): Cache for reusing transport buffers across saves.
+            This avoids expensive RDMA buffer reallocations on subsequent saves.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
 
     Example:
         >>> model = torch.nn.Linear(10, 5)
         >>> await put_state_dict(model.state_dict(), "model_checkpoint")
+
+        >>> # With caching for improved performance
+        >>> cache = TransportBufferCache()
+        >>> for epoch in range(10):
+        ...     # First save allocates buffers, subsequent saves reuse them
+        ...     await put_state_dict(model.state_dict(), "checkpoint", cache=cache)
     """
     cl = await client(store_name)
     await torchstore.state_dict_utils.put_state_dict(
-        store=cl, state_dict=state_dict, key=key
+        store=cl, state_dict=state_dict, key=key, cache=cache
     )
 
 
@@ -295,6 +316,7 @@ async def get_state_dict(
     key: str,
     user_state_dict: Optional[Dict[str, Any]] = None,
     strict: bool = True,
+    cache: Optional[TransportBufferCache] = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> Dict[str, Any]:
     """Retrieve a PyTorch model state_dict from the distributed store.
@@ -303,6 +325,8 @@ async def get_state_dict(
         key (str): Unique identifier of the state_dict to retrieve.
         user_state_dict (dict, optional): Pre-existing state_dict to merge with.
         strict (bool): Whether to enforce strict loading. Defaults to True.
+        cache (TransportBufferCache, optional): Cache for reusing transport buffers across gets.
+            This avoids expensive RDMA buffer reallocations on subsequent gets.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
 
     Returns:
@@ -311,8 +335,14 @@ async def get_state_dict(
     Example:
         >>> state_dict = await get_state_dict("model_checkpoint")
         >>> model.load_state_dict(state_dict)
+        
+        >>> # With caching for improved performance
+        >>> cache = TransportBufferCache()
+        >>> for epoch in range(10):
+        ...     # First get allocates buffers, subsequent gets reuse them
+        ...     state_dict = await get_state_dict("checkpoint", cache=cache)
     """
     cl = await client(store_name)
     return await torchstore.state_dict_utils.get_state_dict(
-        cl, key, user_state_dict, strict
+        cl, key, user_state_dict, strict, cache=cache
     )

@@ -13,13 +13,17 @@ from torch.distributed.checkpoint._nested_dict import (
     unflatten_state_dict,
 )
 
+from torchstore.transport.buffers import TransportBufferCache
+
 DELIM = "/"
 MAPPING = "MAPPING"
 
 logger = getLogger(__name__)
 
 
-async def put_state_dict(store, state_dict, key):
+async def put_state_dict(
+    store, state_dict, key, cache: Optional[TransportBufferCache] = None
+):
     """
     We have an option here. Either we can "flatten state dict", by turning state dict names into a single key,
     or I can actually just maintain the dictionary representation of the state dict, and we can allow some
@@ -28,22 +32,35 @@ async def put_state_dict(store, state_dict, key):
     Overall, this might not even be something we want to solve for in the TorchStore, but I'm adding this
     utility so we can test sharding models.
 
+    Args:
+        store: The store client to use for putting data
+        state_dict: The state dict to store
+        key: The base key to use for storing the state dict
+        cache: Optional TransportBufferCache for reusing allocated buffers across saves
     """
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
     for flattened_key, value in flattened_state_dict.items():
-        await store.put(f"{key}{DELIM}{flattened_key}", value)
+        await store.put(f"{key}{DELIM}{flattened_key}", value, cache=cache)
 
-    await store.put(f"{key}{DELIM}{MAPPING}", mapping)
+    await store.put(f"{key}{DELIM}{MAPPING}", mapping, cache=cache)
 
 
 async def get_state_dict(
-    store, key, user_state_dict: Optional[dict] = None, strict=True
+    store, key, user_state_dict: Optional[dict] = None, strict=True, cache: Optional[TransportBufferCache] = None
 ):
-    """Unflatten the state dict from the store"""
+    """Unflatten the state dict from the store
+    
+    Args:
+        store: The store client to use for getting data
+        key: The base key to use for retrieving the state dict
+        user_state_dict: Optional user state dict for validation
+        strict: Whether to enforce strict validation
+        cache: Optional TransportBufferCache for reusing allocated buffers across gets
+    """
 
     try:
         # Since the mapping is the last thing we write out, it also gaurantees the state dict is not pending
-        fetched_mapping = await store.get(f"{key}{DELIM}{MAPPING}")
+        fetched_mapping = await store.get(f"{key}{DELIM}{MAPPING}", cache=cache)
     except Exception as e:
         raise RuntimeError(
             f"Mapping is missing from the store. This most likely means there is no matching 'push' call for this key: {key=}"
@@ -63,6 +80,7 @@ async def get_state_dict(
         fetched_state_dict[flattened_key] = await store.get(
             f"{key}{DELIM}{flattened_key}",
             inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
+            cache=cache,
         )
 
     # # Prepare all the coroutines first

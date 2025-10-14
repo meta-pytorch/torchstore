@@ -58,6 +58,7 @@ class ModelTest(Actor):
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
         self.file_store_name = file_store_name
+        self.state_dict_cache = None
 
         os.environ["LOCAL_RANK"] = str(self.rank)
 
@@ -110,7 +111,10 @@ class ModelTest(Actor):
 
         self.rlog("pushing state dict")
         t = time.perf_counter()
-        await ts.put_state_dict(state_dict, "v0")
+        if self.state_dict_cache is None:
+            self.state_dict_cache = ts.TransportBufferCache()
+
+        await ts.put_state_dict(state_dict, "v0",cache=self.state_dict_cache)
         self.rlog(f"pushed state dict in {time.perf_counter() - t} seconds")
 
     @endpoint
@@ -125,7 +129,10 @@ class ModelTest(Actor):
             torch.distributed.barrier()
         self.rlog("getting state dict")
         t = time.perf_counter()
-        await ts.get_state_dict("v0", state_dict)
+        if self.state_dict_cache is None:
+            self.state_dict_cache = ts.TransportBufferCache()
+
+        await ts.get_state_dict("v0", state_dict, cache=self.state_dict_cache)
         self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
 
 
@@ -179,9 +186,13 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
             )
 
             logger.info("do_push ")
-            await put_world.do_push.call()
+            for _ in range(3):
+                await put_world.do_push.call()
+                time.sleep(1)
 
-            await get_world.do_get.call()
+            for _ in range(3):
+                await get_world.do_get.call()
+                time.sleep(1)
     finally:
         await ts.shutdown()
 

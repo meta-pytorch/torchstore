@@ -14,6 +14,7 @@ from torch.distributed.tensor import DTensor
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.transport import Pipe, Request, TensorSlice
+from torchstore.transport.buffers import TransportBufferCache
 from torchstore.utils import assemble_tensor, get_local_tensor, get_slice_intersection
 
 logger = getLogger(__name__)
@@ -40,7 +41,12 @@ class LocalClient:
             raise KeyError(str(e)) from e
 
     @torch.no_grad
-    async def put(self, key: str, value: Union[torch.Tensor, Any]):
+    async def put(
+        self,
+        key: str,
+        value: Union[torch.Tensor, Any],
+        cache: TransportBufferCache | None = None,
+    ):
         latency_tracker = LatencyTracker(f"put:{key}")
         request = Request.from_any(value)
         # for now, we only write to one storage volume.
@@ -51,8 +57,18 @@ class LocalClient:
 
         pipe = Pipe(storage_volume)
 
-        await pipe.put_to_storage_volume(key, request)
+        # Check if we have a cached buffer for this key
+        cached_buffer = cache.get(key) if cache is not None else None
+
+        # Put to storage volume and get back the buffer (either cached or newly created)
+        transport_buffer = await pipe.put_to_storage_volume(
+            key, request, cached_buffer=cached_buffer
+        )
         latency_tracker.track_step("put_to_storage_volume")
+
+        # Cache the buffer for future use if cache is provided and buffer wasn't already cached
+        if cache is not None and cached_buffer is None:
+            cache.put(key, transport_buffer)
 
         await self._controller.notify_put.call(key, request.meta_only(), volume_id)
         latency_tracker.track_step("notify_put")
@@ -64,6 +80,7 @@ class LocalClient:
         key: str,
         inplace_tensor: torch.Tensor | DTensor | None = None,
         tensor_slice_spec: TensorSlice | None = None,
+        cache: TransportBufferCache | None = None,
     ):
         logger.debug(f"Fetching {key}")
         latency_tracker = LatencyTracker(f"get:{key}")
@@ -74,11 +91,11 @@ class LocalClient:
         # Get a spec of the shape and offset of the tensor slice to fetch. Fetch the whole tensor otherwise
 
         if stored_object_type is ObjectType.OBJECT:
-            return await self._get_object(key)
+            return await self._get_object(key, cache=cache)
 
         if stored_object_type is ObjectType.TENSOR:
             # TODO: we should get the part of interest in this branch.
-            fetched_tensor = await self._get_tensor(key)
+            fetched_tensor = await self._get_tensor(key, cache=cache)
             if tensor_slice_spec is not None:
                 fetched_tensor = get_local_tensor(
                     fetched_tensor,
@@ -231,15 +248,27 @@ class LocalClient:
             return storage_info.object_type
         raise ValueError(f"Unable to get stored object type for key `{key}`")
 
-    async def _get_object(self, key: str):
+    async def _get_object(self, key: str, cache: TransportBufferCache | None = None):
         volume_map = await self._locate_volumes(key)
         volume_id, _ = volume_map.popitem()
         storage_volume = self.strategy.get_storage_volume(volume_id)
         pipe = Pipe(storage_volume)
         request = Request.from_any(None)
-        return await pipe.get_from_storage_volume(key, request)
+        
+        cached_buffer = cache.get(key) if cache is not None else None
+        result, transport_buffer = await pipe.get_from_storage_volume(
+            key, request, cached_buffer=cached_buffer
+        )
+        
+        # Cache the buffer for future use if cache is provided and buffer wasn't already cached
+        if cache is not None and cached_buffer is None and transport_buffer is not None:
+            cache.put(key, transport_buffer)
+        
+        return result
 
-    async def _get_tensor(self, key: str) -> torch.Tensor:
+    async def _get_tensor(
+        self, key: str, cache: TransportBufferCache | None = None
+    ) -> torch.Tensor:
         """Fetches the tensor which is stored in one volume storage"""
         volume_map = await self._locate_volumes(key)
 
@@ -250,7 +279,17 @@ class LocalClient:
             # TODO: consolidate the logic here - None indicates it is an object request,
             # which is sematically inappropriate here.
             request = Request.from_any(None)
-            return await pipe.get_from_storage_volume(key, request)
+            
+            cached_buffer = cache.get(key) if cache is not None else None
+            result, transport_buffer = await pipe.get_from_storage_volume(
+                key, request, cached_buffer=cached_buffer
+            )
+            
+            # Cache the buffer for future use if cache is provided and buffer wasn't already cached
+            if cache is not None and cached_buffer is None and transport_buffer is not None:
+                cache.put(key, transport_buffer)
+            
+            return result
 
     async def _get_and_assemble_tensor(
         self, key: str, tensor_slice_spec: TensorSlice | None = None
@@ -289,7 +328,7 @@ class LocalClient:
 
                 tensor_slice_request = Request.from_tensor_slice(tensor_slice)
 
-                local_tensor = await pipe.get_from_storage_volume(
+                local_tensor, _ = await pipe.get_from_storage_volume(
                     key, tensor_slice_request
                 )
                 partial_results.append((local_tensor, tensor_slice))

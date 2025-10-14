@@ -18,6 +18,7 @@ from torchstore.transport.buffers import (
     rdma_available,
     RDMATransportBuffer,
     TransportBuffer,
+    TransportBufferCache,
 )
 
 logger = getLogger(__name__)
@@ -142,12 +143,18 @@ class Pipe:
             buffer_cls = MonarchTransportBuffer
         return buffer_cls()
 
-    async def put_to_storage_volume(self, key, request: Request):
-        transport_buffer = self.create_transport_buffer()
-        tensor = request.tensor_val
+    async def put_to_storage_volume(
+        self, key, request: Request, cached_buffer: Optional[TransportBuffer] = None
+    ):
+        if cached_buffer is not None:
+            # Reuse the cached buffer - skip allocation
+            transport_buffer = cached_buffer
+        else:
+            # Create new buffer and allocate
+            transport_buffer = self.create_transport_buffer()
+            transport_buffer.allocate(request.tensor_val)
 
-        transport_buffer.allocate(tensor)
-        await transport_buffer.write_from(tensor)
+        await transport_buffer.write_from(request.tensor_val)
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
@@ -155,19 +162,30 @@ class Pipe:
             key, transport_buffer, request.meta_only()
         )
 
-    async def get_from_storage_volume(self, key, request: Request):
+        # Return the buffer so it can be cached for future use
+        return transport_buffer
 
-        transport_buffer = self.create_transport_buffer()
-
-        # Certain buffers (RDMA) need to know the size of the tensor
-        # so we can allocate the right amount of memory locally.
-        # This can be avoided if the request contains a tensor slice.
-        # Could likely be optimized away in the future.
-        if transport_buffer.requires_meta and request.tensor_val is None:
-            meta = await self.storage_volume.get_meta.call_one(key, request.meta_only())
-            transport_buffer.allocate(meta)
+    async def get_from_storage_volume(
+        self, key, request: Request, cached_buffer: Optional[TransportBuffer] = None
+    ):
+        if cached_buffer is not None:
+            # Reuse the cached buffer - skip allocation
+            transport_buffer = cached_buffer
         else:
-            transport_buffer.allocate(request.tensor_val)
+            # Create new buffer and allocate
+            transport_buffer = self.create_transport_buffer()
+
+            # Certain buffers (RDMA) need to know the size of the tensor
+            # so we can allocate the right amount of memory locally.
+            # This can be avoided if the request contains a tensor slice.
+            # Could likely be optimized away in the future.
+            if transport_buffer.requires_meta and request.tensor_val is None:
+                meta = await self.storage_volume.get_meta.call_one(
+                    key, request.meta_only()
+                )
+                transport_buffer.allocate(meta)
+            else:
+                transport_buffer.allocate(request.tensor_val)
 
         # TODO: consider placing the buffer inside the request or vice versa
         transport_buffer.update(
@@ -177,6 +195,10 @@ class Pipe:
         )
 
         if transport_buffer.is_object:
-            return transport_buffer.objects
+            # For objects, we don't cache buffers
+            return transport_buffer.objects, None
 
-        return await transport_buffer.read_into(request.tensor_val)
+        result = await transport_buffer.read_into(request.tensor_val)
+
+        # Return both the result and the buffer so it can be cached
+        return result, transport_buffer

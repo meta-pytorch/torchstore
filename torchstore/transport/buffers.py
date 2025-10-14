@@ -10,6 +10,41 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
+
+class TransportBufferCache:
+    """Cache for transport buffers to avoid expensive reallocations (especially for RDMA).
+    
+    This cache stores transport buffers by key, allowing them to be reused across
+    multiple put/get operations. This is particularly beneficial for RDMA buffers
+    where allocation is expensive.
+    
+    Example:
+        >>> cache = TransportBufferCache()
+        >>> # First save allocates buffers and stores them in cache
+        >>> await ts.put_state_dict(state_dict, "checkpoint", cache=cache)
+        >>> # Second save reuses the cached buffers, avoiding allocation
+        >>> await ts.put_state_dict(state_dict, "checkpoint", cache=cache)
+    """
+    
+    def __init__(self):
+        self._buffers: Dict[str, "TransportBuffer"] = {}
+    
+    def get(self, key: str) -> Optional["TransportBuffer"]:
+        """Retrieve a cached transport buffer for the given key."""
+        return self._buffers.get(key)
+    
+    def put(self, key: str, buffer: "TransportBuffer") -> None:
+        """Store a transport buffer in the cache."""
+        self._buffers[key] = buffer
+    
+    def clear(self) -> None:
+        """Clear all cached buffers."""
+        self._buffers.clear()
+    
+    def remove(self, key: str) -> None:
+        """Remove a specific cached buffer."""
+        self._buffers.pop(key, None)
+
 try:
     from monarch.rdma import is_rdma_available as monarch_rdma_available, RDMABuffer
 except ImportError:
