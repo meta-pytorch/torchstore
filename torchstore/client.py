@@ -91,6 +91,7 @@ class LocalClient:
             # is DTensor.
             # Here we abused request a bit to get tensor_slice from inplace DTensor. Otherwise
             # Request.from_any(inplace_tensor) will return None, and we use the tensor_slice_spec.
+            assert stored_object_type is ObjectType.TENSOR_SLICE
             tensor_slice = (
                 Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
             )
