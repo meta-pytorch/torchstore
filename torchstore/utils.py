@@ -84,8 +84,8 @@ def assemble_tensor(
         [local_tensor.shape for local_tensor in local_tensors], global_offsets
     )
     if inplace_tensor is not None:
-        assert (
-            inplace_tensor.shape == target_shape
+        assert tuple(inplace_tensor.shape) == tuple(
+            target_shape
         ), f"Inplace tensor shape ({inplace_tensor.shape}) doesn't match target tensor shape ({target_shape})"
         tensor = inplace_tensor
     else:
