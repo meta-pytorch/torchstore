@@ -139,8 +139,20 @@ class RDMATransportBuffer(TransportBuffer):
     def update(self, other_buffer: "TransportBuffer") -> None:
         super().update(other_buffer)
 
-    # send
     async def read_into(self, tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Reads the tensor from the rdma buffer into the provided tensor.
+        If no tensor is provided, a new tensor will be allocated and returned.
+        """
+        if tensor is not None and not tensor.is_contiguous():
+            # if the tensor is not contiguous, we need to allocate a new tensor
+            # and copy the data into it
+            temp_tensor = tensor.contiguous()
+            tensor.copy_(await self._read_into_contiguous(temp_tensor))
+        return await self._read_into_contiguous(tensor)
+
+    async def _read_into_contiguous(
+        self, tensor: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if tensor is None:
             # allocate a tensor to return
             tensor = torch.empty(
@@ -173,8 +185,17 @@ class RDMATransportBuffer(TransportBuffer):
 
         return tensor
 
-    # recv
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+        """Writes the tensor from the provided tensor into the rdma buffer."""
+        if tensor is not None and not tensor.is_contiguous():
+            # if the tensor is not contiguous, we need to allocate a new tensor
+            # and copy the data into it
+            temp_tensor = tensor.contiguous()
+            await self._write_from_contiguous(temp_tensor)
+        await self._write_from_contiguous(tensor)
+
+    # recv
+    async def _write_from_contiguous(self, tensor: Optional[torch.Tensor]) -> None:
         if tensor is None:
             return
 

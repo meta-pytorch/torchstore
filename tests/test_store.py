@@ -86,6 +86,130 @@ async def test_basic(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
+async def test_put_non_contiguous(strategy_params, use_rdma):
+    """Test basic put functionality for non-contiguous tensors"""
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+
+    class PutGetActor(Actor):
+        """Each instance of this actor represents a single process."""
+
+        def __init__(
+            self,
+            world_size,
+        ):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+
+            # required by LocalRankStrategy
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def put(self):
+            t = torch.tensor([[self.rank + 1] * 10] * 2)
+            t = t.transpose(0, 1)
+            assert not t.is_contiguous()
+            await ts.put(f"key_{self.rank}", t)
+
+        @endpoint
+        async def get(self, rank_offset=0):
+            other_rank = (self.rank + rank_offset) % self.world_size
+            return await ts.get(f"key_{other_rank}")
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+    # each actor mesh represents a group of processes.
+    actor_mesh_0 = await spawn_actors(
+        volume_world_size, PutGetActor, "actor_mesh_0", world_size=volume_world_size
+    )
+    actor_mesh_1 = await spawn_actors(
+        volume_world_size, PutGetActor, "actor_mesh_1", world_size=volume_world_size
+    )
+
+    try:
+        await actor_mesh_0.put.call()
+        tensors = await actor_mesh_1.get.call()
+        for pt, val in tensors:
+            expected = torch.tensor([[pt.rank + 1] * 2] * 10)
+            assert torch.equal(expected, val), f"{expected} != {val}"
+
+        # in cases where volume_world_size > 1, we should also test that we can get from a different rank
+        rank_offset = 1
+        tensors = await actor_mesh_1.get.call(rank_offset)
+        for pt, val in tensors:
+            other_rank = (pt.rank + rank_offset) % volume_world_size
+            expected = torch.tensor([[other_rank + 1] * 2] * 10)
+            assert torch.equal(expected, val), f"{expected} != {val}"
+    finally:
+        await actor_mesh_0._proc_mesh.stop()
+        await actor_mesh_1._proc_mesh.stop()
+        await ts.shutdown()
+
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_get_inplace(strategy_params, use_rdma):
+    """Test basic put functionality for non-contiguous tensors"""
+    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+
+    class PutGetActor(Actor):
+        """Each instance of this actor represents a single process."""
+
+        def __init__(
+            self,
+            world_size,
+        ):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+
+            # required by LocalRankStrategy
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def put(self):
+            t = torch.tensor([self.rank + 1] * 10)
+            await ts.put(f"key_{self.rank}", t)
+
+        @endpoint
+        async def get_inplace(self, rank_offset=0):
+            inplace_tensor = torch.tensor([0] * 10)
+            other_rank = (self.rank + rank_offset) % self.world_size
+            await ts.get(f"key_{other_rank}", inplace_tensor=inplace_tensor)
+            return inplace_tensor
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+    # each actor mesh represents a group of processes.
+    actor_mesh_0 = await spawn_actors(
+        volume_world_size, PutGetActor, "actor_mesh_0", world_size=volume_world_size
+    )
+    actor_mesh_1 = await spawn_actors(
+        volume_world_size, PutGetActor, "actor_mesh_1", world_size=volume_world_size
+    )
+
+    try:
+        await actor_mesh_0.put.call()
+        tensors = await actor_mesh_1.get_inplace.call()
+        for pt, val in tensors:
+            expected = torch.tensor([pt.rank + 1] * 10)
+            assert torch.equal(expected, val), f"{expected} != {val}"
+
+        # in cases where volume_world_size > 1, we should also test that we can get from a different rank
+        rank_offset = 1
+        tensors = await actor_mesh_1.get_inplace.call(rank_offset)
+        for pt, val in tensors:
+            other_rank = (pt.rank + rank_offset) % volume_world_size
+            expected = torch.tensor([other_rank + 1] * 10)
+            assert torch.equal(expected, val), f"{expected} != {val}"
+    finally:
+        await actor_mesh_0._proc_mesh.stop()
+        await actor_mesh_1._proc_mesh.stop()
+        await ts.shutdown()
+
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
 async def test_objects(strategy_params, use_rdma):
     """Test put/get on arbitrary object"""
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"

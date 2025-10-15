@@ -6,7 +6,7 @@
 
 import uuid
 from logging import getLogger
-from typing import List, Tuple, TYPE_CHECKING
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 
@@ -64,6 +64,8 @@ def assemble_tensor(
     local_tensors: List[torch.Tensor],
     global_shape: "ShapeType",  # TODO: unused, cleanup
     global_offsets: List["ShapeType"],
+    *,
+    inplace_tensor: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Assemble a global tensor from local tensors based on their shapes and offsets. The final shape of the returned
@@ -72,6 +74,7 @@ def assemble_tensor(
     :param local_tensors: List of local tensors
     :param global_shape: Shape of the final global tensor
     :param global_offsets: List of offsets for each local tensor in the global tensor
+    :param inplace_tensor: Optional tensor to use for inplace assembly, if provided, the inplace tensor must have the expected shape
     :return: The assembled global tensor
     """
     # Create an empty global tensor of the specified shape
@@ -80,10 +83,16 @@ def assemble_tensor(
     target_shape, target_offset = get_target_tensor_shape_and_offset(
         [local_tensor.shape for local_tensor in local_tensors], global_offsets
     )
-    tensor = torch.empty(
-        target_shape,
-        dtype=local_tensors[0].dtype,
-    )
+    if inplace_tensor is not None:
+        assert (
+            inplace_tensor.shape == target_shape
+        ), "Inplace tensor shape doesn't match target tensor shape"
+        tensor = inplace_tensor
+    else:
+        tensor = torch.empty(
+            target_shape,
+            dtype=local_tensors[0].dtype,
+        )
 
     # Iterate over each local tensor and place it in the correct position in the global tensor
     for local_tensor, offset in zip(local_tensors, global_offsets, strict=True):

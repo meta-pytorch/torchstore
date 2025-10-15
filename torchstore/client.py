@@ -6,7 +6,7 @@
 
 import asyncio
 from logging import getLogger
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -78,13 +78,20 @@ class LocalClient:
 
         if stored_object_type is ObjectType.TENSOR:
             # TODO: we should get the part of interest in this branch.
-            fetched_tensor = await self._get_tensor(key)
             if tensor_slice_spec is not None:
+                fetched_whole_tensor = await self._get_tensor(key)
                 fetched_tensor = get_local_tensor(
-                    fetched_tensor,
+                    fetched_whole_tensor,
                     tensor_slice_spec.local_shape,
                     tensor_slice_spec.offsets,
                 )
+            else:
+                # stored tensor is a full tensor and we are getting a full tensor,
+                # so we can return the tensor directly
+                fetched_tensor = await self._get_tensor(
+                    key, inplace_tensor=inplace_tensor
+                )
+                return fetched_tensor
         else:
             # Strored object is a DTensor. Return full tensor if
             # inplace_tensor is None, or return DTensor if inplace_tensor
@@ -105,8 +112,7 @@ class LocalClient:
                 # DTensor case - copy to the local tensor to avoid type mismatch
                 inplace_tensor._local_tensor.copy_(fetched_tensor)
             else:
-                # Regular tensor case
-                inplace_tensor.copy_(fetched_tensor)
+                raise RuntimeError("this branch should not be reached")
 
             return inplace_tensor
 
@@ -239,8 +245,12 @@ class LocalClient:
         request = Request.from_any(None)
         return await pipe.get_from_storage_volume(key, request)
 
-    async def _get_tensor(self, key: str) -> torch.Tensor:
-        """Fetches the tensor which is stored in one volume storage"""
+    async def _get_tensor(
+        self, key: str, *, inplace_tensor: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Fetches the tensor which is stored in one volume storage. If inplace_tensor is provided,
+        the caller has to ensure that the tensor is the same shape as the tensor stored in the storage.
+        """
         volume_map = await self._locate_volumes(key)
 
         # if the storage is a Tensor instead of DTensor, just fetch and return it.
@@ -249,11 +259,15 @@ class LocalClient:
             pipe = Pipe(storage_volume)
             # TODO: consolidate the logic here - None indicates it is an object request,
             # which is sematically inappropriate here.
-            request = Request.from_any(None)
+            request = Request.from_any(inplace_tensor)
             return await pipe.get_from_storage_volume(key, request)
 
     async def _get_and_assemble_tensor(
-        self, key: str, tensor_slice_spec: TensorSlice | None = None
+        self,
+        key: str,
+        tensor_slice_spec: TensorSlice | None = None,
+        *,
+        inplace_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Fetches slices from all volume storages and stitch together to return the whole tensor.
 
@@ -261,6 +275,9 @@ class LocalClient:
             key: The key to fetch from storage
             tensor_slice_spec: Optional tensor slice to optimize fetching by only retrieving
                           intersecting portions from storage volumes. If None, fetches the whole tensor.
+
+        Keyword Args:
+            inplace_tensor: Optional tensor to use for in-place retrieval. If provided, the tensor must have the expected shape.
 
         Returns:
             The assembled tensor from all storage volumes
@@ -324,6 +341,7 @@ class LocalClient:
             local_tensors,
             global_shape,
             global_offsets,
+            inplace_tensor=inplace_tensor,
         )
 
         return assembled_tensor
