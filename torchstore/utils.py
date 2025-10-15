@@ -86,7 +86,7 @@ def assemble_tensor(
     if inplace_tensor is not None:
         assert (
             inplace_tensor.shape == target_shape
-        ), "Inplace tensor shape doesn't match target tensor shape"
+        ), f"Inplace tensor shape ({inplace_tensor.shape}) doesn't match target tensor shape ({target_shape})"
         tensor = inplace_tensor
     else:
         tensor = torch.empty(
