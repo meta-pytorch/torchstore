@@ -61,7 +61,7 @@ async def get_state_dict(
     try:
         # Since the mapping is the last thing we write out, it also gaurantees the state dict is not pending
         fetched_mapping = await store.get(f"{key}{DELIM}{MAPPING}", cache=cache)
-    except Exception as e:
+    except KeyError as e:
         raise RuntimeError(
             f"Mapping is missing from the store. This most likely means there is no matching 'push' call for this key: {key=}"
         ) from e

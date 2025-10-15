@@ -12,7 +12,7 @@ from typing import Any, Optional, Tuple
 import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
-
+from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import (
     MonarchTransportBuffer,
     rdma_available,
@@ -146,6 +146,7 @@ class Pipe:
     async def put_to_storage_volume(
         self, key, request: Request, cached_buffer: Optional[TransportBuffer] = None
     ):
+        latency_tracker = LatencyTracker(f"{key}:Pipe.put_to_storage_volume")
         if cached_buffer is not None:
             # Reuse the cached buffer - skip allocation
             transport_buffer = cached_buffer
@@ -153,14 +154,17 @@ class Pipe:
             # Create new buffer and allocate
             transport_buffer = self.create_transport_buffer()
             transport_buffer.allocate(request.tensor_val)
+            latency_tracker.track_step("allocate")
 
         await transport_buffer.write_from(request.tensor_val)
+        latency_tracker.track_step("write_from")
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
         await self.storage_volume.put.call_one(
             key, transport_buffer, request.meta_only()
         )
+        latency_tracker.track_step("storage_volume.put")
 
         # Return the buffer so it can be cached for future use
         return transport_buffer
@@ -168,12 +172,14 @@ class Pipe:
     async def get_from_storage_volume(
         self, key, request: Request, cached_buffer: Optional[TransportBuffer] = None
     ):
+        latency_tracker = LatencyTracker(f"{key}:Pipe.get_from_storage_volume")
         if cached_buffer is not None:
             # Reuse the cached buffer - skip allocation
             transport_buffer = cached_buffer
         else:
             # Create new buffer and allocate
             transport_buffer = self.create_transport_buffer()
+            latency_tracker.track_step("create_transport_buffer")
 
             # Certain buffers (RDMA) need to know the size of the tensor
             # so we can allocate the right amount of memory locally.
@@ -186,6 +192,7 @@ class Pipe:
                 transport_buffer.allocate(meta)
             else:
                 transport_buffer.allocate(request.tensor_val)
+            latency_tracker.track_step("allocate")
 
         # TODO: consider placing the buffer inside the request or vice versa
         transport_buffer.update(
@@ -193,6 +200,7 @@ class Pipe:
                 key, transport_buffer, request.meta_only()
             )
         )
+        latency_tracker.track_step("storage_volume.get")
 
         if transport_buffer.is_object:
             # For objects, we don't cache buffers

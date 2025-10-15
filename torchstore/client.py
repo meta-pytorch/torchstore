@@ -36,7 +36,10 @@ class LocalClient:
     async def _locate_volumes(self, key: str):
         """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""
         try:
-            return await self._controller.locate_volumes.call_one(key)
+            latenct_tracker = LatencyTracker(f"locate_volumes:{key}")
+            ret = await self._controller.locate_volumes.call_one(key)
+            latenct_tracker.track_e2e()
+            return ret
         except Exception as e:
             raise KeyError(str(e)) from e
 
@@ -54,6 +57,7 @@ class LocalClient:
         # it will never be dynamic. e.g. it's always based on the
         # TorchstoreStrategy defined during intiailization
         storage_volume, volume_id = self.strategy.select_storage_volume()
+        latency_tracker.track_step("select_storage_volume")
 
         pipe = Pipe(storage_volume)
 
@@ -85,6 +89,7 @@ class LocalClient:
         logger.debug(f"Fetching {key}")
         latency_tracker = LatencyTracker(f"get:{key}")
         stored_object_type = await self._get_stored_object_type(key)
+        latency_tracker.track_step("get_stored_object_type")
 
         self._verify_get_args(inplace_tensor, tensor_slice_spec, stored_object_type)
 
@@ -97,10 +102,13 @@ class LocalClient:
             # TODO: we should get the part of interest in this branch.
             fetched_tensor = await self._get_tensor(key, cache=cache)
             if tensor_slice_spec is not None:
+                tensor_slice = (
+                        Request.from_dtensor(inplace_tensor).tensor_slice or tensor_slice_spec
+                    )
                 fetched_tensor = get_local_tensor(
                     fetched_tensor,
-                    tensor_slice_spec.local_shape,
-                    tensor_slice_spec.offsets,
+                    tensor_slice.local_shape,
+                    tensor_slice.offsets,
                 )
         else:
             # Strored object is a DTensor. Return full tensor if
@@ -113,7 +121,9 @@ class LocalClient:
                 Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
             )
             # Here full tensor should be the part of interest.
-            fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
+            # TODO: use cache here
+            fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice, cache=cache)
+            latency_tracker.track_step("_get_and_assemble_tensor")
 
         # Pipe does not have support for inplace copies of fetched tensors yet,
         # so we just copy
@@ -124,6 +134,8 @@ class LocalClient:
             else:
                 # Regular tensor case
                 inplace_tensor.copy_(fetched_tensor)
+
+            latency_tracker.track_e2e()
 
             return inplace_tensor
 
@@ -270,6 +282,7 @@ class LocalClient:
         self, key: str, cache: TransportBufferCache | None = None
     ) -> torch.Tensor:
         """Fetches the tensor which is stored in one volume storage"""
+        latency_tracker = LatencyTracker(f"get_tensor:{key}")
         volume_map = await self._locate_volumes(key)
 
         # if the storage is a Tensor instead of DTensor, just fetch and return it.
@@ -292,7 +305,7 @@ class LocalClient:
             return result
 
     async def _get_and_assemble_tensor(
-        self, key: str, tensor_slice_spec: TensorSlice | None = None
+        self, key: str, tensor_slice_spec: TensorSlice | None = None, cache: TransportBufferCache | None = None
     ) -> torch.Tensor:
         """Fetches slices from all volume storages and stitch together to return the whole tensor.
 
@@ -326,11 +339,17 @@ class LocalClient:
                         # No overlap, skip fetching this slice
                         continue
 
-                tensor_slice_request = Request.from_tensor_slice(tensor_slice)
+                cache_key = f"{key}:{tensor_slice.__hash__()}"
+                cached_buffer = cache.get(key) if cache is not None else None
 
-                local_tensor, _ = await pipe.get_from_storage_volume(
+                tensor_slice_request = Request.from_tensor_slice(tensor_slice)
+                local_tensor, transport_buffer = await pipe.get_from_storage_volume(
                     key, tensor_slice_request
                 )
+                # Cache the buffer for future use if cache is provided and buffer wasn't already cached
+                if cache is not None and cached_buffer is None and transport_buffer is not None:
+                    cache.put(cache_key, transport_buffer)
+
                 partial_results.append((local_tensor, tensor_slice))
         if not partial_results:
             raise RuntimeError(

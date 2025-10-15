@@ -27,14 +27,31 @@ class TransportBufferCache:
     """
     
     def __init__(self):
+        self._force_use_cache = False
         self._buffers: Dict[str, "TransportBuffer"] = {}
+        self.buffer_namespace = ""
+        
     
+    def set_checkpoint_namespace(
+        self,
+        namespace
+    ) -> None:
+        self.buffer_namespace = namespace
+
+    def _namespaced_key(self, key: str) -> str:
+        if self.buffer_namespace and key != self.buffer_namespace and key.startswith(self.buffer_namespace):
+            key = key[len(self.buffer_namespace):]
+        return key
+
     def get(self, key: str) -> Optional["TransportBuffer"]:
         """Retrieve a cached transport buffer for the given key."""
+        key = self._namespaced_key(key)
+        return None
         return self._buffers.get(key)
     
     def put(self, key: str, buffer: "TransportBuffer") -> None:
         """Store a transport buffer in the cache."""
+        key = self._namespaced_key(key)
         self._buffers[key] = buffer
     
     def clear(self) -> None:
@@ -59,7 +76,7 @@ except ImportError:
 # TODO: we no longer need to chunk with monararch rdma buffer. Setting large chunk size for now,
 # but we should remove all chunking code
 RDMA_CHUNK_SIZE_MB: int = int(
-    os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", str(1024 * 32))
+    os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", str(1024 * 4))
 )
 
 
@@ -199,7 +216,7 @@ class RDMATransportBuffer(TransportBuffer):
         # TODO: gather instead of reading sequentially
         try:
             for idx, chunk in enumerate(chunked_byte_view):
-                await self.rdma_buffers[idx].read_into(chunk)
+                await self.rdma_buffers[idx].read_into(chunk, timeout=6000)
         except Exception as e:
             logging.exception(
                 f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e
@@ -228,7 +245,7 @@ class RDMATransportBuffer(TransportBuffer):
         # the rdma buffer
         # TODO: gather instead of reading sequentially
         for idx, chunk in enumerate(chunked_byte_view):
-            await self.rdma_buffers[idx].write_from(chunk)
+            await self.rdma_buffers[idx].write_from(chunk, timeout=6000)
 
 
 class MonarchTransportBuffer(TransportBuffer):

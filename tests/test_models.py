@@ -18,7 +18,9 @@ import math
 import os
 import tempfile
 import time
+import statistics
 from logging import getLogger
+from pprint import pprint
 
 import pytest
 import torch
@@ -59,10 +61,15 @@ class ModelTest(Actor):
         self.world_size = math.prod(mesh_shape)
         self.file_store_name = file_store_name
         self.state_dict_cache = None
+        self.initialized_distributed=False
+        self.step = 0
 
         os.environ["LOCAL_RANK"] = str(self.rank)
 
     def initialize_distributed(self):
+        if self.initialized_distributed:
+            return
+
         self.rlog(f"Initialize process group using {self.file_store_name=} ")
         torch.distributed.init_process_group(
             backend="gloo",
@@ -74,6 +81,7 @@ class ModelTest(Actor):
         # this barrier is more to make sure torch.distibuted is working
         self.rlog("barrrer")
         torch.distributed.barrier()
+        self.initialized_distributed = True
 
     def build_model(self):
         self.rlog("building model")
@@ -114,8 +122,15 @@ class ModelTest(Actor):
         if self.state_dict_cache is None:
             self.state_dict_cache = ts.TransportBufferCache()
 
-        await ts.put_state_dict(state_dict, "v0",cache=self.state_dict_cache)
-        self.rlog(f"pushed state dict in {time.perf_counter() - t} seconds")
+        checkpoint_id = f"v_{self.step}"
+        self.state_dict_cache.set_checkpoint_namespace(checkpoint_id)
+        await ts.put_state_dict(state_dict, checkpoint_id, cache=self.state_dict_cache)
+        
+        delta = time.perf_counter() - t
+        self.step += 1        
+        self.rlog(f"pushed state dict in {delta} seconds")
+        return delta
+        
 
     @endpoint
     async def do_get(self):
@@ -132,8 +147,14 @@ class ModelTest(Actor):
         if self.state_dict_cache is None:
             self.state_dict_cache = ts.TransportBufferCache()
 
-        await ts.get_state_dict("v0", state_dict, cache=self.state_dict_cache)
-        self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
+        checkpoint_id = f"v_{self.step}"
+        self.state_dict_cache.set_checkpoint_namespace(checkpoint_id)
+        await ts.get_state_dict(checkpoint_id, state_dict, cache=self.state_dict_cache)
+
+        delta = time.perf_counter() - t
+        self.step +=1 
+        self.rlog(f"got state dict in {delta} seconds")
+        return delta
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -143,6 +164,19 @@ async def test_basic(strategy_params, use_rdma):
     put_mesh_shape = (1,)
     get_mesh_shape = (1,)
     await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
+
+@pytest.mark.asyncio
+async def test_many_to_one():
+    # FSDP
+    put_mesh_shape = (4,)
+    get_mesh_shape = (1,)
+    await _do_test(
+        put_mesh_shape,
+        get_mesh_shape,
+        ts.LocalRankStrategy(),
+        True,
+        steps=4
+    )
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -154,7 +188,7 @@ async def test_resharding(strategy_params, use_rdma):
     await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
 
 
-async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
+async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma, steps=1):
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
 
     ts.init_logging()
@@ -185,14 +219,29 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
                 file_store_name=os.path.join(tmpdir, "get_world"),
             )
 
-            logger.info("do_push ")
-            for _ in range(3):
-                await put_world.do_push.call()
-                time.sleep(1)
+            push_times=[]
+            for _ in range(steps):
+                step_push_times=[]
+                for _, result in await put_world.do_push.call():
+                    step_push_times.append(result)
+                push_times.append(
+                    f"mean: {statistics.mean(step_push_times)} "
+                    f"max: {max(step_push_times)} "
+                    f"min: {min(step_push_times)} "
+                )
 
-            for _ in range(3):
-                await get_world.do_get.call()
-                time.sleep(1)
+            get_times=[]
+            for _ in range(steps):
+                step_get_times=[]
+                for _, result in await get_world.do_get.call():
+                    step_get_times.append(result)
+                get_times.append(
+                    f"mean: {statistics.mean(step_get_times)} "
+                    f"max: {max(step_get_times)} "
+                    f"min: {min(step_get_times)} "
+                )
+
+            pprint(f"\n{push_times=}\n{get_times=}")
     finally:
         await ts.shutdown()
 

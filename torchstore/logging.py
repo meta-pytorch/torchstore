@@ -35,10 +35,10 @@ class LatencyTracker:
 
     def track_step(self, step_name: str) -> None:
         now = time.perf_counter()
-        logging.debug(f"{self.name}:{step_name} took {now - self.last_step} seconds")
+        print(f"{self.name}:{step_name} took {now - self.last_step} seconds")
         self.last_step = now
 
     def track_e2e(self) -> None:
-        logging.debug(
+        print(
             f"{self.name} took {time.perf_counter() - self.start_time} seconds"
         )
