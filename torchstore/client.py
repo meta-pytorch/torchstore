@@ -93,7 +93,7 @@ class LocalClient:
                 )
                 return fetched_tensor
         else:
-            # Strored object is a DTensor. Return full tensor if
+            # Stored object is a DTensor. Return full tensor if
             # inplace_tensor is None, or return DTensor if inplace_tensor
             # is DTensor.
             # Here we abused request a bit to get tensor_slice from inplace DTensor. Otherwise
@@ -102,19 +102,28 @@ class LocalClient:
             tensor_slice = (
                 Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
             )
+            if inplace_tensor is not None:
+                is_inplace_dtensor = hasattr(inplace_tensor, "_local_tensor")
+                if is_inplace_dtensor:
+                    # Here full tensor should be the part of interest.
+                    fetched_tensor = await self._get_and_assemble_tensor(
+                        key, tensor_slice
+                    )
+                    inplace_tensor._local_tensor.copy_(fetched_tensor)
+                else:
+                    fetched_tensor = await self._get_and_assemble_tensor(
+                        key, tensor_slice, inplace_tensor=inplace_tensor
+                    )
+                    return fetched_tensor
             # Here full tensor should be the part of interest.
             fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
 
-        # Pipe does not have support for inplace copies of fetched tensors yet,
-        # so we just copy
+        # Cover the rest of the cases by copying the fetched tensor to the inplace tensor.
         if inplace_tensor is not None:
             if hasattr(inplace_tensor, "_local_tensor"):
-                # DTensor case - copy to the local tensor to avoid type mismatch
-                inplace_tensor._local_tensor.copy_(fetched_tensor)
+                raise RuntimeError("This branch should not be reached.")
             else:
-                raise RuntimeError("this branch should not be reached")
-
-            return inplace_tensor
+                inplace_tensor.copy_(fetched_tensor)
 
         latency_tracker.track_e2e()
         return fetched_tensor
