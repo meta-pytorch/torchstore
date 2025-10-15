@@ -110,6 +110,7 @@ class LocalClient:
                         key, tensor_slice
                     )
                     inplace_tensor._local_tensor.copy_(fetched_tensor)
+                    return inplace_tensor
                 else:
                     fetched_tensor = await self._get_and_assemble_tensor(
                         key, tensor_slice, inplace_tensor=inplace_tensor
