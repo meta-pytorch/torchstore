@@ -207,6 +207,19 @@ async def get(
     return await cl.get(key, inplace_tensor, tensor_slice_spec)
 
 
+async def defrag(key: str) -> None:
+    """Perform a defragmentation pass on the distributed store.
+
+    This method triggers a defragmentation pass on all storage volumes. It is not necessary to call this
+    method manually, as it is called automatically by the controller when necessary.
+
+    Example:
+        >>> await defrag()
+    """
+    cl = await client()
+    return await cl.defrag(key)
+
+
 async def delete(
     key: str,
     *,

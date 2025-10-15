@@ -19,6 +19,38 @@ from torchstore.utils import assemble_tensor, get_local_tensor, get_slice_inters
 logger = getLogger(__name__)
 
 
+def convert_to_single_shard_request(full_tensor: torch.Tensor) -> Request:
+    """
+    Convert a full tensor to a Request object that represents it as a single-shard DTensor.
+
+    This creates a Request with proper tensor_val and tensor_slice fields to represent
+    the full tensor as if it were a DTensor with a single shard containing all the data.
+    This avoids the overhead of actually creating a DTensor with distributed initialization.
+
+    Args:
+        full_tensor: The complete assembled tensor
+
+    Returns:
+        Request: A Request object representing a single-shard DTensor
+    """
+    # Create a tensor slice that represents the entire tensor as a single shard
+    tensor_slice = TensorSlice(
+        offsets=(0,) * len(full_tensor.shape),  # Start at origin for all dimensions
+        coordinates=(0,),  # Single device at coordinate (0,)
+        global_shape=full_tensor.shape,  # Global shape is the full tensor shape
+        local_shape=full_tensor.shape,  # Local shape equals global (single shard)
+        mesh_shape=(1,),  # Single device mesh
+    )
+
+    # Create and return the Request object
+    return Request(
+        tensor_val=full_tensor,
+        tensor_slice=tensor_slice,
+        objects=None,
+        is_object=False,
+    )
+
+
 class LocalClient:
     """This class represents the local store, which exists on every process. Remote storage
     is handled by the client.
@@ -127,6 +159,35 @@ class LocalClient:
         """
         # Keys are synced across all storage volumes, so we just call one.
         return await self._controller.keys.call_one(prefix)
+
+    async def defrag(self, key: str) -> None:
+        # check if stored key is a tensor slice, return if not.
+        stored_object_type = await self._get_stored_object_type(key)
+
+        if stored_object_type is not ObjectType.TENSOR_SLICE:
+            raise ValueError(
+                f"Cannot defragment for key `{key}` because value type is {stored_object_type}, expect TENSOR_SLICE"
+            )
+
+        # get the tensor slices from each volume and create a single tensor slice and push into storage
+        # TODO: improve comment english
+
+        full_tensor = await self._get_and_assemble_tensor(key)
+
+        # Convert the full tensor to a single-shard Request object for consistency
+        # This maintains DTensor-like behavior without distributed overhead
+        request = convert_to_single_shard_request(full_tensor)
+
+        await self.delete(key)
+
+        # Put the single-shard representation back to storage
+        storage_volume, volume_id = self.strategy.select_storage_volume()
+
+        pipe = Pipe(storage_volume)
+
+        await pipe.put_to_storage_volume(key, request)
+
+        await self._controller.notify_put.call(key, request.meta_only(), volume_id)
 
     async def delete(self, key: str) -> None:
         """

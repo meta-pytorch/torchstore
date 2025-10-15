@@ -94,8 +94,8 @@ class ModelTest(Actor):
 
     def rlog(self, msg):
         print(f"rank: {self.rank} {msg}")
-        self.logger.info(f"rank: {self.rank} {msg}")
-        logger.info(f"rank: {self.rank} {msg}")
+        # self.logger.info(f"rank: {self.rank} {msg}")
+        # logger.info(f"rank: {self.rank} {msg}")
 
     @endpoint
     async def do_push(self):
@@ -123,19 +123,38 @@ class ModelTest(Actor):
 
         if self.world_size > 1:
             torch.distributed.barrier()
+        import time
+
+        t = time.perf_counter()
+        await ts.get_state_dict("v0", state_dict)
+        self.rlog(f"BEFORE defrag got state dict in {time.perf_counter() - t} seconds")
+        keys = await ts.keys("v0/model")
+
+        start = time.perf_counter()
+        count = 0
+        for key in keys:
+            try:
+                await ts.defrag(key)
+                count += 1
+            except Exception as e:
+                print(f"Exception in defrag for key {key}: {e}")
+                continue
+
+        self.rlog(f"defrag {count} keys  took {time.perf_counter() - start} seconds")
+
         self.rlog("getting state dict")
         t = time.perf_counter()
         await ts.get_state_dict("v0", state_dict)
-        self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
+        self.rlog(f"AFTER defrag got state dict in {time.perf_counter() - t} seconds")
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_basic(strategy_params, use_rdma):
     # FSDP
-    put_mesh_shape = (1,)
+    put_mesh_shape = (8,)
     get_mesh_shape = (1,)
-    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
+    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], True)
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
