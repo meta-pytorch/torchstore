@@ -4,15 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from .monarch_patch import apply_monarch_patch
+
+apply_monarch_patch()
+
 import math
 import os
 from itertools import product
 from logging import getLogger
-
 from typing import List
 
 import pytest
 import torch
+
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor

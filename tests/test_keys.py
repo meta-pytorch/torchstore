@@ -6,12 +6,9 @@
 
 """Tests for the keys() api"""
 
-from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
-from monarch._rust_bindings.monarch_hyperactor.config import configure
+from .monarch_patch import apply_monarch_patch
 
-configure(
-    default_transport=ChannelTransport.MetaTlsWithHostname,
-)
+apply_monarch_patch()
 
 import os
 

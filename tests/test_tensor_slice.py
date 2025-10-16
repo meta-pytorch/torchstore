@@ -4,12 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
-from monarch._rust_bindings.monarch_hyperactor.config import configure
+from .monarch_patch import apply_monarch_patch
 
-configure(
-    default_transport=ChannelTransport.MetaTlsWithHostname,
-)
+apply_monarch_patch()
 
 import os
 import tempfile
