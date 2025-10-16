@@ -122,9 +122,9 @@ async def dtensor_put_get_example():
     puts it with Shard(0) and gets it with Shard(1).
     """
     # Configuration variables
-    size = 3  # 100 unit size => 2.4 MB Tensor Size
-    n_put_actors = 8
-    n_get_actors = 8
+    size = 1  # 100 unit size => 2.4 MB Tensor Size
+    n_put_actors = 2
+    n_get_actors = 1
 
     print("Starting DTensor put/get example with:")
     print(f"  size = {size}")

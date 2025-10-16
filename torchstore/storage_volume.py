@@ -65,6 +65,10 @@ class StorageVolume(Actor):
         return await self.store.get(key, transport_buffer, request)
 
     @endpoint
+    async def defrag(self, key: str) -> None:
+        return await self.store.defrag(key)
+
+    @endpoint
     async def get_meta(
         self,
         key: str,
@@ -94,6 +98,10 @@ class StorageImpl:
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> TransportBuffer:
         """Retrieve data from the storage backend."""
+        raise NotImplementedError()
+
+    async def defrag(self, key: str) -> None:
+        """Defragment tensor slices into just one tensor slice"""
         raise NotImplementedError()
 
     async def get_meta(
@@ -188,6 +196,44 @@ class InMemoryStore(StorageImpl):
             "slice": tensor_slice,
             "tensor": tensor,
         }
+
+    async def defrag(self, key: str) -> TensorSlice:
+        # get local tensors, global shape and global offsets from kv[key]
+        local_tensors = []
+        global_offsets = []
+        global_shape = None
+        for shard in self.kv[key].values():
+
+            local_tensors.append(shard["tensor"])
+            tensor_shard = shard["slice"]
+
+            global_offsets.append(tensor_shard.offsets)
+            if global_shape is None:
+                global_shape = tensor_shard.global_shape
+            else:
+                assert global_shape == tensor_shard.global_shape
+
+        full_tensor = assemble_tensor(
+            local_tensors,
+            global_shape,
+            global_offsets,
+        )
+
+        # convert assembled tensor to a single shard tensor and store it in kv[key]
+        tensor_slice = TensorSlice(
+            offsets=(0,) * len(full_tensor.shape),  # Start at origin for all dimensions
+            coordinates=(0,),  # Single device at coordinate (0,)
+            global_shape=full_tensor.shape,  # Global shape is the full tensor shape
+            local_shape=full_tensor.shape,  # Local shape equals global (single shard)
+            mesh_shape=(1,),  # Single device mesh
+        )
+        self.kv[key] = {
+            tensor_slice.coordinates: {
+                "slice": tensor_slice,
+                "tensor": full_tensor,
+            }
+        }
+        return tensor_slice
 
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request

@@ -128,6 +128,10 @@ class LocalClient:
                 Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
             )
             # Here full tensor should be the part of interest.
+            if key == "v0/model.model.norm.weight":
+                print(
+                    f"\033[92mgetting tensor slice {tensor_slice} for key {key}\033[0m"
+                )
             fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
 
         # Pipe does not have support for inplace copies of fetched tensors yet,
@@ -169,25 +173,14 @@ class LocalClient:
                 f"Cannot defragment for key `{key}` because value type is {stored_object_type}, expect TENSOR_SLICE"
             )
 
-        # get the tensor slices from each volume and create a single tensor slice and push into storage
-        # TODO: improve comment english
-
-        full_tensor = await self._get_and_assemble_tensor(key)
-
-        # Convert the full tensor to a single-shard Request object for consistency
-        # This maintains DTensor-like behavior without distributed overhead
-        request = convert_to_single_shard_request(full_tensor)
-
-        await self.delete(key)
-
         # Put the single-shard representation back to storage
         storage_volume, volume_id = self.strategy.select_storage_volume()
-
-        pipe = Pipe(storage_volume)
-
-        await pipe.put_to_storage_volume(key, request)
-
-        await self._controller.notify_put.call(key, request.meta_only(), volume_id)
+        await self._controller.notify_delete.call_one(key, volume_id)
+        tensor_slice = await storage_volume.defrag.call_one(key)
+        if key == "v0/model.model.norm.weight":
+            print(f"tensor_slice: {tensor_slice}")
+        request = Request.from_tensor_slice(tensor_slice)
+        await self._controller.notify_put.call(key, request, volume_id)
 
     async def delete(self, key: str) -> None:
         """
@@ -327,10 +320,15 @@ class LocalClient:
             The assembled tensor from all storage volumes
         """
         volume_map = await self._locate_volumes(key)
+        if key == "v0/model.model.norm.weight":
+            print(f"\033[92mvolume map for key {key}: {volume_map}\033[0m")
         # Handle the tensor case
         partial_results = []
         for volume_id, storage_info in volume_map.items():
             storage_volume = self.strategy.get_storage_volume(volume_id)
+            if key == "v0/model.model.norm.weight":
+                print(f"storage volume: {storage_volume}")
+                # print(f"stored val: {storage_volume.store.kv[key]}")
             pipe = Pipe(storage_volume)
 
             # fetch from all storage volumes, something like this
