@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
+from monarch.actor import get_or_spawn_controller
+
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient
 
@@ -19,8 +21,6 @@ from torchstore.strategy import (
     TorchStoreStrategy,
 )
 from torchstore.transport.pipe import TensorSlice
-
-from monarch.actor import get_or_spawn_controller
 
 
 # I need to keep this somewhere, so here we go
