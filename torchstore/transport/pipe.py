@@ -11,8 +11,8 @@ from typing import Any, Optional, Tuple
 
 import torch
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
+from torchstore.dtensor_utils import create_tensor_slice_from_dtensor
 from torchstore.transport.buffers import (
     MonarchTransportBuffer,
     rdma_available,
@@ -84,21 +84,7 @@ class Request:
 
     @classmethod
     def from_dtensor(cls, dtensor: DTensor) -> "Request":
-        coordinates = dtensor.device_mesh.get_coordinate()
-        _, offsets = _compute_local_shape_and_global_offset(
-            dtensor.shape,
-            mesh_shape=dtensor.device_mesh.shape,
-            my_coordinate=coordinates,
-            placements=dtensor.placements,
-        )
-
-        tensor_slice = TensorSlice(
-            offsets,
-            coordinates,
-            dtensor.shape,
-            dtensor._local_tensor.shape,
-            dtensor.device_mesh.shape,
-        )
+        tensor_slice = create_tensor_slice_from_dtensor(dtensor)
         return cls(
             tensor_val=dtensor._local_tensor,
             tensor_slice=tensor_slice,
