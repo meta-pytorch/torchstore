@@ -27,11 +27,10 @@ class TransportBufferCache:
     """
     
     def __init__(self):
-        self._force_use_cache = False
+        self._force_use_cache: bool = False
         self._buffers: Dict[str, "TransportBuffer"] = {}
         self.buffer_namespace = ""
         
-    
     def set_checkpoint_namespace(
         self,
         namespace
@@ -46,7 +45,11 @@ class TransportBufferCache:
     def get(self, key: str) -> Optional["TransportBuffer"]:
         """Retrieve a cached transport buffer for the given key."""
         key = self._namespaced_key(key)
-        return None
+        if "MAPPING" not in key and self._force_use_cache and key not in self._buffers:
+            print(key)
+            print(f"{self._buffers.keys()=}")
+            raise KeyError(f"Key {key} not found in cache")
+
         return self._buffers.get(key)
     
     def put(self, key: str, buffer: "TransportBuffer") -> None:

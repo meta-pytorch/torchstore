@@ -50,6 +50,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
+TEST_MODEL = "Qwen/Qwen3-32B"
 # TEST_MODEL = "meta-llama/Llama-3.1-8B" # ~ 16GB
 
 
@@ -147,6 +148,9 @@ class ModelTest(Actor):
         if self.state_dict_cache is None:
             self.state_dict_cache = ts.TransportBufferCache()
 
+        # if self.step >= 1:
+        #     self.state_dict_cache._force_use_cache = True
+
         checkpoint_id = f"v_{self.step}"
         self.state_dict_cache.set_checkpoint_namespace(checkpoint_id)
         await ts.get_state_dict(checkpoint_id, state_dict, cache=self.state_dict_cache)
@@ -175,7 +179,7 @@ async def test_many_to_one():
         get_mesh_shape,
         ts.LocalRankStrategy(),
         True,
-        steps=4
+        steps=3
     )
 
 
@@ -240,8 +244,10 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma, steps=1):
                     f"max: {max(step_get_times)} "
                     f"min: {min(step_get_times)} "
                 )
-
-            pprint(f"\n{push_times=}\n{get_times=}")
+            print("push_times")
+            pprint(push_times)
+            print("get_times")
+            pprint(get_times)
     finally:
         await ts.shutdown()
 

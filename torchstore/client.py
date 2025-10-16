@@ -340,11 +340,11 @@ class LocalClient:
                         continue
 
                 cache_key = f"{key}:{tensor_slice.__hash__()}"
-                cached_buffer = cache.get(key) if cache is not None else None
+                cached_buffer = cache.get(cache_key) if cache is not None else None
 
                 tensor_slice_request = Request.from_tensor_slice(tensor_slice)
                 local_tensor, transport_buffer = await pipe.get_from_storage_volume(
-                    key, tensor_slice_request
+                    key, tensor_slice_request, cached_buffer=cached_buffer
                 )
                 # Cache the buffer for future use if cache is provided and buffer wasn't already cached
                 if cache is not None and cached_buffer is None and transport_buffer is not None:
