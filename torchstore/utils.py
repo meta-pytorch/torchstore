@@ -11,12 +11,7 @@ from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 
-from torchstore.constants import MONARCH_HOSTMESH_V1
-
-if MONARCH_HOSTMESH_V1:
-    from monarch._src.actor.v1.host_mesh import this_host
-else:
-    from monarch.actor import this_host
+from monarch.actor import this_host
 
 from torchstore.transport import TensorSlice
 
