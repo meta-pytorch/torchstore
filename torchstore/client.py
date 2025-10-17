@@ -11,12 +11,27 @@ from typing import Any, Union
 import torch
 from torch.distributed.tensor import DTensor
 
+from torchstore._async_utils import SequentialExecutor
+
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.transport import Pipe, Request, TensorSlice
 from torchstore.utils import assemble_tensor, get_local_tensor, get_slice_intersection
 
 logger = getLogger(__name__)
+
+
+def _limit_concurrency(method):
+    """
+    Decorator to limit concurrency of async methods using the instance's semaphore.
+    Assumes the instance has a self._semaphore attribute (asyncio.Semaphore).
+    """
+
+    async def wrapper(self, *args, **kwargs):
+        async with self._semaphore:
+            return await method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class LocalClient:
@@ -28,9 +43,14 @@ class LocalClient:
         self,
         controller,
         strategy,
+        *,
+        rdma_executor: SequentialExecutor | None = None,
+        max_concurrent_requests: int = 4,
     ):
         self._controller = controller
         self.strategy = strategy
+        self.rdma_executor = rdma_executor
+        self._semaphore = asyncio.Semaphore(max_concurrent_requests)
 
     async def _locate_volumes(self, key: str):
         """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""
@@ -40,6 +60,7 @@ class LocalClient:
             raise KeyError(str(e)) from e
 
     @torch.no_grad
+    @_limit_concurrency
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
         latency_tracker = LatencyTracker(f"put:{key}")
         request = Request.from_any(value)
@@ -51,7 +72,7 @@ class LocalClient:
 
         pipe = Pipe(storage_volume)
 
-        await pipe.put_to_storage_volume(key, request)
+        await pipe.put_to_storage_volume(key, request, executor=self.rdma_executor)
         latency_tracker.track_step("put_to_storage_volume")
 
         await self._controller.notify_put.call(key, request.meta_only(), volume_id)
@@ -59,6 +80,7 @@ class LocalClient:
         latency_tracker.track_e2e()
 
     @torch.no_grad
+    @_limit_concurrency
     async def get(
         self,
         key: str,
@@ -237,7 +259,9 @@ class LocalClient:
         storage_volume = self.strategy.get_storage_volume(volume_id)
         pipe = Pipe(storage_volume)
         request = Request.from_any(None)
-        return await pipe.get_from_storage_volume(key, request)
+        return await pipe.get_from_storage_volume(
+            key, request, executor=self.rdma_executor
+        )
 
     async def _get_tensor(self, key: str) -> torch.Tensor:
         """Fetches the tensor which is stored in one volume storage"""
@@ -250,7 +274,9 @@ class LocalClient:
             # TODO: consolidate the logic here - None indicates it is an object request,
             # which is sematically inappropriate here.
             request = Request.from_any(None)
-            return await pipe.get_from_storage_volume(key, request)
+            return await pipe.get_from_storage_volume(
+                key, request, executor=self.rdma_executor
+            )
 
     async def _get_and_assemble_tensor(
         self, key: str, tensor_slice_spec: TensorSlice | None = None
@@ -290,7 +316,7 @@ class LocalClient:
                 tensor_slice_request = Request.from_tensor_slice(tensor_slice)
 
                 local_tensor = await pipe.get_from_storage_volume(
-                    key, tensor_slice_request
+                    key, tensor_slice_request, executor=self.rdma_executor
                 )
                 partial_results.append((local_tensor, tensor_slice))
         if not partial_results:
