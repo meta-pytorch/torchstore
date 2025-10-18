@@ -151,32 +151,44 @@ class Pipe:
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
-        await self.storage_volume.put.call_one(
-            key, transport_buffer, request.meta_only()
-        )
+        try:
+            await self.storage_volume.put.call_one(
+                key, transport_buffer, request.meta_only()
+            )
+        finally:
+            # Clean up the transport buffer after the put operation completes
+            # This is critical for RDMA buffers to deregister memory regions
+            await transport_buffer.drop()
 
     async def get_from_storage_volume(self, key, request: Request):
 
         transport_buffer = self.create_transport_buffer()
 
-        # Certain buffers (RDMA) need to know the size of the tensor
-        # so we can allocate the right amount of memory locally.
-        # This can be avoided if the request contains a tensor slice.
-        # Could likely be optimized away in the future.
-        if transport_buffer.requires_meta and request.tensor_val is None:
-            meta = await self.storage_volume.get_meta.call_one(key, request.meta_only())
-            transport_buffer.allocate(meta)
-        else:
-            transport_buffer.allocate(request.tensor_val)
+        try:
+            # Certain buffers (RDMA) need to know the size of the tensor
+            # so we can allocate the right amount of memory locally.
+            # This can be avoided if the request contains a tensor slice.
+            # Could likely be optimized away in the future.
+            if transport_buffer.requires_meta and request.tensor_val is None:
+                meta = await self.storage_volume.get_meta.call_one(
+                    key, request.meta_only()
+                )
+                transport_buffer.allocate(meta)
+            else:
+                transport_buffer.allocate(request.tensor_val)
 
-        # TODO: consider placing the buffer inside the request or vice versa
-        transport_buffer.update(
-            await self.storage_volume.get.call_one(
-                key, transport_buffer, request.meta_only()
+            # TODO: consider placing the buffer inside the request or vice versa
+            transport_buffer.update(
+                await self.storage_volume.get.call_one(
+                    key, transport_buffer, request.meta_only()
+                )
             )
-        )
 
-        if transport_buffer.is_object:
-            return transport_buffer.objects
+            if transport_buffer.is_object:
+                return transport_buffer.objects
 
-        return await transport_buffer.read_into(request.tensor_val)
+            return await transport_buffer.read_into(request.tensor_val)
+        finally:
+            # Clean up the transport buffer after the get operation completes
+            # This is critical for RDMA buffers to deregister memory regions
+            await transport_buffer.drop()
