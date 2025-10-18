@@ -158,7 +158,7 @@ class Pipe:
         finally:
             # Clean up the transport buffer after the put operation completes
             # This is critical for RDMA buffers to deregister memory regions
-            transport_buffer.cleanup()
+            await transport_buffer.drop()
 
     async def get_from_storage_volume(self, key, request: Request):
 
@@ -191,4 +191,4 @@ class Pipe:
         finally:
             # Clean up the transport buffer after the get operation completes
             # This is critical for RDMA buffers to deregister memory regions
-            transport_buffer.cleanup()
+            await transport_buffer.drop()

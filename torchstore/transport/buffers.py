@@ -59,7 +59,7 @@ class TransportBuffer:
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
         raise NotImplementedError()
 
-    def cleanup(self) -> None:
+    async def drop(self) -> None:
         """Clean up any resources held by this buffer. Override in subclasses if needed."""
         pass
 
@@ -76,7 +76,7 @@ class RDMATransportBuffer(TransportBuffer):
         self.shape: Optional[torch.Size] = None
         self.dtype: Optional[torch.dtype] = None
 
-    def cleanup(self) -> None:
+    async def drop(self) -> None:
         """Explicitly clean up RDMA buffers to prevent kernel memory leak.
 
         When RDMA buffers are created, they register memory regions with the RDMA
@@ -85,14 +85,10 @@ class RDMATransportBuffer(TransportBuffer):
         leading to a memory leak that manifests as unbounded Inactive(anon) growth.
         """
         if self.rdma_buffers is not None:
-            print(
-                f"[RDMA] Dropping {len(self.rdma_buffers)} RDMA buffers for tensor {self.shape} {self.dtype}"
-            )
             for rdma_buf in self.rdma_buffers:
                 try:
                     # Drop the RDMA buffer to deregister the memory region
-                    print("[RDMA] Calling drop() on RDMA buffer")
-                    rdma_buf.drop()
+                    await rdma_buf.drop()
                 except Exception as e:
                     # Log but don't raise - cleanup should be best-effort
                     logging.warning(f"Failed to drop RDMA buffer during cleanup: {e}")
@@ -162,9 +158,6 @@ class RDMATransportBuffer(TransportBuffer):
             torch.empty_like(chunk, device=torch.device("cpu"))
             for chunk in byte_view_chunks
         ]
-        print(
-            f"[RDMA] Creating {len(self.tensor_refs)} RDMA buffers for tensor {self.shape} {self.dtype}"
-        )
         self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
 
         chunk_sizes = set()
