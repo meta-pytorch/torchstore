@@ -85,9 +85,13 @@ class RDMATransportBuffer(TransportBuffer):
         leading to a memory leak that manifests as unbounded Inactive(anon) growth.
         """
         if self.rdma_buffers is not None:
+            print(
+                f"[RDMA] Dropping {len(self.rdma_buffers)} RDMA buffers for tensor {self.shape} {self.dtype}"
+            )
             for rdma_buf in self.rdma_buffers:
                 try:
                     # Drop the RDMA buffer to deregister the memory region
+                    print("[RDMA] Calling drop() on RDMA buffer")
                     rdma_buf.drop()
                 except Exception as e:
                     # Log but don't raise - cleanup should be best-effort
@@ -97,7 +101,9 @@ class RDMATransportBuffer(TransportBuffer):
 
     def __del__(self) -> None:
         """Destructor that ensures RDMA buffers are cleaned up."""
-        self.cleanup()
+        # Note: Not calling cleanup() here to avoid issues with destructor timing
+        # and to make cleanup explicit only where we control the lifecycle
+        pass
 
     def __getstate__(self) -> Dict[str, Any]:
         # Any time that we serialize the transport buffer, the idea is
@@ -156,6 +162,9 @@ class RDMATransportBuffer(TransportBuffer):
             torch.empty_like(chunk, device=torch.device("cpu"))
             for chunk in byte_view_chunks
         ]
+        print(
+            f"[RDMA] Creating {len(self.tensor_refs)} RDMA buffers for tensor {self.shape} {self.dtype}"
+        )
         self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
 
         chunk_sizes = set()
