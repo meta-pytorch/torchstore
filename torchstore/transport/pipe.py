@@ -169,5 +169,5 @@ class Pipe:
             return transport_buffer.objects
 
         ret = await transport_buffer.read_into(request.tensor_val)
-        transport_buffer.drop()
+        await transport_buffer.drop()
         return ret
