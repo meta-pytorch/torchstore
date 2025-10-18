@@ -299,6 +299,7 @@ class InMemoryStore(StorageImpl):
     async def delete(self, key: str) -> None:
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
+        print(f"[storage volume] Deleting key: {key}")
         del self.kv[key]
 
     def reset(self) -> None:
