@@ -158,6 +158,8 @@ class Pipe:
             key, transport_buffer, request.meta_only()
         )
 
+        await transport_buffer.drop()
+
     async def get_from_storage_volume(self, key, request: Request):
         transport_buffer = await self.storage_volume.get.call_one(
             key, request.meta_only()
@@ -166,4 +168,6 @@ class Pipe:
         if transport_buffer.is_object:
             return transport_buffer.objects
 
-        return await transport_buffer.read_into(request.tensor_val)
+        ret = await transport_buffer.read_into(request.tensor_val)
+        transport_buffer.drop()
+        return ret

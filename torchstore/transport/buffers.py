@@ -68,6 +68,9 @@ class TransportBuffer:
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
         raise NotImplementedError()
 
+    async def drop(self) -> None:
+        pass
+
 
 class RDMATransportBuffer(TransportBuffer):
     # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
@@ -181,6 +184,12 @@ class RDMATransportBuffer(TransportBuffer):
             raise e
 
         return tensor
+
+    async def drop(self) -> None:
+        if self.rdma_buffers is not None:
+            for buffer in self.rdma_buffers:
+                await buffer.drop()
+        self.tensor_refs = None
 
     # recv
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
