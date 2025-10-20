@@ -95,12 +95,6 @@ class RDMATransportBuffer(TransportBuffer):
             self.rdma_buffers = None
             self.tensor_refs = None
 
-    def __del__(self) -> None:
-        """Destructor that ensures RDMA buffers are cleaned up."""
-        # Note: Not calling cleanup() here to avoid issues with destructor timing
-        # and to make cleanup explicit only where we control the lifecycle
-        pass
-
     def __getstate__(self) -> Dict[str, Any]:
         # Any time that we serialize the transport buffer, the idea is
         # that tensors will be transported via tensor_enginer.RDMABuffer, so it makes
