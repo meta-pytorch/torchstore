@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchstore"
-version = "0.0.0dev"
+version = "0.1.1"
 description = "A storage solution for PyTorch tensors with distributed tensor support"
 readme = "README.md"
 authors = [
