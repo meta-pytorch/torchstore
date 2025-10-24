@@ -66,52 +66,104 @@ class LocalClient:
         tensor_slice_spec: TensorSlice | None = None,
     ):
         logger.debug(f"Fetching {key}")
-        latency_tracker = LatencyTracker(f"get:{key}")
-        stored_object_type = await self._get_stored_object_type(key)
+
+        try:
+            latency_tracker = LatencyTracker(f"get:{key}")
+            stored_object_type = await self._get_stored_object_type(key)
+        except KeyError:
+            logger.error(f"Key not found: {key}")
+            raise
 
         self._verify_get_args(inplace_tensor, tensor_slice_spec, stored_object_type)
 
         # Get a spec of the shape and offset of the tensor slice to fetch. Fetch the whole tensor otherwise
 
         if stored_object_type is ObjectType.OBJECT:
-            return await self._get_object(key)
+            logger.debug(f"Get object by {key}")
+            result = await self._get_object(key)
+            latency_tracker.track_step("get_object")
+            return result
 
+        # Fetch tensor based on storage type
+        try:
+            logger.debug(f"Fetch tensor by type with key: {key}")
+            fetched_tensor = await self._fetch_tensor_by_type(
+                key, stored_object_type, inplace_tensor, tensor_slice_spec
+            )
+            latency_tracker.track_step("fetch_tensor")
+        except Exception as e:
+            logger.error(
+                f"Failed to fetch tensor by key '{key}' "
+                f"(type: {stored_object_type}): {e}"
+            )
+            raise
+
+        # Handle inplace copy if needed
+        if inplace_tensor is not None:
+            self._copy_to_inplace_tensor(inplace_tensor, fetched_tensor)
+            latency_tracker.track_e2e()
+            return inplace_tensor
+
+        latency_tracker.track_e2e()
+        return fetched_tensor
+
+    async def _fetch_tensor_by_type(
+        self,
+        key: str,
+        stored_object_type: ObjectType,
+        inplace_tensor: torch.Tensor | DTensor | None,
+        tensor_slice_spec: TensorSlice | None,
+    ) -> torch.Tensor:
+        """Fetch tensor based on its storage type (TENSOR or TENSOR_SLICE)."""
         if stored_object_type is ObjectType.TENSOR:
-            # TODO: we should get the part of interest in this branch.
-            fetched_tensor = await self._get_tensor(key)
+            logger.debug(f"Get tensor with key: {key}")
+            try:
+                fetched_tensor = await self._get_tensor(key)
+            except Exception as e:
+                logger.error(f"Failed to fetch tensor by key '{key}': {e}")
+                raise
+            # Apply slice if specified
             if tensor_slice_spec is not None:
                 fetched_tensor = get_local_tensor(
                     fetched_tensor,
                     tensor_slice_spec.local_shape,
                     tensor_slice_spec.offsets,
                 )
-        else:
-            # Strored object is a DTensor. Return full tensor if
-            # inplace_tensor is None, or return DTensor if inplace_tensor
-            # is DTensor.
-            # Here we abused request a bit to get tensor_slice from inplace DTensor. Otherwise
-            # Request.from_any(inplace_tensor) will return None, and we use the tensor_slice_spec.
-            assert stored_object_type is ObjectType.TENSOR_SLICE
-            tensor_slice = (
-                Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
-            )
-            # Here full tensor should be the part of interest.
-            fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
+            return fetched_tensor
 
-        # Pipe does not have support for inplace copies of fetched tensors yet,
-        # so we just copy
+        # Handle TENSOR_SLICE (DTensor case)
+        assert (
+            stored_object_type is ObjectType.TENSOR_SLICE
+        ), f"Unexpected object type: {stored_object_type}"
+
+        # Determine the tensor slice to fetch
+        # For DTensor inplace_tensor, extract the slice spec from it
+        # Otherwise use the provided tensor_slice_spec
+        tensor_slice = self._get_tensor_slice(inplace_tensor, tensor_slice_spec)
+        return await self._get_and_assemble_tensor(key, tensor_slice)
+
+    def _get_tensor_slice(
+        self,
+        inplace_tensor: torch.Tensor | DTensor | None,
+        tensor_slice_spec: TensorSlice | None,
+    ) -> TensorSlice | None:
+        """Extract tensor slice spec from inplace tensor or use provided spec."""
         if inplace_tensor is not None:
-            if hasattr(inplace_tensor, "_local_tensor"):
-                # DTensor case - copy to the local tensor to avoid type mismatch
-                inplace_tensor._local_tensor.copy_(fetched_tensor)
-            else:
-                # Regular tensor case
-                inplace_tensor.copy_(fetched_tensor)
+            request = Request.from_any(inplace_tensor)
+            if request and request.tensor_slice:
+                return request.tensor_slice
+        return tensor_slice_spec
 
-            return inplace_tensor
-
-        latency_tracker.track_e2e()
-        return fetched_tensor
+    def _copy_to_inplace_tensor(
+        self, inplace_tensor: torch.Tensor | DTensor, source_tensor: torch.Tensor
+    ) -> None:
+        """Copy source tensor to inplace tensor, handling both Tensor and DTensor."""
+        if hasattr(inplace_tensor, "_local_tensor"):
+            # DTensor case - copy to the local tensor to avoid type mismatch
+            inplace_tensor._local_tensor.copy_(source_tensor)
+        else:
+            # Regular tensor case
+            inplace_tensor.copy_(source_tensor)
 
     async def keys(self, prefix: str | None = None) -> list[str]:
         """
