@@ -15,7 +15,7 @@ defaults:
 jobs:
   unit_tests:
     if: github.repository_owner == 'meta-pytorch'
-    runs-on: ubuntu-latest
+    runs-on: linux.g5.12xlarge.nvidia.gpu
     timeout-minutes: 60
     strategy:
       matrix:
