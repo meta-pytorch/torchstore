@@ -270,9 +270,8 @@ async def test_dcp_sharding_parity(strategy_params, use_rdma):
                             f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
                         ) from e
         finally:
-            # TODO: Investigate monarch bug with proc_mesh.stop()
-            # await save_world._proc_mesh.stop()
-            # await get_world._proc_mesh.stop()
+            await save_world._proc_mesh.stop()
+            await get_world._proc_mesh.stop()
             await ts.shutdown()
 
 

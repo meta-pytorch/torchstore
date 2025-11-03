@@ -103,8 +103,7 @@ async def test_large_tensors():
         await actor.get.call_one()
         # TODO: assert equal tensors from put/get
     finally:
-        # TODO: Investigate monarch bug with proc_mesh.stop()
-        # await actor._proc_mesh.stop()
+        await actor._proc_mesh.stop()
         await ts.shutdown()
 
 
