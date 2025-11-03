@@ -46,3 +46,15 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["torchstore*"]
 exclude = ["assets*", "tests*", "docs*"]
+
+# pytorch
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url  = "https://download.pytorch.org/whl/cu128"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+prerelease = "allow"
