@@ -2,6 +2,7 @@ name: Unit Test
 
 on:
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: unit-test-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
