@@ -247,9 +247,11 @@ async def _test_resharding(
 
         # teardown distributed or the next test will complain
         await put_mesh.destroy_process_group.call()
-        await put_mesh._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await put_mesh._proc_mesh.stop()
         await get_mesh.destroy_process_group.call()
-        await get_mesh._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await get_mesh._proc_mesh.stop()
         await ts.shutdown()
 
 

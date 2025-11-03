@@ -81,7 +81,8 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         assert tensor_slice.shape == (5, 10)
 
     finally:
-        await put_actor_mesh._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await put_actor_mesh._proc_mesh.stop()
         await ts.shutdown()
 
 
@@ -147,7 +148,8 @@ async def test_put_dtensor_get_full_tensor():
         finally:
             # Clean up process groups
             await put_mesh.destroy_process_group.call()
-            await put_mesh._proc_mesh.stop()
+            # TODO: Investigate monarch bug with proc_mesh.stop()
+            # await put_mesh._proc_mesh.stop()
             await ts.shutdown()
 
 
@@ -232,7 +234,8 @@ async def test_dtensor_fetch_slice():
         finally:
             if put_mesh is not None:
                 await put_mesh.destroy_process_group.call()
-                await put_mesh._proc_mesh.stop()
+                # TODO: Investigate monarch bug with proc_mesh.stop()
+                # await put_mesh._proc_mesh.stop()
             await ts.shutdown()
 
 
@@ -280,7 +283,8 @@ async def test_partial_put():
         finally:
             # Clean up process groups
             await put_mesh.destroy_process_group.call()
-            await put_mesh._proc_mesh.stop()
+            # TODO: Investigate monarch bug with proc_mesh.stop()
+            # await put_mesh._proc_mesh.stop()
             await ts.shutdown()
 
 
