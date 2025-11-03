@@ -13,6 +13,7 @@ defaults:
 
 jobs:
   unit_tests:
+    if: github.repository_owner == 'meta-pytorch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
