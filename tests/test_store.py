@@ -79,8 +79,9 @@ async def test_basic(strategy_params, use_rdma):
             expected = torch.tensor([other_rank + 1] * 10)
             assert torch.equal(expected, val), f"{expected} != {val}"
     finally:
-        await actor_mesh_0._proc_mesh.stop()
-        await actor_mesh_1._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await actor_mesh_0._proc_mesh.stop()
+        # await actor_mesh_1._proc_mesh.stop()
         await ts.shutdown()
 
 
@@ -142,8 +143,9 @@ async def test_objects(strategy_params, use_rdma):
                 assert expected == val, f"{expected.val} != {val.val}"
 
     finally:
-        await actor_mesh_0._proc_mesh.stop()
-        await actor_mesh_1._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await actor_mesh_0._proc_mesh.stop()
+        # await actor_mesh_1._proc_mesh.stop()
         await ts.shutdown()
 
 
@@ -211,7 +213,8 @@ async def test_exists(strategy_params, use_rdma):
                 assert exists_result
 
     finally:
-        await actor_mesh._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await actor_mesh._proc_mesh.stop()
         await ts.shutdown()
 
 
@@ -292,7 +295,8 @@ async def test_delete(strategy_params, use_rdma):
             await actor_mesh.get.call("tensor_key_0")
 
     finally:
-        await actor_mesh._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await actor_mesh._proc_mesh.stop()
         await ts.shutdown()
 
 
