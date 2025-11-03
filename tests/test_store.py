@@ -7,18 +7,23 @@
 import os
 from logging import getLogger
 
+import monarch.actor
+
 import pytest
 
 import torch
 
 import torchstore as ts
-
 from monarch.actor import Actor, current_rank, endpoint
 
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
 from .utils import main, transport_plus_strategy_params
+
+# Temporary workaround - without this, proc_mesh.stop
+# will raise an exit code 1 failing all other tests.
+monarch.actor.unhandled_fault_hook = lambda failure: None
 
 init_logging()
 logger = getLogger(__name__)

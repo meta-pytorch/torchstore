@@ -8,6 +8,8 @@ import math
 import time
 from logging import getLogger
 
+import monarch.actor
+
 import pytest
 import torch
 
@@ -17,6 +19,10 @@ from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
 from .utils import main
+
+# Temporary workaround - without this, proc_mesh.stop
+# will raise an exit code 1 failing all other tests.
+monarch.actor.unhandled_fault_hook = lambda failure: None
 
 init_logging()
 logger = getLogger(__name__)

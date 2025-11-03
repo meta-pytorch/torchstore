@@ -8,6 +8,8 @@
 
 import os
 
+import monarch.actor
+
 import pytest
 import torch
 
@@ -16,6 +18,10 @@ from monarch.actor import Actor, current_rank, endpoint
 from pytest_unordered import unordered
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
+
+# Temporary workaround - without this, proc_mesh.stop
+# will raise an exit code 1 failing all other tests.
+monarch.actor.unhandled_fault_hook = lambda failure: None
 
 
 @pytest.mark.asyncio

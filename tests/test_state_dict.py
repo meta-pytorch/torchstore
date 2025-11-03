@@ -11,6 +11,8 @@ import tempfile
 from logging import getLogger
 from typing import Union
 
+import monarch.actor
+
 import pytest
 
 import torch
@@ -18,7 +20,6 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 
 import torchstore as ts
-
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.checkpoint.state_dict import (
@@ -31,6 +32,10 @@ from torch.distributed.tensor import DTensor
 from torchstore.utils import spawn_actors
 
 from .utils import main, transport_plus_strategy_params
+
+# Temporary workaround - without this, proc_mesh.stop
+# will raise an exit code 1 failing all other tests.
+monarch.actor.unhandled_fault_hook = lambda failure: None
 
 logger = getLogger(__name__)
 

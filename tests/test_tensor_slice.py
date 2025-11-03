@@ -7,6 +7,8 @@
 import os
 import tempfile
 
+import monarch.actor
+
 import pytest
 import torch
 
@@ -20,6 +22,10 @@ from torchstore.transport.pipe import TensorSlice
 from torchstore.utils import spawn_actors
 
 from .utils import DTensorActor, main, transport_plus_strategy_params
+
+# Temporary workaround - without this, proc_mesh.stop
+# will raise an exit code 1 failing all other tests.
+monarch.actor.unhandled_fault_hook = lambda failure: None
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())

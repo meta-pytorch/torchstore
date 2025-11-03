@@ -10,17 +10,22 @@ import tempfile
 from logging import getLogger
 from typing import List, Tuple, Union
 
+import monarch.actor
+
 import pytest
 
 import torch
 
 import torchstore as ts
-
 from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torchstore.utils import get_local_tensor, spawn_actors
 
 from .utils import DTensorActor, main, transport_plus_strategy_params
+
+# Temporary workaround - without this, proc_mesh.stop
+# will raise an exit code 1 failing all other tests.
+monarch.actor.unhandled_fault_hook = lambda failure: None
 
 logger = getLogger(__name__)
 
