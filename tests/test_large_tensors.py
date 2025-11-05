@@ -10,7 +10,6 @@ from logging import getLogger
 
 import pytest
 import torch
-
 import torchstore as ts
 from monarch.actor import Actor, endpoint
 from torchstore.logging import init_logging

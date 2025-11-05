@@ -7,11 +7,9 @@
 from logging import getLogger
 
 import pytest
-
 from torch.distributed._tensor import Shard
 
 from .test_resharding_basic import _test_resharding
-
 from .utils import main, transport_plus_strategy_params
 
 logger = getLogger(__name__)

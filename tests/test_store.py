@@ -8,13 +8,9 @@ import os
 from logging import getLogger
 
 import pytest
-
 import torch
-
 import torchstore as ts
-
 from monarch.actor import Actor, current_rank, endpoint
-
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
@@ -303,19 +299,31 @@ async def test_delete(strategy_params, use_rdma):
 @pytest.mark.asyncio
 async def test_key_miss():
     """Test the behavior of get() when the key is missing."""
+
+    class TestActor(Actor):
+        @endpoint
+        async def test(self) -> Exception or None:
+            try:
+                key = "foo"
+                value = torch.tensor([1, 2, 3])
+                await ts.put(key, value)
+
+                # Get the value back
+                retrieved_value = await ts.get(key)
+                assert torch.equal(value, retrieved_value)
+
+                # Get a missing key
+                with pytest.raises(KeyError):
+                    await ts.get("bar")
+            except Exception as e:
+                return e
+
     await ts.initialize()
 
-    key = "foo"
-    value = torch.tensor([1, 2, 3])
-    await ts.put(key, value)
+    actor = await spawn_actors(1, TestActor, "actor_0")
+    err = await actor.test.call_one()
 
-    # Get the value back
-    retrieved_value = await ts.get(key)
-    assert torch.equal(value, retrieved_value)
-
-    # Get a missing key
-    with pytest.raises(KeyError):
-        await ts.get("bar")
+    assert err is None
 
     await ts.shutdown()
 
