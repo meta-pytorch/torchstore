@@ -9,7 +9,6 @@ import tempfile
 
 import pytest
 import torch
-
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 
@@ -42,6 +41,13 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         async def put(self, key, tensor):
             await ts.put(key, tensor)
 
+    class TensorSliceGetActor(Actor):
+        """Actor for getting tensors."""
+
+        @endpoint
+        async def get(self, key, tensor_slice_spec=None):
+            return await ts.get(key, tensor_slice_spec=tensor_slice_spec)
+
     volume_world_size, strategy = strategy_params
     await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
 
@@ -53,6 +59,8 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         world_size=volume_world_size,
     )
 
+    get_actor = await spawn_actors(1, TensorSliceGetActor, "tensor_slice_get_actor")
+
     try:
         # Create a 100x100 tensor filled with sequential values 0-9999
         test_tensor = torch.arange(10000).reshape(100, 100).float()
@@ -63,7 +71,7 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
         await put_actor.put.call(key, test_tensor)
 
         # Test full tensor retrieval using get actor mesh
-        retrieved_tensor = await ts.get(key)
+        retrieved_tensor = await get_actor.get.call_one(key)
         assert torch.equal(test_tensor, retrieved_tensor)
 
         # Test slice retrieval using get actor mesh
@@ -75,7 +83,9 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
             mesh_shape=(),
         )
 
-        tensor_slice = await ts.get(key, tensor_slice_spec=tensor_slice_spec)
+        tensor_slice = await get_actor.get.call_one(
+            key, tensor_slice_spec=tensor_slice_spec
+        )
         expected_slice = test_tensor[10:15, 20:30]
         assert torch.equal(tensor_slice, expected_slice)
         assert tensor_slice.shape == (5, 10)
@@ -89,32 +99,46 @@ async def test_get_tensor_slice(strategy_params, use_rdma):
 @pytest.mark.asyncio
 async def test_tensor_slice_inplace():
     """Test tensor slice API with in-place operations"""
+
+    class TestActor(Actor):
+        @endpoint
+        async def test(self, test_tensor) -> Exception or None:
+            try:
+                # Store a test tensor
+                await ts.put("inplace_test", test_tensor)
+
+                # Test in-place retrieval with slice
+                slice_spec = TensorSlice(
+                    offsets=(10, 20),
+                    coordinates=(),
+                    global_shape=(100, 200),
+                    local_shape=(30, 40),
+                    mesh_shape=(),
+                )
+
+                # Create pre-allocated buffer
+                slice_buffer = torch.empty(30, 40)
+                result = await ts.get(
+                    "inplace_test",
+                    inplace_tensor=slice_buffer,
+                    tensor_slice_spec=slice_spec,
+                )
+
+                # Verify in-place operation
+                assert result is slice_buffer
+                expected_slice = test_tensor[10:40, 20:60]
+                assert torch.equal(slice_buffer, expected_slice)
+            except Exception as e:
+                return e
+
     await ts.initialize(num_storage_volumes=1)
 
     try:
-        # Store a test tensor
         test_tensor = torch.randn(100, 200)
-        await ts.put("inplace_test", test_tensor)
+        actor = await spawn_actors(1, TestActor, "actor_0")
+        err = await actor.test.call_one(test_tensor)
 
-        # Test in-place retrieval with slice
-        slice_spec = TensorSlice(
-            offsets=(10, 20),
-            coordinates=(),
-            global_shape=(100, 200),
-            local_shape=(30, 40),
-            mesh_shape=(),
-        )
-
-        # Create pre-allocated buffer
-        slice_buffer = torch.empty(30, 40)
-        result = await ts.get(
-            "inplace_test", inplace_tensor=slice_buffer, tensor_slice_spec=slice_spec
-        )
-
-        # Verify in-place operation
-        assert result is slice_buffer
-        expected_slice = test_tensor[10:40, 20:60]
-        assert torch.equal(slice_buffer, expected_slice)
+        assert err is None
 
     finally:
         await ts.shutdown()
@@ -123,6 +147,12 @@ async def test_tensor_slice_inplace():
 @pytest.mark.asyncio
 async def test_put_dtensor_get_full_tensor():
     """Test basic DTensor put/get functionality with separate put and get meshes using shared DTensorActor"""
+
+    class GetActor(Actor):
+        @endpoint
+        async def get_tensor(self, key):
+            return await ts.get(key)
+
     await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
 
     original_tensor = torch.arange(16).reshape(4, 4).float()
@@ -142,7 +172,8 @@ async def test_put_dtensor_get_full_tensor():
 
             await put_mesh.do_put.call()
 
-            fetched_tensor = await ts.get("test_key")
+            get_actor = await spawn_actors(1, GetActor, "get_actor_0")
+            fetched_tensor = await get_actor.get_tensor.call_one("test_key")
             assert torch.equal(original_tensor, fetched_tensor)
 
         finally:
@@ -166,6 +197,11 @@ async def test_dtensor_fetch_slice():
     4. Maintains correctness while providing performance benefits
     """
     import tempfile
+
+    class GetActor(Actor):
+        @endpoint
+        async def get_tensor(self, key, tensor_slice_spec=None):
+            return await ts.get(key, tensor_slice_spec=tensor_slice_spec)
 
     # Use LocalRankStrategy with 2 storage volumes (no RDMA, no parametrization)
     os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
@@ -195,6 +231,8 @@ async def test_dtensor_fetch_slice():
 
             await put_mesh.do_put.call()
 
+            get_actor = await spawn_actors(1, GetActor, "get_actor_0")
+
             # Test 1: Cross-volume slice (spans both volumes)
             # Request rows 2-5 (spans volume boundary at row 4)
             cross_volume_slice = TensorSlice(
@@ -205,7 +243,7 @@ async def test_dtensor_fetch_slice():
                 mesh_shape=(),
             )
 
-            cross_volume_result = await ts.get(
+            cross_volume_result = await get_actor.get_tensor.call_one(
                 "test_key", tensor_slice_spec=cross_volume_slice
             )
             expected_cross_volume = original_tensor[2:6, 1:5]
@@ -223,7 +261,7 @@ async def test_dtensor_fetch_slice():
                 mesh_shape=(),
             )
 
-            single_volume_result = await ts.get(
+            single_volume_result = await get_actor.get_tensor.call_one(
                 "test_key", tensor_slice_spec=single_volume_slice
             )
             expected_single_volume = original_tensor[1:3, 0:3]
@@ -249,6 +287,19 @@ async def test_partial_put():
        because the DTensor is not fully committed (only rank 0's shard is stored).
     """
 
+    class TestActor(Actor):
+        @endpoint
+        async def exists(self, key):
+            return await ts.exists(key)
+
+        @endpoint
+        async def get(self, key):
+            try:
+                result = await ts.get(key)
+                return {"success": True, "result": result}
+            except Exception as e:
+                return {"success": False, "error": e, "error_str": str(e)}
+
     await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
 
     original_tensor = torch.arange(16).reshape(4, 4).float()
@@ -270,15 +321,21 @@ async def test_partial_put():
             # Execute the put - rank 0 will put, rank 1 will skip
             await put_mesh.do_put.call()
 
-            assert not await ts.exists("test_key")
+            test_actor = await spawn_actors(1, TestActor, "test_actor_0")
+
+            assert not await test_actor.exists.call_one("test_key")
             # Try to get the tensor - should raise KeyError because only rank 0 has committed
-            with pytest.raises(KeyError) as exc_info:
-                await ts.get("test_key")
+            result = await test_actor.get.call_one("test_key")
+
+            assert not result["success"], "Expected get to fail but it succeeded"
+            assert isinstance(
+                result["error"], KeyError
+            ), f"Expected KeyError but got {type(result['error'])}"
 
             # Verify the error message mentions partial commit
-            assert "partially committed" in str(
-                exc_info.value
-            ), f"Error message should mention partial commit: {exc_info.value}"
+            assert (
+                "partially committed" in result["error_str"]
+            ), f"Error message should mention partial commit: {result['error_str']}"
 
         finally:
             # Clean up process groups

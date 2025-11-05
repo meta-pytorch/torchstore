@@ -10,7 +10,6 @@ import os
 
 import pytest
 import torch
-
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from pytest_unordered import unordered
@@ -21,24 +20,36 @@ from torchstore.utils import spawn_actors
 @pytest.mark.asyncio
 async def test_keys_basic():
     """Test basic put/get functionality"""
+
+    class TestActor(Actor):
+        @endpoint
+        async def test(self) -> Exception or None:
+            try:
+                await ts.put("", torch.tensor([1, 2, 3]))
+                await ts.put(".x", torch.tensor([1, 2, 3]))
+                await ts.put("v0.x", torch.tensor([1, 2, 3]))
+                await ts.put("v0.y", torch.tensor([4, 5, 6]))
+                await ts.put("v0.x.z", torch.tensor([7, 8, 9]))
+                await ts.put("v1.x", torch.tensor([7, 8, 9]))
+                await ts.put("v1.y", torch.tensor([10, 11, 12]))
+
+                assert await ts.keys() == unordered(
+                    ["", ".x", "v0.x", "v0.y", "v0.x.z", "v1.x", "v1.y"]
+                )
+                assert await ts.keys("v0") == unordered(["v0.x", "v0.y", "v0.x.z"])
+                assert await ts.keys("v0.x") == unordered(["v0.x", "v0.x.z"])
+                assert await ts.keys("v0.x.z") == unordered(["v0.x.z"])
+                assert await ts.keys("") == unordered(["", ".x"])
+                assert await ts.keys("v1") == unordered(["v1.x", "v1.y"])
+            except Exception as e:
+                return e
+
     await ts.initialize()
 
-    await ts.put("", torch.tensor([1, 2, 3]))
-    await ts.put(".x", torch.tensor([1, 2, 3]))
-    await ts.put("v0.x", torch.tensor([1, 2, 3]))
-    await ts.put("v0.y", torch.tensor([4, 5, 6]))
-    await ts.put("v0.x.z", torch.tensor([7, 8, 9]))
-    await ts.put("v1.x", torch.tensor([7, 8, 9]))
-    await ts.put("v1.y", torch.tensor([10, 11, 12]))
+    actor = await spawn_actors(1, TestActor, "actor_0")
+    err = await actor.test.call_one()
 
-    assert await ts.keys() == unordered(
-        ["", ".x", "v0.x", "v0.y", "v0.x.z", "v1.x", "v1.y"]
-    )
-    assert await ts.keys("v0") == unordered(["v0.x", "v0.y", "v0.x.z"])
-    assert await ts.keys("v0.x") == unordered(["v0.x", "v0.x.z"])
-    assert await ts.keys("v0.x.z") == unordered(["v0.x.z"])
-    assert await ts.keys("") == unordered(["", ".x"])
-    assert await ts.keys("v1") == unordered(["v1.x", "v1.y"])
+    assert err is None
 
     await ts.shutdown()
 
