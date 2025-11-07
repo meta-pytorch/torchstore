@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from logging import getLogger
 
 import pytest
@@ -13,6 +14,16 @@ from .test_resharding_basic import _test_resharding
 from .utils import main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
+
+
+def slow_tests_enabled():
+    return os.environ.get("TORCHSTORE_ENABLE_SLOW_TESTS", "0") == "1"
+
+
+requires_slow_tests_enabled = pytest.mark.skipif(
+    not slow_tests_enabled(),
+    reason="Slow tests are disabled by default, use TORCHSTORE_ENABLE_SLOW_TESTS=1 to enable them",
+)
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -53,6 +64,7 @@ async def test_1d_resharding(
     )
 
 
+@requires_slow_tests_enabled
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_2d_to_2d_resharding(strategy_params, use_rdma):
