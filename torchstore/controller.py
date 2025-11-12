@@ -120,13 +120,13 @@ class Controller(Actor):
         self.is_initialized = True
 
     @endpoint
-    def get_controller_strategy(self) -> TorchStoreStrategy:
+    async def get_controller_strategy(self) -> TorchStoreStrategy:
         self.assert_initialized()
         assert self.strategy is not None, "Strategy is not set"
         return self.strategy
 
     @endpoint
-    def locate_volumes(
+    async def locate_volumes(
         self,
         key: str,
     ) -> Dict[str, StorageInfo]:
@@ -178,7 +178,9 @@ class Controller(Actor):
         return volume_map
 
     @endpoint
-    def notify_put(self, key: str, request: Request, storage_volume_id: str) -> None:
+    async def notify_put(
+        self, key: str, request: Request, storage_volume_id: str
+    ) -> None:
         """Notify the controller that data has been stored in a storage volume.
 
         This should called after a successful put operation to
@@ -208,21 +210,25 @@ class Controller(Actor):
             self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
 
     @endpoint
-    def teardown(self) -> None:
+    async def teardown(self) -> None:
         self.is_initialized = False
         self.keys_to_storage_volumes = Trie()
         self.strategy = None
+        # StorageVolume in ControllerStrategy can be reused because it was spawned with get_or_spawn_controller.
+        # So we have to reset it, otherwise new TensorSlice values for the same key will get piled up in the set.
+        if self.storage_volumes is not None:
+            await self.storage_volumes.reset.call()
         self.storage_volumes = None
         self.num_storage_volumes = None
 
     @endpoint
-    def keys(self, prefix=None) -> List[str]:
+    async def keys(self, prefix=None) -> List[str]:
         if prefix is None:
             return list(self.keys_to_storage_volumes.keys())
         return self.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
 
     @endpoint
-    def notify_delete(self, key: str, storage_volume_id: str) -> None:
+    async def notify_delete(self, key: str, storage_volume_id: str) -> None:
         """
         Notify the controller that deletion of data is initiated in a storage volume.
 

@@ -154,20 +154,26 @@ class Pipe:
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
-        await self.storage_volume.put.call_one(
-            key, transport_buffer, request.meta_only()
-        )
-
-        await transport_buffer.drop()
+        try:
+            await self.storage_volume.put.call_one(
+                key, transport_buffer, request.meta_only()
+            )
+        finally:
+            # Clean up the transport buffer after the put operation completes
+            # This is critical for RDMA buffers to deregister memory regions
+            await transport_buffer.drop()
 
     async def get_from_storage_volume(self, key, request: Request):
         transport_buffer = await self.storage_volume.get.call_one(
             key, request.meta_only()
         )
 
-        if transport_buffer.is_object:
-            return transport_buffer.objects
+        try:
+            if transport_buffer.is_object:
+                return transport_buffer.objects
 
-        ret = await transport_buffer.read_into(request.tensor_val)
-        await transport_buffer.drop()
-        return ret
+            return await transport_buffer.read_into(request.tensor_val)
+        finally:
+            # Clean up the transport buffer after the get operation completes
+            # This is critical for RDMA buffers to deregister memory regions
+            await transport_buffer.drop()

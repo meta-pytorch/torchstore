@@ -8,13 +8,9 @@ import os
 from logging import getLogger
 
 import pytest
-
 import torch
-
 import torchstore as ts
-
 from monarch.actor import Actor, current_rank, endpoint
-
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
@@ -79,8 +75,9 @@ async def test_basic(strategy_params, use_rdma):
             expected = torch.tensor([other_rank + 1] * 10)
             assert torch.equal(expected, val), f"{expected} != {val}"
     finally:
-        await actor_mesh_0._proc_mesh.stop()
-        await actor_mesh_1._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await actor_mesh_0._proc_mesh.stop()
+        # await actor_mesh_1._proc_mesh.stop()
         await ts.shutdown()
 
 
@@ -142,8 +139,9 @@ async def test_objects(strategy_params, use_rdma):
                 assert expected == val, f"{expected.val} != {val.val}"
 
     finally:
-        await actor_mesh_0._proc_mesh.stop()
-        await actor_mesh_1._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await actor_mesh_0._proc_mesh.stop()
+        # await actor_mesh_1._proc_mesh.stop()
         await ts.shutdown()
 
 
@@ -211,7 +209,8 @@ async def test_exists(strategy_params, use_rdma):
                 assert exists_result
 
     finally:
-        await actor_mesh._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await actor_mesh._proc_mesh.stop()
         await ts.shutdown()
 
 
@@ -292,26 +291,39 @@ async def test_delete(strategy_params, use_rdma):
             await actor_mesh.get.call("tensor_key_0")
 
     finally:
-        await actor_mesh._proc_mesh.stop()
+        # TODO: Investigate monarch bug with proc_mesh.stop()
+        # await actor_mesh._proc_mesh.stop()
         await ts.shutdown()
 
 
 @pytest.mark.asyncio
 async def test_key_miss():
     """Test the behavior of get() when the key is missing."""
+
+    class TestActor(Actor):
+        @endpoint
+        async def test(self) -> Exception or None:
+            try:
+                key = "foo"
+                value = torch.tensor([1, 2, 3])
+                await ts.put(key, value)
+
+                # Get the value back
+                retrieved_value = await ts.get(key)
+                assert torch.equal(value, retrieved_value)
+
+                # Get a missing key
+                with pytest.raises(KeyError):
+                    await ts.get("bar")
+            except Exception as e:
+                return e
+
     await ts.initialize()
 
-    key = "foo"
-    value = torch.tensor([1, 2, 3])
-    await ts.put(key, value)
+    actor = await spawn_actors(1, TestActor, "actor_0")
+    err = await actor.test.call_one()
 
-    # Get the value back
-    retrieved_value = await ts.get(key)
-    assert torch.equal(value, retrieved_value)
-
-    # Get a missing key
-    with pytest.raises(KeyError):
-        await ts.get("bar")
+    assert err is None
 
     await ts.shutdown()
 

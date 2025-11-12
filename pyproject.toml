@@ -4,23 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchstore"
-version = "0.1.0"
+version = "0.0.0dev"
 description = "A storage solution for PyTorch tensors with distributed tensor support"
 readme = "README.md"
 authors = [
     { name = "PyTorch Team", email = "packages@pytorch.org" },
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
     "pygtrie",
+    "torch==2.9.0",
+    "torchmonarch==0.1.2"
 ] #todo: add toml
 
 [project.urls]
@@ -44,3 +46,15 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["torchstore*"]
 exclude = ["assets*", "tests*", "docs*"]
+
+# pytorch
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url  = "https://download.pytorch.org/whl/cu128"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+prerelease = "allow"

@@ -4,16 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchstore.constants import MONARCH_HOSTMESH_V1
-
-if MONARCH_HOSTMESH_V1:
-    from monarch._rust_bindings.monarch_hyperactor.channel import ChannelTransport
-    from monarch._rust_bindings.monarch_hyperactor.config import configure
-
-    configure(
-        default_transport=ChannelTransport.MetaTlsWithHostname,
-    )
-
 import math
 import os
 import tempfile
@@ -22,7 +12,6 @@ from logging import getLogger
 
 import pytest
 import torch
-
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.device_mesh import init_device_mesh

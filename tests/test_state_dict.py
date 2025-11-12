@@ -12,13 +12,10 @@ from logging import getLogger
 from typing import Union
 
 import pytest
-
 import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-
 import torchstore as ts
-
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.checkpoint.state_dict import (
@@ -265,8 +262,9 @@ async def test_dcp_sharding_parity(strategy_params, use_rdma):
                             f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
                         ) from e
         finally:
-            await save_world._proc_mesh.stop()
-            await get_world._proc_mesh.stop()
+            # TODO: Investigate monarch bug with proc_mesh.stop()
+            # await save_world._proc_mesh.stop()
+            # await get_world._proc_mesh.stop()
             await ts.shutdown()
 
 
@@ -278,7 +276,6 @@ def _assert_equal_state_dict(state_dict1, state_dict2):
         flattened_state_dict_2
     ), f"{flattened_state_dict_1.keys()=}\n{flattened_state_dict_2.keys()=}"
     for key in flattened_state_dict_1:
-
         assert key in flattened_state_dict_2
         if isinstance(flattened_state_dict_1[key], torch.Tensor):
             t1, t2 = flattened_state_dict_1[key], flattened_state_dict_2[key]

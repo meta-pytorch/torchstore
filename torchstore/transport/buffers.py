@@ -69,6 +69,7 @@ class TransportBuffer:
         raise NotImplementedError()
 
     async def drop(self) -> None:
+        """Clean up any resources held by this buffer. Override in subclasses if needed."""
         pass
 
 
@@ -83,6 +84,25 @@ class RDMATransportBuffer(TransportBuffer):
         self.tensor_refs: Optional[List[torch.Tensor]] = None
         self.shape: Optional[torch.Size] = None
         self.dtype: Optional[torch.dtype] = None
+
+    async def drop(self) -> None:
+        """Explicitly clean up RDMA buffers to prevent kernel memory leak.
+
+        When RDMA buffers are created, they register memory regions with the RDMA
+        hardware which pins pages in kernel memory. Without explicit cleanup, these
+        pages remain pinned even after the Python objects are garbage collected,
+        leading to a memory leak that manifests as unbounded Inactive(anon) growth.
+        """
+        if self.rdma_buffers is not None:
+            for rdma_buf in self.rdma_buffers:
+                try:
+                    # Drop the RDMA buffer to deregister the memory region
+                    await rdma_buf.drop()
+                except Exception as e:
+                    # Log but don't raise - cleanup should be best-effort
+                    logging.warning(f"Failed to drop RDMA buffer during cleanup: {e}")
+            self.rdma_buffers = None
+            self.tensor_refs = None
 
     def __getstate__(self) -> Dict[str, Any]:
         # Any time that we serialize the transport buffer, the idea is
@@ -184,12 +204,6 @@ class RDMATransportBuffer(TransportBuffer):
             raise e
 
         return tensor
-
-    async def drop(self) -> None:
-        if self.rdma_buffers is not None:
-            for buffer in self.rdma_buffers:
-                await buffer.drop()
-        self.tensor_refs = None
 
     # recv
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:

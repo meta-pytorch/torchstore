@@ -16,7 +16,7 @@ from torchstore.transport.buffers import (
     TransportBuffer,
 )
 from torchstore.transport.pipe import Request, TensorSlice
-from torchstore.utils import assemble_global_tensor, spawn_actors
+from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
 
 logger = getLogger(__name__)
 
@@ -75,6 +75,10 @@ class StorageVolume(Actor):
     @endpoint
     async def delete(self, key: str) -> None:
         await self.store.delete(key)
+
+    @endpoint
+    async def reset(self) -> None:
+        self.store.reset()
 
 
 class StorageImpl:
@@ -144,7 +148,7 @@ class InMemoryStore(StorageImpl):
         assert local_tensors and global_offsets and global_shape
 
         # TODO: doing it this way has peek 2x tensor size in memory :(
-        full_tensor = assemble_global_tensor(
+        full_tensor = assemble_tensor(
             local_tensors,
             global_shape,
             global_offsets,
@@ -201,7 +205,6 @@ class InMemoryStore(StorageImpl):
         self.kv[key] = tensor
 
     async def get(self, key: str, request: Request) -> TransportBuffer:
-
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
@@ -218,18 +221,42 @@ class InMemoryStore(StorageImpl):
             transport_buffer.from_contiguous_tensor(self.kv[key])
             return transport_buffer
 
-        # TODO:
-        # for now, we're only going to support requesting the entire tensor_slice,
-        # but this goes entire the value prop of torchstore. StorageVolume must
-        # support requesting a subset of the regions which exist locally in the
-        # store.
-
         for shard in self.kv[key].values():
-            if shard["slice"] == request.tensor_slice:
-                transport_buffer.from_contiguous_tensor(shard["tensor"])
+            stored_slice = shard["slice"]
+            stored_tensor = shard["tensor"]
+
+            intersection_slice = get_slice_intersection(
+                stored_slice, request.tensor_slice
+            )
+
+            # We don't want to visit the shard where requested tensor slice is not completely contained
+            # in the stored tensor slice.
+            if (
+                intersection_slice is None
+                or intersection_slice.local_shape != request.tensor_slice.local_shape
+                or intersection_slice.offsets != request.tensor_slice.offsets
+            ):
+                continue
+
+            # Extract the intersection from the stored tensor
+            indices = []
+            for dim in range(len(stored_slice.global_shape)):
+                start = intersection_slice.offsets[dim] - stored_slice.offsets[dim]
+                indices.append(
+                    slice(
+                        start,
+                        start + intersection_slice.local_shape[dim],
+                    )
+                )
+            extracted_tensor = stored_tensor[tuple(indices)]
+
+            if extracted_tensor is not None:
+                transport_buffer.from_contiguous_tensor(extracted_tensor)
                 return transport_buffer
 
-        raise RuntimeError(f"Tensor slice {request.tensor_slice} not found in {key}")
+        raise RuntimeError(
+            f"Tensor slice {request.tensor_slice} not found in any stored shards for {key}"
+        )
 
     async def get_meta(
         self,
@@ -270,3 +297,6 @@ class InMemoryStore(StorageImpl):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
         del self.kv[key]
+
+    def reset(self) -> None:
+        self.kv = {}

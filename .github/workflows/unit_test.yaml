@@ -2,11 +2,20 @@ name: Unit Test
 
 on:
   pull_request:
+  workflow_dispatch:
 
+concurrency:
+  group: unit-test-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -l -eo pipefail {0}
 
 jobs:
   unit_tests:
-    runs-on: ubuntu-latest
+    if: github.repository_owner == 'meta-pytorch'
+    runs-on: linux.g5.12xlarge.nvidia.gpu
     timeout-minutes: 60
     strategy:
       matrix:
@@ -14,26 +23,29 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      - name: Setup conda env
+        uses: conda-incubator/setup-miniconda@v2
         with:
+          auto-update-conda: true
+          miniconda-version: "latest"
+          activate-environment: test
           python-version: ${{ matrix.python-version }}
-      - name: Verify Python version
-        run: |
-          python --version
-          python -c "import sys; print(f'Python version: {sys.version_info.major}.{sys.version_info.minor}')"
       - name: Update pip
         run: python -m pip install --upgrade pip
-      - name: Install torch
-        run: python -m pip install torch
-      - name: Install monarch from local wheel
-        run: python -m pip install assets/ci/monarch-0.0.1-cp310-cp310-linux_x86_64.whl --force-reinstall
-      - name: Install dependencies
-        run: python -m pip install -e ".[dev]"
+      - name: Install torchstore
+        run: pip install uv && uv pip install . && uv pip install .[dev]
       - name: Run slice tests (test_slice.py) with coverage
         run: |
           TORCHSTORE_RDMA_ENABLED=0 \
           pytest tests/test_tensor_slice.py \
+            --cov=. --cov-report=xml -vv -s
+      - name: Run test_resharding_basic tests with coverage
+        # TorchStore RDMA will not run on CPU-only machines
+        # resharding tests runs for too long.
+        # test_large_tensors.py can OOM.
+        run: |
+          TORCHSTORE_RDMA_ENABLED=0 \
+          pytest tests/test_resharding_basic.py \
             --cov=. --cov-report=xml -vv -s
       - name: Run remaining tests with coverage
         # TorchStore RDMA will not run on CPU-only machines
@@ -42,7 +54,8 @@ jobs:
         run: |
           TORCHSTORE_RDMA_ENABLED=0 \
           pytest tests/ \
-            --ignore=tests/test_resharding.py \
+            --ignore=tests/test_resharding_basic.py \
+            --ignore=tests/test_resharding_ext.py \
             --ignore=tests/test_tensor_slice.py \
             --ignore=tests/test_large_tensors.py \
             --cov=. --cov-report=xml --cov-append --durations=20 -vv -s
