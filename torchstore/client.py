@@ -19,6 +19,38 @@ from torchstore.utils import assemble_tensor, get_local_tensor, get_slice_inters
 logger = getLogger(__name__)
 
 
+def convert_to_single_shard_request(full_tensor: torch.Tensor) -> Request:
+    """
+    Convert a full tensor to a Request object that represents it as a single-shard DTensor.
+
+    This creates a Request with proper tensor_val and tensor_slice fields to represent
+    the full tensor as if it were a DTensor with a single shard containing all the data.
+    This avoids the overhead of actually creating a DTensor with distributed initialization.
+
+    Args:
+        full_tensor: The complete assembled tensor
+
+    Returns:
+        Request: A Request object representing a single-shard DTensor
+    """
+    # Create a tensor slice that represents the entire tensor as a single shard
+    tensor_slice = TensorSlice(
+        offsets=(0,) * len(full_tensor.shape),  # Start at origin for all dimensions
+        coordinates=(0,),  # Single device at coordinate (0,)
+        global_shape=full_tensor.shape,  # Global shape is the full tensor shape
+        local_shape=full_tensor.shape,  # Local shape equals global (single shard)
+        mesh_shape=(1,),  # Single device mesh
+    )
+
+    # Create and return the Request object
+    return Request(
+        tensor_val=full_tensor,
+        tensor_slice=tensor_slice,
+        objects=None,
+        is_object=False,
+    )
+
+
 class LocalClient:
     """This class represents the local store, which exists on every process. Remote storage
     is handled by the client.
@@ -96,6 +128,10 @@ class LocalClient:
                 Request.from_any(inplace_tensor).tensor_slice or tensor_slice_spec
             )
             # Here full tensor should be the part of interest.
+            if key == "v0/model.model.norm.weight":
+                print(
+                    f"\033[92mgetting tensor slice {tensor_slice} for key {key}\033[0m"
+                )
             fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
 
         # Pipe does not have support for inplace copies of fetched tensors yet,
@@ -127,6 +163,24 @@ class LocalClient:
         """
         # Keys are synced across all storage volumes, so we just call one.
         return await self._controller.keys.call_one(prefix)
+
+    async def defrag(self, key: str) -> None:
+        # check if stored key is a tensor slice, return if not.
+        stored_object_type = await self._get_stored_object_type(key)
+
+        if stored_object_type is not ObjectType.TENSOR_SLICE:
+            raise ValueError(
+                f"Cannot defragment for key `{key}` because value type is {stored_object_type}, expect TENSOR_SLICE"
+            )
+
+        # Put the single-shard representation back to storage
+        storage_volume, volume_id = self.strategy.select_storage_volume()
+        await self._controller.notify_delete.call_one(key, volume_id)
+        tensor_slice = await storage_volume.defrag.call_one(key)
+        if key == "v0/model.model.norm.weight":
+            print(f"tensor_slice: {tensor_slice}")
+        request = Request.from_tensor_slice(tensor_slice)
+        await self._controller.notify_put.call(key, request, volume_id)
 
     async def delete(self, key: str) -> None:
         """
@@ -266,10 +320,15 @@ class LocalClient:
             The assembled tensor from all storage volumes
         """
         volume_map = await self._locate_volumes(key)
+        if key == "v0/model.model.norm.weight":
+            print(f"\033[92mvolume map for key {key}: {volume_map}\033[0m")
         # Handle the tensor case
         partial_results = []
         for volume_id, storage_info in volume_map.items():
             storage_volume = self.strategy.get_storage_volume(volume_id)
+            if key == "v0/model.model.norm.weight":
+                print(f"storage volume: {storage_volume}")
+                # print(f"stored val: {storage_volume.store.kv[key]}")
             pipe = Pipe(storage_volume)
 
             # fetch from all storage volumes, something like this
