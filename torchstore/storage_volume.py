@@ -12,7 +12,6 @@ import torch
 from monarch.actor import Actor, endpoint
 
 from torchstore.transport.buffers import TransportBuffer
-
 from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
 
@@ -189,6 +188,50 @@ class InMemoryStore(StorageImpl):
             "tensor": tensor,
         }
 
+    def _get_sharded_tensor(self, request: Request, key: str) -> Optional[torch.Tensor]:
+        """
+        Searches stored shards and returns one which completely contains the requested tensor slice
+
+        Args:
+            request: Request object containing the tensor_slice specification
+            key: Storage key identifying the tensor shards to search.
+
+        Returns:
+            The extracted tensor slice if found completely within a stored shard,
+            None otherwise.
+        """
+        for shard in self.kv[key].values():
+            stored_slice = shard["slice"]
+            stored_tensor = shard["tensor"]
+
+            intersection_slice = get_slice_intersection(
+                stored_slice, request.tensor_slice
+            )
+
+            # We don't want to visit the shard where requested tensor slice is not completely contained
+            # in the stored tensor slice.
+            if (
+                intersection_slice is None
+                or intersection_slice.local_shape != request.tensor_slice.local_shape
+                or intersection_slice.offsets != request.tensor_slice.offsets
+            ):
+                continue
+
+            # Extract the intersection from the stored tensor
+            indices = []
+            for dim in range(len(stored_slice.global_shape)):
+                start = intersection_slice.offsets[dim] - stored_slice.offsets[dim]
+                indices.append(
+                    slice(
+                        start,
+                        start + intersection_slice.local_shape[dim],
+                    )
+                )
+            extracted_tensor = stored_tensor[tuple(indices)]
+
+            if extracted_tensor is not None:
+                return extracted_tensor
+
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
@@ -223,39 +266,11 @@ class InMemoryStore(StorageImpl):
             await transport_buffer.write_from(self.kv[key])
             return transport_buffer
 
-        for shard in self.kv[key].values():
-            stored_slice = shard["slice"]
-            stored_tensor = shard["tensor"]
+        extracted_tensor = self._get_sharded_tensor(request, key)
 
-            intersection_slice = get_slice_intersection(
-                stored_slice, request.tensor_slice
-            )
-
-            # We don't want to visit the shard where requested tensor slice is not completely contained
-            # in the stored tensor slice.
-            if (
-                intersection_slice is None
-                or intersection_slice.local_shape != request.tensor_slice.local_shape
-                or intersection_slice.offsets != request.tensor_slice.offsets
-            ):
-                continue
-
-            # Extract the intersection from the stored tensor
-            indices = []
-            for dim in range(len(stored_slice.global_shape)):
-                start = intersection_slice.offsets[dim] - stored_slice.offsets[dim]
-                indices.append(
-                    slice(
-                        start,
-                        start + intersection_slice.local_shape[dim],
-                    )
-                )
-            extracted_tensor = stored_tensor[tuple(indices)]
-
-            if extracted_tensor is not None:
-
-                await transport_buffer.write_from(extracted_tensor)
-                return transport_buffer
+        if extracted_tensor is not None:
+            await transport_buffer.write_from(extracted_tensor)
+            return transport_buffer
 
         raise RuntimeError(
             f"Tensor slice {request.tensor_slice} not found in any stored shards for {key}"
@@ -281,20 +296,17 @@ class InMemoryStore(StorageImpl):
             return stored_object["tensor"].shape, stored_object["tensor"].dtype
 
         if request is not None and request.tensor_slice is not None:
-            # TODO: makes this an object
-            for shard in stored_object.values():
-                shard_slice = shard["slice"]
-                if (
-                    shard_slice.local_shape == request.tensor_slice.local_shape
-                    and shard_slice.offsets == request.tensor_slice.offsets
-                ):
-                    return shard["tensor"].shape, shard["tensor"].dtype
+            extracted_tensor = self._get_sharded_tensor(request, key)
+            if extracted_tensor is not None:
+                return extracted_tensor.shape, extracted_tensor.dtype
 
             raise KeyError(
                 f"Could not find shard slice with {request.tensor_slice=}  Slices:{stored_object}"
             )
 
-        raise RuntimeError(f"Unknown type for {key} type={type(val)} {val=}")
+        raise RuntimeError(
+            f"Unknown type for {key} type={type(stored_object)} {stored_object=}"
+        )
 
     async def delete(self, key: str) -> None:
         if key not in self.kv:
