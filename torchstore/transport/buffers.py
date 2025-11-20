@@ -115,11 +115,13 @@ class RDMATransportBuffer(TransportBuffer):
 
         return tensor_chunks
 
-    def _assert_valid_tensor(self, tensor: torch.Tensor) -> None:
+    def _assert_valid_tensor(
+        self, tensor: torch.Tensor, must_be_contiguous: bool = True
+    ) -> None:
         assert isinstance(tensor, torch.Tensor)
         assert tensor.dtype == self.dtype, f"{tensor.dtype} != {self.dtype}"
         assert tensor.shape == self.shape, f"{tensor.shape} != {self.shape}"
-        assert tensor.is_contiguous()
+        assert not must_be_contiguous or tensor.is_contiguous()
 
     def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
         """Allocates internal buffers based on either an existing tensor
@@ -200,8 +202,8 @@ class RDMATransportBuffer(TransportBuffer):
     async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
         if tensor is None:
             return
-
-        self._assert_valid_tensor(tensor)
+        # source tensor does not have to be contiguous, it is copied into contiguous memory later in this function
+        self._assert_valid_tensor(tensor, must_be_contiguous=False)
         assert self.rdma_buffers is not None
 
         chunked_byte_view = self._create_byte_views_from_tensor(tensor)
