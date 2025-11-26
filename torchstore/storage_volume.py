@@ -130,7 +130,7 @@ class InMemoryStore(StorageImpl):
     async def handshake(
         self, transport_buffer: TransportBuffer
     ) -> Optional[Any]:
-        pass
+        return await transport_buffer.recv_handshake(self.transport_context)
 
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")
@@ -262,7 +262,7 @@ class InMemoryStore(StorageImpl):
 
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
-        tensor = await transport_buffer.read_into(tensor=None)
+        tensor = await transport_buffer.read_into(None, self.transport_context)
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
@@ -283,13 +283,13 @@ class InMemoryStore(StorageImpl):
             return transport_buffer
 
         if request.tensor_slice is None:
-            await transport_buffer.write_from(self.kv[key])
+            await transport_buffer.write_from(self.kv[key], self.transport_context)
             return transport_buffer
 
         extracted_tensor = self._get_sharded_tensor(request, key)
 
         if extracted_tensor is not None:
-            await transport_buffer.write_from(extracted_tensor)
+            await transport_buffer.write_from(extracted_tensor, self.transport_context)
             return transport_buffer
 
         raise RuntimeError(
