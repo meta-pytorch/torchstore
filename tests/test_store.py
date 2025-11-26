@@ -14,7 +14,7 @@ from monarch.actor import Actor, current_rank, endpoint
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
-from .utils import main, transport_plus_strategy_params
+from .utils import main, set_transport_type, transport_plus_strategy_params
 
 init_logging()
 logger = getLogger(__name__)
@@ -22,9 +22,9 @@ logger = getLogger(__name__)
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_basic(strategy_params, use_rdma):
+async def test_basic(strategy_params, transport_type):
     """Test basic put/get functionality for multiple processes"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+    set_transport_type(transport_type)
 
     class PutGetActor(Actor):
         """Each instance of this actor represents a single process."""
@@ -83,9 +83,9 @@ async def test_basic(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_objects(strategy_params, use_rdma):
+async def test_objects(strategy_params, transport_type):
     """Test put/get on arbitrary object"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+    set_transport_type(transport_type)
 
     class ObjectActor(Actor):
         """Each instance of this actor represents a single process."""
@@ -147,9 +147,9 @@ async def test_objects(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_exists(strategy_params, use_rdma):
+async def test_exists(strategy_params, transport_type):
     """Test the exists() API functionality"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+    set_transport_type(transport_type)
 
     class ExistsTestActor(Actor):
         """Actor for testing exists functionality."""
@@ -216,9 +216,9 @@ async def test_exists(strategy_params, use_rdma):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_delete(strategy_params, use_rdma):
+async def test_delete(strategy_params, transport_type):
     """Test the delete() API functionality"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+    set_transport_type(transport_type)
 
     class DeleteTestActor(Actor):
         """Actor for testing delete functionality."""

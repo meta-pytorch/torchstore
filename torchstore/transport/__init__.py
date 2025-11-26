@@ -5,5 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchstore.transport.pipe import Pipe, Request, TensorSlice
+from torchstore.transport.buffers import TransportType
 
-__all__ = ["Pipe", "Request", "TensorSlice"]
+__all__ = ["Pipe", "Request", "TensorSlice", "TransportType"]
