@@ -17,7 +17,7 @@ from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torchstore.utils import get_local_tensor, spawn_actors
 
-from .utils import DTensorActor, main, transport_plus_strategy_params
+from .utils import DTensorActor, main, set_transport_type, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -35,7 +35,7 @@ logger = getLogger(__name__)
 @pytest.mark.asyncio
 async def test_1d_resharding(
     strategy_params,
-    use_rdma,
+    transport_type,
     put_mesh_shape,
     get_mesh_shape,
     put_sharding_dim,
@@ -50,13 +50,13 @@ async def test_1d_resharding(
         get_mesh_shape=get_mesh_shape,
         get_placements=[Shard(get_sharding_dim)],
         strategy=strategy,
-        use_rdma=use_rdma,
+        transport_type=transport_type,
     )
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_2d_to_2d_resharding(strategy_params, use_rdma):
+async def test_2d_to_2d_resharding(strategy_params, transport_type):
     _, strategy = strategy_params
 
     put_mesh_shape = get_mesh_shape = (2, 2)
@@ -69,13 +69,13 @@ async def test_2d_to_2d_resharding(strategy_params, use_rdma):
             get_mesh_shape=get_mesh_shape,
             get_placements=[Shard(dim) for dim in get_sharding_dims],
             strategy=strategy,
-            use_rdma=use_rdma,
+            transport_type=transport_type,
         )
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_1d_to_2d_resharding(strategy_params, use_rdma):
+async def test_1d_to_2d_resharding(strategy_params, transport_type):
     _, strategy = strategy_params
 
     put_mesh_shape = (4,)
@@ -89,13 +89,13 @@ async def test_1d_to_2d_resharding(strategy_params, use_rdma):
             get_mesh_shape=get_mesh_shape,
             get_placements=[Shard(dim) for dim in get_sharding_dims],
             strategy=strategy,
-            use_rdma=use_rdma,
+            transport_type=transport_type,
         )
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_2d_to_1d_resharding(strategy_params, use_rdma):
+async def test_2d_to_1d_resharding(strategy_params, transport_type):
     _, strategy = strategy_params
 
     put_mesh_shape = (2, 2)
@@ -109,13 +109,13 @@ async def test_2d_to_1d_resharding(strategy_params, use_rdma):
             get_mesh_shape=get_mesh_shape,
             get_placements=[Shard(dim) for dim in get_sharding_dims],
             strategy=strategy,
-            use_rdma=use_rdma,
+            transport_type=transport_type,
         )
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_data_parallel(strategy_params, use_rdma):
+async def test_data_parallel(strategy_params, transport_type):
     _, strategy = strategy_params
 
     # # 1d
@@ -128,7 +128,7 @@ async def test_data_parallel(strategy_params, use_rdma):
         get_mesh_shape=get_mesh_shape,
         get_placements=placements,
         strategy=strategy,
-        use_rdma=use_rdma,
+        transport_type=transport_type,
     )
 
     # 2d -> 1d
@@ -143,7 +143,7 @@ async def test_data_parallel(strategy_params, use_rdma):
         get_mesh_shape=get_mesh_shape,
         get_placements=[Shard(1)],
         strategy=strategy,
-        use_rdma=use_rdma,
+        transport_type=transport_type,
     )
 
 
@@ -153,7 +153,7 @@ async def _test_resharding(
     get_mesh_shape: Tuple[int],
     get_placements: List[Union[Replicate, Shard]],
     strategy: ts.TorchStoreStrategy,
-    use_rdma: bool,
+    transport_type: str,
 ):
     """Given a "put" mesh shape and a "get" mesh shape.
     1. Create separate worlds for each mesh shape, running on different devices /PGs.
@@ -177,7 +177,7 @@ async def _test_resharding(
 
     # Rank0: dtensor._local_tensor == [0,1], Rank1: dtensor._local_tensor == [2,3]
     """
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+    set_transport_type(transport_type)
 
     put_world_size = math.prod(put_mesh_shape)
     get_world_size = math.prod(get_mesh_shape)

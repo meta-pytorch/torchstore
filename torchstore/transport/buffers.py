@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 from functools import cache
+from enum import auto, Enum
 
 import torch
 
@@ -47,7 +48,7 @@ def rdma_available() -> bool:
 @cache
 def torchcomms_rdma_available() -> bool:
     rdma_enabled = (
-        os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1"
+        os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1"
     )
     # (1) CommsRDMA flag is enabled (2) torchcomms lib is available (3) RDMA is supported
     return rdma_enabled and torchcomms_available and RdmaTransport.supported()
@@ -110,6 +111,10 @@ class TransportContext:
     def get_rdma_transport_cache(self) -> RdmaTransportCache:
         return self.transport_context.get(self.RDMA_TRANSPORT_CACHE, None)
 
+class TransportType(Enum):
+    MonarchRPC = auto()
+    MonarchRDMA = auto()
+    TorchCommsRDMA = auto()
 
 class TransportBuffer:
     finalize: bool = False
