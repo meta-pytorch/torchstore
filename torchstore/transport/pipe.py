@@ -7,11 +7,14 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
+
+if TYPE_CHECKING:
+    from torchstore.strategy import StorageVolumeRef
 
 from torchstore.transport.buffers import (
     MonarchTransportBuffer,
@@ -19,6 +22,8 @@ from torchstore.transport.buffers import (
     RDMATransportBuffer,
     TransportBuffer,
 )
+from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
+from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
 
 logger = getLogger(__name__)
 
@@ -131,12 +136,16 @@ class Pipe:
     Transport wrapper for communicating from local clients to storage volumes.
     """
 
-    def __init__(self, storage_volume) -> None:
-        self.storage_volume = storage_volume
+    def __init__(self, storage_volume_ref: "StorageVolumeRef") -> None:
+        self.storage_volume_ref = storage_volume_ref
+        self.transport_context = storage_volume_ref.transport_context
+        self.storage_volume = storage_volume_ref.volume
 
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
-        if rdma_available():
+        if torchcomms_rdma_available():
+            buffer_cls = TorchCommsRdmaTransportBuffer
+        elif rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
             buffer_cls = MonarchTransportBuffer
@@ -146,12 +155,16 @@ class Pipe:
         transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
 
-        transport_buffer.allocate(tensor)
-        await transport_buffer.write_from(tensor)
-
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
         try:
+            await transport_buffer.handshake(tensor, self.storage_volume_ref)
+            if isinstance(transport_buffer, TorchCommsRdmaTransportBuffer):
+                transport_buffer.allocate_source(tensor)
+            else:
+                transport_buffer.allocate(tensor)
+                await transport_buffer.write_from(tensor, self.transport_context)
+
             await self.storage_volume.put.call_one(
                 key, transport_buffer, request.meta_only()
             )
@@ -161,10 +174,20 @@ class Pipe:
             await transport_buffer.drop()
 
     async def get_from_storage_volume(self, key, request: Request):
-
         transport_buffer = self.create_transport_buffer()
+        # TODO @lucas/@amir: remove this after pipe refactor
+        is_torchcomms_rdma = isinstance(transport_buffer, TorchCommsRdmaTransportBuffer)
 
         try:
+            await transport_buffer.handshake(
+                request.tensor_val, self.storage_volume_ref
+            )
+            allocate = (
+                transport_buffer.allocate_dest
+                if is_torchcomms_rdma
+                else transport_buffer.allocate
+            )
+
             # Certain buffers (RDMA) need to know the size of the tensor
             # so we can allocate the right amount of memory locally.
             # This can be avoided if the request contains a tensor slice.
@@ -173,9 +196,9 @@ class Pipe:
                 meta = await self.storage_volume.get_meta.call_one(
                     key, request.meta_only()
                 )
-                transport_buffer.allocate(meta)
+                allocate(meta)
             else:
-                transport_buffer.allocate(request.tensor_val)
+                allocate(request.tensor_val)
 
             # TODO: consider placing the buffer inside the request or vice versa
             transport_buffer.update(
@@ -187,7 +210,12 @@ class Pipe:
             if transport_buffer.is_object:
                 return transport_buffer.objects
 
-            return await transport_buffer.read_into(request.tensor_val)
+            if not is_torchcomms_rdma:
+                return await transport_buffer.read_into(
+                    request.tensor_val, self.transport_context
+                )
+            else:
+                return transport_buffer.tensor_ref
         finally:
             # Clean up the transport buffer after the get operation completes
             # This is critical for RDMA buffers to deregister memory regions

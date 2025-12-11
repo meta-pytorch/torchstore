@@ -11,10 +11,30 @@ multiple storage volumes. Strategies map client processes to storage volumes.
 """
 
 import os
+import socket
+from typing import TYPE_CHECKING
 
 from monarch.actor import current_rank
 
-from torchstore.storage_volume import StorageVolume
+from torchstore.transport.buffers import TransportContext
+
+if TYPE_CHECKING:
+    from torchstore.storage_volume import StorageVolume
+
+
+class StorageVolumeRef:
+    __slots__ = ("volume", "volume_id", "transport_context")
+
+    def __init__(
+        self,
+        volume: "StorageVolume",
+        volume_id: str,
+        transport_context: TransportContext,
+    ):
+        self.volume = volume
+        self.volume_id = volume_id
+        # useful for caching elements that should survive the lifetime of the client/volume
+        self.transport_context = transport_context
 
 
 class TorchStoreStrategy:
@@ -31,6 +51,7 @@ class TorchStoreStrategy:
     def __init__(self):
         self.storage_volumes = None
         self.volume_id_to_coord = {}
+        self.transport_context = TransportContext()
 
     def __str__(self) -> str:
         storage_vol_len = (
@@ -84,7 +105,7 @@ class TorchStoreStrategy:
             client_id,
         )  # client_id == volume_id for this strategy
 
-    def get_storage_volume(self, volume_id: str) -> StorageVolume:
+    def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
         """Retrieves storage volume actor for a given volume ID.
 
         Args:
@@ -94,7 +115,11 @@ class TorchStoreStrategy:
             StorageVolume: The storage volume actor for the given ID.
         """
         volume_coord = self.volume_id_to_coord[volume_id]
-        return self.storage_volumes.slice(**volume_coord)
+        return StorageVolumeRef(
+            self.storage_volumes.slice(**volume_coord),
+            volume_id,
+            self.transport_context,
+        )
 
 
 class SingletonStrategy(TorchStoreStrategy):
@@ -130,12 +155,14 @@ class HostStrategy(TorchStoreStrategy):
     """Assumes one storage volume per host.
 
     Each process uses 'HOSTNAME' to determine which storage volume to connect to.
+    This strategy requires the HOSTNAME environment variable to be set and assumes
+    one storage volume per local rank.
     """
 
     @classmethod
     def get_volume_id(cls):
         # Note: this should only called at spawn, which makes this safe.
-        return os.environ["HOSTNAME"]
+        return os.environ.get("HOSTNAME", socket.gethostname())
 
     @classmethod
     def get_client_id(cls):
@@ -205,5 +232,9 @@ class ControllerStorageVolumes(TorchStoreStrategy):
             client_id,
         )  # client_id == volume_id for this strategy
 
-    def get_storage_volume(self, volume_id: str) -> StorageVolume:
-        return self.storage_volumes
+    def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
+        return StorageVolumeRef(
+            self.storage_volumes,
+            volume_id,
+            self.transport_context,
+        )

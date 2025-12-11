@@ -18,14 +18,19 @@ from torchstore.logging import init_logging
 from torchstore.transport.pipe import TensorSlice
 from torchstore.utils import spawn_actors
 
-from .utils import DTensorActor, main, transport_plus_strategy_params
+from .utils import (
+    DTensorActor,
+    main,
+    set_transport_type,
+    transport_plus_strategy_params,
+)
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_get_tensor_slice(strategy_params, use_rdma):
+async def test_get_tensor_slice(strategy_params, transport_type):
     """Test tensor slice API functionality"""
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+    set_transport_type(transport_type)
 
     class TensorSlicePutActor(Actor):
         """Actor for putting tensors."""
@@ -204,7 +209,7 @@ async def test_dtensor_fetch_slice():
             return await ts.get(key, tensor_slice_spec=tensor_slice_spec)
 
     # Use LocalRankStrategy with 2 storage volumes (no RDMA, no parametrization)
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
+    set_transport_type("none")
     os.environ["LOCAL_RANK"] = "0"  # Required by LocalRankStrategy
 
     await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
