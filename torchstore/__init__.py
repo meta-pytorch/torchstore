@@ -20,7 +20,6 @@ from torchstore.api import (
     reset_client,
     shutdown,
 )
-
 from torchstore.logging import init_logging
 from torchstore.strategy import (
     ControllerStorageVolumes,
