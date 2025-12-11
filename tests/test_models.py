@@ -20,7 +20,7 @@ from torchstore.state_dict_utils import _state_dict_size
 from torchstore.utils import spawn_actors
 from transformers import AutoModelForCausalLM
 
-from .utils import main, transport_plus_strategy_params
+from .utils import main, set_transport_type, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -120,24 +120,24 @@ class ModelTest(Actor):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_basic(strategy_params, use_rdma):
+async def test_basic(strategy_params, transport_type):
     # FSDP
     put_mesh_shape = (1,)
     get_mesh_shape = (1,)
-    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
+    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], transport_type)
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_resharding(strategy_params, use_rdma):
+async def test_resharding(strategy_params, transport_type):
     # FSDP
     put_mesh_shape = (4,)
     get_mesh_shape = (8,)
-    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], use_rdma)
+    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], transport_type)
 
 
-async def _do_test(put_mesh_shape, get_mesh_shape, strategy, use_rdma):
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+async def _do_test(put_mesh_shape, get_mesh_shape, strategy, transport_type):
+    set_transport_type(transport_type)
 
     ts.init_logging()
     logger.info(f"Testing with strategy: {strategy}")

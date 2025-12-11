@@ -6,6 +6,7 @@
 
 import logging
 import os
+from enum import auto, Enum
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
@@ -55,6 +56,12 @@ class TransportContext:
 
     def get_rdma_transport_cache(self) -> RdmaTransportCache:
         return self.transport_context.get(self.RDMA_TRANSPORT_CACHE, None)
+
+
+class TransportType(Enum):
+    MonarchRPC = auto()
+    MonarchRDMA = auto()
+    TorchCommsRDMA = auto()
 
 
 class TransportBuffer:
