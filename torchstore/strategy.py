@@ -11,6 +11,7 @@ multiple storage volumes. Strategies map client processes to storage volumes.
 """
 
 import os
+import socket
 from typing import TYPE_CHECKING
 
 from monarch.actor import current_rank
@@ -154,12 +155,14 @@ class HostStrategy(TorchStoreStrategy):
     """Assumes one storage volume per host.
 
     Each process uses 'HOSTNAME' to determine which storage volume to connect to.
+    This strategy requires the HOSTNAME environment variable to be set and assumes
+    one storage volume per local rank.
     """
 
     @classmethod
     def get_volume_id(cls):
         # Note: this should only called at spawn, which makes this safe.
-        return os.environ["HOSTNAME"]
+        return os.environ.get("HOSTNAME", socket.gethostname())
 
     @classmethod
     def get_client_id(cls):
