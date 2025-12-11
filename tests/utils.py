@@ -8,7 +8,6 @@ import math
 import os
 from itertools import product
 from logging import getLogger
-
 from typing import List
 
 import pytest

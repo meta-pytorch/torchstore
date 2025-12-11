@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 
-from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
 
@@ -52,6 +52,10 @@ class StorageVolume(Actor):
         return self.volume_id
 
     @endpoint
+    async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
+        return await self.store.handshake(transport_buffer)
+
+    @endpoint
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
@@ -83,6 +87,9 @@ class StorageVolume(Actor):
 class StorageImpl:
     """Abstract base class for storage implementations."""
 
+    def __init__(self) -> None:
+        self.transport_context = TransportContext()
+
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> Optional[TransportBuffer]:
@@ -105,12 +112,19 @@ class StorageImpl:
         """Delete data from the storage backend."""
         raise NotImplementedError()
 
+    async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
+        raise NotImplementedError()
+
 
 class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
     def __init__(self) -> None:
         self.kv: Dict[str, Any] = {}
+        super().__init__()
+
+    async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
+        pass
 
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")

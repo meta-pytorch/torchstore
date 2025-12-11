@@ -6,7 +6,6 @@
 
 # pyre-unsafe
 import asyncio
-
 from typing import Tuple
 
 import torch
