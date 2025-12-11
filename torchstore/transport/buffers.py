@@ -6,7 +6,8 @@
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from enum import auto, Enum
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
 
@@ -17,8 +18,14 @@ except ImportError:
 
     def RDMABuffer(*args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(
-            "RDMABuffer is not available. This environemnt was likely not built with rdma support."
+            "RDMABuffer is not available. This environment was likely not built with rdma support."
         )
+
+
+from torchstore.transport.torchcomms.cache import RdmaTransportCache
+
+if TYPE_CHECKING:
+    from torchstore.transport.pipe import StorageVolumeRef
 
 
 # TODO: we no longer need to chunk with monararch rdma buffer. Setting large chunk size for now,
@@ -33,6 +40,28 @@ def rdma_available() -> bool:
         os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
     )  # TODO: enable on this build
     return rdma_enabled and monarch_rdma_available()
+
+
+class TransportContext:
+    RDMA_TRANSPORT_CACHE = "rdma_transport_cache"
+
+    def __init__(self):
+        self.transport_context = {}
+        self.transport_context[
+            self.RDMA_TRANSPORT_CACHE
+        ] = RdmaTransportCache.try_init()
+
+    def get_transport_context(self) -> Dict[Any, Any]:
+        return self.transport_context
+
+    def get_rdma_transport_cache(self) -> RdmaTransportCache:
+        return self.transport_context.get(self.RDMA_TRANSPORT_CACHE, None)
+
+
+class TransportType(Enum):
+    MonarchRPC = auto()
+    MonarchRDMA = auto()
+    TorchCommsRDMA = auto()
 
 
 class TransportBuffer:
@@ -53,15 +82,43 @@ class TransportBuffer:
         """
         raise NotImplementedError()
 
-    async def read_into(self, tensor: Optional[torch.Tensor]) -> torch.Tensor:
+    async def read_into(
+        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+    ) -> torch.Tensor:
         raise NotImplementedError()
 
-    async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+    async def write_from(
+        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+    ) -> None:
         raise NotImplementedError()
+
+    async def handshake(
+        self, tensor: torch.Tensor, volume_ref: "StorageVolumeRef"
+    ) -> None:
+        """Establish a handshake with the remote volume, such as for RDMA."""
+        pass
+
+    async def recv_handshake(
+        self, transport_context: TransportContext
+    ) -> Optional[Any]:
+        """Confirm a handshake initiated by the local client, and return some result."""
+        pass
 
     async def drop(self) -> None:
         """Clean up any resources held by this buffer. Override in subclasses if needed."""
         pass
+
+    def _assert_valid_tensor(
+        self,
+        tensor: torch.Tensor,
+        dtype: torch.dtype,
+        shape: torch.Size,
+        must_be_contiguous=False,
+    ) -> None:
+        assert isinstance(tensor, torch.Tensor)
+        assert tensor.dtype == dtype, f"{tensor.dtype} != {dtype}"
+        assert tensor.shape == shape, f"{tensor.shape} != {shape}"
+        assert not must_be_contiguous or tensor.is_contiguous()
 
 
 class RDMATransportBuffer(TransportBuffer):
@@ -115,14 +172,6 @@ class RDMATransportBuffer(TransportBuffer):
 
         return tensor_chunks
 
-    def _assert_valid_tensor(
-        self, tensor: torch.Tensor, must_be_contiguous: bool = True
-    ) -> None:
-        assert isinstance(tensor, torch.Tensor)
-        assert tensor.dtype == self.dtype, f"{tensor.dtype} != {self.dtype}"
-        assert tensor.shape == self.shape, f"{tensor.shape} != {self.shape}"
-        assert not must_be_contiguous or tensor.is_contiguous()
-
     def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
         """Allocates internal buffers based on either an existing tensor
         or a Tuple of (shape, dtype)
@@ -147,7 +196,7 @@ class RDMATransportBuffer(TransportBuffer):
         self.dtype = tensor.dtype
         self.dim = tensor.dim()
 
-        self._assert_valid_tensor(tensor)
+        self._assert_valid_tensor(tensor, self.dtype, self.shape)
 
         byte_view_chunks = self._create_byte_views_from_tensor(tensor)
         self.tensor_refs = [
@@ -165,14 +214,16 @@ class RDMATransportBuffer(TransportBuffer):
         super().update(other_buffer)
 
     # send
-    async def read_into(self, tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    async def read_into(
+        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+    ) -> torch.Tensor:
         if tensor is None:
             # allocate a tensor to return
             tensor = torch.empty(
                 self.shape, dtype=self.dtype, device=torch.device("cpu")
             )
 
-        self._assert_valid_tensor(tensor)
+        self._assert_valid_tensor(tensor, self.dtype, self.shape)
         assert self.rdma_buffers is not None
 
         chunked_byte_view = self._create_byte_views_from_tensor(tensor)
@@ -199,11 +250,15 @@ class RDMATransportBuffer(TransportBuffer):
         return tensor
 
     # recv
-    async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+    async def write_from(
+        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+    ) -> None:
         if tensor is None:
             return
         # source tensor does not have to be contiguous, it is copied into contiguous memory later in this function
-        self._assert_valid_tensor(tensor, must_be_contiguous=False)
+        self._assert_valid_tensor(
+            tensor, self.dtype, self.shape, must_be_contiguous=False
+        )
         assert self.rdma_buffers is not None
 
         chunked_byte_view = self._create_byte_views_from_tensor(tensor)
@@ -236,7 +291,9 @@ class MonarchTransportBuffer(TransportBuffer):
         return None
 
     # send
-    async def read_into(self, tensor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    async def read_into(
+        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+    ) -> torch.Tensor:
         if tensor is not None:
             # if there is a tensor here, likely this is the 'inplace' case,
             # and we should return back a ptr to the original tensor
@@ -248,7 +305,9 @@ class MonarchTransportBuffer(TransportBuffer):
         return self.tensor
 
     # recv
-    async def write_from(self, tensor: Optional[torch.Tensor]) -> None:
+    async def write_from(
+        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+    ) -> None:
         self.tensor = tensor
 
     def update(self, other_buffer: "TransportBuffer") -> None:

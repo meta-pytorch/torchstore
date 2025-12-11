@@ -37,6 +37,7 @@ jobs:
       - name: Run slice tests (test_slice.py) with coverage
         run: |
           TORCHSTORE_RDMA_ENABLED=0 \
+          USE_TORCHCOMMS_RDMA=0 \
           pytest tests/test_tensor_slice.py \
             --cov=. --cov-report=xml -vv -s
       - name: Run test_resharding_basic tests with coverage
@@ -45,6 +46,7 @@ jobs:
         # test_large_tensors.py can OOM.
         run: |
           TORCHSTORE_RDMA_ENABLED=0 \
+          USE_TORCHCOMMS_RDMA=0 \
           pytest tests/test_resharding_basic.py \
             --cov=. --cov-report=xml -vv -s
       - name: Run remaining tests with coverage
@@ -53,6 +55,7 @@ jobs:
         # test_large_tensors.py can OOM.
         run: |
           TORCHSTORE_RDMA_ENABLED=0 \
+          USE_TORCHCOMMS_RDMA=0 \
           pytest tests/ \
             --ignore=tests/test_resharding_basic.py \
             --ignore=tests/test_resharding_ext.py \

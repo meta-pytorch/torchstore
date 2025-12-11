@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 
-from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
 
@@ -52,6 +52,10 @@ class StorageVolume(Actor):
         return self.volume_id
 
     @endpoint
+    async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
+        return await self.store.handshake(transport_buffer)
+
+    @endpoint
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
@@ -83,6 +87,9 @@ class StorageVolume(Actor):
 class StorageImpl:
     """Abstract base class for storage implementations."""
 
+    def __init__(self) -> None:
+        self.transport_context = TransportContext()
+
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> Optional[TransportBuffer]:
@@ -105,12 +112,19 @@ class StorageImpl:
         """Delete data from the storage backend."""
         raise NotImplementedError()
 
+    async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
+        raise NotImplementedError()
+
 
 class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
     def __init__(self) -> None:
         self.kv: Dict[str, Any] = {}
+        super().__init__()
+
+    async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
+        return await transport_buffer.recv_handshake(self.transport_context)
 
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")
@@ -242,7 +256,7 @@ class InMemoryStore(StorageImpl):
 
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
-        tensor = await transport_buffer.read_into(tensor=None)
+        tensor = await transport_buffer.read_into(None, self.transport_context)
         if request.tensor_slice is not None:
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
@@ -263,13 +277,13 @@ class InMemoryStore(StorageImpl):
             return transport_buffer
 
         if request.tensor_slice is None:
-            await transport_buffer.write_from(self.kv[key])
+            await transport_buffer.write_from(self.kv[key], self.transport_context)
             return transport_buffer
 
         extracted_tensor = self._get_sharded_tensor(request, key)
 
         if extracted_tensor is not None:
-            await transport_buffer.write_from(extracted_tensor)
+            await transport_buffer.write_from(extracted_tensor, self.transport_context)
             return transport_buffer
 
         raise RuntimeError(
