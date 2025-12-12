@@ -13,7 +13,9 @@ from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
+from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import Pipe, Request, TensorSlice
+from torchstore.transport.buffers import TransportContext
 from torchstore.utils import assemble_tensor, get_local_tensor, get_slice_intersection
 
 logger = getLogger(__name__)
@@ -30,7 +32,8 @@ class LocalClient:
         strategy,
     ):
         self._controller = controller
-        self.strategy = strategy
+        self.strategy: TorchStoreStrategy = strategy
+        self.transport_context = TransportContext()
 
     async def _locate_volumes(self, key: str):
         """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""
@@ -145,11 +148,11 @@ class LocalClient:
         volume_map = await self._controller.locate_volumes.call_one(key)
 
         async def delete_from_volume(volume_id: str):
-            volume = self.strategy.get_storage_volume(volume_id)
+            volume_ref = self.strategy.get_storage_volume(volume_id)
             # Notify should come before the actual delete, so that the controller
             # doesn't think the key is still in the store when delete is happening.
             await self._controller.notify_delete.call_one(key, volume_id)
-            await volume.delete.call(key)
+            await volume_ref.volume.delete.call(key)
 
         await asyncio.gather(
             *[delete_from_volume(volume_id) for volume_id in volume_map]
@@ -234,8 +237,8 @@ class LocalClient:
     async def _get_object(self, key: str):
         volume_map = await self._locate_volumes(key)
         volume_id, _ = volume_map.popitem()
-        storage_volume = self.strategy.get_storage_volume(volume_id)
-        pipe = Pipe(storage_volume)
+        volume_ref = self.strategy.get_storage_volume(volume_id)
+        pipe = Pipe(volume_ref)
         request = Request.from_any(None)
         return await pipe.get_from_storage_volume(key, request)
 
@@ -245,8 +248,8 @@ class LocalClient:
 
         # if the storage is a Tensor instead of DTensor, just fetch and return it.
         for volume_id, _ in volume_map.items():
-            storage_volume = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(storage_volume)
+            volume_ref = self.strategy.get_storage_volume(volume_id)
+            pipe = Pipe(volume_ref)
             # TODO: consolidate the logic here - None indicates it is an object request,
             # which is sematically inappropriate here.
             request = Request.from_any(None)
@@ -269,8 +272,8 @@ class LocalClient:
         # Handle the tensor case
         partial_results = []
         for volume_id, storage_info in volume_map.items():
-            storage_volume = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(storage_volume)
+            volume_ref = self.strategy.get_storage_volume(volume_id)
+            pipe = Pipe(volume_ref)
 
             # fetch from all storage volumes, something like this
             # TODO: fix so we can request all tensor slices from a storage volume

@@ -10,7 +10,6 @@ from logging import getLogger
 from typing import List, Tuple, TYPE_CHECKING
 
 import torch
-
 from monarch.actor import this_host
 
 from torchstore.transport import TensorSlice

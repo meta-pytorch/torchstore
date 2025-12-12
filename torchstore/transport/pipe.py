@@ -7,11 +7,14 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
+
+if TYPE_CHECKING:
+    from torchstore.strategy import StorageVolumeRef
 
 from torchstore.transport.buffers import (
     MonarchTransportBuffer,
@@ -131,8 +134,9 @@ class Pipe:
     Transport wrapper for communicating from local clients to storage volumes.
     """
 
-    def __init__(self, storage_volume) -> None:
-        self.storage_volume = storage_volume
+    def __init__(self, storage_volume_ref: "StorageVolumeRef") -> None:
+        self.storage_volume_ref = storage_volume_ref
+        self.storage_volume = storage_volume_ref.volume
 
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
