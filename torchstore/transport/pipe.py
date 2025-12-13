@@ -20,10 +20,10 @@ from torchstore.transport.buffers import (
     MonarchTransportBuffer,
     rdma_available,
     RDMATransportBuffer,
-    torchcomms_rdma_available,
-    TorchCommsRdmaTransportBuffer,
     TransportBuffer,
 )
+from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
+from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
 
 logger = getLogger(__name__)
 
