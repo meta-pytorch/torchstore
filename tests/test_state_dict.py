@@ -27,7 +27,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 from torchstore.utils import spawn_actors
 
-from .utils import main, transport_plus_strategy_params
+from .utils import main, set_transport_type, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -164,8 +164,8 @@ class DCPParityTest(Actor):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_state_dict(strategy_params, use_rdma):
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+async def test_state_dict(strategy_params, transport_type):
+    set_transport_type(transport_type)
 
     class Trainer(Actor):
         # Monarch RDMA does not work outside of an actor, so we need
@@ -209,8 +209,8 @@ async def test_state_dict(strategy_params, use_rdma):
 @pytest.mark.skip("TODO(kaiyuan-li@): fix this test")
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_dcp_sharding_parity(strategy_params, use_rdma):
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "1" if use_rdma else "0"
+async def test_dcp_sharding_parity(strategy_params, transport_type):
+    set_transport_type(transport_type)
 
     for save_mesh_shape, get_mesh_shape in [
         ((2,), (4,)),

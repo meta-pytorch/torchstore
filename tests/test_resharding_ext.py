@@ -45,7 +45,7 @@ requires_slow_tests_enabled = pytest.mark.skipif(
 @pytest.mark.asyncio
 async def test_1d_resharding(
     strategy_params,
-    use_rdma,
+    transport_type,
     put_mesh_shape,
     get_mesh_shape,
     put_sharding_dim,
@@ -60,14 +60,14 @@ async def test_1d_resharding(
         get_mesh_shape=get_mesh_shape,
         get_placements=[Shard(get_sharding_dim)],
         strategy=strategy,
-        use_rdma=use_rdma,
+        transport_type=transport_type,
     )
 
 
 @requires_slow_tests_enabled
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_2d_to_2d_resharding(strategy_params, use_rdma):
+async def test_2d_to_2d_resharding(strategy_params, transport_type):
     _, strategy = strategy_params
 
     put_mesh_shape = get_mesh_shape = (2, 2)
@@ -83,13 +83,13 @@ async def test_2d_to_2d_resharding(strategy_params, use_rdma):
             get_mesh_shape=get_mesh_shape,
             get_placements=[Shard(dim) for dim in get_sharding_dims],
             strategy=strategy,
-            use_rdma=use_rdma,
+            transport_type=transport_type,
         )
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_1d_to_2d_resharding(strategy_params, use_rdma):
+async def test_1d_to_2d_resharding(strategy_params, transport_type):
     _, strategy = strategy_params
 
     put_mesh_shape = (4,)
@@ -106,13 +106,13 @@ async def test_1d_to_2d_resharding(strategy_params, use_rdma):
             get_mesh_shape=get_mesh_shape,
             get_placements=[Shard(dim) for dim in get_sharding_dims],
             strategy=strategy,
-            use_rdma=use_rdma,
+            transport_type=transport_type,
         )
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_2d_to_1d_resharding(strategy_params, use_rdma):
+async def test_2d_to_1d_resharding(strategy_params, transport_type):
     _, strategy = strategy_params
 
     put_mesh_shape = (2, 2)
@@ -129,7 +129,7 @@ async def test_2d_to_1d_resharding(strategy_params, use_rdma):
             get_mesh_shape=get_mesh_shape,
             get_placements=[Shard(dim) for dim in get_sharding_dims],
             strategy=strategy,
-            use_rdma=use_rdma,
+            transport_type=transport_type,
         )
 
 

@@ -16,8 +16,26 @@ import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
+from torchstore.transport import TransportType
 
 logger = getLogger(__name__)
+
+
+def set_transport_type(transport_type: TransportType) -> None:
+    """Set environment variables based on the transport type.
+
+    Args:
+        transport_type: A registered TransportType
+    """
+    if transport_type == TransportType.MonarchRDMA:
+        os.environ["TORCHSTORE_RDMA_ENABLED"] = "1"
+        os.environ["USE_TORCHCOMMS_RDMA"] = "0"
+    elif transport_type == TransportType.TorchCommsRDMA:
+        os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
+        os.environ["USE_TORCHCOMMS_RDMA"] = "1"
+    else:
+        os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
+        os.environ["USE_TORCHCOMMS_RDMA"] = "0"
 
 
 def main(file):
@@ -31,13 +49,17 @@ def transport_plus_strategy_params():
         (1, None),  # ts.SingletonStrategy
         (1, ts.ControllerStorageVolumes()),
     ]
-    rdma_options = (
-        [True, False]
-        if os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1"
-        else [False]
-    )
 
-    return "strategy_params, use_rdma", list(product(strategies, rdma_options))
+    # Only run monarch/torchcomms tests if their respective env vars are set. Enabled by default.
+    enabled_transport_types = [TransportType.MonarchRPC]
+    if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
+        enabled_transport_types.append(TransportType.MonarchRDMA)
+    if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
+        enabled_transport_types.append(TransportType.TorchCommsRDMA)
+
+    return "strategy_params, transport_type", list(
+        product(strategies, enabled_transport_types)
+    )
 
 
 class DTensorActor(Actor):
