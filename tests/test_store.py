@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import socket
 from logging import getLogger
 
 import pytest
@@ -20,7 +21,8 @@ init_logging()
 logger = getLogger(__name__)
 
 
-@pytest.mark.parametrize(*transport_plus_strategy_params())
+# Ensure we have some kind of basic coverage for HostStrategy
+@pytest.mark.parametrize(*transport_plus_strategy_params(with_host_strategy=True))
 @pytest.mark.asyncio
 async def test_basic(strategy_params, transport_type):
     """Test basic put/get functionality for multiple processes"""
@@ -39,6 +41,8 @@ async def test_basic(strategy_params, transport_type):
 
             # required by LocalRankStrategy
             os.environ["LOCAL_RANK"] = str(self.rank)
+            # required by HostStrategy
+            os.environ["HOSTNAME"] = socket.gethostname()
 
         @endpoint
         async def put(self):
