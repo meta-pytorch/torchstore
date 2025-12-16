@@ -16,6 +16,7 @@ import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
+from torchstore.strategy import HostStrategy
 from torchstore.transport import TransportType
 
 logger = getLogger(__name__)
@@ -43,12 +44,15 @@ def main(file):
     pytest.main([file])
 
 
-def transport_plus_strategy_params():
+def transport_plus_strategy_params(with_host_strategy: bool = False):
     strategies = [
         (2, ts.LocalRankStrategy()),
         (1, None),  # ts.SingletonStrategy
         (1, ts.ControllerStorageVolumes()),
     ]
+
+    if with_host_strategy:
+        strategies.append((1, HostStrategy()))
 
     # Only run monarch/torchcomms tests if their respective env vars are set. Enabled by default.
     enabled_transport_types = [TransportType.MonarchRPC]
