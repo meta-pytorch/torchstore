@@ -250,14 +250,21 @@ class InMemoryStore(StorageImpl):
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
 
+        data = await transport_buffer.handle_put_request(
+            request,
+            self.kv.get(key, None), # passing existing object to allow for inplace puts with no new allocation
+            self.transport_context
+        )
+        # self.update_key(key, request, data) #? need request
+
+        # def store_data
         if request.is_object:
-            self.kv[key] = {"obj": request.objects}
+            self.kv[key] = {"obj": data}
             return
 
-        # since we pass tensor=None to the transport buffer,
-        # we allocate on the fly
-        tensor = await transport_buffer.read_into(None, self.transport_context)
+        tensor = data #TODO
         if request.tensor_slice is not None:
+            # tensor is actually part of a DTensor
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
 
@@ -269,6 +276,10 @@ class InMemoryStore(StorageImpl):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
+        data = self.get_data(request, key)
+        self.transport_buffer.recv_from_storage_volume(data, self.transport_context)
+
+
         # TODO: clean up
         val = self.kv[key]
         if isinstance(val, dict) and "obj" in val:
@@ -276,19 +287,21 @@ class InMemoryStore(StorageImpl):
             transport_buffer.objects = val["obj"]
             return transport_buffer
 
-        if request.tensor_slice is None:
-            await transport_buffer.write_from(self.kv[key], self.transport_context)
-            return transport_buffer
+        
+        # def get_data(...)
+        # if request.tensor_slice is None:
+        #     await transport_buffer.write_from(self.kv[key], self.transport_context)
+        #     return transport_buffer
 
-        extracted_tensor = self._get_sharded_tensor(request, key)
+        # extracted_tensor = self._get_sharded_tensor(request, key)
 
-        if extracted_tensor is not None:
-            await transport_buffer.write_from(extracted_tensor, self.transport_context)
-            return transport_buffer
+        # if extracted_tensor is not None:
+        #     await transport_buffer.write_from(extracted_tensor, self.transport_context)
+        #     return transport_buffer
 
-        raise RuntimeError(
-            f"Tensor slice {request.tensor_slice} not found in any stored shards for {key}"
-        )
+        # raise RuntimeError(
+        #     f"Tensor slice {request.tensor_slice} not found in any stored shards for {key}"
+        # )
 
     async def get_meta(
         self,

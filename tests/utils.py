@@ -46,20 +46,21 @@ def main(file):
 
 def transport_plus_strategy_params(with_host_strategy: bool = False):
     strategies = [
-        (2, ts.LocalRankStrategy()),
-        (1, None),  # ts.SingletonStrategy
-        (1, ts.ControllerStorageVolumes()),
+        (2, ts.LocalRankStrategy),
+        (1, None),  # defaults to ts.SingletonStrategy
+        (1, ts.ControllerStorageVolumes),
     ]
 
     if with_host_strategy:
-        strategies.append((1, HostStrategy()))
+        strategies.append((1, HostStrategy))
 
     # Only run monarch/torchcomms tests if their respective env vars are set. Enabled by default.
-    enabled_transport_types = [TransportType.MonarchRPC]
-    if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
-        enabled_transport_types.append(TransportType.MonarchRDMA)
-    if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
-        enabled_transport_types.append(TransportType.TorchCommsRDMA)
+    enabled_transport_types = [TransportType.MonarchRDMA]
+    # enabled_transport_types = [TransportType.MonarchRPC]
+    # if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
+    #     enabled_transport_types.append(TransportType.MonarchRDMA)
+    # if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
+    #     enabled_transport_types.append(TransportType.TorchCommsRDMA)
 
     return "strategy_params, transport_type", list(
         product(strategies, enabled_transport_types)

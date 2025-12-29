@@ -27,9 +27,10 @@ For more information on what Monarch is, see https://github.com/meta-pytorch/mon
 
 ## Installation
 
-### Env Setup
+### Nightly Setup
 ```bash
 conda create -n torchstore python=3.12
+conda activate torchstore
 pip install torch
 
 git clone git@github.com:meta-pytorch/monarch.git
@@ -46,8 +47,11 @@ pip install -e .
 To install the package in development mode:
 
 ```bash
+conda create -n torchstore python=3.12
+conda activate torchstore
+
 # Clone the repository
-git clone https://github.com/your-username/torchstore.git
+git clone git@github.com:meta-pytorch/torchstore.git
 cd torchstore
 
 # Install in development mode
