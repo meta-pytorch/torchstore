@@ -14,7 +14,7 @@ from torch.distributed.tensor import DTensor
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
-from torchstore.transport import Request, TensorSlice, create_transport_buffer
+from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.transport.buffers import TransportContext
 from torchstore.utils import assemble_tensor, get_local_tensor, get_slice_intersection
 
@@ -46,15 +46,17 @@ class LocalClient:
     async def put(self, key: str, value: Union[torch.Tensor, Any]):
         latency_tracker = LatencyTracker(f"put:{key}")
         request = Request.from_any(value)
-    
-        storage_volume_ref= self.strategy.select_storage_volume()
+
+        storage_volume_ref = self.strategy.select_storage_volume()
         transport_buffer = create_transport_buffer(storage_volume_ref)
         latency_tracker.track_step("create transport buffer")
 
         await transport_buffer.put_to_storage_volume(key, request)
         latency_tracker.track_step("put_to_storage_volume")
-        
-        await self._controller.notify_put.call(key, request.meta_only(), storage_volume.volume_id)
+
+        await self._controller.notify_put.call(
+            key, request.meta_only(), storage_volume_ref.volume_id
+        )
         latency_tracker.track_step("notify_put")
         latency_tracker.track_e2e()
 

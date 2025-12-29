@@ -10,20 +10,22 @@ This module defines strategies for determining how storage is distributed across
 multiple storage volumes. Strategies map client processes to storage volumes.
 """
 
+import logging
 import os
 import socket
-import logging
 from typing import TYPE_CHECKING
 
 from monarch.actor import current_rank
 
-from torchstore.transport.buffers import TransportContext
 from torchstore.transport import TransportType
+
+from torchstore.transport.buffers import TransportContext
 
 if TYPE_CHECKING:
     from torchstore.storage_volume import StorageVolume
 
 logger = logging.getLogger(__name__)
+
 
 class StorageVolumeRef:
     __slots__ = ("volume", "volume_id", "transport_context", "default_transport_type")
@@ -33,14 +35,14 @@ class StorageVolumeRef:
         volume: "StorageVolume",
         volume_id: str,
         transport_context: TransportContext,
-        default_transport_type: TransportType
+        default_transport_type: TransportType,
     ):
         self.volume = volume
         self.volume_id = volume_id
-        # useful for caching elements that should survive the lifetime of the client/volume    
+        # useful for caching elements that should survive the lifetime of the client/volume
         self.transport_context = transport_context
         self.default_transport_type = default_transport_type
-    
+
 
 class TorchStoreStrategy:
     """Base class for TorchStore distribution strategies.
@@ -53,10 +55,12 @@ class TorchStoreStrategy:
     Subclasses must implement get_volume_id() and get_client_id() methods.
     """
 
-    def __init__(self, default_transport_type: TransportType = TransportType.MonarchRPC):
+    def __init__(
+        self, default_transport_type: TransportType = TransportType.MonarchRPC
+    ):
         self.default_transport_type = default_transport_type
         logger.info(f"Initializing TorchStoreStrategy with {default_transport_type=}")
-        
+
         self.storage_volumes = None
         self.volume_id_to_coord = {}
         self.transport_context = TransportContext()
@@ -125,7 +129,7 @@ class TorchStoreStrategy:
             self.storage_volumes.slice(**volume_coord),
             volume_id,
             self.transport_context,
-            self.default_transport_type
+            self.default_transport_type,
         )
 
 
@@ -229,18 +233,18 @@ class ControllerStorageVolumes(TorchStoreStrategy):
             tuple: (StorageVolume actor, volume_id) for this client.
         """
         # client_id is hardcded to a controller only volume
-        client_id = self.get_client_id() 
+        client_id = self.get_client_id()
         if client_id not in self.volume_id_to_coord:
             raise KeyError(
                 f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
             )
 
-        return self.get_storage_volume(client_id),
+        return (self.get_storage_volume(client_id),)
 
     def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
         return StorageVolumeRef(
             self.storage_volumes,
             volume_id,
             self.transport_context,
-            self.default_transport_type
+            self.default_transport_type,
         )

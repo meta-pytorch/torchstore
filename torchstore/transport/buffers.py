@@ -4,20 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
 import os
-from enum import auto, Enum
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
-
-
 
 from torchstore.transport.torchcomms.cache import RdmaTransportCache
 
 if TYPE_CHECKING:
-    from torchstore.transport.pipe import StorageVolumeRef, Request
-    
+    from torchstore.transport.pipe import Request, StorageVolumeRef
 
 
 def rdma_available() -> bool:
@@ -46,42 +41,38 @@ class TransportBuffer:
 
     requires_handshake: bool = False
 
+    def __init__(self, storage_volume_ref: "StorageVolumeRef"):
+        self.storage_volume_ref = storage_volume_ref
+
     # Client-side interface. Called by the client to send/recv data to the storage volume.
     async def put_to_storage_volume(self, key, request: "Request"):
         try:
-            # self._give concrete implementaiton a chance to parse the request
-            self._pre_put_hook(request) 
-            
-            if self.requires_handshake:
-                self.storage_volume.handshake.call(self)
+            # _give concrete implementaiton a chance to parse the request
+            self._pre_put_hook(request)
 
-            # recv_to_storage_volume?
-            self.storage_volume.put.call(key, self, request)
+            if self.requires_handshake:
+                self.storage_volume_ref.volume.handshake.call(self)
+
+            self.storage_volume_ref.volume.put.call(key, self, request)
         finally:
             self.drop()
-        
 
     async def get_from_storage_volume(self, request: "Request"):
         try:
             self._pre_get_hook(request)
 
             if self.requires_handshake:
-                self.storage_volume.handshake.call(self)
+                self.storage_volume_ref.volume.handshake.call(self)
 
             # when fetching data, we may need to handle the response from the storage volume
             # TODO: think of a good prefix to differentiate this between remote handlers
-            
             response = await self._handle_storage_volume_response(
-                await self.storage_volume.get.call_one(self, request)
+                await self.storage_volume_ref.volume.get.call_one(self, request)
             )
         finally:
             self.drop()
 
-
         return response
-
-    async def _handle_storage_volume_response(self, response: Any) -> Any:
-        pass
 
     async def _drop(self, response: Any):
         pass
@@ -91,6 +82,9 @@ class TransportBuffer:
 
     async def _pre_get_hook(self, request: "Request"):
         pass
+
+    async def _handle_storage_volume_response(self, response: Any) -> Any:
+        raise NotImplementedError()
 
     # StorageVolume handlers -- must be implemented by concrete implementaiton
     # These methods are called by the StorageVolume on the remote side
@@ -176,8 +170,6 @@ class TransportBuffer:
 #         assert tensor.dtype == dtype, f"{tensor.dtype} != {dtype}"
 #         assert tensor.shape == shape, f"{tensor.shape} != {shape}"
 #         assert not must_be_contiguous or tensor.is_contiguous()
-
-
 
 
 class MonarchTransportBuffer(TransportBuffer):

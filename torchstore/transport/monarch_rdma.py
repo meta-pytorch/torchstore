@@ -1,6 +1,12 @@
-import os
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import logging
-from typing import Optional, List, Any, Union, Tuple, Dict, TYPE_CHECKING
+import os
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
 
@@ -15,11 +21,14 @@ except ImportError:
             "RDMABuffer is not available. This environment was likely not built with rdma support."
         )
 
-from torchstore.transport.pipe import Request
+
 from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.pipe import Request
 
 if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
+    from torchstore.transport.pipe import StorageVolumeRef
+
 
 # TODO: we no longer need to chunk with monararch rdma buffer. Setting large chunk size for now,
 # but we should remove all chunking code
@@ -27,42 +36,45 @@ RDMA_CHUNK_SIZE_MB: int = int(
     os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", str(1024 * 32))
 )
 
+
 class MonarchRDMATransportBuffer(TransportBuffer):
-    
+
     requires_handshake: bool = False
-    
+
     # # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
     # # for now we utilize copies.
     # # The major blocker for this is dealing with non-contiguous tensors
     # requires_meta: bool = True
 
-    def __init__(self) -> None:
+    def __init__(self, storage_volume_ref: "StorageVolumeRef"):
+        super().__init__(storage_volume_ref)
+
         self.rdma_buffers: Optional[List[Any]] = None
         self.tensor_refs: Optional[List[torch.Tensor]] = None
         self.shape: Optional[torch.Size] = None
         self.dtype: Optional[torch.dtype] = None
 
     def _pre_put_hook(self, request: Request) -> None:
-        """Hook to perform any pre-put operations on the buffer."""        
-        self.allocate(request.tensor_val) # figure out right inputs.
+        """Hook to perform any pre-put operations on the buffer."""
+        self.allocate(request.tensor_val)
 
-    async def handle_put_request(self, request: Request, current_object, storage_transport_context):
+    async def handle_put_request(
+        self, request: Request, current_object, storage_transport_context
+    ):
 
-        #TODO:
+        # TODO:
         # add support for writting diretly to current_object (inplace update)
 
-        #TODO: clunky, this transport buffer should have something for
-        # objects as well. 
+        # TODO: clunky, this transport buffer should have something for
+        # objects as well.
         if request.is_object:
-            return request.objects 
+            return request.objects
 
         # allocate new tensor to return
-        tensor = torch.empty(
-            self.shape, dtype=self.dtype, device=torch.device("cpu")
-        )
+        tensor = torch.empty(self.shape, dtype=self.dtype, device=torch.device("cpu"))
         chunked_byte_view = self._create_byte_views_from_tensor(tensor)
 
-        #TODO: gather instead of reading sequentially
+        # TODO: gather instead of reading sequentially
         try:
             for idx, chunk in enumerate(chunked_byte_view):
                 await self.rdma_buffers[idx].read_into(chunk)
@@ -73,7 +85,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             raise e
 
         return tensor
-
 
     async def drop(self) -> None:
         """Explicitly clean up RDMA buffers to prevent kernel memory leak.
@@ -123,7 +134,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         if isinstance(tensor_like, str) or tensor_like is None:
             # tensor is just an object, nothing to allocte
             return
-        elif isinstance(tensor_like, Tuple): 
+        elif isinstance(tensor_like, Tuple):
             # Happens only on get if we don't have an inplace tensor.
             # In that case, we know the size of the tensor from fetching metadata
             tensor = torch.empty(
@@ -160,7 +171,8 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     # send
     async def read_into(
-        self, tensor: Optional[torch.Tensor],
+        self,
+        tensor: Optional[torch.Tensor],
     ) -> torch.Tensor:
         if tensor is None:
             # allocate a tensor to return
@@ -170,8 +182,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
         assert self.rdma_buffers is not None
-
-
 
     # recv
     async def write_from(
