@@ -431,7 +431,7 @@ async def test_fully_local_dtensor_put_get():
             keys = []
             for rank_id in range(2):
                 expert_id = rank_id * 16  # Rank 0: expert 0, Rank 1: expert 16
-                put_actor = put_mesh.slice(procs=rank_id)
+                put_actor = put_mesh.slice(gpus=rank_id)
                 key = await put_actor.put_expert.call_one(expert_id=expert_id)
                 keys.append(key)
 
