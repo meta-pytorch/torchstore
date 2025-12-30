@@ -350,5 +350,115 @@ async def test_partial_put():
             await ts.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_fully_local_dtensor_put_get():
+    """
+    Test that fully local DTensors (Replicate placement) are stored as regular tensors.
+
+    This simulates the MoE use case in torchtitan where individual expert parameters are DTensors
+    with Replicate() placement, but each rank puts different expert IDs.
+    """
+    from torch.distributed.tensor.placement_types import Replicate
+
+    class ExpertPutActor(Actor):
+        """Actor simulating MoE expert parameter storage."""
+
+        def __init__(self, world_size, expert_offset):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            self.expert_offset = expert_offset  # Different per replica
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def init_process_group(self, file_store_name, mesh_shape):
+            from torch.distributed import init_process_group
+            from torch.distributed.device_mesh import init_device_mesh
+
+            init_process_group(
+                "gloo",
+                rank=self.rank,
+                world_size=self.world_size,
+                store=torch.distributed.FileStore(file_store_name, self.world_size),
+            )
+            self.mesh = init_device_mesh("cpu", mesh_shape)
+
+        @endpoint
+        async def destroy_process_group(self):
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+        @endpoint
+        async def put_expert(self, expert_id: int):
+            """Put a single expert parameter (DTensor with Replicate placement)."""
+            # Create a fully replicated DTensor (simulates individual expert after splitting)
+            local_tensor = torch.randn(256, 512)  # Expert weight
+            from torch.distributed.tensor import DTensor
+
+            expert_dtensor = DTensor.from_local(
+                local_tensor, self.mesh, [Replicate()], run_check=False
+            )
+
+            key = f"expert_{expert_id}.weight"
+            await ts.put(key, expert_dtensor)
+            return key
+
+    class ExpertGetActor(Actor):
+        """Actor for retrieving expert parameters."""
+
+        @endpoint
+        async def get_expert(self, key):
+            return await ts.get(key)
+
+    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
+
+    with tempfile.TemporaryDirectory() as filesystem_store_dir:
+        try:
+            # Create two actor replicas, each will put different expert IDs
+            put_mesh = await spawn_actors(
+                2,
+                ExpertPutActor,
+                "expert_put_mesh",
+                world_size=2,
+                expert_offset=0,  # Not actually used, just for init
+            )
+
+            # Initialize process group
+            await put_mesh.init_process_group.call(
+                file_store_name=os.path.join(filesystem_store_dir, "expert_test"),
+                mesh_shape=(2,),
+            )
+
+            # Each rank puts different experts (simulating EP sharding)
+            # Rank 0 puts expert 0, Rank 1 puts expert 1
+            keys = []
+            for rank_id in range(2):
+                expert_id = rank_id * 16  # Rank 0: expert 0, Rank 1: expert 16
+                put_actor = put_mesh.slice(gpus=rank_id)
+                key = await put_actor.put_expert.call_one(expert_id=expert_id)
+                keys.append(key)
+
+            # Create get actor
+            get_actor = await spawn_actors(1, ExpertGetActor, "expert_get_actor")
+
+            # Should be able to retrieve both experts independently
+            # (they were stored as regular tensors, not DTensors)
+            for key in keys:
+                retrieved = await get_actor.get_expert.call_one(key)
+                assert retrieved is not None
+                assert retrieved.shape == (256, 512)
+                assert isinstance(retrieved, torch.Tensor)
+                # Should NOT be a DTensor
+                from torch.distributed.tensor import DTensor
+
+                assert not isinstance(retrieved, DTensor)
+
+        finally:
+            await put_mesh.destroy_process_group.call()
+            await ts.shutdown()
+
+
 if __name__ == "__main__":
     main(__file__)
