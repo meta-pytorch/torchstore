@@ -350,7 +350,7 @@ async def test_fully_local_dtensor_put_get():
     """
     Test that fully local DTensors (Replicate placement) are stored as regular tensors.
 
-    This simulates the MoE use case where individual expert parameters are DTensors
+    This simulates the MoE use case in torchtitan where individual expert parameters are DTensors
     with Replicate() placement, but each rank puts different expert IDs.
     """
     from torch.distributed.tensor.placement_types import Replicate

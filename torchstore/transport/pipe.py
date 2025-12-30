@@ -106,6 +106,9 @@ class Request:
         if isinstance(value, DTensor):
             # Check if DTensor is fully local (not actually distributed)
             # If so, treat it as a regular tensor to avoid collective requirements
+            # Note: this is due to behavior in torchtitan, where we have Replicate()
+            # placement which is not actually replicated along device-mesh
+            # todo: Revisit this if this is fixed in torchtitan
             if _is_dtensor_fully_local(value):
                 logger.debug(
                     f"DTensor with shape {value.shape} is fully local "
