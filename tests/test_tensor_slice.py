@@ -381,6 +381,7 @@ async def test_fully_local_dtensor_put_get():
         @endpoint
         async def destroy_process_group(self):
             import torch.distributed as dist
+
             if dist.is_initialized():
                 dist.destroy_process_group()
 
@@ -446,6 +447,7 @@ async def test_fully_local_dtensor_put_get():
                 assert isinstance(retrieved, torch.Tensor)
                 # Should NOT be a DTensor
                 from torch.distributed.tensor import DTensor
+
                 assert not isinstance(retrieved, DTensor)
 
         finally:
