@@ -7,9 +7,9 @@
 from typing import Any, Dict, List, Optional, Union
 
 import torch
-from monarch.actor import get_or_spawn_controller
 
 import torchstore.state_dict_utils
+from monarch.actor import get_or_spawn_controller
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
@@ -280,7 +280,7 @@ async def put_state_dict(
         >>> await put_state_dict(model.state_dict(), "model_checkpoint")
     """
     cl = await client(store_name)
-    await torchstore.state_dict_utils.put_state_dict(
+    await torchstore.state_dict_utils.put_state_dict_batch(
         store=cl, state_dict=state_dict, key=key
     )
 

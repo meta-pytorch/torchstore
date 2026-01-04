@@ -25,6 +25,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
+from torchstore.state_dict_utils import TorchStoreStateDict
 from torchstore.utils import spawn_actors
 
 from .utils import main, set_transport_type, transport_plus_strategy_params
@@ -192,7 +193,7 @@ async def test_state_dict(strategy_params, transport_type):
                 "optimizer": optimizer.state_dict(),
             }
             await ts.put_state_dict(state_dict, "v0")
-
+            print(state_dict)
             fetched_state_dict = await ts.get_state_dict("v0")
             return state_dict, fetched_state_dict
 
@@ -291,6 +292,141 @@ def _assert_equal_state_dict(state_dict1, state_dict2):
             assert (
                 flattened_state_dict_1[key] == flattened_state_dict_2[key]
             ), f"{key=} {flattened_state_dict_1[key]=} {flattened_state_dict_2[key]=}"
+
+
+def _verify_reconstructed_state_dict(flattened_original, flattened_reconstructed):
+    """Utility function to verify reconstructed state dict matches original."""
+    for key, original_value in flattened_original.items():
+        reconstructed_value = flattened_reconstructed[key]
+
+        if hasattr(original_value, "_local_tensor"):  # DTensor check
+            # Should be reconstructed as DTensor
+            assert hasattr(
+                reconstructed_value, "_local_tensor"
+            ), f"Expected DTensor for {key}"
+
+            # Verify local tensor data matches
+            assert torch.equal(
+                original_value._local_tensor, reconstructed_value._local_tensor
+            ), f"Local tensor data mismatch for {key}"
+
+            # Verify global shape matches
+            assert (
+                original_value.shape == reconstructed_value.shape
+            ), f"Global shape mismatch for {key}"
+
+            # Verify placements match
+            assert (
+                original_value.placements == reconstructed_value.placements
+            ), f"Placements mismatch for {key}"
+
+        elif isinstance(original_value, torch.Tensor):
+            # Regular tensors should remain the same
+            assert torch.equal(
+                original_value, reconstructed_value
+            ), f"Regular tensor mismatch for {key}"
+        else:
+            # Non-tensor values should be preserved
+            assert (
+                original_value == reconstructed_value
+            ), f"Non-tensor value mismatch for {key}"
+
+
+def test_torchstore_state_dict():
+    """Test TorchStoreStateDict class with various tensor types and reconstruction."""
+
+    # Create a state dict with various tensor types and shapes
+    original_state_dict = {
+        # Scalar tensor (0D)
+        "scalar": torch.tensor(42.5, dtype=torch.float32),
+        # 1D tensors with different dtypes
+        "vector_float": torch.randn(10, dtype=torch.float32),
+        "vector_int": torch.randint(0, 100, (5,), dtype=torch.int64),
+        "vector_half": torch.randn(8, dtype=torch.float16),
+        # 2D tensors with different dtypes
+        "matrix_float": torch.randn(3, 4, dtype=torch.float32),
+        "matrix_double": torch.randn(2, 3, dtype=torch.float64),
+        "matrix_int": torch.randint(-50, 50, (4, 2), dtype=torch.int32),
+        # Nested structure
+        "model": {
+            "layer1": {
+                "weight": torch.randn(5, 3, dtype=torch.float32),
+                "bias": torch.randn(5, dtype=torch.float32),
+            },
+            "layer2": {
+                "weight": torch.randn(2, 5, dtype=torch.float32),
+                "bias": torch.randn(2, dtype=torch.float32),
+            },
+        },
+        # Mixed with non-tensor data
+        "metadata": {
+            "epoch": 10,
+            "learning_rate": 0.001,
+            "optimizer_state": torch.randn(3, 3, dtype=torch.float32),
+        },
+        # List with tensors (note: flattened state dict doesn't preserve list structure)
+        "layer_weights": [
+            torch.randn(2, 2, dtype=torch.float32),
+            torch.tensor(123, dtype=torch.int32),
+        ],
+    }
+
+    # Create TorchStoreStateDict
+    torchstore_state_dict = TorchStoreStateDict.from_state_dict(original_state_dict)
+
+    # Verify blob properties
+    blob = torchstore_state_dict.tensor_blob
+    assert blob.dtype == torch.uint8, f"Expected uint8 blob, got {blob.dtype}"
+    assert blob.dim() == 1, f"Expected 1D blob, got {blob.dim()}D"
+
+    # 1. Flatten original state dict
+    original_flattened, _ = flatten_state_dict(original_state_dict)
+
+    # 2. Verify keys match between original flattened and torchstore flattened state dict
+    assert set(original_flattened.keys()) == set(
+        torchstore_state_dict.flattened_state_dict.keys()
+    ), "Keys don't match between original and torchstore flattened state dicts"
+
+    # 3. Verify tensor references and calculate total size
+    # _verify_tensor_references(torchstore_state_dict, original_flattened)
+
+    # Calculate total size for blob verification
+    total_size = 0
+    for key, original_value in original_flattened.items():
+        if isinstance(original_value, torch.Tensor):
+            tensor_to_size = (
+                original_value._local_tensor
+                if hasattr(original_value, "_local_tensor")
+                else original_value
+            )
+            total_size += tensor_to_size.numel() * tensor_to_size.element_size()
+
+    # Verify tensor blob size matches total size
+    assert (
+        len(blob) == total_size
+    ), f"Tensor blob size {len(blob)} doesn't match expected total size {total_size}"
+
+    # Reconstruct the state dict
+    reconstructed_state_dict = torchstore_state_dict.to_state_dict()
+
+    # Compare flattened versions - simpler than recursive comparison
+    original_flattened, original_mapping = flatten_state_dict(original_state_dict)
+    reconstructed_flattened, reconstructed_mapping = flatten_state_dict(
+        reconstructed_state_dict
+    )
+
+    # Verify mappings are identical (structure preserved)
+    assert (
+        original_mapping == reconstructed_mapping
+    ), "State dict structure mappings don't match"
+
+    # Verify keys match
+    assert set(original_flattened.keys()) == set(
+        reconstructed_flattened.keys()
+    ), "Flattened keys don't match"
+
+    # Verify reconstruction using utility function
+    _verify_reconstructed_state_dict(original_flattened, reconstructed_flattened)
 
 
 if __name__ == "__main__":
