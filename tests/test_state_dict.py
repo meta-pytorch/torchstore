@@ -13,6 +13,7 @@ from typing import Union
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 import torchstore as ts
@@ -22,10 +23,10 @@ from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
 )
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import DTensor
-from torchstore.state_dict_utils import TorchStoreStateDict
+from torch.distributed.tensor import DTensor, Replicate, Shard
+from torchstore.state_dict_utils import TensorReference, TorchStoreStateDict
 from torchstore.utils import spawn_actors
 
 from .utils import main, set_transport_type, transport_plus_strategy_params
@@ -34,6 +35,29 @@ logger = getLogger(__name__)
 
 
 MODEL_LINER_LENGTH = 10
+
+
+def _setup_process_group():
+    """Set up minimal distributed environment for DTensor testing."""
+
+    if not dist.is_initialized():
+        # Set minimal environment variables for single process
+        import os
+
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault(
+            "MASTER_PORT", "29501"
+        )  # Different port to avoid conflicts
+        os.environ.setdefault("RANK", "0")
+        os.environ.setdefault("WORLD_SIZE", "1")
+
+        # Initialize single-process group
+        dist.init_process_group(
+            backend="gloo",  # CPU backend
+            rank=0,
+            world_size=1,
+        )
+        return True
 
 
 class UnitModule(nn.Module):
@@ -427,6 +451,215 @@ def test_torchstore_state_dict():
 
     # Verify reconstruction using utility function
     _verify_reconstructed_state_dict(original_flattened, reconstructed_flattened)
+
+
+def _verify_tensor_references(torchstore_state_dict, flattened_original):
+    """Utility function to verify TensorReference objects in flattened state dict."""
+    for key, original_value in flattened_original.items():
+        torchstore_value = torchstore_state_dict.flattened_state_dict[key]
+
+        if isinstance(original_value, torch.Tensor):
+            if hasattr(original_value, "_local_tensor"):  # DTensor check
+                # DTensor should be converted to TensorReference with tensor_slice
+                assert isinstance(torchstore_value, TensorReference)
+                assert (
+                    torchstore_value.tensor_slice is not None
+                ), f"DTensor at {key} should have tensor_slice"
+                assert (
+                    torchstore_value.device_mesh is not None
+                ), f"DTensor at {key} should have device_mesh"
+                assert (
+                    torchstore_value.placements is not None
+                ), f"DTensor at {key} should have placements"
+
+                # Verify local tensor metadata
+                local_tensor = original_value._local_tensor
+                assert torchstore_value.shape == tuple(local_tensor.shape)
+                assert torchstore_value.dtype == local_tensor.dtype
+            else:
+                # Regular tensor should not have tensor_slice
+                assert isinstance(torchstore_value, TensorReference)
+                assert (
+                    torchstore_value.tensor_slice is None
+                ), f"Regular tensor at {key} should not have tensor_slice"
+                assert torchstore_value.shape == tuple(original_value.shape)
+                assert torchstore_value.dtype == original_value.dtype
+
+
+def test_torchstore_state_dict_with_dtensor():
+    """Test TorchStoreStateDict with DTensor support."""
+    _setup_process_group()
+
+    # Create single-device mesh (CPU only)
+    device_mesh = DeviceMesh("cpu", [0])
+
+    # Create DTensor from local tensor
+    local_tensor = torch.arange(4 * 6, dtype=torch.float32).reshape(4, 6)
+    dtensor = DTensor.from_local(local_tensor, device_mesh, [Replicate()])
+
+    # Create state dict with DTensor and regular tensor
+    original_state_dict = {
+        "regular_tensor": torch.randn(3, 3),
+        "dtensor": dtensor,
+        "nested": {
+            "another_dtensor": DTensor.from_local(
+                torch.ones(2, 3), device_mesh, [Shard(0)]
+            ),
+            "metadata": {"test": "value"},
+        },
+    }
+
+    # Test serialization
+    torchstore_state_dict = TorchStoreStateDict.from_state_dict(original_state_dict)
+
+    # Verify DTensor metadata is preserved using utility function
+    flattened_original, _ = flatten_state_dict(original_state_dict)
+    _verify_tensor_references(torchstore_state_dict, flattened_original)
+
+    # Test deserialization
+    reconstructed_state_dict = torchstore_state_dict.to_state_dict()
+
+    # Verify reconstruction using utility function
+    flattened_reconstructed, _ = flatten_state_dict(reconstructed_state_dict)
+    _verify_reconstructed_state_dict(flattened_original, flattened_reconstructed)
+
+    dist.destroy_process_group()
+
+
+class TorchStoreStateDictDTensorActor(Actor):
+    """Actor for testing TorchStoreStateDict with distributed DTensors."""
+
+    def __init__(self, mesh_shape, original_tensor, file_store_name):
+        self.rank = current_rank().rank
+        self.mesh_shape = mesh_shape
+        self.world_size = math.prod(mesh_shape)
+        self.original_tensor = original_tensor
+        self.file_store_name = file_store_name
+        os.environ["LOCAL_RANK"] = str(self.rank)
+
+    def initialize_distributed(self):
+        torch.distributed.init_process_group(
+            backend="gloo",
+            rank=self.rank,
+            world_size=self.world_size,
+            init_method=f"file://{self.file_store_name}",
+        )
+        torch.distributed.barrier()
+
+    @endpoint
+    async def test_state_dict_with_dtensor(self):
+        from torch.distributed._tensor import distribute_tensor
+
+        self.initialize_distributed()
+
+        device_mesh = init_device_mesh("cpu", self.mesh_shape)
+
+        # Create DTensors with different placements
+        tensor1 = self.original_tensor.clone()
+        tensor2 = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+        dtensor_sharded = distribute_tensor(tensor1, device_mesh, placements=[Shard(0)])
+        dtensor_replicated = distribute_tensor(
+            tensor2, device_mesh, placements=[Replicate()]
+        )
+
+        # Create state dict with DTensors and regular tensors
+        original_state_dict = {
+            "sharded_dtensor": dtensor_sharded,
+            "replicated_dtensor": dtensor_replicated,
+            "regular_tensor": torch.randn(2, 2),
+            "nested": {
+                "weight": dtensor_sharded,
+                "epoch": 5,
+            },
+        }
+
+        # Test TorchStoreStateDict serialization
+        torchstore_sd = TorchStoreStateDict.from_state_dict(original_state_dict)
+
+        # Verify blob is created
+        assert torchstore_sd.tensor_blob.dtype == torch.uint8
+        assert torchstore_sd.tensor_blob.dim() == 1
+
+        # Verify DTensor metadata is preserved
+        flattened_original, _ = flatten_state_dict(original_state_dict)
+        for key, value in flattened_original.items():
+            ref = torchstore_sd.flattened_state_dict.get(key)
+            if isinstance(value, DTensor):
+                assert isinstance(ref, TensorReference)
+                assert ref.tensor_slice is not None
+                assert ref.device_mesh is not None
+                assert ref.placements is not None
+
+        # Test reconstruction
+        reconstructed_sd = torchstore_sd.to_state_dict()
+        flattened_reconstructed, _ = flatten_state_dict(reconstructed_sd)
+
+        # Verify data integrity
+        for key, original_value in flattened_original.items():
+            reconstructed_value = flattened_reconstructed[key]
+            if isinstance(original_value, DTensor):
+                original_local = original_value._local_tensor
+                if isinstance(reconstructed_value, DTensor):
+                    reconstructed_local = reconstructed_value._local_tensor
+                else:
+                    reconstructed_local = reconstructed_value
+                assert torch.equal(
+                    original_local, reconstructed_local
+                ), f"Mismatch for {key} on rank {self.rank}"
+            elif isinstance(original_value, torch.Tensor):
+                assert torch.equal(original_value, reconstructed_value)
+            else:
+                assert original_value == reconstructed_value
+
+        return self.rank, "success"
+
+    @endpoint
+    async def destroy_process_group(self):
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_torchstore_state_dict_dtensor_distributed(
+    strategy_params, transport_type
+):
+    """Test TorchStoreStateDict with DTensors across multiple distributed actors."""
+    set_transport_type(transport_type)
+
+    num_actors = 2
+    mesh_shape = (num_actors,)
+    # Tensor shape must be divisible by num_actors for Shard(0)
+    original_tensor = torch.arange(num_actors * 4 * 3, dtype=torch.float32).reshape(
+        num_actors * 4, 3
+    )
+
+    _, strategy = strategy_params
+    await ts.initialize(
+        num_storage_volumes=num_actors if strategy is not None else 1,
+        strategy=strategy,
+    )
+
+    actors = None
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            actors = await spawn_actors(
+                num_actors,
+                TorchStoreStateDictDTensorActor,
+                "dtensor_state_dict_test",
+                mesh_shape=mesh_shape,
+                original_tensor=original_tensor,
+                file_store_name=os.path.join(tmpdir, "pg_store"),
+            )
+
+            results = await actors.test_state_dict_with_dtensor.call()
+            for coord, (rank, status) in results:
+                assert status == "success", f"Actor rank {rank} failed"
+
+    finally:
+        if actors is not None:
+            await actors.destroy_process_group.call()
+        await ts.shutdown()
 
 
 if __name__ == "__main__":
