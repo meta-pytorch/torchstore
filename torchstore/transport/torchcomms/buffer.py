@@ -91,7 +91,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         if isinstance(tensor_like, str) or tensor_like is None:
             return
         elif isinstance(tensor_like, Tuple):
-            self.tensor_ref = torch.empty(
+            self.tensor_ref = torch.zeros(
                 tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
             )
             self.shape, self.dtype = tensor_like
@@ -118,7 +118,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     ) -> torch.Tensor:
         """Called by the remote storage volume. Read from the local client's source RdmaMemory (put)"""
         if tensor is None:
-            tensor = torch.empty(
+            tensor = torch.zeros(
                 self.shape, dtype=self.dtype, device=torch.device("cpu")
             )
 
@@ -144,12 +144,10 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             return
 
         if not tensor.is_contiguous():
-            contiguous_buffer = torch.empty(
-                tensor.shape,
-                dtype=tensor.dtype,
+            contiguous_buffer = torch.zeros_like(
+                tensor,
                 device="cpu",
                 memory_format=torch.contiguous_format,
-                pin_memory=True,
             )
             contiguous_buffer.copy_(tensor)
             tensor = contiguous_buffer
