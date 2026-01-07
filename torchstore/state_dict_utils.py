@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from dataclasses import dataclass
 from logging import getLogger
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,6 +23,16 @@ MAPPING = "MAPPING"
 TORCHSTORE_STATE_DICT = "TORCHSTORE_STATE_DICT"
 
 logger = getLogger(__name__)
+
+
+def tssd_enabled() -> bool:
+    """
+    Check if TorchStoreStateDict is enabled for put and get. If enabled, we will use the
+    TorchStoreStateDict to batch tensors in the state dict into one blob and transfer
+    them more efficiently.
+    """
+
+    return os.environ.get("TORCHSTORE_EXPERIMENTAL_BATCH_STATE_DICT", "1") == "1"
 
 
 async def put_state_dict(store, state_dict, key):
@@ -67,40 +78,21 @@ async def get_state_dict(
             f"Mapping is missing from the store. This most likely means there is no matching 'push' call for this key: {key=}"
         ) from e
 
-    # see if state_dict was stored as one single key with TorchStoreStateDict
-    try:
-        # Get the tensor tensor_blob and flattened state dict
-        tensor_blob = await store.get(f"{key}{DELIM}{tensor_blob}")
-        flattened_state_dict = await store.get(f"{key}{DELIM}{FLATTENED_STATE_DICT}")
+    user_flattened_state_dict, user_mapping = (
+        flatten_state_dict(user_state_dict)
+        if user_state_dict is not None
+        else ({}, None)
+    )
+    if strict and user_mapping is not None:
+        assert user_mapping == fetched_mapping
 
-        # Reconstruct TorchStoreStateDict and convert back to state dict
-        torchstore_state_dict = TorchStoreStateDict(
-            tensor_blob=tensor_blob,
-            flattened_state_dict=flattened_state_dict,
-            mapping=fetched_mapping,
+    fetched_state_dict = {}
+    for flattened_key in fetched_mapping.keys():
+        inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
+        fetched_state_dict[flattened_key] = await store.get(
+            f"{key}{DELIM}{flattened_key}",
+            inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
         )
-
-        return torchstore_state_dict.to_state_dict()
-    except Exception as e:
-        logger.info(
-            f"Failed to retrieve TorchStoreStateDict data for key: {key=}. Falling back to getting each tenso individually."
-        )
-        # TODO: Deprecate this code path eventually once we have fully moved to TorchStoreStateDict
-        user_flattened_state_dict, user_mapping = (
-            flatten_state_dict(user_state_dict)
-            if user_state_dict is not None
-            else ({}, None)
-        )
-        if strict and user_mapping is not None:
-            assert user_mapping == fetched_mapping
-
-        fetched_state_dict = {}
-        for flattened_key in fetched_mapping.keys():
-            inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
-            fetched_state_dict[flattened_key] = await store.get(
-                f"{key}{DELIM}{flattened_key}",
-                inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
-            )
 
     # # Prepare all the coroutines first
     # coros = []
@@ -120,6 +112,24 @@ async def get_state_dict(
     # fetched_state_dict = dict(zip(keys, results))
 
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
+
+
+async def get_state_dict_batch(
+    store, key, user_state_dict: Optional[dict] = None, strict=True
+):
+    # TODO: add support for user_state_dict and strict
+    try:
+        # Since the mapping is the last thing we write out, it also guarantees the state dict is not pending
+        fetched_mapping = await store.get(f"{key}{DELIM}{MAPPING}")
+    except Exception as e:
+        raise RuntimeError(
+            f"Mapping is missing from the store. This most likely means there is no matching 'push' call for this key: {key=}"
+        ) from e
+
+    flattened_keys = list(fetched_mapping.keys())
+    flattened_state_dict = await store.get_batch(f"{key}{DELIM}", flattened_keys)
+
+    return unflatten_state_dict(flattened_state_dict, fetched_mapping)
 
 
 @dataclass
@@ -169,10 +179,6 @@ class TorchStoreStateDict:
         # store the tensors in one blob
         # 1. flatten the state dict
         flattened_state_dict, mapping = flatten_state_dict(state_dict)
-        print("flattened_state_dict")
-        print(flattened_state_dict)
-        print("mapping")
-        print(mapping)
 
         # 2. iterate through the flattened state dict, collect all tensors and replace them with TensorMetadata objects
         tensor_list: List[Tuple[torch.Tensor, TensorMetadata]] = []
@@ -222,7 +228,7 @@ class TorchStoreStateDict:
 
             # Copy tensor data
             for tensor, tensor_metadata in tensor_list:
-                tensor_cpu = tensor.detach().cpu()
+                tensor_cpu = tensor.detach().cpu().contiguous()
                 # Convert scalar tensors from 0D to 1D
                 if tensor_cpu.dim() == 0:
                     tensor_cpu = tensor_cpu.unsqueeze(0)

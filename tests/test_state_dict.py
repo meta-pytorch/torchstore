@@ -221,10 +221,8 @@ async def test_state_dict(strategy_params, transport_type):
                 "optimizer": optimizer.state_dict(),
             }
             await ts.put_state_dict(state_dict, "v0")
-            return state_dict, {}
-            # print(state_dict)
-            # fetched_state_dict = await ts.get_state_dict("v0")
-            # return state_dict, fetched_state_dict
+            fetched_state_dict = await ts.get_state_dict("v0")
+            return state_dict, fetched_state_dict
 
     _, strategy = strategy_params
     await ts.initialize(num_storage_volumes=1, strategy=strategy)
@@ -233,7 +231,7 @@ async def test_state_dict(strategy_params, transport_type):
         state_dict, fetched_state_dict = await trainer.do_test.call_one()
     finally:
         await ts.shutdown()
-    # _assert_equal_state_dict(state_dict, fetched_state_dict)
+    _assert_equal_state_dict(state_dict, fetched_state_dict)
 
 
 @pytest.mark.skip("TODO(kaiyuan-li@): fix this test")

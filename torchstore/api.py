@@ -14,7 +14,10 @@ from torchstore.controller import Controller
 
 from torchstore.state_dict_utils import (
     get_state_dict as get_state_dict_util,
+    get_state_dict_batch,
+    put_state_dict as put_state_dict_util,
     put_state_dict_batch,
+    tssd_enabled,
 )
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import (
@@ -29,7 +32,7 @@ from torchstore.transport.pipe import TensorSlice
 DEFAULT_TORCHSTORE_NAME: str = "TorchStore"
 
 # cache for local clients
-_local_clent_map: Dict[str, LocalClient] = {}
+_local_client_map: Dict[str, LocalClient] = {}
 
 
 async def initialize(
@@ -97,14 +100,14 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     """
     controller = await _controller(store_name)
     await controller.teardown.call()
-    global _local_clent_map
-    _local_clent_map = {}
+    global _local_client_map
+    _local_client_map = {}
 
 
 def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     """Reset the local client for a given store. Useful for refreshing client state after shutdown."""
-    global _local_clent_map
-    _local_clent_map.pop(store_name, None)
+    global _local_client_map
+    _local_client_map.pop(store_name, None)
 
 
 async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:
@@ -127,8 +130,8 @@ async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
         >>> store_client = await client()
         >>> await store_client.put("my_key", tensor)
     """
-    if store_name in _local_clent_map:
-        return _local_clent_map[store_name]
+    if store_name in _local_client_map:
+        return _local_client_map[store_name]
 
     controller = await _controller(store_name)
     controller_strategy = await controller.get_controller_strategy.call_one()
@@ -137,7 +140,7 @@ async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
         controller=controller,
         strategy=controller_strategy,
     )
-    _local_clent_map[store_name] = local_client
+    _local_client_map[store_name] = local_client
 
     return local_client
 
@@ -284,7 +287,10 @@ async def put_state_dict(
         >>> await put_state_dict(model.state_dict(), "model_checkpoint")
     """
     cl = await client(store_name)
-    await put_state_dict_batch(store=cl, state_dict=state_dict, key=key)
+    if tssd_enabled():
+        await put_state_dict_batch(store=cl, state_dict=state_dict, key=key)
+    else:
+        await put_state_dict_util(store=cl, state_dict=state_dict, key=key)
 
 
 async def get_state_dict(
@@ -309,4 +315,11 @@ async def get_state_dict(
         >>> model.load_state_dict(state_dict)
     """
     cl = await client(store_name)
-    return await get_state_dict_util(cl, key, user_state_dict, strict)
+    if tssd_enabled():
+        return await get_state_dict_batch(
+            store=cl, key=key, user_state_dict=user_state_dict, strict=strict
+        )
+    else:
+        return await get_state_dict_util(
+            store=cl, key=key, user_state_dict=user_state_dict, strict=strict
+        )

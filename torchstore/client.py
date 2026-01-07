@@ -13,6 +13,7 @@ from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
+from torchstore.state_dict_utils import unpack_metadata_state_dict
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import Pipe, Request, TensorSlice
 from torchstore.transport.buffers import TransportContext
@@ -115,6 +116,35 @@ class LocalClient:
 
         latency_tracker.track_e2e()
         return fetched_tensor
+
+    @torch.no_grad
+    async def get_batch(self, key_prefix: str, keys: list[str]) -> dict[str, Any]:
+        """Fetch multiple tensors at once.
+
+        Args:
+            key_prefix: Prefix to prepend to each key (e.g., "v0/").
+            keys: List of keys to fetch.
+
+        Returns:
+            Dictionary mapping keys to their values (tensors or objects).
+        """
+        logger.debug(f"Batch fetching {len(keys)} keys with prefix {key_prefix}")
+        latency_tracker = LatencyTracker(f"get_batch:{len(keys)}_keys")
+
+        # For now, we assume all keys are on the same storage volume
+        # (which is true when using SingletonStrategy or batch put)
+        storage_volume, _ = self.strategy.select_storage_volume()
+        pipe = Pipe(storage_volume)
+
+        tensor_blob, metadata_state_dict = await pipe.get_batch_from_storage_volume(
+            key_prefix, keys
+        )
+
+        # Unpack the metadata state dict to get actual tensors
+        result = unpack_metadata_state_dict(metadata_state_dict, tensor_blob)
+
+        latency_tracker.track_e2e()
+        return result
 
     async def keys(self, prefix: str | None = None) -> list[str]:
         """

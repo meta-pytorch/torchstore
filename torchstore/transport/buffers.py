@@ -197,6 +197,14 @@ class RDMATransportBuffer(TransportBuffer):
 
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
 
+        # Only allocate new RDMA buffers if we don't already have them.
+        # On the storage side after deserialization, rdma_buffers contains
+        # the client's memory region handles. We should use those for RDMA
+        # writes, not create new ones.
+        if self.rdma_buffers is not None:
+            logging.debug("Preserving existing rdma_buffers from client")
+            return
+
         byte_view_chunks = self._create_byte_views_from_tensor(tensor)
         self.tensor_refs = [
             torch.empty_like(chunk, device=torch.device("cpu"))
