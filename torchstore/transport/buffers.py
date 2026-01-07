@@ -22,6 +22,7 @@ except ImportError:
         )
 
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport.torchcomms.cache import RdmaTransportCache
 
 if TYPE_CHECKING:
@@ -224,16 +225,19 @@ class RDMATransportBuffer(TransportBuffer):
     async def read_into(
         self, tensor: Optional[torch.Tensor], transport_context: TransportContext
     ) -> torch.Tensor:
+        latency_tracker = LatencyTracker("rdma_read_into")
         if tensor is None:
             # allocate a tensor to return
             tensor = torch.empty(
                 self.shape, dtype=self.dtype, device=torch.device("cpu")
             )
+        latency_tracker.track_step("allocate_tensor")
 
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
         assert self.rdma_buffers is not None
 
         chunked_byte_view = self._create_byte_views_from_tensor(tensor)
+        latency_tracker.track_step("create_byte_views")
 
         # if we have tensor refs locally, we're still in the local case,
         # and we're just copying over our chunks into the tensor from
@@ -241,6 +245,8 @@ class RDMATransportBuffer(TransportBuffer):
         if self.tensor_refs is not None:
             for idx, chunk in enumerate(chunked_byte_view):
                 chunk.copy_(self.tensor_refs[idx])
+            latency_tracker.track_step("local_copy")
+            latency_tracker.track_e2e()
             return tensor
         # else: we are in the remote case (in a different process), and must read from
         # the rdma buffer
@@ -248,12 +254,14 @@ class RDMATransportBuffer(TransportBuffer):
         try:
             for idx, chunk in enumerate(chunked_byte_view):
                 await self.rdma_buffers[idx].read_into(chunk)
+            latency_tracker.track_step("rdma_read")
         except Exception as e:
             logging.exception(
                 f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e
             )
             raise e
 
+        latency_tracker.track_e2e()
         return tensor
 
     # recv

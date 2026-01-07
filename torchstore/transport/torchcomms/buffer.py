@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
 
+from torchstore.logging import init_logging, LatencyTracker
+
 from torchstore.transport.buffers import TransportBuffer
 
 try:
@@ -27,6 +29,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     def __init__(self) -> None:
         # local client's rdmatransport address. used by storage volume to retrieve cached peer transport.
+        init_logging()
         self.address: bytes | None = None
 
         self.tensor_ref: torch.Tensor | None = (
@@ -117,23 +120,29 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self, tensor: Optional[torch.Tensor], transport_context: "TransportContext"
     ) -> torch.Tensor:
         """Called by the remote storage volume. Read from the local client's source RdmaMemory (put)"""
+        latency_tracker = LatencyTracker("torchcomms_read_into")
         if tensor is None:
-            tensor = torch.empty(
+            tensor = torch.zeros(
                 self.shape, dtype=self.dtype, device=torch.device("cpu")
             )
+        latency_tracker.track_step("allocate_tensor")
 
         assert self.rdma_remote_buffer is not None
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
 
         transport_cache = transport_context.get_rdma_transport_cache()
         transport = transport_cache.get(self.address, 0)[0]
+        latency_tracker.track_step("get_transport")
 
         receiving_buffer = RdmaMemory(tensor)
+        latency_tracker.track_step("create_rdma_memory")
         res = transport.read(
             receiving_buffer.to_mutable_view(), self.rdma_remote_buffer
         )
+        latency_tracker.track_step("rdma_read")
         assert res == 0, f"RDMA read failed: conn code {res}"
 
+        latency_tracker.track_e2e()
         return tensor
 
     async def write_from(
