@@ -26,7 +26,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from torchstore.state_dict_utils import TensorReference, TorchStoreStateDict
+from torchstore.state_dict_utils import TensorMetadata, TorchStoreStateDict
 from torchstore.utils import spawn_actors
 
 from .utils import main, set_transport_type, transport_plus_strategy_params
@@ -410,7 +410,7 @@ def test_torchstore_state_dict():
 
     # 2. Verify keys match between original flattened and torchstore flattened state dict
     assert set(original_flattened.keys()) == set(
-        torchstore_state_dict.metadata.flattened_state_dict.keys()
+        torchstore_state_dict.metadata_state_dict.keys()
     ), "Keys don't match between original and torchstore flattened state dicts"
 
     # 3. Verify tensor references and calculate total size
@@ -456,14 +456,14 @@ def test_torchstore_state_dict():
 
 
 def _verify_tensor_references(torchstore_state_dict, flattened_original):
-    """Utility function to verify TensorReference objects in flattened state dict."""
+    """Utility function to verify TensorMetadata objects in flattened state dict."""
     for key, original_value in flattened_original.items():
-        torchstore_value = torchstore_state_dict.metadata.flattened_state_dict[key]
+        torchstore_value = torchstore_state_dict.metadata_state_dict[key]
 
         if isinstance(original_value, torch.Tensor):
             if hasattr(original_value, "_local_tensor"):  # DTensor check
-                # DTensor should be converted to TensorReference with tensor_slice
-                assert isinstance(torchstore_value, TensorReference)
+                # DTensor should be converted to TensorMetadata with tensor_slice
+                assert isinstance(torchstore_value, TensorMetadata)
                 assert (
                     torchstore_value.tensor_slice is not None
                 ), f"DTensor at {key} should have tensor_slice"
@@ -480,7 +480,7 @@ def _verify_tensor_references(torchstore_state_dict, flattened_original):
                 assert torchstore_value.dtype == local_tensor.dtype
             else:
                 # Regular tensor should not have tensor_slice
-                assert isinstance(torchstore_value, TensorReference)
+                assert isinstance(torchstore_value, TensorMetadata)
                 assert (
                     torchstore_value.tensor_slice is None
                 ), f"Regular tensor at {key} should not have tensor_slice"
@@ -586,9 +586,9 @@ class TorchStoreStateDictDTensorActor(Actor):
         # Verify DTensor metadata is preserved
         flattened_original, _ = flatten_state_dict(original_state_dict)
         for key, value in flattened_original.items():
-            ref = torchstore_sd.metadata.flattened_state_dict.get(key)
+            ref = torchstore_sd.metadata_state_dict.get(key)
             if isinstance(value, DTensor):
-                assert isinstance(ref, TensorReference)
+                assert isinstance(ref, TensorMetadata)
                 assert ref.tensor_slice is not None
                 assert ref.device_mesh is not None
                 assert ref.placements is not None

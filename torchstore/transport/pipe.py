@@ -114,7 +114,9 @@ class Request:
 
     @classmethod
     def from_tssd(cls, tssd: "TorchStoreStateDict") -> "Request":
-        return cls(tensor_val=tssd.tensor_blob, objects=tssd.metadata, is_tssd=True)
+        return cls(
+            tensor_val=tssd.tensor_blob, objects=tssd.metadata_state_dict, is_tssd=True
+        )
 
     @classmethod
     def from_dtensor(cls, dtensor: DTensor) -> "Request":

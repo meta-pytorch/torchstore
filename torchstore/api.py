@@ -8,10 +8,14 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 from monarch.actor import get_or_spawn_controller
+
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 
-from torchstore.state_dict_utils import get_state_dict, put_state_dict_batch
+from torchstore.state_dict_utils import (
+    get_state_dict as get_state_dict_util,
+    put_state_dict_batch,
+)
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import (
     ControllerStorageVolumes,
@@ -305,4 +309,4 @@ async def get_state_dict(
         >>> model.load_state_dict(state_dict)
     """
     cl = await client(store_name)
-    return await get_state_dict(cl, key, user_state_dict, strict)
+    return await get_state_dict_util(cl, key, user_state_dict, strict)

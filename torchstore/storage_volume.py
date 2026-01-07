@@ -11,7 +11,8 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 from torch.distributed.tensor import DTensor
-from torchstore.state_dict_utils import deref_flattened_state_dict, TorchStoreStateDict
+
+from torchstore.state_dict_utils import DELIM, unpack_metadata_state_dict
 
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.pipe import Request, TensorSlice
@@ -251,22 +252,23 @@ class InMemoryStore(StorageImpl):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
+        # key is for example: 'v0/TORCHSTORE_STATE_DICT'
+        key_prefix = key.split(DELIM)[0]  # key_prefix is 'v0
         if request.is_tssd:
             tensor_blob = await transport_buffer.read_into(None, self.transport_context)
-            metadata = request.objects
-            tssd = TorchStoreStateDict(tensor_blob, metadata)
-            state_dict = deref_flattened_state_dict(
-                tssd.metadata.flattened_state_dict, tensor_blob
+            metadata_state_dict = request.objects
+            flattened_state_dict = unpack_metadata_state_dict(
+                metadata_state_dict, tensor_blob
             )
-
-            for k, v in state_dict.items():
-                if isinstance(v, DTensor):
-                    tensor_slice = metadata.flattened_state_dict[k].tensor_slice
-                    self._handle_dtensor(key, tensor_slice, v)
-                elif isinstance(v, torch.Tensor):
-                    self.kv[k] = v
+            for flattened_key, value in flattened_state_dict.items():
+                key_to_store = f"{key_prefix}{DELIM}{flattened_key}"
+                if isinstance(value, DTensor):
+                    tensor_slice = metadata_state_dict[flattened_key].tensor_slice
+                    self._handle_dtensor(key_to_store, tensor_slice, value)
+                elif isinstance(value, torch.Tensor):
+                    self.kv[key_to_store] = value
                 else:  # is object
-                    self.kv[key] = {"obj": v}
+                    self.kv[key_to_store] = {"obj": value}
             return
 
         if request.is_object:
