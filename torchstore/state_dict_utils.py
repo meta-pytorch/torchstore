@@ -229,9 +229,9 @@ class TorchStoreStateDict:
 
         # 3. create the tensor tensor_blob by concatenating all tensors
         if not tensor_list:
-            tensor_blob = torch.empty(0, dtype=torch.uint8)
+            tensor_blob = torch.zeros(0, dtype=torch.uint8)
         else:
-            tensor_blob = torch.empty(current_offset, dtype=torch.uint8)
+            tensor_blob = torch.zeros(current_offset, dtype=torch.uint8)
 
             # Copy tensor data
             for tensor, tensor_metadata in tensor_list:
@@ -302,7 +302,7 @@ def unpack_metadata_state_dict(
     for key, value in metadata_state_dict.items():
         if isinstance(value, TensorMetadata):
             # Pre-allocate tensor with correct shape and dtype (TorchStore approach)
-            tensor = torch.empty(value.shape, dtype=value.dtype)
+            tensor = torch.zeros(value.shape, dtype=value.dtype)
 
             # Get byte view of the allocated tensor
             if tensor.dim() == 0:
