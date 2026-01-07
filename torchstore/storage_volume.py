@@ -282,7 +282,7 @@ class InMemoryStore(StorageImpl):
         # key is for example: 'v0/TORCHSTORE_STATE_DICT'
         key_prefix = key.split(DELIM)[0]  # key_prefix is 'v0
         if request.is_tssd:
-            latency_tracker = LatencyTracker("put_tssd")
+            latency_tracker = LatencyTracker(f"put_tssd: {key_prefix}")
             tensor_blob = await transport_buffer.read_into(None, self.transport_context)
             latency_tracker.track_step("read_into")
             metadata_state_dict = request.objects
@@ -305,7 +305,9 @@ class InMemoryStore(StorageImpl):
             return
 
         if request.is_object:
+            latency_tracker = LatencyTracker(f"put_object: {key_prefix}")
             self.kv[key] = {"obj": request.objects}
+            latency_tracker.track_step("store object")
             return
 
         # since we pass tensor=None to the transport buffer,
@@ -402,7 +404,7 @@ class InMemoryStore(StorageImpl):
                     + tensor_metadata.size
                 ] = byte_view
 
-        transport_buffer.allocate(blob)
+        # transport_buffer.allocate(blob)
         # Send the blob via transport and attach metadata
         await transport_buffer.write_from(blob, self.transport_context)
         transport_buffer.objects = metadata_state_dict

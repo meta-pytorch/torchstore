@@ -15,7 +15,7 @@ from torch.distributed.checkpoint._nested_dict import (
     unflatten_state_dict,
 )
 from torch.distributed.tensor import DTensor, Placement
-from torchstore.logging import LatencyTracker
+from torchstore.logging import init_logging, LatencyTracker
 
 from torchstore.transport.pipe import TensorSlice
 
@@ -57,6 +57,7 @@ async def put_state_dict_batch(store, state_dict, key):
     """
     Turning state dict names into a single key.
     """
+    init_logging()
     latency_tracker = LatencyTracker(f"put_state_dict_batch:{key}")
     torchstore_state_dict: TorchStoreStateDict = TorchStoreStateDict.from_state_dict(
         state_dict

@@ -186,9 +186,10 @@ class Pipe:
                 transport_buffer.allocate(tensor)
                 await transport_buffer.write_from(tensor, self.transport_context)
             latency_tracker.track_step("allocate_and_write")
-            request_meta = request.meta_only()
-            latency_tracker.track_step("request_meta")
-            await self.storage_volume.put.call_one(key, transport_buffer, request_meta)
+
+            await self.storage_volume.put.call_one(
+                key, transport_buffer, request.meta_only()
+            )
             latency_tracker.track_step("storage_volume_put")
             latency_tracker.track_e2e()
         finally:

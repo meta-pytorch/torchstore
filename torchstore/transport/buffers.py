@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from torchstore.transport.pipe import StorageVolumeRef
 
 
-# TODO: we no longer need to chunk with monararch rdma buffer. Setting large chunk size for now,
+# TODO: we no longer need to chunk with monarch rdma buffer. Setting large chunk size for now,
 # but we should remove all chunking code
 RDMA_CHUNK_SIZE_MB: int = int(
     os.environ.get("TORCHSTORE_RDMA_CHUNK_SIZE_MB", str(1024 * 32))
