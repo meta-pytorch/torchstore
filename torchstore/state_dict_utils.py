@@ -14,15 +14,11 @@ from torch.distributed.checkpoint._nested_dict import (
     unflatten_state_dict,
 )
 from torch.distributed.tensor import DTensor, Placement
-from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torchstore.transport.pipe import TensorSlice
 
 DELIM = "/"
 MAPPING = "MAPPING"
-
-# Reserved keys for torchstore internal handling of state dict
-TENSOR_BLOB = "TORCHSTORE_STATE_DICT_TENSOR_BLOB"
-FLATTENED_STATE_DICT = "TORCHSTORE_STATE_DICT_FLATTENED_STATE_DICT"
+TORCHSTORE_STATE_DICT = "TORCHSTORE_STATE_DICT"
 
 logger = getLogger(__name__)
 
@@ -50,16 +46,16 @@ async def put_state_dict_batch(store, state_dict, key):
     """
     torchstore_state_dict = TorchStoreStateDict.from_state_dict(state_dict)
     # Store the tensor blob
-    await store.put(f"{key}{DELIM}{TENSOR_BLOB}", torchstore_state_dict.tensor_blob)
+    await store.put(f"{key}{DELIM}{TORCHSTORE_STATE_DICT}", torchstore_state_dict)
 
-    # Store the flattened state dict (contains TensorReferences and non-tensor data)
-    await store.put(
-        f"{key}{DELIM}{FLATTENED_STATE_DICT}",
-        torchstore_state_dict.flattened_state_dict,
-    )
+    # # Store the flattened state dict (contains TensorReferences and non-tensor data)
+    # await store.put(
+    #     f"{key}{DELIM}{FLATTENED_STATE_DICT}",
+    #     torchstore_state_dict.flattened_state_dict,
+    # )
 
-    # Store the mapping (this serves as the completion indicator)
-    await store.put(f"{key}{DELIM}{MAPPING}", torchstore_state_dict.mapping)
+    # # Store the mapping (this serves as the completion indicator)
+    # await store.put(f"{key}{DELIM}{MAPPING}", torchstore_state_dict.mapping)
 
 
 async def get_state_dict(
@@ -87,10 +83,6 @@ async def get_state_dict(
             flattened_state_dict=flattened_state_dict,
             mapping=fetched_mapping,
         )
-
-        import fbvscode
-
-        fbvscode.set_trace()
 
         return torchstore_state_dict.to_state_dict()
     except Exception as e:
@@ -147,6 +139,18 @@ class TensorReference:
     placements: Tuple[Any, ...] | None = None  # Placements for DTensor reconstruction
 
 
+@dataclass
+class TorchStoreStateDictMetadata:
+    """Metadata for a TorchStoreStateDict"""
+
+    flattened_state_dict: Dict[
+        str, Any
+    ]  # flattened state dict with TensorReference objects
+    mapping: Dict[
+        str, Any
+    ]  # mapping from calling torch.distributed.checkpoint.flatten_state_dict
+
+
 def _state_dict_size(state_dict):
     """Returns the size of the state dict in MBs"""
     size = 0
@@ -159,33 +163,6 @@ def _state_dict_size(state_dict):
     return size // (1024 * 1024)
 
 
-def create_tensor_slice_from_dtensor(dtensor: DTensor) -> "TensorSlice":
-    """
-    Create a TensorSlice from a DTensor.
-
-    Args:
-        dtensor: The DTensor to extract metadata from
-
-    Returns:
-        TensorSlice containing the distributed tensor metadata
-    """
-    coordinates = dtensor.device_mesh.get_coordinate()
-    _, offsets = _compute_local_shape_and_global_offset(
-        dtensor.shape,
-        mesh_shape=dtensor.device_mesh.shape,
-        my_coordinate=coordinates,
-        placements=dtensor.placements,
-    )
-
-    return TensorSlice(
-        offsets=offsets,
-        coordinates=coordinates,
-        global_shape=dtensor.shape,
-        local_shape=dtensor._local_tensor.shape,
-        mesh_shape=dtensor.device_mesh.shape,
-    )
-
-
 class TorchStoreStateDict:
     """
     A torchstore representation of a state dict. It contains a flattened state dict and a tensor blob.
@@ -195,14 +172,10 @@ class TorchStoreStateDict:
     def __init__(
         self,
         tensor_blob: torch.Tensor,
-        flattened_state_dict: Dict[str, Any],
-        mapping: Dict[str, Any],
+        metadata: TorchStoreStateDictMetadata,
     ):
         self.tensor_blob = tensor_blob
-        self.flattened_state_dict = flattened_state_dict
-        self.mapping = mapping
-        print(f"tenosr blob: {self.tensor_blob}")
-        print(f"flattened state dict: {self.flattened_state_dict}")
+        self.metadata = metadata
 
     @classmethod
     def from_state_dict(cls, state_dict: Dict[str, Any]) -> "TorchStoreStateDict":
@@ -223,7 +196,7 @@ class TorchStoreStateDict:
                 # Handle DTensor: store local tensor and add TensorSlice metadata
                 local_tensor = value._local_tensor
                 tensor_size = local_tensor.numel() * local_tensor.element_size()
-                tensor_slice = create_tensor_slice_from_dtensor(value)
+                tensor_slice = TensorSlice.from_dtensor(value)
 
                 ref = TensorReference(
                     shape=tuple(local_tensor.shape),
@@ -261,8 +234,8 @@ class TorchStoreStateDict:
 
             # Copy tensor data
             for tensor, ref in tensor_list:
-                # Convert scalar tensors from 0D to 1D
                 tensor_cpu = tensor.detach().cpu()
+                # Convert scalar tensors from 0D to 1D
                 if tensor_cpu.dim() == 0:
                     tensor_cpu = tensor_cpu.unsqueeze(0)
 
@@ -272,7 +245,9 @@ class TorchStoreStateDict:
                 blob[ref.offset : ref.offset + ref.size] = byte_view
 
         # 4. return the TorchStoreStateDict object
-        return cls(blob, modified_flattened_state_dict, mapping)
+        return cls(
+            blob, TorchStoreStateDictMetadata(modified_flattened_state_dict, mapping)
+        )
 
     def to_state_dict(self) -> Dict[str, Any]:
         """
@@ -280,8 +255,10 @@ class TorchStoreStateDict:
         the corresponding tensors from the tensor blob. DTensors are reconstructed using stored metadata.
         """
         state_dict = unflatten_state_dict(
-            deref_flattened_state_dict(self.flattened_state_dict, self.tensor_blob),
-            self.mapping,
+            deref_flattened_state_dict(
+                self.metadata.flattened_state_dict, self.tensor_blob
+            ),
+            self.metadata.mapping,
         )
 
         return state_dict

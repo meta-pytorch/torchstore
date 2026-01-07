@@ -14,6 +14,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 
 if TYPE_CHECKING:
+    from torchstore.state_dict_utils import TorchStoreStateDict
     from torchstore.strategy import StorageVolumeRef
 
 from torchstore.transport.buffers import (
@@ -56,6 +57,24 @@ class TensorSlice:
             )
         )
 
+    @classmethod
+    def from_dtensor(cls, dtensor: DTensor) -> "TensorSlice":
+        coordinates = dtensor.device_mesh.get_coordinate()
+        _, offsets = _compute_local_shape_and_global_offset(
+            dtensor.shape,
+            mesh_shape=dtensor.device_mesh.shape,
+            my_coordinate=coordinates,
+            placements=dtensor.placements,
+        )
+
+        return cls(
+            offsets=offsets,
+            coordinates=coordinates,
+            global_shape=dtensor.shape,
+            local_shape=dtensor._local_tensor.shape,
+            mesh_shape=dtensor.device_mesh.shape,
+        )
+
 
 @dataclass
 class Request:
@@ -74,13 +93,19 @@ class Request:
     tensor_slice: Optional[TensorSlice] = None
     objects: Optional[Any] = None  # Any, but must be pickleable.
     is_object: bool = False
+    is_tssd: bool = False
 
     @classmethod
     def from_any(cls, value: torch.Tensor | DTensor | None) -> "Request":
+
+        from torchstore.state_dict_utils import TorchStoreStateDict
+
         if isinstance(value, DTensor):
             request = cls.from_dtensor(value)
         elif isinstance(value, torch.Tensor):
             request = cls.from_tensor(value)
+        elif isinstance(value, TorchStoreStateDict):
+            request = cls.from_tssd(value)
         else:
             # TODO: consolidate this path for the None case
             request = cls.from_objects(value)
@@ -88,22 +113,12 @@ class Request:
         return request
 
     @classmethod
-    def from_dtensor(cls, dtensor: DTensor) -> "Request":
-        coordinates = dtensor.device_mesh.get_coordinate()
-        _, offsets = _compute_local_shape_and_global_offset(
-            dtensor.shape,
-            mesh_shape=dtensor.device_mesh.shape,
-            my_coordinate=coordinates,
-            placements=dtensor.placements,
-        )
+    def from_tssd(cls, tssd: "TorchStoreStateDict") -> "Request":
+        return cls(tensor_val=tssd.tensor_blob, objects=tssd.metadata, is_tssd=True)
 
-        tensor_slice = TensorSlice(
-            offsets,
-            coordinates,
-            dtensor.shape,
-            dtensor._local_tensor.shape,
-            dtensor.device_mesh.shape,
-        )
+    @classmethod
+    def from_dtensor(cls, dtensor: DTensor) -> "Request":
+        tensor_slice = TensorSlice.from_dtensor(dtensor)
         return cls(
             tensor_val=dtensor._local_tensor,
             tensor_slice=tensor_slice,
@@ -128,6 +143,7 @@ class Request:
             tensor_slice=self.tensor_slice,
             objects=self.objects,
             is_object=self.is_object,
+            is_tssd=self.is_tssd,
         )
 
 

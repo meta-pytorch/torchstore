@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from monarch.actor import Actor, endpoint
+from torch.distributed.tensor import DTensor
+from torchstore.state_dict_utils import deref_flattened_state_dict, TorchStoreStateDict
 
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.pipe import Request, TensorSlice
@@ -249,6 +251,23 @@ class InMemoryStore(StorageImpl):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
+        if request.is_tssd:
+            tensor_blob = await transport_buffer.read_into(None, self.transport_context)
+            metadata = request.objects
+            tssd = TorchStoreStateDict(tensor_blob, metadata)
+            state_dict = deref_flattened_state_dict(
+                tssd.metadata.flattened_state_dict, tensor_blob
+            )
+
+            for k, v in state_dict.items():
+                if isinstance(v, DTensor):
+                    tensor_slice = metadata.flattened_state_dict[k].tensor_slice
+                    self._handle_dtensor(key, tensor_slice, v)
+                elif isinstance(v, torch.Tensor):
+                    self.kv[k] = v
+                else:  # is object
+                    self.kv[key] = {"obj": v}
+            return
 
         if request.is_object:
             self.kv[key] = {"obj": request.objects}
@@ -257,7 +276,7 @@ class InMemoryStore(StorageImpl):
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
         tensor = await transport_buffer.read_into(None, self.transport_context)
-        if request.tensor_slice is not None:
+        if request.tensor_slice is not None:  # is dtensor
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
 
