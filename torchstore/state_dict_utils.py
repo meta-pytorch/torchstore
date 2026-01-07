@@ -15,6 +15,7 @@ from torch.distributed.checkpoint._nested_dict import (
     unflatten_state_dict,
 )
 from torch.distributed.tensor import DTensor, Placement
+from torchstore.logging import LatencyTracker
 
 from torchstore.transport.pipe import TensorSlice
 
@@ -56,13 +57,18 @@ async def put_state_dict_batch(store, state_dict, key):
     """
     Turning state dict names into a single key.
     """
+    latency_tracker = LatencyTracker(f"put_state_dict_batch:{key}")
     torchstore_state_dict: TorchStoreStateDict = TorchStoreStateDict.from_state_dict(
         state_dict
     )
+    latency_tracker.track_step("from_state_dict")
     # Store the TorchStoreStateDict object
     await store.put(f"{key}{DELIM}{TORCHSTORE_STATE_DICT}", torchstore_state_dict)
+    latency_tracker.track_step("store_put_tssd")
 
     await store.put(f"{key}{DELIM}{MAPPING}", torchstore_state_dict.mapping)
+    latency_tracker.track_step("store_put_mapping")
+    latency_tracker.track_e2e()
 
 
 async def get_state_dict(
@@ -250,9 +256,7 @@ class TorchStoreStateDict:
         the corresponding tensors from the tensor blob. DTensors are reconstructed using stored metadata.
         """
         state_dict = unflatten_state_dict(
-            unpack_metadata_state_dict(
-                self.metadata.flattened_state_dict, self.tensor_blob
-            ),
+            unpack_metadata_state_dict(self.metadata_state_dict, self.tensor_blob),
             self.mapping,
         )
 

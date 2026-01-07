@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 from torch.distributed.tensor import DTensor
+from torchstore.logging import init_logging, LatencyTracker
 
 from torchstore.state_dict_utils import DELIM, unpack_metadata_state_dict
 
@@ -149,6 +150,7 @@ class InMemoryStore(StorageImpl):
 
     def __init__(self) -> None:
         self.kv: Dict[str, Any] = {}
+        init_logging()
         super().__init__()
 
     async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
@@ -280,11 +282,15 @@ class InMemoryStore(StorageImpl):
         # key is for example: 'v0/TORCHSTORE_STATE_DICT'
         key_prefix = key.split(DELIM)[0]  # key_prefix is 'v0
         if request.is_tssd:
+            latency_tracker = LatencyTracker("put_tssd")
             tensor_blob = await transport_buffer.read_into(None, self.transport_context)
+            latency_tracker.track_step("read_into")
             metadata_state_dict = request.objects
+
             flattened_state_dict = unpack_metadata_state_dict(
                 metadata_state_dict, tensor_blob
             )
+            latency_tracker.track_step("unpack_metadata_state_dict")
             for flattened_key, value in flattened_state_dict.items():
                 key_to_store = f"{key_prefix}{DELIM}{flattened_key}"
                 if isinstance(value, DTensor):
@@ -294,6 +300,8 @@ class InMemoryStore(StorageImpl):
                     self.kv[key_to_store] = value
                 else:  # is object
                     self.kv[key_to_store] = {"obj": value}
+            latency_tracker.track_step("store_tensors")
+            latency_tracker.track_e2e()
             return
 
         if request.is_object:

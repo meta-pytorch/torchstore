@@ -204,6 +204,7 @@ async def test_state_dict(strategy_params, transport_type):
             self.rank = current_rank().rank
             # needed for LocalRankStrategy
             os.environ["LOCAL_RANK"] = str(self.rank)
+            ts.init_logging()
 
         @endpoint
         async def do_test(self):

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from torchstore.state_dict_utils import TorchStoreStateDict
     from torchstore.strategy import StorageVolumeRef
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import (
     MonarchTransportBuffer,
     rdma_available,
@@ -170,6 +171,7 @@ class Pipe:
         return buffer_cls()
 
     async def put_to_storage_volume(self, key, request: Request):
+        latency_tracker = LatencyTracker(f"put_to_storage_volume:{key}")
         transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
 
@@ -177,15 +179,18 @@ class Pipe:
         # via monarch RPC since that would generate considerable overhead
         try:
             await transport_buffer.handshake(tensor, self.storage_volume_ref)
+            latency_tracker.track_step("handshake")
             if isinstance(transport_buffer, TorchCommsRdmaTransportBuffer):
                 transport_buffer.allocate_source(tensor)
             else:
                 transport_buffer.allocate(tensor)
                 await transport_buffer.write_from(tensor, self.transport_context)
-
-            await self.storage_volume.put.call_one(
-                key, transport_buffer, request.meta_only()
-            )
+            latency_tracker.track_step("allocate_and_write")
+            request_meta = request.meta_only()
+            latency_tracker.track_step("request_meta")
+            await self.storage_volume.put.call_one(key, transport_buffer, request_meta)
+            latency_tracker.track_step("storage_volume_put")
+            latency_tracker.track_e2e()
         finally:
             # Clean up the transport buffer after the put operation completes
             # This is critical for RDMA buffers to deregister memory regions
