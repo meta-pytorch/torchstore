@@ -23,6 +23,7 @@ from torchstore.transport.buffers import (
     RDMATransportBuffer,
     TransportBuffer,
 )
+from torchstore.transport.nixl.buffer import nixl_available, NixlTransportBuffer
 from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
 
@@ -185,9 +186,13 @@ class Pipe:
         self.transport_context = storage_volume_ref.transport_context
         self.storage_volume = storage_volume_ref.volume
 
-    def create_transport_buffer(self) -> TransportBuffer:
+    def create_transport_buffer(
+        self, tensor: Optional[torch.Tensor] = None
+    ) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
-        if torchcomms_rdma_available():
+        if nixl_available():
+            buffer_cls = NixlTransportBuffer
+        elif torchcomms_rdma_available():
             buffer_cls = TorchCommsRdmaTransportBuffer
         elif rdma_available():
             buffer_cls = RDMATransportBuffer
@@ -196,14 +201,17 @@ class Pipe:
         return buffer_cls()
 
     async def put_to_storage_volume(self, key, request: Request):
-        transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
+        transport_buffer = self.create_transport_buffer(tensor)
 
         # transporting tensors is handled by the buffer, so we don't want to send it
         # via monarch RPC since that would generate considerable overhead
+        is_direct_rdma = isinstance(
+            transport_buffer, (TorchCommsRdmaTransportBuffer, NixlTransportBuffer)
+        )
         try:
             await transport_buffer.handshake(tensor, self.storage_volume_ref)
-            if isinstance(transport_buffer, TorchCommsRdmaTransportBuffer):
+            if is_direct_rdma:
                 transport_buffer.allocate_source(tensor)
             else:
                 transport_buffer.allocate(tensor)
@@ -218,9 +226,11 @@ class Pipe:
             await transport_buffer.drop()
 
     async def get_from_storage_volume(self, key, request: Request):
-        transport_buffer = self.create_transport_buffer()
-        # TODO @lucas/@amir: remove this after pipe refactor
-        is_torchcomms_rdma = isinstance(transport_buffer, TorchCommsRdmaTransportBuffer)
+        transport_buffer = self.create_transport_buffer(request.tensor_val)
+        # Direct RDMA buffers (TorchComms and NIXL) use allocate_dest and return tensor_ref
+        is_direct_rdma = isinstance(
+            transport_buffer, (TorchCommsRdmaTransportBuffer, NixlTransportBuffer)
+        )
 
         try:
             await transport_buffer.handshake(
@@ -228,7 +238,7 @@ class Pipe:
             )
             allocate = (
                 transport_buffer.allocate_dest
-                if is_torchcomms_rdma
+                if is_direct_rdma
                 else transport_buffer.allocate
             )
 
@@ -254,7 +264,7 @@ class Pipe:
             if transport_buffer.is_object:
                 return transport_buffer.objects
 
-            if not is_torchcomms_rdma:
+            if not is_direct_rdma:
                 return await transport_buffer.read_into(
                     request.tensor_val, self.transport_context
                 )
