@@ -41,12 +41,13 @@ TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
 
 
 class ModelTest(Actor):
-    def __init__(self, mesh_shape, file_store_name):
+    def __init__(self, mesh_shape, file_store_name, device="cpu"):
         ts.init_logging()
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape
         self.world_size = math.prod(mesh_shape)
         self.file_store_name = file_store_name
+        self.device = device
 
         os.environ["LOCAL_RANK"] = str(self.rank)
 
@@ -63,18 +64,21 @@ class ModelTest(Actor):
         self.rlog("barrrer")
         torch.distributed.barrier()
 
-    def build_model(self):
+    def build_model(self, device="cpu"):
         self.rlog("building model")
         model = AutoModelForCausalLM.from_pretrained(
             TEST_MODEL, token=os.environ["HF_TOKEN"]
         )
+        # Move model to specified device
+        if device == "cuda":
+            model = model.to("cuda")
         self.rlog(f"State dict size: {_state_dict_size(model.state_dict())}")
         if self.world_size > 1:
             self.initialize_distributed()
             self.rlog("sharding")
             mesh_dim_names = ["dp", "tp"] if len(self.mesh_shape) == 2 else None
             device_mesh = init_device_mesh(
-                "cpu", self.mesh_shape, mesh_dim_names=mesh_dim_names
+                device, self.mesh_shape, mesh_dim_names=mesh_dim_names
             )
             model = fully_shard(model, mesh=device_mesh)
 
@@ -88,7 +92,7 @@ class ModelTest(Actor):
 
     @endpoint
     async def do_push(self):
-        model, optimizer = self.build_model()
+        model, optimizer = self.build_model(self.device)
         state_dict = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -104,7 +108,7 @@ class ModelTest(Actor):
 
     @endpoint
     async def do_get(self):
-        model, optimizer = self.build_model()
+        model, optimizer = self.build_model(self.device)
         state_dict = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -124,7 +128,10 @@ async def test_basic(strategy_params, transport_type):
     # FSDP
     put_mesh_shape = (1,)
     get_mesh_shape = (1,)
-    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], transport_type)
+    # Use CUDA for NIXL transport, CPU otherwise
+    from torchstore.transport import TransportType
+    device = "cuda" if transport_type == TransportType.NIXL else "cpu"
+    await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], transport_type, device=device)
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -136,7 +143,7 @@ async def test_resharding(strategy_params, transport_type):
     await _do_test(put_mesh_shape, get_mesh_shape, strategy_params[1], transport_type)
 
 
-async def _do_test(put_mesh_shape, get_mesh_shape, strategy, transport_type):
+async def _do_test(put_mesh_shape, get_mesh_shape, strategy, transport_type, device="cpu"):
     set_transport_type(transport_type)
 
     ts.init_logging()
@@ -156,6 +163,7 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, transport_type):
                 "save_world",
                 mesh_shape=put_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "save_world"),
+                device=device,
             )
 
             get_world_size = math.prod(get_mesh_shape)
@@ -165,6 +173,7 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, transport_type):
                 "get_world",
                 mesh_shape=get_mesh_shape,
                 file_store_name=os.path.join(tmpdir, "get_world"),
+                device=device,
             )
 
             logger.info("do_push ")

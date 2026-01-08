@@ -61,6 +61,7 @@ class TransportType(Enum):
     MonarchRPC = auto()
     MonarchRDMA = auto()
     TorchCommsRDMA = auto()
+    NIXL = auto()
 
 
 class TransportBuffer:

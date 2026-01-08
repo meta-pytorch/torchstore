@@ -46,7 +46,9 @@ async def test_basic(strategy_params, transport_type):
 
         @endpoint
         async def put(self):
-            t = torch.tensor([self.rank + 1] * 10)
+            # Use CUDA if available, otherwise CPU
+            device = "cpu"
+            t = torch.tensor([self.rank + 1] * 10, device=device)
             await ts.put(f"key_{self.rank}", t)
 
         @endpoint
