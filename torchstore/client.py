@@ -10,9 +10,8 @@ from typing import Any, Union
 
 import torch
 from torch.distributed.tensor import DTensor
-
 from torchstore.controller import ObjectType
-from torchstore.logging import LatencyTracker
+from torchstore.logging import init_logging, LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import Pipe, Request, TensorSlice
 from torchstore.transport.buffers import TransportContext
@@ -31,6 +30,7 @@ class LocalClient:
         controller,
         strategy,
     ):
+        init_logging()
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
         self.transport_context = TransportContext()
@@ -53,7 +53,7 @@ class LocalClient:
         storage_volume, volume_id = self.strategy.select_storage_volume()
 
         pipe = Pipe(storage_volume)
-
+        latency_tracker.track_step("created Pipe")
         await pipe.put_to_storage_volume(key, request)
         latency_tracker.track_step("put_to_storage_volume")
 

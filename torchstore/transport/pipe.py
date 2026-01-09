@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 import copy
 from dataclasses import dataclass
 from logging import getLogger
@@ -23,6 +24,7 @@ from torchstore.transport.buffers import (
     RDMATransportBuffer,
     TransportBuffer,
 )
+from torchstore.transport.gloo import gloo_available, GlooTransportBuffer
 from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
 
@@ -189,6 +191,8 @@ class Pipe:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
         if torchcomms_rdma_available():
             buffer_cls = TorchCommsRdmaTransportBuffer
+        elif gloo_available():
+            buffer_cls = GlooTransportBuffer
         elif rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
@@ -205,13 +209,23 @@ class Pipe:
             await transport_buffer.handshake(tensor, self.storage_volume_ref)
             if isinstance(transport_buffer, TorchCommsRdmaTransportBuffer):
                 transport_buffer.allocate_source(tensor)
+            elif isinstance(transport_buffer, GlooTransportBuffer):
+                # For Gloo, start send concurrently with RPC
+                # Storage will recv during RPC, and client's send will complete
+                transport_buffer.allocate_source(tensor)
+                send_task = asyncio.create_task(
+                    transport_buffer.write_from(tensor, self.transport_context)
+                )
+                await self.storage_volume.put.call_one(
+                    key, transport_buffer, request.meta_only()
+                )
+                await send_task
             else:
                 transport_buffer.allocate(tensor)
                 await transport_buffer.write_from(tensor, self.transport_context)
-
-            await self.storage_volume.put.call_one(
-                key, transport_buffer, request.meta_only()
-            )
+                await self.storage_volume.put.call_one(
+                    key, transport_buffer, request.meta_only()
+                )
         finally:
             # Clean up the transport buffer after the put operation completes
             # This is critical for RDMA buffers to deregister memory regions
@@ -221,6 +235,7 @@ class Pipe:
         transport_buffer = self.create_transport_buffer()
         # TODO @lucas/@amir: remove this after pipe refactor
         is_torchcomms_rdma = isinstance(transport_buffer, TorchCommsRdmaTransportBuffer)
+        is_gloo = isinstance(transport_buffer, GlooTransportBuffer)
 
         try:
             await transport_buffer.handshake(
@@ -228,7 +243,7 @@ class Pipe:
             )
             allocate = (
                 transport_buffer.allocate_dest
-                if is_torchcomms_rdma
+                if is_torchcomms_rdma or is_gloo
                 else transport_buffer.allocate
             )
 
@@ -244,22 +259,39 @@ class Pipe:
             else:
                 allocate(request.tensor_val)
 
-            # TODO: consider placing the buffer inside the request or vice versa
-            transport_buffer.update(
-                await self.storage_volume.get.call_one(
-                    key, transport_buffer, request.meta_only()
+            if is_gloo:
+                # For Gloo, start recv concurrently with RPC
+                # Storage will send during RPC, and client's recv will complete
+                recv_task = asyncio.create_task(
+                    transport_buffer.read_into(None, self.transport_context)
                 )
-            )
-
-            if transport_buffer.is_object:
-                return transport_buffer.objects
-
-            if not is_torchcomms_rdma:
-                return await transport_buffer.read_into(
-                    request.tensor_val, self.transport_context
+                transport_buffer.update(
+                    await self.storage_volume.get.call_one(
+                        key, transport_buffer, request.meta_only()
+                    )
                 )
-            else:
+                if transport_buffer.is_object:
+                    recv_task.cancel()
+                    return transport_buffer.objects
+                await recv_task
                 return transport_buffer.tensor_ref
+            else:
+                # TODO: consider placing the buffer inside the request or vice versa
+                transport_buffer.update(
+                    await self.storage_volume.get.call_one(
+                        key, transport_buffer, request.meta_only()
+                    )
+                )
+
+                if transport_buffer.is_object:
+                    return transport_buffer.objects
+
+                if is_torchcomms_rdma:
+                    return transport_buffer.tensor_ref
+                else:
+                    return await transport_buffer.read_into(
+                        request.tensor_val, self.transport_context
+                    )
         finally:
             # Clean up the transport buffer after the get operation completes
             # This is critical for RDMA buffers to deregister memory regions
