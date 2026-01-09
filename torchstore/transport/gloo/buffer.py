@@ -260,7 +260,15 @@ class GlooTransportBuffer(TransportBuffer):
                     tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
                 )
             else:
-                self.tensor_ref = tensor_like
+                # Gloo TCP transport requires CPU tensors for recv
+                if tensor_like.device.type != "cpu":
+                    self.tensor_ref = torch.zeros(
+                        tensor_like.shape,
+                        dtype=tensor_like.dtype,
+                        device=torch.device("cpu"),
+                    )
+                else:
+                    self.tensor_ref = tensor_like
 
     def allocate_source(self, tensor: Optional[torch.Tensor]) -> None:
         """Called by client for PUT operations. Prepare source tensor for sending."""
@@ -285,6 +293,12 @@ class GlooTransportBuffer(TransportBuffer):
                 tensor = torch.zeros(
                     self.shape, dtype=self.dtype, device=torch.device("cpu")
                 )
+
+        # Gloo TCP transport requires CPU tensors for recv
+        if tensor.device.type != "cpu":
+            tensor = torch.zeros(
+                tensor.shape, dtype=tensor.dtype, device=torch.device("cpu")
+            )
 
         # Get process group from transport context
         ctx = transport_context.get_transport_context()
@@ -316,6 +330,10 @@ class GlooTransportBuffer(TransportBuffer):
 
         if tensor is None:
             return
+
+        # Gloo TCP transport requires CPU tensors
+        if tensor.device.type != "cpu":
+            tensor = tensor.cpu()
 
         # Get process group from transport context
         ctx = transport_context.get_transport_context()

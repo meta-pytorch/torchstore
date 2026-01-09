@@ -197,6 +197,7 @@ class Pipe:
             buffer_cls = RDMATransportBuffer
         else:
             buffer_cls = MonarchTransportBuffer
+        logger.info(f"Creating transport buffer: {buffer_cls.__name__}")
         return buffer_cls()
 
     async def put_to_storage_volume(self, key, request: Request):
