@@ -332,6 +332,7 @@ class GlooTransportBuffer(TransportBuffer):
         self, tensor: Optional[torch.Tensor], transport_context: "TransportContext"
     ) -> None:
         """Send tensor via gloo. Waits for send to complete before returning."""
+
         if self.is_object:
             return
 
@@ -347,6 +348,7 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Get process group from transport context
         ctx = transport_context.get_transport_context()
+        print(f"ctx.keys(): {ctx.keys()}")
         pg = ctx[self.store_key]
 
         # Determine remote rank based on our rank in the PG
