@@ -61,7 +61,6 @@ class TransportType(Enum):
     MonarchRPC = auto()
     MonarchRDMA = auto()
     TorchCommsRDMA = auto()
-    NIXL = auto()
 
 
 class TransportBuffer:
@@ -183,13 +182,13 @@ class RDMATransportBuffer(TransportBuffer):
             return
         elif isinstance(tensor_like, Tuple):
             # we know the size of the tensor from fetching metadata
-            tensor = torch.empty(
+            tensor = torch.zeros(
                 tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
             )
         else:
             # we have an inplace tensor, allocate a copy
             assert isinstance(tensor_like, torch.Tensor)
-            tensor = torch.empty_like(tensor_like, device=torch.device("cpu"))
+            tensor = torch.zeros_like(tensor_like, device=torch.device("cpu"))
 
         # store tensor meta
         self.shape = tensor.shape
@@ -200,7 +199,7 @@ class RDMATransportBuffer(TransportBuffer):
 
         byte_view_chunks = self._create_byte_views_from_tensor(tensor)
         self.tensor_refs = [
-            torch.empty_like(chunk, device=torch.device("cpu"))
+            torch.zeros_like(chunk, device=torch.device("cpu"))
             for chunk in byte_view_chunks
         ]
         self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
@@ -219,7 +218,7 @@ class RDMATransportBuffer(TransportBuffer):
     ) -> torch.Tensor:
         if tensor is None:
             # allocate a tensor to return
-            tensor = torch.empty(
+            tensor = torch.zeros(
                 self.shape, dtype=self.dtype, device=torch.device("cpu")
             )
 
