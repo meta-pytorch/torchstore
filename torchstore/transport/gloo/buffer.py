@@ -36,8 +36,11 @@ def _find_free_port() -> int:
 
 
 def _get_hostname() -> str:
-    """Get the hostname of the local machine."""
-    return socket.gethostname()
+    """Get the fully qualified hostname of the local machine.
+
+    Uses FQDN to ensure hostname is resolvable from other nodes in multi-node setups.
+    """
+    return socket.getfqdn()
 
 
 def _gloo_factory(
@@ -308,12 +311,19 @@ class GlooTransportBuffer(TransportBuffer):
         my_rank = pg.rank()
         remote_rank = 1 - my_rank
 
+        logger.debug(
+            f"read_into: receiving tensor shape={tensor.shape} dtype={tensor.dtype} "
+            f"from rank {remote_rank} (my_rank={my_rank}, store_key={self.store_key})"
+        )
+
         # Run recv in thread and wait for completion
         def do_recv():
             work = pg.recv([tensor], srcRank=remote_rank, tag=0)
             work.wait()
 
         await asyncio.to_thread(do_recv)
+
+        logger.debug(f"read_into: completed receiving tensor shape={tensor.shape}")
 
         self.tensor_ref = tensor
         return tensor
@@ -343,12 +353,19 @@ class GlooTransportBuffer(TransportBuffer):
         my_rank = pg.rank()
         remote_rank = 1 - my_rank
 
+        logger.debug(
+            f"write_from: sending tensor shape={tensor.shape} dtype={tensor.dtype} "
+            f"to rank {remote_rank} (my_rank={my_rank}, store_key={self.store_key})"
+        )
+
         # Run send in thread and wait for completion
         def do_send():
             work = pg.send([tensor], dstRank=remote_rank, tag=0)
             work.wait()
 
         await asyncio.to_thread(do_send)
+
+        logger.debug(f"write_from: completed sending tensor shape={tensor.shape}")
 
     async def drop(self) -> None:
         """Clean up resources held by this buffer."""
