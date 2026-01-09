@@ -349,7 +349,10 @@ class GlooTransportBuffer(TransportBuffer):
         # Get process group from transport context
         ctx = transport_context.get_transport_context()
         print(f"ctx.keys(): {ctx.keys()}")
-        pg = ctx[self.store_key]
+        try:
+            pg = ctx[self.store_key]
+        except Exception as e:
+            raise RuntimeError(f"ctx.keys(): {ctx.keys()}") from e
 
         # Determine remote rank based on our rank in the PG
         my_rank = pg.rank()
