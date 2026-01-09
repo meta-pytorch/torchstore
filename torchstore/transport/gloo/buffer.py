@@ -5,13 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import socket
 import uuid
 from datetime import timedelta
 from logging import getLogger
 from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
-from torch.distributed import ProcessGroup, ProcessGroupGloo, Store
+from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
 from torchstore.transport.buffers import TransportBuffer
 
 if TYPE_CHECKING:
@@ -22,7 +23,21 @@ if TYPE_CHECKING:
 logger = getLogger(__name__)
 
 # Global caches
-_file_store_names: Dict[str, str] = {}  # volume_id -> file_store_name
+_store_addrs: Dict[str, Tuple[str, int]] = {}  # volume_id -> (master_addr, master_port)
+
+
+def _find_free_port() -> int:
+    """Find a free port on the local machine."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
+
+
+def _get_hostname() -> str:
+    """Get the hostname of the local machine."""
+    return socket.gethostname()
 
 
 def _gloo_factory(
@@ -62,15 +77,14 @@ class GlooTransportBuffer(TransportBuffer):
     """Transport buffer implementation using PyTorch distributed (gloo backend) for tensor transfer.
 
     This buffer creates a dedicated 2-process gloo process group between the client
-    and storage volume for each connection using FileStore for coordination.
+    and storage volume for each connection using TCPStore for coordination.
 
     Prerequisites:
     - TORCHSTORE_GLOO_ENABLED=1 environment variable must be set
-    - Shared filesystem access between client and storage (for FileStore)
+    - Network connectivity between client and storage (for TCPStore)
     """
 
     requires_meta: bool = True
-    read_ahead: bool = False  # Disable read_ahead - we handle it differently
 
     def __init__(self) -> None:
         # Tensor metadata
@@ -78,7 +92,9 @@ class GlooTransportBuffer(TransportBuffer):
         self.dtype: Optional[torch.dtype] = None
 
         # Process group coordination
-        self.file_store_name: Optional[str] = None
+        self.master_addr: Optional[str] = None
+        self.master_port: Optional[int] = None
+        self.store_key: Optional[str] = None  # Unique key for this connection
         self.transport_context: Optional[Dict[str, Any]] = None
 
         # Local tensor reference
@@ -99,32 +115,42 @@ class GlooTransportBuffer(TransportBuffer):
     ) -> None:
         """Establish a gloo process group with the storage volume.
 
-        Uses FileStore for coordination. Both sides create their ProcessGroups
+        Uses TCPStore for coordination. Both sides create their ProcessGroups
         in parallel using non-blocking RPC.
         """
         volume_id = volume_ref.volume_id
 
-        if volume_id not in _file_store_names:
-            # Generate unique file store path
-            file_store_name = f"/tmp/torchstore_gloo_{str(uuid.uuid4())[:8]}"
+        if volume_id not in _store_addrs:
+            # Generate unique store key and find free port
+            store_key = f"torchstore_gloo_{str(uuid.uuid4())[:8]}"
+            master_addr = _get_hostname()
+            master_port = _find_free_port()
 
             logger.info(
                 f"Initiating gloo handshake with StorageVolume:[{volume_id}] "
-                f"using file_store={file_store_name}"
+                f"using TCPStore at {master_addr}:{master_port}"
             )
 
-            self.file_store_name = file_store_name
+            self.master_addr = master_addr
+            self.master_port = master_port
+            self.store_key = store_key
 
             # Start storage-side setup via non-blocking RPC
             handshake_fut = volume_ref.volume.handshake.call(self)
 
             try:
-                # Create FileStore and ProcessGroup on client side (rank 0)
+                # Create TCPStore and ProcessGroup on client side (rank 0, master)
                 # Run in thread to avoid blocking event loop
                 def create_pg():
-                    file_store = torch.distributed.FileStore(file_store_name, 2)
+                    tcp_store = TCPStore(
+                        host_name=master_addr,
+                        port=master_port,
+                        world_size=2,
+                        is_master=True,
+                        timeout=timedelta(seconds=120),
+                    )
                     return _gloo_factory(
-                        store=file_store,
+                        store=tcp_store,
                         rank=0,
                         world_size=2,
                         timeout=timedelta(seconds=120),
@@ -133,11 +159,9 @@ class GlooTransportBuffer(TransportBuffer):
 
                 pg = await asyncio.to_thread(create_pg)
 
-                # Cache the file store name and process group
-                _file_store_names[volume_id] = file_store_name
-                volume_ref.transport_context.get_transport_context()[
-                    file_store_name
-                ] = pg
+                # Cache the store address and process group
+                _store_addrs[volume_id] = (master_addr, master_port)
+                volume_ref.transport_context.get_transport_context()[store_key] = pg
 
             finally:
                 # Wait for storage side to complete
@@ -146,7 +170,14 @@ class GlooTransportBuffer(TransportBuffer):
             logger.info(f"Finished gloo handshake with StorageVolume:[{volume_id}]")
 
         # Set up instance state for this operation
-        self.file_store_name = _file_store_names[volume_id]
+        cached_addr = _store_addrs[volume_id]
+        self.master_addr = cached_addr[0]
+        self.master_port = cached_addr[1]
+        # Look up store_key from context keys
+        for key in volume_ref.transport_context.get_transport_context().keys():
+            if isinstance(key, str) and key.startswith("torchstore_gloo_"):
+                self.store_key = key
+                break
         self.transport_context = volume_ref.transport_context.get_transport_context()
 
     async def recv_handshake(
@@ -154,29 +185,37 @@ class GlooTransportBuffer(TransportBuffer):
     ) -> Optional[Any]:
         """Called on storage volume side to set up the process group.
 
-        Creates FileStore and ProcessGroup on storage side (rank 1).
+        Creates TCPStore and ProcessGroup on storage side (rank 1).
         """
         ctx = transport_context.get_transport_context()
 
-        if self.file_store_name in ctx:
+        if self.store_key in ctx:
             logger.debug(
-                f"Reusing existing gloo process group for file_store={self.file_store_name}"
+                f"Reusing existing gloo process group for store_key={self.store_key}"
             )
             self.transport_context = ctx
             return None
 
         logger.info(
-            f"Storage volume setting up gloo process group with file_store={self.file_store_name}"
+            f"Storage volume setting up gloo process group with TCPStore at "
+            f"{self.master_addr}:{self.master_port}"
         )
 
-        # Create FileStore and ProcessGroup on storage side (rank 1)
+        # Create TCPStore and ProcessGroup on storage side (rank 1, worker)
         # Run in thread to avoid blocking event loop
-        file_store_name = self.file_store_name
+        master_addr = self.master_addr
+        master_port = self.master_port
 
         def create_pg():
-            file_store = torch.distributed.FileStore(file_store_name, 2)
+            tcp_store = TCPStore(
+                host_name=master_addr,
+                port=master_port,
+                world_size=2,
+                is_master=False,
+                timeout=timedelta(seconds=120),
+            )
             return _gloo_factory(
-                store=file_store,
+                store=tcp_store,
                 rank=1,
                 world_size=2,
                 timeout=timedelta(seconds=120),
@@ -186,13 +225,13 @@ class GlooTransportBuffer(TransportBuffer):
         pg = await asyncio.to_thread(create_pg)
 
         # Cache the process group
-        ctx[self.file_store_name] = pg
+        ctx[self.store_key] = pg
 
         # Set instance state
         self.transport_context = ctx
 
         logger.info(
-            f"Storage volume finished gloo process group setup for file_store={self.file_store_name}"
+            f"Storage volume finished gloo process group setup for store_key={self.store_key}"
         )
 
         return None
@@ -217,7 +256,7 @@ class GlooTransportBuffer(TransportBuffer):
         self.allocate(tensor_like)
         if not self.is_object:
             if isinstance(tensor_like, Tuple):
-                self.tensor_ref = torch.empty(
+                self.tensor_ref = torch.zeros(
                     tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
                 )
             else:
@@ -243,13 +282,13 @@ class GlooTransportBuffer(TransportBuffer):
             if self.tensor_ref is not None:
                 tensor = self.tensor_ref
             else:
-                tensor = torch.empty(
+                tensor = torch.zeros(
                     self.shape, dtype=self.dtype, device=torch.device("cpu")
                 )
 
         # Get process group from transport context
         ctx = transport_context.get_transport_context()
-        pg = ctx[self.file_store_name]
+        pg = ctx[self.store_key]
 
         # Determine remote rank based on our rank in the PG
         my_rank = pg.rank()
@@ -280,7 +319,7 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Get process group from transport context
         ctx = transport_context.get_transport_context()
-        pg = ctx[self.file_store_name]
+        pg = ctx[self.store_key]
 
         # Determine remote rank based on our rank in the PG
         my_rank = pg.rank()

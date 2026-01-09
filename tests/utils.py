@@ -62,7 +62,7 @@ def transport_plus_strategy_params(with_host_strategy: bool = False):
         strategies.append((1, HostStrategy()))
 
     # Only run monarch/torchcomms/gloo tests if their respective env vars are set. Enabled by default.
-    enabled_transport_types = [TransportType.MonarchRPC]
+    enabled_transport_types = [TransportType.Gloo]
     # if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
     #     enabled_transport_types.append(TransportType.MonarchRDMA)
     # if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
