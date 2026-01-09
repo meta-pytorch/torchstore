@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from monarch.actor import Actor, endpoint
+
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
@@ -252,6 +253,7 @@ class InMemoryStore(StorageImpl):
         if request.is_object:
             self.kv[key] = {"obj": request.objects}
             return
+
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
         tensor = await transport_buffer.read_into(None, self.transport_context)
