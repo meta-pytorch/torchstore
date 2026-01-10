@@ -116,6 +116,9 @@ class ModelTest(Actor):
         t = time.perf_counter()
         await ts.get_state_dict("v0", state_dict)
         self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
+        t = time.perf_counter()
+        await ts.get_state_dict("v0", state_dict)
+        self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
