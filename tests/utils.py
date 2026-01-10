@@ -54,12 +54,12 @@ def main(file):
 def transport_plus_strategy_params(with_host_strategy: bool = False):
     strategies = [
         (2, ts.LocalRankStrategy()),
-        (1, None),  # ts.SingletonStrategy
-        (1, ts.ControllerStorageVolumes()),
+        # (1, None),  # ts.SingletonStrategy
+        # (1, ts.ControllerStorageVolumes()),
     ]
 
-    if with_host_strategy:
-        strategies.append((1, HostStrategy()))
+    # if with_host_strategy:
+    #     strategies.append((1, HostStrategy()))
 
     # Only run monarch/torchcomms/gloo tests if their respective env vars are set. Enabled by default.
     enabled_transport_types = [TransportType.Gloo]

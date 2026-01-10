@@ -163,7 +163,7 @@ class GlooTransportBuffer(TransportBuffer):
                 pg = await asyncio.to_thread(create_pg)
 
                 # Cache the store address and process group
-                _store_addrs[volume_id] = (master_addr, master_port)
+                _store_addrs[volume_id] = (master_addr, master_port, store_key)
                 volume_ref.transport_context.get_transport_context()[store_key] = pg
 
             finally:
@@ -176,11 +176,21 @@ class GlooTransportBuffer(TransportBuffer):
         cached_addr = _store_addrs[volume_id]
         self.master_addr = cached_addr[0]
         self.master_port = cached_addr[1]
+        self.store_key = cached_addr[2]
         # Look up store_key from context keys
-        for key in volume_ref.transport_context.get_transport_context().keys():
-            if isinstance(key, str) and key.startswith("torchstore_gloo_"):
-                self.store_key = key
-                break
+        # needs to be unique to storage volume
+        print(
+            f"volume_ref.transport_context.get_transport_context().keys(): {volume_ref.transport_context.get_transport_context().keys()}"
+        )
+        # for key in volume_ref.transport_context.get_transport_context().keys():
+        #     print()
+        #     if isinstance(key, str) and key.startswith("torchstore_gloo_"):
+        #         self.store_key = key
+        #         break
+
+        # self.store_key = list(
+        #     volume_ref.transport_context.get_transport_context()[volume_id].keys()
+        # )[0]
         self.transport_context = volume_ref.transport_context.get_transport_context()
 
     async def recv_handshake(

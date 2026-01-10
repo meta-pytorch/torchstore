@@ -10,7 +10,6 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from monarch.actor import Actor, endpoint
-
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
@@ -277,7 +276,9 @@ class InMemoryStore(StorageImpl):
             return transport_buffer
 
         if request.tensor_slice is None:
-            await transport_buffer.write_from(self.kv[key], self.transport_context)
+            await transport_buffer.write_from(
+                self.kv[key], self.transport_context
+            )  # send
             return transport_buffer
 
         extracted_tensor = self._get_sharded_tensor(request, key)
