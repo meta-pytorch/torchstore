@@ -34,7 +34,7 @@ jobs:
         run: python -m pip install --upgrade pip
       - name: Install torchstore
         run: pip install uv && uv pip install . && uv pip install .[dev]
-      - name: Run slice tests (test_slice.py) with coverage
+      - name: Run tensor slice tests (test_tensor_slice.py) with coverage
         run: |
           TORCHSTORE_RDMA_ENABLED=0 \
           USE_TORCHCOMMS_RDMA=0 \
