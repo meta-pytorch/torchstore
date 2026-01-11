@@ -24,9 +24,9 @@ if TYPE_CHECKING:
 logger = getLogger(__name__)
 
 # Global cache
-_store_addrs: Dict[str, Tuple[str, int]] = (
-    {}
-)  # volume_id -> (master_addr, master_port, store_key)
+_store_addrs: Dict[
+    str, Tuple[str, int]
+] = {}  # volume_id -> (master_addr, master_port, store_key)
 
 
 def _find_free_port() -> int:
@@ -349,6 +349,10 @@ class GlooTransportBuffer(TransportBuffer):
         # Gloo TCP transport requires CPU tensors
         if tensor.device.type != "cpu":
             tensor = tensor.cpu()
+
+        # Gloo requires contiguous tensors (slices may be non-contiguous views)
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
 
         # Get process group from transport context
         ctx = transport_context.get_transport_context()
