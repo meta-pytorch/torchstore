@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Gloo Tensor Send Benchmark Example (Two Nodes via Slurm)
+Gloo Tensor Send Benchmark Example (Cross node via Slurm)
 =========================================================
 
 This example demonstrates sending a 1GB tensor between two processes on different
@@ -16,10 +16,8 @@ Usage:
     python example/send_tensor_gloo_multinode_slurm.py
 """
 
-import argparse
 import asyncio
 import atexit
-import os
 import time
 
 from monarch.actor import Actor, endpoint, HostMesh
@@ -88,7 +86,7 @@ class GlooWorker(Actor):
 
         if rank == 0:
             # Send tensor to rank 1
-            print(f"Rank 0: Sending 1GB tensor to rank 1...")
+            print("Rank 0: Sending 1GB tensor to rank 1...")
             start_time = time.time()
             dist.send(tensor=tensor, dst=1)
             end_time = time.time()
@@ -106,7 +104,7 @@ class GlooWorker(Actor):
         elif rank == 1:
             # Prepare empty tensor to receive
             recv_tensor = torch.empty(num_elements, dtype=torch.float32)
-            print(f"Rank 1: Waiting to receive 1GB tensor from rank 0...")
+            print("Rank 1: Waiting to receive 1GB tensor from rank 0...")
             start_time = time.time()
             dist.recv(tensor=recv_tensor, src=0)
             end_time = time.time()
@@ -119,9 +117,9 @@ class GlooWorker(Actor):
             # Verify the tensor was received correctly
             verified = bool(torch.all(recv_tensor == 1.0))
             if verified:
-                print(f"Rank 1: Tensor verified successfully!")
+                print("Rank 1: Tensor verified successfully!")
             else:
-                print(f"Rank 1: Warning - tensor values don't match expected!")
+                print("Rank 1: Warning - tensor values don't match expected!")
 
             result = {
                 "rank": rank,
@@ -233,11 +231,6 @@ async def benchmark_gloo_tensor_send() -> None:
 
 
 async def main():
-    parser = argparse.ArgumentParser(
-        description="Benchmark Gloo tensor send between two nodes via Slurm"
-    )
-    args = parser.parse_args()
-
     print(f"{'#' * 60}")
     print("# Benchmarking 1GB tensor send using Gloo on two nodes")
     print(f"{'#' * 60}\n")

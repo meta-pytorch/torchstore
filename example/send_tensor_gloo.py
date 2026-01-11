@@ -1,7 +1,17 @@
-import torch
-import torch.distributed as dist
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# torchrun --nproc_per_node=2 example/send_tensor_gloo.py
+
 import os
 import time
+
+import torch
+import torch.distributed as dist
+
 
 def main():
     rank = int(os.environ["RANK"])
@@ -22,7 +32,9 @@ def main():
         dist.send(tensor=tensor, dst=1)
         end_time = time.time()
         elapsed = end_time - start_time
-        print(f"Rank 0 sent 1GB tensor to rank 1 in {elapsed:.4f} seconds ({1.0/elapsed:.2f} GB/s)")
+        print(
+            f"Rank 0 sent 1GB tensor to rank 1 in {elapsed:.4f} seconds ({1.0/elapsed:.2f} GB/s)"
+        )
     elif dist.get_rank() == 1:
         # Prepare empty tensor to receive
         recv_tensor = torch.empty(num_elements, dtype=torch.float32)
@@ -30,17 +42,12 @@ def main():
         dist.recv(tensor=recv_tensor, src=0)
         end_time = time.time()
         elapsed = end_time - start_time
-        print(f"Rank 1 received 1GB tensor from rank 0 in {elapsed:.4f} seconds ({1.0/elapsed:.2f} GB/s)")
+        print(
+            f"Rank 1 received 1GB tensor from rank 0 in {elapsed:.4f} seconds ({1.0/elapsed:.2f} GB/s)"
+        )
 
     dist.destroy_process_group()
 
+
 if __name__ == "__main__":
     main()
-
-
-# torchrun --nproc_per_node=2 example/send_tensor_gloo.py
-# measure throughtput for 1GB tensor using monarch and using gloo
-# time two different hosts monarch
-
-# other host.receive tensor
-# 

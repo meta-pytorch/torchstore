@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Tensor Send Benchmark Example (Two Nodes via Slurm)
+Tensor Send Benchmark Example (Cross node via Slurm)
 ====================================================
 
 This example demonstrates sending a 1GB tensor between actors on two different
@@ -14,14 +14,14 @@ nodes allocated via Slurm, and timing the operation.
 Usage:
     python example/send_tensor_monarch_rpc_multinode.py
 """
-import os 
 import argparse
 import asyncio
 import atexit
+import os
 import time
 
 import torch
-from monarch.actor import Actor, endpoint, HostMesh, ProcMesh
+from monarch.actor import Actor, endpoint, HostMesh
 from monarch.job import SlurmJob
 
 
@@ -132,7 +132,9 @@ async def benchmark_tensor_send(
                 elapsed = await receiver.receive_tensor.call_one()
                 latencies.append(elapsed)
                 throughput = tensor_size_gb / elapsed
-                print(f"  Iteration {i + 1}: {elapsed * 1000:.3f} ms ({throughput:.2f} GB/s)")
+                print(
+                    f"  Iteration {i + 1}: {elapsed * 1000:.3f} ms ({throughput:.2f} GB/s)"
+                )
 
             # Verify the tensor was received correctly
             shape = await receiver.get_tensor_shape.call_one()
