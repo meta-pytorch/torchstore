@@ -24,9 +24,9 @@ if TYPE_CHECKING:
 logger = getLogger(__name__)
 
 # Global cache
-_store_addrs: Dict[
-    str, Tuple[str, int]
-] = {}  # volume_id -> (master_addr, master_port, store_key)
+_store_addrs: Dict[str, Tuple[str, int]] = (
+    {}
+)  # volume_id -> (master_addr, master_port, store_key)
 
 
 def _find_free_port() -> int:
@@ -193,9 +193,6 @@ class GlooTransportBuffer(TransportBuffer):
 
         if self.store_key in ctx:
             raise RuntimeError("this shouldnt happen")
-            # logger.debug(
-            #     f"Reusing existing gloo process group for store_key={self.store_key}"
-            # )
 
         logger.info(
             f"Storage volume setting up gloo process group with TCPStore at "
@@ -356,7 +353,7 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Get process group from transport context
         ctx = transport_context.get_transport_context()
-        print(f"ctx.keys(): {ctx.keys()}")
+
         try:
             pg = ctx[self.store_key]
         except Exception as e:
