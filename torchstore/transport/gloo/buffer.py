@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
+
 from torchstore.transport.buffers import TransportBuffer
 
 if TYPE_CHECKING:
@@ -98,7 +99,7 @@ class GlooTransportBuffer(TransportBuffer):
         self.master_addr: Optional[str] = None
         self.master_port: Optional[int] = None
         self.store_key: Optional[str] = None  # Unique key for this connection
-        self.transport_context: Optional[Dict[str, Any]] = None
+        # self.transport_context: Optional[Dict[str, Any]] = None
 
         # Local tensor reference
         self.tensor_ref: Optional[torch.Tensor] = None
@@ -179,19 +180,7 @@ class GlooTransportBuffer(TransportBuffer):
         self.store_key = cached_addr[2]
         # Look up store_key from context keys
         # needs to be unique to storage volume
-        print(
-            f"volume_ref.transport_context.get_transport_context().keys(): {volume_ref.transport_context.get_transport_context().keys()}"
-        )
-        # for key in volume_ref.transport_context.get_transport_context().keys():
-        #     print()
-        #     if isinstance(key, str) and key.startswith("torchstore_gloo_"):
-        #         self.store_key = key
-        #         break
-
-        # self.store_key = list(
-        #     volume_ref.transport_context.get_transport_context()[volume_id].keys()
-        # )[0]
-        self.transport_context = volume_ref.transport_context.get_transport_context()
+        # self.transport_context = volume_ref.transport_context.get_transport_context()
 
     async def recv_handshake(
         self, transport_context: "TransportContext"
@@ -199,15 +188,19 @@ class GlooTransportBuffer(TransportBuffer):
         """Called on storage volume side to set up the process group.
 
         Creates TCPStore and ProcessGroup on storage side (rank 1).
+
+        transport_context: the TransportContext from the StorageVolume to which the pg will be added
+
         """
         ctx = transport_context.get_transport_context()
 
         if self.store_key in ctx:
+            raise RuntimeError("this shouldnt happen")
             logger.debug(
                 f"Reusing existing gloo process group for store_key={self.store_key}"
             )
-            self.transport_context = ctx
-            return None
+        # self.transport_context = ctx
+        # return None
 
         logger.info(
             f"Storage volume setting up gloo process group with TCPStore at "
@@ -241,7 +234,7 @@ class GlooTransportBuffer(TransportBuffer):
         ctx[self.store_key] = pg
 
         # Set instance state
-        self.transport_context = ctx
+        # sport_context = ctx
 
         logger.info(
             f"Storage volume finished gloo process group setup for store_key={self.store_key}"

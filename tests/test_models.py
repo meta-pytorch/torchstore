@@ -36,8 +36,8 @@ pytestmark = pytest.mark.skipif(
     reason="HF_TOKEN not available - skipping Transformers model tests",
 )
 
-# TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
-TEST_MODEL = "meta-llama/Llama-3.1-8B"  # ~ 16GB
+TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
+# TEST_MODEL = "meta-llama/Llama-3.1-8B" # ~ 16GB
 
 
 class ModelTest(Actor):
@@ -113,9 +113,6 @@ class ModelTest(Actor):
         if self.world_size > 1:
             torch.distributed.barrier()
         self.rlog("getting state dict")
-        t = time.perf_counter()
-        await ts.get_state_dict("v0", state_dict)
-        self.rlog(f"got state dict in {time.perf_counter() - t} seconds")
         t = time.perf_counter()
         await ts.get_state_dict("v0", state_dict)
         self.rlog(f"got state dict in {time.perf_counter() - t} seconds")

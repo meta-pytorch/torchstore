@@ -17,9 +17,6 @@ def gloo_available() -> bool:
     2. torch.distributed is available
     3. gloo backend is available
 
-    Note: Unlike the previous implementation, this no longer requires a
-    pre-initialized process group. The GlooTransportBuffer creates its
-    own dedicated process group per client-storage connection.
     """
     gloo_enabled = os.environ.get("TORCHSTORE_GLOO_ENABLED", "0") == "1"
     if not gloo_enabled:
