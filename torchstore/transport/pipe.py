@@ -15,8 +15,10 @@ from torch.distributed.tensor._utils import _compute_local_shape_and_global_offs
 from torch.distributed.tensor.placement_types import Replicate
 
 if TYPE_CHECKING:
+    from torchstore.state_dict_utils import TorchStoreStateDict
     from torchstore.strategy import StorageVolumeRef
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import (
     MonarchTransportBuffer,
     rdma_available,
@@ -87,6 +89,24 @@ class TensorSlice:
             )
         )
 
+    @classmethod
+    def from_dtensor(cls, dtensor: DTensor) -> "TensorSlice":
+        coordinates = dtensor.device_mesh.get_coordinate()
+        _, offsets = _compute_local_shape_and_global_offset(
+            dtensor.shape,
+            mesh_shape=dtensor.device_mesh.shape,
+            my_coordinate=coordinates,
+            placements=dtensor.placements,
+        )
+
+        return cls(
+            offsets=offsets,
+            coordinates=coordinates,
+            global_shape=dtensor.shape,
+            local_shape=dtensor._local_tensor.shape,
+            mesh_shape=dtensor.device_mesh.shape,
+        )
+
 
 @dataclass
 class Request:
@@ -99,15 +119,20 @@ class Request:
             including offsets, coordinates, and shape information.
         objects (Optional[Any]): Arbitrary Python objects that must be pickleable.
         is_object (bool): Flag indicating whether this request contains a non-tensor object.
+        is_tssd (bool): Flag indicating whether this request contains a TorchStoreStateDict object.
     """
 
     tensor_val: Optional[torch.Tensor] = None
     tensor_slice: Optional[TensorSlice] = None
     objects: Optional[Any] = None  # Any, but must be pickleable.
     is_object: bool = False
+    is_tssd: bool = False
 
     @classmethod
     def from_any(cls, value: torch.Tensor | DTensor | None) -> "Request":
+
+        from torchstore.state_dict_utils import TorchStoreStateDict
+
         if isinstance(value, DTensor):
             # Check if DTensor is fully local (not actually distributed)
             # If so, treat it as a regular tensor to avoid collective requirements
@@ -125,6 +150,8 @@ class Request:
                 request = cls.from_dtensor(value)
         elif isinstance(value, torch.Tensor):
             request = cls.from_tensor(value)
+        elif isinstance(value, TorchStoreStateDict):
+            request = cls.from_tssd(value)
         else:
             # TODO: consolidate this path for the None case
             request = cls.from_objects(value)
@@ -132,22 +159,14 @@ class Request:
         return request
 
     @classmethod
-    def from_dtensor(cls, dtensor: DTensor) -> "Request":
-        coordinates = dtensor.device_mesh.get_coordinate()
-        _, offsets = _compute_local_shape_and_global_offset(
-            dtensor.shape,
-            mesh_shape=dtensor.device_mesh.shape,
-            my_coordinate=coordinates,
-            placements=dtensor.placements,
+    def from_tssd(cls, tssd: "TorchStoreStateDict") -> "Request":
+        return cls(
+            tensor_val=tssd.tensor_blob, objects=tssd.metadata_state_dict, is_tssd=True
         )
 
-        tensor_slice = TensorSlice(
-            offsets,
-            coordinates,
-            dtensor.shape,
-            dtensor._local_tensor.shape,
-            dtensor.device_mesh.shape,
-        )
+    @classmethod
+    def from_dtensor(cls, dtensor: DTensor) -> "Request":
+        tensor_slice = TensorSlice.from_dtensor(dtensor)
         return cls(
             tensor_val=dtensor._local_tensor,
             tensor_slice=tensor_slice,
@@ -172,6 +191,7 @@ class Request:
             tensor_slice=self.tensor_slice,
             objects=self.objects,
             is_object=self.is_object,
+            is_tssd=self.is_tssd,
         )
 
 
@@ -188,7 +208,9 @@ class Pipe:
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
         if torchcomms_rdma_available():
-            buffer_cls = TorchCommsRdmaTransportBuffer
+            buffer_cls: type[
+                TorchCommsRdmaTransportBuffer
+            ] = TorchCommsRdmaTransportBuffer
         elif rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
@@ -196,6 +218,7 @@ class Pipe:
         return buffer_cls()
 
     async def put_to_storage_volume(self, key, request: Request):
+        latency_tracker = LatencyTracker(f"put_to_storage_volume:{key}")
         transport_buffer = self.create_transport_buffer()
         tensor = request.tensor_val
 
@@ -203,15 +226,18 @@ class Pipe:
         # via monarch RPC since that would generate considerable overhead
         try:
             await transport_buffer.handshake(tensor, self.storage_volume_ref)
+            latency_tracker.track_step("handshake")
             if isinstance(transport_buffer, TorchCommsRdmaTransportBuffer):
                 transport_buffer.allocate_source(tensor)
             else:
                 transport_buffer.allocate(tensor)
                 await transport_buffer.write_from(tensor, self.transport_context)
-
+            latency_tracker.track_step("allocate_and_write")
             await self.storage_volume.put.call_one(
                 key, transport_buffer, request.meta_only()
             )
+            latency_tracker.track_step("storage_volume_put")
+            latency_tracker.track_e2e()
         finally:
             # Clean up the transport buffer after the put operation completes
             # This is critical for RDMA buffers to deregister memory regions

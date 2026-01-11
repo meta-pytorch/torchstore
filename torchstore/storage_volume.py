@@ -11,6 +11,12 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 from monarch.actor import Actor, endpoint
 
+from torchstore.logging import init_logging, LatencyTracker
+from torchstore.state_dict_utils import (
+    DELIM,
+    TensorMetadata,
+    unpack_metadata_state_dict,
+)
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.pipe import Request, TensorSlice
 from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
@@ -121,6 +127,7 @@ class InMemoryStore(StorageImpl):
 
     def __init__(self) -> None:
         self.kv: Dict[str, Any] = {}
+        init_logging()
         super().__init__()
 
     async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
@@ -194,6 +201,8 @@ class InMemoryStore(StorageImpl):
     def _handle_dtensor(
         self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
     ) -> None:
+        """Stores dtensor in kv; but stores it as a regular tensor (local tensor)
+        not a DTensor"""
         if key not in self.kv:
             self.kv[key] = {}
 
@@ -249,15 +258,45 @@ class InMemoryStore(StorageImpl):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
+        # key is for example: 'v0/TORCHSTORE_STATE_DICT'
+        key_prefix = key.split(DELIM)[0]  # key_prefix is 'v0
+        if request.is_tssd:
+            latency_tracker = LatencyTracker(f"put_tssd: {key_prefix}")
+            tensor_blob = await transport_buffer.read_into(None, self.transport_context)
+            latency_tracker.track_step("read_into")
+            metadata_state_dict = request.objects
+
+            flattened_state_dict = unpack_metadata_state_dict(
+                metadata_state_dict, tensor_blob
+            )
+            latency_tracker.track_step("unpack_metadata_state_dict")
+            for flattened_key, value in flattened_state_dict.items():
+                key_to_store = f"{key_prefix}{DELIM}{flattened_key}"
+                metadata = metadata_state_dict[flattened_key]
+                if (
+                    isinstance(metadata, TensorMetadata)
+                    and metadata.tensor_slice is not None
+                ):
+                    # It's a DTensor - value is just the local tensor
+                    self._handle_dtensor(key_to_store, metadata.tensor_slice, value)
+                elif isinstance(value, torch.Tensor):
+                    self.kv[key_to_store] = value
+                else:  # is object
+                    self.kv[key_to_store] = {"obj": value}
+            latency_tracker.track_step("store_tensors")
+            latency_tracker.track_e2e()
+            return
 
         if request.is_object:
+            latency_tracker = LatencyTracker(f"put_object: {key_prefix}")
             self.kv[key] = {"obj": request.objects}
+            latency_tracker.track_step("store object")
             return
 
         # since we pass tensor=None to the transport buffer,
         # we allocate on the fly
         tensor = await transport_buffer.read_into(None, self.transport_context)
-        if request.tensor_slice is not None:
+        if request.tensor_slice is not None:  # is dtensor
             self._handle_dtensor(key, request.tensor_slice, tensor)
             return
 
