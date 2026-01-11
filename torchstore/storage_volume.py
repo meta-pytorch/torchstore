@@ -277,7 +277,7 @@ class InMemoryStore(StorageImpl):
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
         data = self.get_data(request, key)
-        self.transport_buffer.recv_from_storage_volume(data, self.transport_context)
+        self.transport_buffer.handle_put_request(request, data, self.transport_context)
 
 
         # TODO: clean up

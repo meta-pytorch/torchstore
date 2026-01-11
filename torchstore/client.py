@@ -62,7 +62,6 @@ class LocalClient:
 
     @torch.no_grad
     async def get(
-        self,
         key: str,
         inplace_tensor: torch.Tensor | DTensor | None = None,
         tensor_slice_spec: TensorSlice | None = None,
@@ -237,9 +236,11 @@ class LocalClient:
         volume_map = await self._locate_volumes(key)
         volume_id, _ = volume_map.popitem()
         volume_ref = self.strategy.get_storage_volume(volume_id)
-        pipe = Pipe(volume_ref)
-        request = Request.from_any(None)
-        return await pipe.get_from_storage_volume(key, request)
+        transport_buffer = create_transport_buffer(volume_ref)
+        
+        # pipe = Pipe(volume_ref)
+        # request = Request.from_any(None)
+        return await transport_buffer.get_from_storage_volume(key, Request.from_any(None))
 
     async def _get_tensor(self, key: str) -> torch.Tensor:
         """Fetches the tensor which is stored in one volume storage"""
@@ -248,11 +249,13 @@ class LocalClient:
         # if the storage is a Tensor instead of DTensor, just fetch and return it.
         for volume_id, _ in volume_map.items():
             volume_ref = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(volume_ref)
+            transport_buffer = create_transport_buffer(volume_ref)            
+            # pipe = Pipe(volume_ref)
             # TODO: consolidate the logic here - None indicates it is an object request,
             # which is sematically inappropriate here.
             request = Request.from_any(None)
-            return await pipe.get_from_storage_volume(key, request)
+            # return await pipe.get_from_storage_volume(key, request)
+            return await transport_buffer.get_from_storage_volume(key, request)
 
     async def _get_and_assemble_tensor(
         self, key: str, tensor_slice_spec: TensorSlice | None = None
@@ -272,7 +275,10 @@ class LocalClient:
         partial_results = []
         for volume_id, storage_info in volume_map.items():
             volume_ref = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(volume_ref)
+
+
+            transport_buffer = create_transport_buffer(volume_ref)            
+            # pipe = Pipe(volume_ref)
 
             # fetch from all storage volumes, something like this
             # TODO: fix so we can request all tensor slices from a storage volume
@@ -291,9 +297,10 @@ class LocalClient:
 
                 tensor_slice_request = Request.from_tensor_slice(tensor_slice)
 
-                local_tensor = await pipe.get_from_storage_volume(
-                    key, tensor_slice_request
-                )
+                local_tensor = await transport_buffer.get_from_storage_volume(key , tensor_slice_request)
+                # local_tensor = await pipe.get_from_storage_volume(
+                #     key, tensor_slice_request
+                # )
                 partial_results.append((local_tensor, tensor_slice))
         if not partial_results:
             raise RuntimeError(

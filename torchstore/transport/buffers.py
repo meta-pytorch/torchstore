@@ -57,9 +57,9 @@ class TransportBuffer:
         finally:
             self.drop()
 
-    async def get_from_storage_volume(self, request: "Request"):
+    async def get_from_storage_volume(self, key, request: "Request"):
         try:
-            self._pre_get_hook(request)
+            self._pre_get_hook(key, request)
 
             if self.requires_handshake:
                 self.storage_volume_ref.volume.handshake.call(self)
@@ -67,7 +67,7 @@ class TransportBuffer:
             # when fetching data, we may need to handle the response from the storage volume
             # TODO: think of a good prefix to differentiate this between remote handlers
             response = await self._handle_storage_volume_response(
-                await self.storage_volume_ref.volume.get.call_one(self, request)
+                await self.storage_volume_ref.volume.get.call_one(key, self, request)
             )
         finally:
             self.drop()
@@ -80,7 +80,7 @@ class TransportBuffer:
     async def _pre_put_hook(self, request: "Request"):
         pass
 
-    async def _pre_get_hook(self, request: "Request"):
+    async def _pre_get_hook(self, key:str, request: "Request"):
         pass
 
     async def _handle_storage_volume_response(self, response: Any) -> Any:
