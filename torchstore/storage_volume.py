@@ -82,6 +82,19 @@ class StorageVolume(Actor):
         return await self.store.get_meta(key, request)
 
     @endpoint
+    async def get_batch(
+        self, key_prefix: str, keys: list[str], transport_buffer: TransportBuffer
+    ) -> TransportBuffer:
+        return await self.store.get_batch(key_prefix, keys, transport_buffer)
+
+    @endpoint
+    async def get_batch_meta(
+        self, key_prefix: str, keys: list[str]
+    ) -> Tuple[int, torch.dtype]:
+        """Get metadata about batch get (total blob size) for RDMA pre-allocation."""
+        return await self.store.get_batch_meta(key_prefix, keys)
+
+    @endpoint
     async def delete(self, key: str) -> None:
         await self.store.delete(key)
 
@@ -112,6 +125,18 @@ class StorageImpl:
         self, key: str, request: Optional[Request] = None
     ) -> Union[Tuple[torch.Size, torch.dtype], str]:
         """Get metadata about stored data."""
+        raise NotImplementedError()
+
+    async def get_batch(
+        self, key_prefix: str, keys: list[str], transport_buffer: TransportBuffer
+    ) -> TransportBuffer:
+        """Retrieve multiple keys from the storage backend."""
+        raise NotImplementedError()
+
+    async def get_batch_meta(
+        self, key_prefix: str, keys: list[str]
+    ) -> Tuple[int, torch.dtype]:
+        """Get metadata about batch get (total blob size) for RDMA pre-allocation."""
         raise NotImplementedError()
 
     async def delete(self, key: str) -> None:
@@ -360,6 +385,93 @@ class InMemoryStore(StorageImpl):
         raise RuntimeError(
             f"Unknown type for {key} type={type(stored_object)} {stored_object=}"
         )
+
+    async def get_batch(
+        self, key_prefix: str, keys: list[str], transport_buffer: TransportBuffer
+    ) -> TransportBuffer:
+        """Retrieve multiple tensors at once, packed into a single blob."""
+        from torchstore.state_dict_utils import TensorMetadata
+
+        # Collect all tensors and build metadata
+        tensor_list: list[tuple[torch.Tensor, TensorMetadata]] = []
+        metadata_state_dict: Dict[str, Any] = {}
+        current_offset = 0
+
+        for key in keys:
+            full_key = f"{key_prefix}{key}"
+            if full_key not in self.kv:
+                raise KeyError(f"Key '{full_key}' not found. {list(self.kv.keys())=}")
+
+            val = self.kv[full_key]
+
+            if isinstance(val, dict) and "obj" in val:
+                # Non-tensor object - store as-is
+                metadata_state_dict[key] = val["obj"]
+            elif isinstance(val, torch.Tensor):
+                # Regular tensor
+                tensor_size = val.numel() * val.element_size()
+                tensor_metadata = TensorMetadata(
+                    shape=tuple(val.shape),
+                    dtype=val.dtype,
+                    offset=current_offset,
+                    size=tensor_size,
+                )
+                tensor_list.append((val, tensor_metadata))
+                metadata_state_dict[key] = tensor_metadata
+                current_offset += tensor_size
+            else:
+                raise RuntimeError(f"Unsupported type for batch get: {type(val)}")
+
+        # Create the tensor blob
+        if not tensor_list:
+            blob = torch.empty(0, dtype=torch.uint8)
+        else:
+            blob = torch.empty(current_offset, dtype=torch.uint8)
+
+            for tensor, tensor_metadata in tensor_list:
+                # We need the tensor on CPU and contiguous to view as bytes
+                tensor_cpu = tensor.cpu().contiguous()
+                if tensor_cpu.dim() == 0:
+                    tensor_cpu = tensor_cpu.unsqueeze(0)
+                byte_view = tensor_cpu.view(torch.uint8).flatten()
+                assert byte_view.numel() == tensor_metadata.size, (
+                    f"Size mismatch: byte_view.numel()={byte_view.numel()}, "
+                    f"tensor_metadata.size={tensor_metadata.size}, "
+                    f"tensor.shape={tensor.shape}, tensor.dtype={tensor.dtype}"
+                )
+                blob[
+                    tensor_metadata.offset : tensor_metadata.offset
+                    + tensor_metadata.size
+                ] = byte_view
+
+        # transport_buffer.allocate(blob)
+        # Send the blob via transport and attach metadata
+        await transport_buffer.write_from(blob, self.transport_context)
+        transport_buffer.objects = metadata_state_dict
+        return transport_buffer
+
+    async def get_batch_meta(
+        self, key_prefix: str, keys: list[str]
+    ) -> Tuple[int, torch.dtype]:
+        """Get metadata about batch get (total blob size) for RDMA pre-allocation."""
+        total_size = 0
+
+        for key in keys:
+            full_key = f"{key_prefix}{key}"
+            if full_key not in self.kv:
+                raise KeyError(f"Key '{full_key}' not found. {list(self.kv.keys())=}")
+
+            val = self.kv[full_key]
+
+            if isinstance(val, dict) and "obj" in val:
+                # Non-tensor object - no size contribution to blob
+                pass
+            elif isinstance(val, torch.Tensor):
+                total_size += val.numel() * val.element_size()
+            else:
+                raise RuntimeError(f"Unsupported type for batch get: {type(val)}")
+
+        return total_size, torch.uint8
 
     async def delete(self, key: str) -> None:
         if key not in self.kv:
