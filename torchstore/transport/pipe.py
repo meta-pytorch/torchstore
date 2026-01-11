@@ -271,6 +271,8 @@ class Pipe:
                         key, transport_buffer, request.meta_only()
                     )
                 )
+                # if we are getting an object, we already received it from the Monarch RPC call above
+                # (storage volume get returns the pickled TransportBuffer from the storage volume)
                 if transport_buffer.is_object:
                     recv_task.cancel()
                     return transport_buffer.objects

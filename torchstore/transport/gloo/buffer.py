@@ -23,8 +23,10 @@ if TYPE_CHECKING:
 
 logger = getLogger(__name__)
 
-# Global caches
-_store_addrs: Dict[str, Tuple[str, int]] = {}  # volume_id -> (master_addr, master_port)
+# Global cache
+_store_addrs: Dict[str, Tuple[str, int]] = (
+    {}
+)  # volume_id -> (master_addr, master_port, store_key)
 
 
 def _find_free_port() -> int:
@@ -99,7 +101,6 @@ class GlooTransportBuffer(TransportBuffer):
         self.master_addr: Optional[str] = None
         self.master_port: Optional[int] = None
         self.store_key: Optional[str] = None  # Unique key for this connection
-        # self.transport_context: Optional[Dict[str, Any]] = None
 
         # Local tensor reference
         self.tensor_ref: Optional[torch.Tensor] = None
@@ -110,7 +111,6 @@ class GlooTransportBuffer(TransportBuffer):
     def __getstate__(self) -> Dict[str, Any]:
         """Serialize state, excluding non-serializable fields."""
         state = self.__dict__.copy()
-        state["transport_context"] = None
         state["tensor_ref"] = None
         return state
 
@@ -163,7 +163,7 @@ class GlooTransportBuffer(TransportBuffer):
 
                 pg = await asyncio.to_thread(create_pg)
 
-                # Cache the store address and process group
+                # Cache the connection info
                 _store_addrs[volume_id] = (master_addr, master_port, store_key)
                 volume_ref.transport_context.get_transport_context()[store_key] = pg
 
@@ -173,14 +173,11 @@ class GlooTransportBuffer(TransportBuffer):
 
             logger.info(f"Finished gloo handshake with StorageVolume:[{volume_id}]")
 
-        # Set up instance state for this operation
+        # Set connection info from cache (since handshake is only done the first time)
         cached_addr = _store_addrs[volume_id]
         self.master_addr = cached_addr[0]
         self.master_port = cached_addr[1]
         self.store_key = cached_addr[2]
-        # Look up store_key from context keys
-        # needs to be unique to storage volume
-        # self.transport_context = volume_ref.transport_context.get_transport_context()
 
     async def recv_handshake(
         self, transport_context: "TransportContext"
@@ -196,11 +193,9 @@ class GlooTransportBuffer(TransportBuffer):
 
         if self.store_key in ctx:
             raise RuntimeError("this shouldnt happen")
-            logger.debug(
-                f"Reusing existing gloo process group for store_key={self.store_key}"
-            )
-        # self.transport_context = ctx
-        # return None
+            # logger.debug(
+            #     f"Reusing existing gloo process group for store_key={self.store_key}"
+            # )
 
         logger.info(
             f"Storage volume setting up gloo process group with TCPStore at "
@@ -334,7 +329,13 @@ class GlooTransportBuffer(TransportBuffer):
     async def write_from(
         self, tensor: Optional[torch.Tensor], transport_context: "TransportContext"
     ) -> None:
-        """Send tensor via gloo. Waits for send to complete before returning."""
+        """Send tensor via gloo. Waits for send to complete before returning.
+        # called on client rank 0
+        # called on storage volume rank 1
+        Args:
+            tensor (Optional[torch.Tensor]): Tensor to send. If None, the tensor will be retrieved from the tensor_ref
+            transport_context (TransportContext): Transport context from the client
+        """
 
         if self.is_object:
             return
