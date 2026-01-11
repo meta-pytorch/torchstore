@@ -29,12 +29,19 @@ def set_transport_type(transport_type: TransportType) -> None:
         transport_type: A registered TransportType
     """
     if transport_type == TransportType.MonarchRDMA:
+        os.environ["TORCHSTORE_ENABLE_GLOO"] = "0"
         os.environ["TORCHSTORE_RDMA_ENABLED"] = "1"
         os.environ["USE_TORCHCOMMS_RDMA"] = "0"
     elif transport_type == TransportType.TorchCommsRDMA:
+        os.environ["TORCHSTORE_ENABLE_GLOO"] = "0"
         os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
         os.environ["USE_TORCHCOMMS_RDMA"] = "1"
+    elif transport_type == TransportType.Gloo:
+        os.environ["TORCHSTORE_ENABLE_GLOO"] = "1"
+        os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
+        os.environ["USE_TORCHCOMMS_RDMA"] = "0"
     else:
+        os.environ["TORCHSTORE_ENABLE_GLOO"] = "0"
         os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
         os.environ["USE_TORCHCOMMS_RDMA"] = "0"
 
@@ -60,7 +67,8 @@ def transport_plus_strategy_params(with_host_strategy: bool = False):
         enabled_transport_types.append(TransportType.MonarchRDMA)
     if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
         enabled_transport_types.append(TransportType.TorchCommsRDMA)
-
+    if os.environ.get("TORCHSTORE_ENABLE_GLOO", "1") == "1":
+        enabled_transport_types.append(TransportType.Gloo)
     return "strategy_params, transport_type", list(
         product(strategies, enabled_transport_types)
     )
