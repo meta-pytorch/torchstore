@@ -14,7 +14,6 @@ from monarch.actor import this_host
 
 from torchstore.transport import TensorSlice
 
-
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
 

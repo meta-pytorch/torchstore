@@ -13,7 +13,6 @@ from torchstore.transport.monarch_rdma import MonarchRDMATransportBuffer
 # from torchstore.transport.pipe import Pipe, Request, TensorSlice
 from torchstore.transport.pipe import Request, TensorSlice
 
-
 if TYPE_CHECKING:
     from torchstore.transport.pipe import StorageVolumeRef
 

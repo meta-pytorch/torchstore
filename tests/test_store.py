@@ -68,18 +68,18 @@ async def test_basic(strategy_params, transport_type):
 
     try:
         await actor_mesh_0.put.call()
-        # tensors = await actor_mesh_1.get.call()
-        # for pt, val in tensors:
-        #     expected = torch.tensor([pt.rank + 1] * 10)
-        #     assert torch.equal(expected, val), f"{expected} != {val}"
+        tensors = await actor_mesh_1.get.call()
+        for pt, val in tensors:
+            expected = torch.tensor([pt.rank + 1] * 10)
+            assert torch.equal(expected, val), f"{expected} != {val}"
 
         # in cases where volume_world_size > 1, we should also test that we can get from a different rank
         rank_offset = 1
-        # tensors = await actor_mesh_1.get.call(rank_offset)
-        # for pt, val in tensors:
-        #     other_rank = (pt.rank + rank_offset) % volume_world_size
-        #     expected = torch.tensor([other_rank + 1] * 10)
-        #     assert torch.equal(expected, val), f"{expected} != {val}"
+        tensors = await actor_mesh_1.get.call(rank_offset)
+        for pt, val in tensors:
+            other_rank = (pt.rank + rank_offset) % volume_world_size
+            expected = torch.tensor([other_rank + 1] * 10)
+            assert torch.equal(expected, val), f"{expected} != {val}"
     finally:
         # TODO: Investigate monarch bug with proc_mesh.stop()
         # await actor_mesh_0._proc_mesh.stop()

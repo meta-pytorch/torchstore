@@ -22,6 +22,7 @@ from torchstore.transport.buffers import (
     # RDMATransportBuffer,
     TransportBuffer,
 )
+
 # from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 # from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
 
@@ -136,10 +137,7 @@ class TransportBufferFactory:
     Creates TransportBuffers
     """
 
-    def __init__(
-        self,
-        storage_volume_ref: "StorageVolumeRef"
-    ) -> None:
+    def __init__(self, storage_volume_ref: "StorageVolumeRef") -> None:
         self.storage_volume_ref = storage_volume_ref
         self.transport_context = storage_volume_ref.transport_context
         self.storage_volume = storage_volume_ref.volume
@@ -159,7 +157,7 @@ class TransportBufferFactory:
         # else:
         #     buffer_cls = MonarchTransportBuffer
         # return buffer_cls()
-        
+
         # # TODO @lucas/@amir: remove this after pipe refactor
         # is_torchcomms_rdma = isinstance(transport_buffer, TorchCommsRdmaTransportBuffer)
 

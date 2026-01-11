@@ -20,7 +20,6 @@ from torchstore.strategy import (
 )
 from torchstore.transport.pipe import TensorSlice
 
-
 # I need to keep this somewhere, so here we go
 DEFAULT_TORCHSTORE_NAME: str = "TorchStore"
 

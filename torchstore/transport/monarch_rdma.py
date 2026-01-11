@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch
 
-
 try:
     from monarch.rdma import is_rdma_available as monarch_rdma_available, RDMABuffer
 except ImportError:
@@ -26,7 +25,6 @@ from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.pipe import Request
 
 if TYPE_CHECKING:
-    from torchstore.transport.buffers import TransportContext
     from torchstore.transport.pipe import StorageVolumeRef
 
 
@@ -53,6 +51,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         self.tensor_refs: Optional[List[torch.Tensor]] = None
         self.shape: Optional[torch.Size] = None
         self.dtype: Optional[torch.dtype] = None
+        self.is_object: bool = False
 
     async def _pre_put_hook(self, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
@@ -61,16 +60,19 @@ class MonarchRDMATransportBuffer(TransportBuffer):
     async def _pre_get_hook(self, key, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
 
+        # keep request for later
+        self.request = request
+
         # rdma buffer requires we have a ore-existing memory space locally
         # if the user has not provided a local tensor, we need to first
         # identify and allocate  ahead of time
         meta = None
         if not request.tensor_val:
-            meta = await self.storage_volume.get_meta.call_one(
+            meta = await self.storage_volume_ref.volume.get_meta.call_one(
                 key, request.meta_only()
             )
             if isinstance(meta, str) or meta is None:
-                return # objects don't get handled
+                return  # objects don't get handled
 
         self.allocate(meta or request.tensor_val)
 
@@ -84,6 +86,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         # TODO: clunky, this transport buffer should have something for
         # objects as well.
         if request.is_object:
+            self.is_object = True
             return request.objects
 
         # allocate new tensor to return
@@ -102,14 +105,17 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         return tensor
 
-    async def handle_get_request(
-        self, data, storage_transport_context
-    ):
+    async def handle_get_request(self, data, storage_transport_context):
         # add support for writting diretly to current_object (inplace update)
 
-        # todo:handle objects
+        # todo:handle objects better
+        if not isinstance(data, torch.Tensor):
+            self.is_object = True
+            self.objects = data
+            return
+
         tensor = data
-        
+
         # source tensor does not have to be contiguous, it is copied into contiguous memory later in this function
         self._assert_valid_tensor(
             tensor, self.dtype, self.shape, must_be_contiguous=False
@@ -121,11 +127,13 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             # TODO: gather instead of reading sequentially
             await self.rdma_buffers[idx].write_from(chunk)
 
-    async def _handle_storage_volume_response(self, transport_buffer: TransportBuffer) -> Any:
+    async def _handle_storage_volume_response(
+        self, transport_buffer: TransportBuffer
+    ) -> Any:
         if transport_buffer.is_object:
             return transport_buffer.objects
 
-        # TODO: this is silly, we should be using rdma to write diretly into 
+        # TODO: this is silly, we should be using rdma to write diretly into
         # the original tensor, but we don't because of the chunking logic
         # the other place you can'tsafely copy values directly is when tensors are
         # non-contiguous which actually comes up often in specific sharding cases
@@ -133,14 +141,17 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         assert self.tensor_refs is not None
         for idx, chunk in enumerate(chunked_byte_view):
-            chunk.copy_(self.tensor_refs[idx])        
+            chunk.copy_(self.tensor_refs[idx])
 
         # TODO: this is probably even more wrong
         if self.request.tensor_val is not None:
             self.request.tensor_val.copy_(self.tensor)
 
-        return self.request.tensor_val if self.request.tensor_val is not None else self.tensor        
-    
+        return (
+            self.request.tensor_val
+            if self.request.tensor_val is not None
+            else self.tensor
+        )
 
     async def drop(self) -> None:
         """Explicitly clean up RDMA buffers to prevent kernel memory leak.
@@ -168,6 +179,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         state = self.__dict__.copy()
         state["tensor_refs"] = None
         state["tensor"] = None
+        state["request"] = None
         return state
 
     def _create_byte_views_from_tensor(
@@ -199,7 +211,8 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             # this copy is mostly to avoid contiguous tensors issues
             # that show up during resharding
             assert isinstance(tensor_like, torch.Tensor)
-            tensor = torch.empty_like(tensor_like, device=torch.device("cpu"))
+            tensor = tensor_like.contiguous()
+            # tensor = torch.empty_like(tensor_like, device=torch.device("cpu"))
 
         self.tensor = tensor
 
@@ -211,10 +224,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
 
         byte_view_chunks = self._create_byte_views_from_tensor(tensor)
-        self.tensor_refs = [
-            torch.empty_like(chunk, device=torch.device("cpu"))
-            for chunk in byte_view_chunks
-        ]
+        # self.tensor_refs = [
+        #     torch.empty_like(chunk, device=torch.device("cpu"))
+        #     for chunk in byte_view_chunks
+        # ]
+        self.tensor_refs = byte_view_chunks  # TODO: just remove the chunking logic
         self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
 
         chunk_sizes = set()

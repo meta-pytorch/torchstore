@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING
 from monarch.actor import current_rank
 
 from torchstore.transport import TransportType
-
 from torchstore.transport.buffers import TransportContext
 
 if TYPE_CHECKING:
@@ -239,7 +238,7 @@ class ControllerStorageVolumes(TorchStoreStrategy):
                 f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
             )
 
-        return (self.get_storage_volume(client_id),)
+        return self.get_storage_volume(client_id)
 
     def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
         return StorageVolumeRef(

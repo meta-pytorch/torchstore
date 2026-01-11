@@ -55,7 +55,7 @@ class TransportBuffer:
 
             await self.storage_volume_ref.volume.put.call(key, self, request)
         finally:
-            self.drop()
+            await self.drop()
 
     async def get_from_storage_volume(self, key, request: "Request"):
         try:
@@ -70,7 +70,7 @@ class TransportBuffer:
                 await self.storage_volume_ref.volume.get.call_one(key, self, request)
             )
         finally:
-            self.drop()
+            await self.drop()
 
         return response
 
@@ -80,7 +80,7 @@ class TransportBuffer:
     async def _pre_put_hook(self, request: "Request"):
         pass
 
-    async def _pre_get_hook(self, key:str, request: "Request"):
+    async def _pre_get_hook(self, key: str, request: "Request"):
         pass
 
     async def _handle_storage_volume_response(self, response: Any) -> Any:
