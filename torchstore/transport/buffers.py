@@ -48,18 +48,18 @@ class TransportBuffer:
     async def put_to_storage_volume(self, key, request: "Request"):
         try:
             # _give concrete implementaiton a chance to parse the request
-            self._pre_put_hook(request)
+            await self._pre_put_hook(request)
 
             if self.requires_handshake:
-                self.storage_volume_ref.volume.handshake.call(self)
+                await self.storage_volume_ref.volume.handshake.call(self)
 
-            self.storage_volume_ref.volume.put.call(key, self, request)
+            await self.storage_volume_ref.volume.put.call(key, self, request)
         finally:
             self.drop()
 
     async def get_from_storage_volume(self, key, request: "Request"):
         try:
-            self._pre_get_hook(key, request)
+            await self._pre_get_hook(key, request)
 
             if self.requires_handshake:
                 self.storage_volume_ref.volume.handshake.call(self)

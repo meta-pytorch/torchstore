@@ -54,11 +54,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         self.shape: Optional[torch.Size] = None
         self.dtype: Optional[torch.dtype] = None
 
-    def _pre_put_hook(self, request: Request) -> None:
+    async def _pre_put_hook(self, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
         self.allocate(request.tensor_val)
 
-    def _pre_get_hook(self, key, request: Request) -> None:
+    async def _pre_get_hook(self, key, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
 
         # rdma buffer requires we have a ore-existing memory space locally
