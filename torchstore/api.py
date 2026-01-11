@@ -14,7 +14,6 @@ from torchstore.controller import Controller
 
 from torchstore.state_dict_utils import (
     get_state_dict as get_state_dict_util,
-    get_state_dict_batch,
     put_state_dict as put_state_dict_util,
     put_state_dict_batch,
     tssd_enabled,
@@ -315,11 +314,6 @@ async def get_state_dict(
         >>> model.load_state_dict(state_dict)
     """
     cl = await client(store_name)
-    if tssd_enabled():
-        return await get_state_dict_batch(
-            store=cl, key=key, user_state_dict=user_state_dict, strict=strict
-        )
-    else:
-        return await get_state_dict_util(
-            store=cl, key=key, user_state_dict=user_state_dict, strict=strict
-        )
+    return await get_state_dict_util(
+        store=cl, key=key, user_state_dict=user_state_dict, strict=strict
+    )

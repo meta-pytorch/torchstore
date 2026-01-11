@@ -18,7 +18,7 @@ from torch.distributed.tensor import DTensor, Placement
 
 from torchstore.logging import init_logging, LatencyTracker
 
-from torchstore.transport.pipe import TensorSlice
+from torchstore.transport.pipe import Request, TensorSlice
 
 DELIM = "/"
 MAPPING = "MAPPING"
@@ -34,7 +34,7 @@ def tssd_enabled() -> bool:
     them more efficiently.
     """
 
-    return os.environ.get("TORCHSTORE_EXPERIMENTAL_BATCH_STATE_DICT", "1") == "1"
+    return os.environ.get("TORCHSTORE_EXPERIMENTAL_BATCH_STATE_DICT", "0") == "1"
 
 
 async def put_state_dict(store, state_dict, key):
@@ -64,12 +64,29 @@ async def put_state_dict_batch(store, state_dict, key):
         state_dict
     )
     latency_tracker.track_step("from_state_dict")
+
+    # Get storage volume info for notify_put
+    storage_volume, volume_id = store.strategy.select_storage_volume()
+
     # Store the TorchStoreStateDict object
     await store.put(f"{key}{DELIM}{TORCHSTORE_STATE_DICT}", torchstore_state_dict)
     latency_tracker.track_step("store_put_tssd")
 
     await store.put(f"{key}{DELIM}{MAPPING}", torchstore_state_dict.mapping)
     latency_tracker.track_step("store_put_mapping")
+
+    # Notify controller about each logical key in the state dict
+    for flattened_key, metadata in torchstore_state_dict.metadata_state_dict.items():
+        full_key = f"{key}{DELIM}{flattened_key}"
+        if isinstance(metadata, TensorMetadata):
+            # Create a request with tensor metadata (tensor_slice for DTensor support)
+            request = Request(tensor_slice=metadata.tensor_slice)
+        else:
+            # Non-tensor object
+            request = Request(is_object=True)
+        await store._controller.notify_put.call(full_key, request, volume_id)
+    latency_tracker.track_step("notify_put_keys")
+
     latency_tracker.track_e2e()
 
 
@@ -122,24 +139,6 @@ async def get_state_dict(
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
 
 
-async def get_state_dict_batch(
-    store, key, user_state_dict: Optional[dict] = None, strict=True
-):
-    # TODO: add support for user_state_dict and strict
-    try:
-        # Since the mapping is the last thing we write out, it also guarantees the state dict is not pending
-        fetched_mapping = await store.get(f"{key}{DELIM}{MAPPING}")
-    except Exception as e:
-        raise RuntimeError(
-            f"Mapping is missing from the store. This most likely means there is no matching 'push' call for this key: {key=}"
-        ) from e
-
-    flattened_keys = list(fetched_mapping.keys())
-    flattened_state_dict = await store.get_batch(f"{key}{DELIM}", flattened_keys)
-
-    return unflatten_state_dict(flattened_state_dict, fetched_mapping)
-
-
 @dataclass
 class TensorMetadata:
     """Metadata for a tensor in a tensor blob"""
@@ -148,9 +147,9 @@ class TensorMetadata:
     dtype: torch.dtype
     offset: int  # Byte offset in the blob
     size: int  # Size in bytes
-    tensor_slice: TensorSlice | None = None  # TensorSlice for DTensor reconstruction
-    device_mesh: Any | None = None  # DeviceMesh for DTensor reconstruction
-    placements: Tuple[Any, ...] | None = None  # Placements for DTensor reconstruction
+    tensor_slice: TensorSlice | None = None  # TensorSlice with DTensor metadata
+    # device_mesh: Any | None = None  # DeviceMesh for DTensor reconstruction
+    # placements: Tuple[Any, ...] | None = None  # Placements for DTensor reconstruction
 
 
 def _state_dict_size(state_dict):
@@ -206,8 +205,8 @@ class TorchStoreStateDict:
                     offset=current_offset,
                     size=tensor_size,
                     tensor_slice=tensor_slice,
-                    device_mesh=value.device_mesh,
-                    placements=value.placements,
+                    # device_mesh=value.device_mesh,
+                    # placements=value.placements,
                 )
                 tensor_list.append((local_tensor, tensor_metadata))
                 metadata_state_dict[key] = tensor_metadata
@@ -230,9 +229,9 @@ class TorchStoreStateDict:
 
         # 3. create the tensor tensor_blob by concatenating all tensors
         if not tensor_list:
-            tensor_blob = torch.zeros(0, dtype=torch.uint8)
+            tensor_blob = torch.empty(0, dtype=torch.uint8)
         else:
-            tensor_blob = torch.zeros(current_offset, dtype=torch.uint8)
+            tensor_blob = torch.empty(current_offset, dtype=torch.uint8)
 
             # Copy tensor data directly from source device to CPU blob
             for tensor, tensor_metadata in tensor_list:
@@ -252,17 +251,17 @@ class TorchStoreStateDict:
         # 4. return the TorchStoreStateDict object
         return cls(tensor_blob, metadata_state_dict, mapping)
 
-    def to_state_dict(self) -> Dict[str, Any]:
-        """
-        Convert the TorchStoreStateDict back to a state_dict. All TensorMetadata objects are replaced with
-        the corresponding tensors from the tensor blob. DTensors are reconstructed using stored metadata.
-        """
-        state_dict = unflatten_state_dict(
-            unpack_metadata_state_dict(self.metadata_state_dict, self.tensor_blob),
-            self.mapping,
-        )
+    # def to_state_dict(self) -> Dict[str, Any]:
+    #     """
+    #     Convert the TorchStoreStateDict back to a state_dict. All TensorMetadata objects are replaced with
+    #     the corresponding tensors from the tensor blob. DTensors are reconstructed using stored metadata.
+    #     """
+    #     state_dict = unflatten_state_dict(
+    #         unpack_metadata_state_dict(self.metadata_state_dict, self.tensor_blob),
+    #         self.mapping,
+    #     )
 
-        return state_dict
+    #     return state_dict
 
 
 def reconstruct_dtensor_from_local_tensor(
@@ -303,7 +302,7 @@ def unpack_metadata_state_dict(
     for key, value in metadata_state_dict.items():
         if isinstance(value, TensorMetadata):
             # Pre-allocate tensor with correct shape and dtype (TorchStore approach)
-            tensor = torch.zeros(value.shape, dtype=value.dtype)
+            tensor = torch.empty(value.shape, dtype=value.dtype)
 
             # Get byte view of the allocated tensor
             if tensor.dim() == 0:
@@ -317,18 +316,18 @@ def unpack_metadata_state_dict(
             tensor_bytes = tensor_blob[value.offset : value.offset + value.size]
             byte_view.copy_(tensor_bytes)
 
-            # Check if this should be reconstructed as a DTensor
-            if (
-                value.tensor_slice is not None
-                and value.device_mesh is not None
-                and value.placements is not None
-            ):
-                tensor = reconstruct_dtensor_from_local_tensor(
-                    local_tensor=tensor,
-                    tensor_slice=value.tensor_slice,
-                    device_mesh=value.device_mesh,
-                    placements=value.placements,
-                )
+            # # Check if this should be reconstructed as a DTensor
+            # if (
+            #     value.tensor_slice is not None
+            #     and value.device_mesh is not None
+            #     and value.placements is not None
+            # ):
+            #     tensor = reconstruct_dtensor_from_local_tensor(
+            #         local_tensor=tensor,
+            #         tensor_slice=value.tensor_slice,
+            #         device_mesh=value.device_mesh,
+            #         placements=value.placements,
+            #     )
 
             unpacked_flattened_state_dict[key] = tensor
         else:

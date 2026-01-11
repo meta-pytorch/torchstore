@@ -88,6 +88,7 @@ class Request:
             including offsets, coordinates, and shape information.
         objects (Optional[Any]): Arbitrary Python objects that must be pickleable.
         is_object (bool): Flag indicating whether this request contains a non-tensor object.
+        is_tssd (bool): Flag indicating whether this request contains a TorchStoreStateDict object.
     """
 
     tensor_val: Optional[torch.Tensor] = None
@@ -163,7 +164,9 @@ class Pipe:
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
         if torchcomms_rdma_available():
-            buffer_cls = TorchCommsRdmaTransportBuffer
+            buffer_cls: type[TorchCommsRdmaTransportBuffer] = (
+                TorchCommsRdmaTransportBuffer
+            )
         elif rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
@@ -186,7 +189,6 @@ class Pipe:
                 transport_buffer.allocate(tensor)
                 await transport_buffer.write_from(tensor, self.transport_context)
             latency_tracker.track_step("allocate_and_write")
-
             await self.storage_volume.put.call_one(
                 key, transport_buffer, request.meta_only()
             )
@@ -243,59 +245,4 @@ class Pipe:
         finally:
             # Clean up the transport buffer after the get operation completes
             # This is critical for RDMA buffers to deregister memory regions
-            await transport_buffer.drop()
-
-    async def get_batch_from_storage_volume(
-        self, key_prefix: str, keys: list[str]
-    ) -> Tuple[torch.Tensor, dict]:
-        """Fetch multiple tensors at once from storage volume.
-
-        Returns:
-            Tuple of (tensor_blob, metadata_state_dict) that can be used to reconstruct tensors.
-        """
-        transport_buffer = self.create_transport_buffer()
-        is_torchcomms_rdma = isinstance(transport_buffer, TorchCommsRdmaTransportBuffer)
-
-        try:
-            await transport_buffer.handshake(None, self.storage_volume_ref)
-
-            allocate = (
-                transport_buffer.allocate_dest
-                if is_torchcomms_rdma
-                else transport_buffer.allocate
-            )
-
-            # For RDMA buffers, we need to know the size upfront to pre-allocate
-            # client-side memory regions. Get metadata first.
-            if transport_buffer.requires_meta:
-                meta = await self.storage_volume.get_batch_meta.call_one(
-                    key_prefix, keys
-                )
-                # meta is (total_size, dtype) - create a shape for allocation
-                total_size, dtype = meta
-                if total_size > 0:
-                    allocate((torch.Size([total_size]), dtype))
-                else:
-                    allocate(None)
-            else:
-                # For non-RDMA buffers, we don't need to pre-allocate
-                allocate(None)
-
-            transport_buffer.update(
-                await self.storage_volume.get_batch.call_one(
-                    key_prefix, keys, transport_buffer
-                )
-            )
-
-            metadata_state_dict = transport_buffer.objects
-
-            if not is_torchcomms_rdma:
-                tensor_blob = await transport_buffer.read_into(
-                    None, self.transport_context
-                )
-            else:
-                tensor_blob = transport_buffer.tensor_ref
-
-            return tensor_blob, metadata_state_dict
-        finally:
             await transport_buffer.drop()
