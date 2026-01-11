@@ -139,6 +139,24 @@ async def get_state_dict(
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
 
 
+async def get_state_dict_batch(
+    store, key, user_state_dict: Optional[dict] = None, strict=True
+):
+    # TODO: add support for user_state_dict and strict
+    try:
+        # Since the mapping is the last thing we write out, it also guarantees the state dict is not pending
+        fetched_mapping = await store.get(f"{key}{DELIM}{MAPPING}")
+    except Exception as e:
+        raise RuntimeError(
+            f"Mapping is missing from the store. This most likely means there is no matching 'push' call for this key: {key=}"
+        ) from e
+
+    flattened_keys = list(fetched_mapping.keys())
+    flattened_state_dict = await store.get_batch(f"{key}{DELIM}", flattened_keys)
+
+    return unflatten_state_dict(flattened_state_dict, fetched_mapping)
+
+
 @dataclass
 class TensorMetadata:
     """Metadata for a tensor in a tensor blob"""
