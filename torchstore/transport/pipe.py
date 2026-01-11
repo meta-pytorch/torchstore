@@ -164,9 +164,9 @@ class Pipe:
     def create_transport_buffer(self) -> TransportBuffer:
         # TODO: eventually this should be dependent on the connections available to a storage_volume
         if torchcomms_rdma_available():
-            buffer_cls: type[TorchCommsRdmaTransportBuffer] = (
+            buffer_cls: type[
                 TorchCommsRdmaTransportBuffer
-            )
+            ] = TorchCommsRdmaTransportBuffer
         elif rdma_available():
             buffer_cls = RDMATransportBuffer
         else:
