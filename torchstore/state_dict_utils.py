@@ -234,20 +234,20 @@ class TorchStoreStateDict:
         else:
             tensor_blob = torch.zeros(current_offset, dtype=torch.uint8)
 
-            # Copy tensor data
+            # Copy tensor data directly from source device to CPU blob
             for tensor, tensor_metadata in tensor_list:
-                tensor_cpu = tensor.detach().cpu().contiguous()
+                tensor_contig = tensor.detach().contiguous()
                 # Convert scalar tensors from 0D to 1D
-                if tensor_cpu.dim() == 0:
-                    tensor_cpu = tensor_cpu.unsqueeze(0)
+                if tensor_contig.dim() == 0:
+                    tensor_contig = tensor_contig.unsqueeze(0)
 
-                byte_view = tensor_cpu.view(torch.uint8).flatten()
+                byte_view = tensor_contig.view(torch.uint8).flatten()
 
-                # Copy to tensor_blob
+                # Copy directly from source device (e.g. GPU) to CPU tensor_blob
                 tensor_blob[
                     tensor_metadata.offset : tensor_metadata.offset
                     + tensor_metadata.size
-                ] = byte_view
+                ].copy_(byte_view)
 
         # 4. return the TorchStoreStateDict object
         return cls(tensor_blob, metadata_state_dict, mapping)
