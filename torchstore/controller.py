@@ -4,13 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from itertools import product
-from collections.abc import Mapping
 
 from monarch.actor import Actor, endpoint
-
 from torchstore.storage_utils.trie import Trie
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import TorchStoreStrategy

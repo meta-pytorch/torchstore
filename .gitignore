@@ -189,3 +189,4 @@ cover/
 wandb/
 
 assets/wheels/vllm*.whl
+.claude/

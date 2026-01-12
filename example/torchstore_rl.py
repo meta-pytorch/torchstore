@@ -53,15 +53,11 @@ class Generator(Actor):
     @endpoint
     async def update_weights(self):
         print(
-            "[generator {}] original weights: {}".format(
-                self.index, self.model.state_dict()
-            )
+            f"[generator {self.index}] original weights: {self.model.state_dict()}"
         )
         # Fetch weights from torch.store
         await ts.get_state_dict(key="toy_app", user_state_dict=self.model.state_dict())
-        print(
-            "[generator {}] new weights: {}".format(self.index, self.model.state_dict())
-        )
+        print(f"[generator {self.index}] new weights: {self.model.state_dict()}")
 
     @endpoint
     async def generate(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
