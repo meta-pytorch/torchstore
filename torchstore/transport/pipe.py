@@ -7,7 +7,7 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -61,11 +61,11 @@ def _is_dtensor_fully_local(dtensor: DTensor) -> bool:
 
 @dataclass
 class TensorSlice:
-    offsets: Tuple
-    coordinates: Tuple
-    global_shape: Tuple
-    local_shape: Tuple  # TODO: fix type hints
-    mesh_shape: Tuple
+    offsets: tuple
+    coordinates: tuple
+    global_shape: tuple
+    local_shape: tuple  # TODO: fix type hints
+    mesh_shape: tuple
 
     def __post_init__(self):
         if self.coordinates is not None:

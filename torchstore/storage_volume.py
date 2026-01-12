@@ -6,7 +6,7 @@
 
 from itertools import product
 from logging import getLogger
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Optional
 
 import torch
 from monarch.actor import Actor, endpoint
@@ -71,8 +71,8 @@ class StorageVolume(Actor):
     async def get_meta(
         self,
         key: str,
-        request: Optional[Request] = None,
-    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
+        request: Request | None = None,
+    ) -> tuple[torch.Size, torch.dtype] | str:
         return await self.store.get_meta(key, request)
 
     @endpoint
@@ -104,7 +104,7 @@ class StorageImpl:
 
     async def get_meta(
         self, key: str, request: Optional[Request] = None
-    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
+    ) -> tuple[torch.Size, torch.dtype] | str:
         """Get metadata about stored data."""
         raise NotImplementedError()
 
@@ -120,7 +120,7 @@ class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
     def __init__(self) -> None:
-        self.kv: Dict[str, Any] = {}
+        self.kv: dict[str, Any] = {}
         super().__init__()
 
     async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
@@ -293,8 +293,8 @@ class InMemoryStore(StorageImpl):
     async def get_meta(
         self,
         key: str,
-        request: Optional[Request] = None,
-    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
+        request: Request | None = None,
+    ) -> tuple[torch.Size, torch.dtype] | str:
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 

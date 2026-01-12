@@ -7,7 +7,7 @@
 """A wrapper around pygtrie.Trie to provide a trie data structure based dictionary."""
 
 from collections.abc import ItemsView, KeysView, Mapping, MutableMapping, ValuesView
-from typing import Any, Iterator, List, Optional
+from typing import Any, Iterator, Optional
 
 import pygtrie
 
@@ -27,7 +27,7 @@ class TrieKeysView(KeysView[str]):
     def __contains__(self, key: object) -> bool:
         return key in self._trie
 
-    def filter_by_prefix(self, prefix: str) -> List[str]:
+    def filter_by_prefix(self, prefix: str) -> list[str]:
         """Return a list of keys that start with the given prefix."""
         try:
             return [str(key) for key in self._trie.iterkeys(prefix=prefix)]

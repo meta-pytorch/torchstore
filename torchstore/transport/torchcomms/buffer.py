@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 import torch
 
@@ -72,7 +72,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         transport.connect(self.address)
         return addr
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         """
         Serialize the state of the buffer, including RdmaRemoteBuffer but excluding the RdmaMemory and local dest tensor ref.
         """
@@ -86,11 +86,11 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self.rdma_memory = RdmaMemory(tensor)
         self.rdma_remote_buffer = self.rdma_memory.to_remote_buffer()
 
-    def allocate_dest(self, tensor_like: torch.Tensor | Tuple) -> None:
+    def allocate_dest(self, tensor_like: torch.Tensor | tuple) -> None:
         """Called by the local client. Allocate RdmaMemory for the destination tensor (get)."""
         if isinstance(tensor_like, str) or tensor_like is None:
             return
-        elif isinstance(tensor_like, Tuple):
+        elif isinstance(tensor_like, tuple):
             self.tensor_ref = torch.zeros(
                 tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
             )

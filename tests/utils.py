@@ -8,7 +8,6 @@ import math
 import os
 from itertools import product
 from logging import getLogger
-from typing import List
 
 import pytest
 import torch
@@ -81,7 +80,7 @@ class DTensorActor(Actor):
         file_store_name,
         visible_devices="0,1,2,3,4,5,6,7",
         ranks_to_skip_put: (
-            List[int] | None
+            list[int] | None
         ) = None,  # ranks that should skip put operation
     ):
         self.rank = current_rank().rank
