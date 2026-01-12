@@ -6,8 +6,8 @@
 
 """A wrapper around pygtrie.Trie to provide a trie data structure based dictionary."""
 
-from collections.abc import ItemsView, KeysView, Mapping, MutableMapping, ValuesView
-from typing import Any, Iterator
+from collections.abc import ItemsView, Iterator, KeysView, Mapping, MutableMapping, ValuesView
+from typing import Any
 
 import pygtrie
 

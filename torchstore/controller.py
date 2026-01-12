@@ -201,7 +201,7 @@ class Controller(Actor):
 
         storage_info = StorageInfo(
             object_type=ObjectType.from_request(request),
-            tensor_slices=set([request.tensor_slice]),
+            tensor_slices={request.tensor_slice},
         )
 
         if storage_volume_id not in self.keys_to_storage_volumes[key]:
