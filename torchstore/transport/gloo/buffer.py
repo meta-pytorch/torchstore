@@ -24,9 +24,9 @@ if TYPE_CHECKING:
 logger = getLogger(__name__)
 
 # Global cache
-_store_addrs: Dict[str, Tuple[str, int]] = (
-    {}
-)  # volume_id -> (master_addr, master_port, store_key)
+_store_addrs: Dict[
+    str, Tuple[str, int]
+] = {}  # volume_id -> (master_addr, master_port, store_key)
 
 
 def _find_free_port() -> int:
