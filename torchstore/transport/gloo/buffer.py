@@ -108,12 +108,9 @@ class GlooTransportBuffer(TransportBuffer):
         # Flag for object (non-tensor) transport
         self.is_object: bool = False
 
-        self.transport_context: Optional[Dict[str, Any]] = None
-
     def __getstate__(self) -> Dict[str, Any]:
         """Serialize state, excluding non-serializable fields."""
         state = self.__dict__.copy()
-        state["transport_context"] = None
         state["tensor_ref"] = None
         return state
 
@@ -181,10 +178,6 @@ class GlooTransportBuffer(TransportBuffer):
         self.master_addr = cached_addr[0]
         self.master_port = cached_addr[1]
         self.store_key = cached_addr[2]
-        print(
-            f"volume_ref.transport_context.get_transport_context().keys(): {volume_ref.transport_context.get_transport_context().keys()}"
-        )
-        self.transport_context = volume_ref.transport_context.get_transport_context()
 
     async def recv_handshake(
         self, transport_context: "TransportContext"
@@ -231,7 +224,6 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Cache the process group
         ctx[self.store_key] = pg
-        self.transport_context = ctx
 
         logger.info(
             f"Storage volume finished gloo process group setup for store_key={self.store_key}"
