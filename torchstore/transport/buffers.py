@@ -7,7 +7,7 @@
 import logging
 import os
 from enum import auto, Enum
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -48,7 +48,7 @@ class TransportContext:
     def __init__(self):
         self.transport_context = {}
 
-    def get_transport_context(self) -> Dict[Any, Any]:
+    def get_transport_context(self) -> dict[Any, Any]:
         return self.transport_context
 
     def get_rdma_transport_cache(self) -> RdmaTransportCache:
@@ -66,7 +66,7 @@ class TransportType(Enum):
 class TransportBuffer:
     finalize: bool = False
     is_object: bool = False
-    objects: Optional[Any] = None
+    objects: Any | None = None
     requires_meta: bool = False
 
     def update(self, other_buffer: "TransportBuffer") -> None:
@@ -75,19 +75,19 @@ class TransportBuffer:
         self.objects = other_buffer.objects
         self.requires_meta = other_buffer.requires_meta
 
-    def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
+    def allocate(self, tensor_like: torch.Tensor | tuple) -> None:
         """Allocates internal buffers based on either an existing tensor
-        or a Tuple of (shape, dtype)
+        or a tuple of (shape, dtype)
         """
         raise NotImplementedError()
 
     async def read_into(
-        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+        self, tensor: torch.Tensor | None, transport_context: TransportContext
     ) -> torch.Tensor:
         raise NotImplementedError()
 
     async def write_from(
-        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+        self, tensor: torch.Tensor | None, transport_context: TransportContext
     ) -> None:
         raise NotImplementedError()
 
@@ -99,7 +99,7 @@ class TransportBuffer:
 
     async def recv_handshake(
         self, transport_context: TransportContext
-    ) -> Optional[Any]:
+    ) -> Any | None:
         """Confirm a handshake initiated by the local client, and return some result."""
         pass
 
@@ -127,10 +127,10 @@ class RDMATransportBuffer(TransportBuffer):
     requires_meta: bool = True
 
     def __init__(self) -> None:
-        self.rdma_buffers: Optional[List[Any]] = None
-        self.tensor_refs: Optional[List[torch.Tensor]] = None
-        self.shape: Optional[torch.Size] = None
-        self.dtype: Optional[torch.dtype] = None
+        self.rdma_buffers: list[Any] | None = None
+        self.tensor_refs: list[torch.Tensor] | None = None
+        self.shape: torch.Size | None = None
+        self.dtype: torch.dtype | None = None
 
     async def drop(self) -> None:
         """Explicitly clean up RDMA buffers to prevent kernel memory leak.
@@ -151,7 +151,7 @@ class RDMATransportBuffer(TransportBuffer):
             self.rdma_buffers = None
             self.tensor_refs = None
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         # Any time that we serialize the transport buffer, the idea is
         # that tensors will be transported via tensor_enginer.RDMABuffer, so it makes
         # no sense to hold this reference when we are serializing
@@ -161,7 +161,7 @@ class RDMATransportBuffer(TransportBuffer):
 
     def _create_byte_views_from_tensor(
         self, tensor: torch.Tensor
-    ) -> List[torch.Tensor]:
+    ) -> list[torch.Tensor]:
         # handle scalar values
         if tensor.dim() == 0:
             tensor = tensor.unsqueeze(0)
@@ -171,16 +171,16 @@ class RDMATransportBuffer(TransportBuffer):
 
         return tensor_chunks
 
-    def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
+    def allocate(self, tensor_like: torch.Tensor | tuple) -> None:
         """Allocates internal buffers based on either an existing tensor
-        or a Tuple of (shape, dtype)
+        or a tuple of (shape, dtype)
         """
         logging.debug("Allocating rdma buffer")
 
         if isinstance(tensor_like, str) or tensor_like is None:
             # tensor is just an object, nothing to allocte
             return
-        elif isinstance(tensor_like, Tuple):
+        elif isinstance(tensor_like, tuple):
             # we know the size of the tensor from fetching metadata
             tensor = torch.zeros(
                 tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
@@ -214,7 +214,7 @@ class RDMATransportBuffer(TransportBuffer):
 
     # send
     async def read_into(
-        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+        self, tensor: torch.Tensor | None, transport_context: TransportContext
     ) -> torch.Tensor:
         if tensor is None:
             # allocate a tensor to return
@@ -250,7 +250,7 @@ class RDMATransportBuffer(TransportBuffer):
 
     # recv
     async def write_from(
-        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+        self, tensor: torch.Tensor | None, transport_context: TransportContext
     ) -> None:
         if tensor is None:
             return
@@ -283,15 +283,15 @@ class MonarchTransportBuffer(TransportBuffer):
     finalize: bool = True
 
     def __init__(self) -> None:
-        self.tensor: Optional[torch.Tensor] = None
+        self.tensor: torch.Tensor | None = None
 
-    def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
+    def allocate(self, tensor_like: torch.Tensor | tuple) -> None:
         """In the case of using monarch comms, we don't do any allocation ahead of time"""
         return None
 
     # send
     async def read_into(
-        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+        self, tensor: torch.Tensor | None, transport_context: TransportContext
     ) -> torch.Tensor:
         if tensor is not None:
             # if there is a tensor here, likely this is the 'inplace' case,
@@ -305,7 +305,7 @@ class MonarchTransportBuffer(TransportBuffer):
 
     # recv
     async def write_from(
-        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
+        self, tensor: torch.Tensor | None, transport_context: TransportContext
     ) -> None:
         self.tensor = tensor
 

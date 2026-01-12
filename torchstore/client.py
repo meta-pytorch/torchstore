@@ -6,7 +6,7 @@
 
 import asyncio
 from logging import getLogger
-from typing import Any, Union
+from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -43,7 +43,7 @@ class LocalClient:
             raise KeyError(str(e)) from e
 
     @torch.no_grad
-    async def put(self, key: str, value: Union[torch.Tensor, Any]):
+    async def put(self, key: str, value: torch.Tensor | Any):
         latency_tracker = LatencyTracker(f"put:{key}")
         request = Request.from_any(value)
         # for now, we only write to one storage volume.

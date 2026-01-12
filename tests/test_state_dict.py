@@ -9,7 +9,6 @@ import math
 import os
 import tempfile
 from logging import getLogger
-from typing import Union
 
 import pytest
 import torch
@@ -56,7 +55,7 @@ class CompositeParamModel(nn.Module):
     https://github.com/pytorch/pytorch/blob/e2c9d8d6414927ce754bbc40b767edf103cf16da/torch/testing/_internal/common_dist_composable.py#L52
     """
 
-    def __init__(self, device: Union[torch.device, str] = "cpu"):
+    def __init__(self, device: torch.device | str = "cpu"):
         super().__init__()
         if isinstance(device, str):
             device = torch.device(device)

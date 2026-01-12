@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 from logging import getLogger
-from typing import Optional
 
 import torch
 from torch.distributed.checkpoint._nested_dict import (
@@ -37,7 +36,7 @@ async def put_state_dict(store, state_dict, key):
 
 
 async def get_state_dict(
-    store, key, user_state_dict: Optional[dict] = None, strict=True
+    store, key, user_state_dict: dict | None = None, strict=True
 ):
     """Unflatten the state dict from the store"""
 
