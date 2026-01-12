@@ -11,11 +11,11 @@ from logging import getLogger
 
 import pytest
 import torch
+
+import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
-
-import torchstore as ts
 from torchstore.strategy import HostStrategy
 from torchstore.transport import TransportType
 
@@ -80,7 +80,8 @@ class DTensorActor(Actor):
         placements,
         file_store_name,
         visible_devices="0,1,2,3,4,5,6,7",
-        ranks_to_skip_put: list[int] | None = None,  # ranks that should skip put operation
+        ranks_to_skip_put: list[int]
+        | None = None,  # ranks that should skip put operation
     ):
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape

@@ -35,9 +35,7 @@ async def put_state_dict(store, state_dict, key):
     await store.put(f"{key}{DELIM}{MAPPING}", mapping)
 
 
-async def get_state_dict(
-    store, key, user_state_dict: dict | None = None, strict=True
-):
+async def get_state_dict(store, key, user_state_dict: dict | None = None, strict=True):
     """Unflatten the state dict from the store"""
 
     try:

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import TYPE_CHECKING, Any
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -61,9 +61,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         peer_addr = await volume_ref.volume.handshake.call_one(self)
         local_transport.connect(peer_addr)
 
-    async def recv_handshake(
-        self, transport_context: "TransportContext"
-    ) -> Any | None:
+    async def recv_handshake(self, transport_context: "TransportContext") -> Any | None:
         """
         Confirm a handshake initiated by the local client.
         """

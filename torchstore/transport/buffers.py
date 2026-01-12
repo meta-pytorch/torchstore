@@ -7,14 +7,14 @@
 import logging
 import os
 from enum import auto, Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any, TYPE_CHECKING
 
 import torch
 
 from torchstore.transport.torchcomms.cache import RdmaTransportCache
 
 try:
-    from monarch.rdma import RDMABuffer, is_rdma_available as monarch_rdma_available
+    from monarch.rdma import is_rdma_available as monarch_rdma_available, RDMABuffer
 except ImportError:
     monarch_rdma_available = lambda: False
 
@@ -97,9 +97,7 @@ class TransportBuffer:
         """Establish a handshake with the remote volume, such as for RDMA."""
         pass
 
-    async def recv_handshake(
-        self, transport_context: TransportContext
-    ) -> Any | None:
+    async def recv_handshake(self, transport_context: TransportContext) -> Any | None:
         """Confirm a handshake initiated by the local client, and return some result."""
         pass
 

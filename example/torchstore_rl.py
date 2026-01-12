@@ -8,9 +8,9 @@
 import asyncio
 
 import torch
-from monarch.actor import Actor, current_rank, endpoint, proc_mesh
 
 import torchstore as ts
+from monarch.actor import Actor, current_rank, endpoint, proc_mesh
 
 
 # Run the example : python example/torchstore_rl.py
@@ -53,9 +53,7 @@ class Generator(Actor):
 
     @endpoint
     async def update_weights(self):
-        print(
-            f"[generator {self.index}] original weights: {self.model.state_dict()}"
-        )
+        print(f"[generator {self.index}] original weights: {self.model.state_dict()}")
         # Fetch weights from torch.store
         await ts.get_state_dict(key="toy_app", user_state_dict=self.model.state_dict())
         print(f"[generator {self.index}] new weights: {self.model.state_dict()}")
