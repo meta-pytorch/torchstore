@@ -34,7 +34,7 @@ def tssd_enabled() -> bool:
     them more efficiently.
     """
 
-    return os.environ.get("TORCHSTORE_EXPERIMENTAL_BATCH_STATE_DICT", "0") == "1"
+    return os.environ.get("TORCHSTORE_EXPERIMENTAL_BATCH_STATE_DICT", "1") == "1"
 
 
 async def put_state_dict(store, state_dict, key):
