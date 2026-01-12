@@ -8,8 +8,9 @@
 import asyncio
 
 import torch
-import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint, proc_mesh
+
+import torchstore as ts
 
 
 # Run the example : python example/torchstore_rl.py

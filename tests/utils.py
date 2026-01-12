@@ -11,10 +11,11 @@ from logging import getLogger
 
 import pytest
 import torch
-import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
+
+import torchstore as ts
 from torchstore.strategy import HostStrategy
 from torchstore.transport import TransportType
 

@@ -7,12 +7,14 @@
 import logging
 import os
 from enum import auto, Enum
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+from torchstore.transport.torchcomms.cache import RdmaTransportCache
+
 try:
-    from monarch.rdma import is_rdma_available as monarch_rdma_available, RDMABuffer
+    from monarch.rdma import RDMABuffer, is_rdma_available as monarch_rdma_available
 except ImportError:
     monarch_rdma_available = lambda: False
 
@@ -21,8 +23,6 @@ except ImportError:
             "RDMABuffer is not available. This environment was likely not built with rdma support."
         )
 
-
-from torchstore.transport.torchcomms.cache import RdmaTransportCache
 
 if TYPE_CHECKING:
     from torchstore.transport.pipe import StorageVolumeRef
