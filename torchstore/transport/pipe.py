@@ -7,7 +7,7 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Optional, Tuple, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -61,11 +61,11 @@ def _is_dtensor_fully_local(dtensor: DTensor) -> bool:
 
 @dataclass
 class TensorSlice:
-    offsets: Tuple
-    coordinates: Tuple
-    global_shape: Tuple
-    local_shape: Tuple  # TODO: fix type hints
-    mesh_shape: Tuple
+    offsets: tuple
+    coordinates: tuple
+    global_shape: tuple
+    local_shape: tuple  # TODO: fix type hints
+    mesh_shape: tuple
 
     def __post_init__(self):
         if self.coordinates is not None:
@@ -93,17 +93,17 @@ class Request:
     """Request object encapsulating data to be stored or retrieved from TorchStore.
 
     Attributes:
-        tensor_val (Optional[torch.Tensor]): The actual tensor data to store/retrieve.
+        tensor_val (torch.Tensor | None): The actual tensor data to store/retrieve.
             For DTensors, this contains the local tensor shard.
-        tensor_slice (Optional[TensorSlice]): Metadata about distributed tensor sharding,
+        tensor_slice (TensorSlice | None): Metadata about distributed tensor sharding,
             including offsets, coordinates, and shape information.
-        objects (Optional[Any]): Arbitrary Python objects that must be pickleable.
+        objects (Any | None): Arbitrary Python objects that must be pickleable.
         is_object (bool): Flag indicating whether this request contains a non-tensor object.
     """
 
-    tensor_val: Optional[torch.Tensor] = None
-    tensor_slice: Optional[TensorSlice] = None
-    objects: Optional[Any] = None  # Any, but must be pickleable.
+    tensor_val: torch.Tensor | None = None
+    tensor_slice: TensorSlice | None = None
+    objects: Any | None = None  # Any, but must be pickleable.
     is_object: bool = False
 
     @classmethod

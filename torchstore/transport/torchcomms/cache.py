@@ -6,7 +6,6 @@
 
 import logging
 from functools import cache
-from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -27,17 +26,17 @@ def torchcomms_rdma_available() -> bool:
     return rdma_enabled and torchcomms_available and RdmaTransport.supported()
 
 
-TransportAndAddress = Tuple["RdmaTransport", bytes]
+TransportAndAddress = tuple["RdmaTransport", bytes]
 
 
 class RdmaTransportCache:
     def __init__(self) -> None:
         assert torchcomms_rdma_available(), "TorchComms RDMA is not available."
         # {key: {device: (transport, address)}}
-        self.transports: Dict[str, Dict[int, TransportAndAddress]] = {}
+        self.transports: dict[str, dict[int, TransportAndAddress]] = {}
 
     @classmethod
-    def try_init(cls) -> Optional["RdmaTransportCache"]:
+    def try_init(cls) -> "RdmaTransportCache | None":
         try:
             return cls()
         except Exception as e:

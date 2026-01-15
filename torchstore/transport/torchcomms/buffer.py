@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -39,8 +39,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             None  # remote reference of rdma memory
         )
 
-        self.shape: Optional[torch.Size] = None
-        self.dtype: Optional[torch.dtype] = None
+        self.shape: torch.Size | None = None
+        self.dtype: torch.dtype | None = None
 
     async def handshake(
         self, tensor: torch.Tensor, volume_ref: "StorageVolumeRef"
@@ -61,9 +61,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         peer_addr = await volume_ref.volume.handshake.call_one(self)
         local_transport.connect(peer_addr)
 
-    async def recv_handshake(
-        self, transport_context: "TransportContext"
-    ) -> Optional[Any]:
+    async def recv_handshake(self, transport_context: "TransportContext") -> Any | None:
         """
         Confirm a handshake initiated by the local client.
         """
@@ -72,7 +70,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         transport.connect(self.address)
         return addr
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         """
         Serialize the state of the buffer, including RdmaRemoteBuffer but excluding the RdmaMemory and local dest tensor ref.
         """
@@ -86,11 +84,11 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self.rdma_memory = RdmaMemory(tensor)
         self.rdma_remote_buffer = self.rdma_memory.to_remote_buffer()
 
-    def allocate_dest(self, tensor_like: torch.Tensor | Tuple) -> None:
+    def allocate_dest(self, tensor_like: torch.Tensor | tuple) -> None:
         """Called by the local client. Allocate RdmaMemory for the destination tensor (get)."""
         if isinstance(tensor_like, str) or tensor_like is None:
             return
-        elif isinstance(tensor_like, Tuple):
+        elif isinstance(tensor_like, tuple):
             self.tensor_ref = torch.zeros(
                 tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
             )
@@ -103,7 +101,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self._allocate(self.tensor_ref)
 
     # TODO @amirafzali: add test case and support for non-contiguous input
-    def allocate_source(self, tensor: Optional[torch.Tensor]) -> None:
+    def allocate_source(self, tensor: torch.Tensor | None) -> None:
         """Called by the local client. Allocate RdmaMemory for the source tensor (put)."""
         if tensor is None:
             return
@@ -114,7 +112,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self._allocate(tensor)
 
     async def read_into(
-        self, tensor: Optional[torch.Tensor], transport_context: "TransportContext"
+        self, tensor: torch.Tensor | None, transport_context: "TransportContext"
     ) -> torch.Tensor:
         """Called by the remote storage volume. Read from the local client's source RdmaMemory (put)"""
         if tensor is None:
@@ -137,7 +135,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         return tensor
 
     async def write_from(
-        self, tensor: Optional[torch.Tensor], transport_context: "TransportContext"
+        self, tensor: torch.Tensor | None, transport_context: "TransportContext"
     ) -> None:
         """Called by the remote storage volume. Write to the local client's dest RdmaMemory (get)"""
         if tensor is None:

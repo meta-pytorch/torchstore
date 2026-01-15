@@ -4,10 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from itertools import product
-from typing import Dict, List, Mapping, Optional, Set
 
 from monarch.actor import Actor, endpoint
 
@@ -36,7 +36,7 @@ class ObjectType(Enum):
 @dataclass
 class StorageInfo:
     object_type: ObjectType
-    tensor_slices: Set[Optional[TensorSlice]] = field(default_factory=set)
+    tensor_slices: set[TensorSlice | None] = field(default_factory=set)
 
     def update(self, other_storage_info: "StorageInfo"):
         assert (
@@ -52,10 +52,10 @@ class Controller(Actor):
     ) -> None:
         self.keys_to_storage_volumes = Trie()
         self.is_initialized: bool = False
-        self.strategy: Optional[TorchStoreStrategy] = None
-        self.storage_volumes: Optional[StorageVolume] = None
-        self.num_storage_volumes: Optional[int] = None
-        self.strategy: Optional[TorchStoreStrategy] = None
+        self.strategy: TorchStoreStrategy | None = None
+        self.storage_volumes: StorageVolume | None = None
+        self.num_storage_volumes: int | None = None
+        self.strategy: TorchStoreStrategy | None = None
 
     def assert_initialized(self) -> None:
         assert (
@@ -63,7 +63,7 @@ class Controller(Actor):
         ), "Please call torchstore.initialize before attempting to use store."
 
     def _is_dtensor_fully_committed(
-        self, key: str, volume_map: Dict[str, StorageInfo]
+        self, key: str, volume_map: dict[str, StorageInfo]
     ) -> bool:
         """
         Check if all shards of a DTensor have been committed.
@@ -129,7 +129,7 @@ class Controller(Actor):
     async def locate_volumes(
         self,
         key: str,
-    ) -> Dict[str, StorageInfo]:
+    ) -> dict[str, StorageInfo]:
         """Locate storage volumes containing shards of the specified key.
 
         Returns {<storage_volume_id> -> StorageInfo} where <storage_volume_id>
@@ -201,7 +201,7 @@ class Controller(Actor):
 
         storage_info = StorageInfo(
             object_type=ObjectType.from_request(request),
-            tensor_slices=set([request.tensor_slice]),
+            tensor_slices={request.tensor_slice},
         )
 
         if storage_volume_id not in self.keys_to_storage_volumes[key]:
@@ -222,7 +222,7 @@ class Controller(Actor):
         self.num_storage_volumes = None
 
     @endpoint
-    async def keys(self, prefix=None) -> List[str]:
+    async def keys(self, prefix=None) -> list[str]:
         if prefix is None:
             return list(self.keys_to_storage_volumes.keys())
         return self.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
@@ -246,5 +246,5 @@ class Controller(Actor):
         if len(self.keys_to_storage_volumes[key]) == 0:
             del self.keys_to_storage_volumes[key]
 
-    def get_keys_to_storage_volumes(self) -> Mapping[str, Dict[str, StorageInfo]]:
+    def get_keys_to_storage_volumes(self) -> Mapping[str, dict[str, StorageInfo]]:
         return self.keys_to_storage_volumes

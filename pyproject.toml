@@ -34,6 +34,7 @@ dev = [
     "anyio",
     "expecttest",
     "pre-commit",
+    "pyupgrade",
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
