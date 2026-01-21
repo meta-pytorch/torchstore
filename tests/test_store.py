@@ -15,7 +15,12 @@ from monarch.actor import Actor, current_rank, endpoint
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
-from .utils import main, set_transport_type, transport_plus_strategy_params
+from .utils import (
+    main,
+    set_transport_type,
+    strategy_params,
+    transport_plus_strategy_params,
+)
 
 init_logging()
 logger = getLogger(__name__)
@@ -26,7 +31,6 @@ logger = getLogger(__name__)
 @pytest.mark.asyncio
 async def test_basic(strategy_params, transport_type):
     """Test basic put/get functionality for multiple processes"""
-    # set_transport_type(transport_type)
 
     class PutGetActor(Actor):
         """Each instance of this actor represents a single process."""
@@ -117,7 +121,7 @@ async def test_objects(strategy_params, transport_type):
 
     volume_world_size, strategy = strategy_params
     await ts.initialize(
-        num_storage_volumes=volume_world_size,  # TODO: volume_world_size should potentially be in strategy.
+        num_storage_volumes=volume_world_size,
         strategy=strategy(transport_type),
     )
     # each actor mesh represents a group of processes.
@@ -225,11 +229,10 @@ async def test_exists(strategy_params, transport_type):
         await ts.shutdown()
 
 
-@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.parametrize(*strategy_params())
 @pytest.mark.asyncio
-async def test_delete(strategy_params, transport_type):
+async def test_delete(strategy_params):
     """Test the delete() API functionality"""
-    set_transport_type(transport_type)  # TODO: BOOOOOOO
 
     class DeleteTestActor(Actor):
         """Actor for testing delete functionality."""

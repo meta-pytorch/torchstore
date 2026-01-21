@@ -22,8 +22,11 @@ logger = getLogger(__name__)
 
 
 class LocalClient:
-    """This class represents the local store, which exists on every process. Remote storage
-    is handled by the client.
+    """Client-side interface for TorchStore operations.
+
+    LocalClient runs in the user's process and coordinates with remote StorageVolumes
+    via TransportBuffers. It handles put/get operations by selecting appropriate storage
+    volumes through the configured strategy and managing data transport.
     """
 
     def __init__(
@@ -100,8 +103,7 @@ class LocalClient:
             # Here full tensor should be the part of interest.
             fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
 
-        # Pipe does not have support for inplace copies of fetched tensors yet,
-        # so we just copy
+        # TODO: This should be removed and handled in tranpsort buffer
         if inplace_tensor is not None:
             if hasattr(inplace_tensor, "_local_tensor"):
                 # DTensor case - copy to the local tensor to avoid type mismatch
@@ -239,8 +241,6 @@ class LocalClient:
         volume_ref = self.strategy.get_storage_volume(volume_id)
         transport_buffer = create_transport_buffer(volume_ref)
 
-        # pipe = Pipe(volume_ref)
-        # request = Request.from_any(None)
         return await transport_buffer.get_from_storage_volume(
             key, Request.from_any(None)
         )
@@ -253,11 +253,7 @@ class LocalClient:
         for volume_id, _ in volume_map.items():
             volume_ref = self.strategy.get_storage_volume(volume_id)
             transport_buffer = create_transport_buffer(volume_ref)
-            # pipe = Pipe(volume_ref)
-            # TODO: consolidate the logic here - None indicates it is an object request,
-            # which is sematically inappropriate here.
             request = Request.from_any(None)
-            # return await pipe.get_from_storage_volume(key, request)
             return await transport_buffer.get_from_storage_volume(key, request)
 
     async def _get_and_assemble_tensor(
@@ -280,11 +276,10 @@ class LocalClient:
             volume_ref = self.strategy.get_storage_volume(volume_id)
 
             transport_buffer = create_transport_buffer(volume_ref)
-            # pipe = Pipe(volume_ref)
 
-            # fetch from all storage volumes, something like this
+            # fetch from all storage volumes
             # TODO: fix so we can request all tensor slices from a storage volume
-            # at once, this is silly
+            # at once, this is silly !
             for tensor_slice in storage_info.tensor_slices:
                 # Intersect the tensor slice with the DTensor slice to optimize fetching
                 if tensor_slice_spec is not None:
@@ -302,9 +297,6 @@ class LocalClient:
                 local_tensor = await transport_buffer.get_from_storage_volume(
                     key, tensor_slice_request
                 )
-                # local_tensor = await pipe.get_from_storage_volume(
-                #     key, tensor_slice_request
-                # )
                 partial_results.append((local_tensor, tensor_slice))
         if not partial_results:
             raise RuntimeError(

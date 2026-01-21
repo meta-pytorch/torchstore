@@ -250,6 +250,7 @@ class InMemoryStore(StorageImpl):
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
 
+        # fetch from remote
         data = await transport_buffer.handle_put_request(
             request,
             self.kv.get(
@@ -257,20 +258,18 @@ class InMemoryStore(StorageImpl):
             ),  # passing existing object to allow for inplace puts with no new allocation
             self.transport_context,
         )
-        # self.update_key(key, request, data) #? need request
 
-        # def store_data
+        # store locally
         if request.is_object:
             self.kv[key] = {"obj": data}
             return
 
-        tensor = data  # TODO
         if request.tensor_slice is not None:
             # tensor is actually part of a DTensor
-            self._handle_dtensor(key, request.tensor_slice, tensor)
+            self._handle_dtensor(key, request.tensor_slice, data)
             return
 
-        self.kv[key] = tensor
+        self.kv[key] = data
 
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request

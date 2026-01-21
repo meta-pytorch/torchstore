@@ -115,7 +115,7 @@ class TransportBuffer:
 
     See Also
     --------
-    MonarchRDMATransportBuffer : RDMA-based implementation for high-performance tensor transport.
+    MonarchRDMATransportBuffer : RDMA-based implementation from Monarch
     MonarchTransportBuffer : Simple RPC-based implementation (slower but always works).
     """
 

@@ -43,6 +43,19 @@ def main(file):
     pytest.main([file])
 
 
+def strategy_params(with_host_strategy: bool = False):
+    strategies = [
+        (2, ts.LocalRankStrategy),
+        (1, ts.SingletonStrategy),
+        (1, ts.ControllerStorageVolumes),
+    ]
+
+    if with_host_strategy:
+        strategies.append((1, ts.HostStrategy))
+
+    return "strategy_params", strategies
+
+
 def transport_plus_strategy_params(with_host_strategy: bool = False):
     strategies = [
         (2, ts.LocalRankStrategy),
