@@ -4,22 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Dict, TYPE_CHECKING
 
 import torch
 
 from torchstore.transport.torchcomms.cache import RdmaTransportCache
 
 if TYPE_CHECKING:
-    from torchstore.transport.pipe import Request, StorageVolumeRef
-
-
-def rdma_available() -> bool:
-    rdma_enabled = (
-        os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
-    )  # TODO: enable on this build
-    return rdma_enabled and monarch_rdma_available()
+    from torchstore.strategy import StorageVolumeRef
+    from torchstore.transport.types import Request
 
 
 class TransportContext:
@@ -38,6 +31,93 @@ class TransportContext:
 
 
 class TransportBuffer:
+    """Abstract base class for transporting tensor data between clients and storage volumes.
+
+    TransportBuffer provides the interface for moving tensor data across process boundaries
+    in TorchStore's distributed architecture. Concrete implementations (e.g., MonarchRDMATransportBuffer)
+    handle the actual data transport using different mechanisms (RDMA, RPC, etc.).
+
+    Architecture Overview
+    ---------------------
+    TorchStore operates with a client-server model where:
+    - **Client (local)**: The process calling `ts.put()` or `ts.get()`. Runs in the user's actor.
+    - **StorageVolume (remote)**: A separate actor process that stores tensor data.
+
+    The TransportBuffer is instantiated on the client side and serialized/sent to the
+    StorageVolume. Methods are invoked on both sides during a put/get operation.
+
+    Lifecycle: PUT Operation
+    ------------------------
+    1. Client creates TransportBuffer via TransportBufferFactory
+    2. Client calls `put_to_storage_volume(key, request)` which:
+       a. Invokes `_pre_put_hook(request)` [CLIENT] - allocate local buffers, prepare data
+       b. Optionally performs handshake if `requires_handshake=True`
+       c. Serializes self and sends to StorageVolume
+    3. StorageVolume receives buffer and calls `handle_put_request(...)` [STORAGE VOLUME]
+       - Reads data from transport mechanism (e.g., RDMA read) into local tensor
+       - Returns the tensor to be stored
+    4. Client calls `drop()` [CLIENT] - cleanup resources (e.g., deregister RDMA memory)
+
+    Lifecycle: GET Operation
+    ------------------------
+    1. Client creates TransportBuffer via TransportBufferFactory
+    2. Client calls `get_from_storage_volume(key, request)` which:
+       a. Invokes `_pre_get_hook(key, request)` [CLIENT] - allocate receive buffers
+       b. Optionally performs handshake if `requires_handshake=True`
+       c. Serializes self and sends to StorageVolume
+    3. StorageVolume receives buffer and calls `handle_get_request(...)` [STORAGE VOLUME]
+       - Writes stored tensor data into the transport buffer (e.g., RDMA write)
+       - Returns the buffer with data ready to be read
+    4. Client calls `_handle_storage_volume_response(response)` [CLIENT]
+       - Extracts tensor data from the response buffer
+       - Copies into user's tensor if inplace, or returns new tensor
+    5. Client calls `drop()` [CLIENT] - cleanup resources
+
+    Methods Called on CLIENT (Local Process)
+    ----------------------------------------
+    - `__init__`: Initialize buffer with reference to target storage volume
+    - `put_to_storage_volume`: Entry point for put operations
+    - `get_from_storage_volume`: Entry point for get operations
+    - `_pre_put_hook`: Prepare buffers before sending put request
+    - `_pre_get_hook`: Prepare buffers before sending get request
+    - `_handle_storage_volume_response`: Process response from storage volume
+    - `drop`: Cleanup resources (CRITICAL for RDMA to prevent memory leaks)
+
+    Methods Called on STORAGE VOLUME (Remote Process)
+    -------------------------------------------------
+    - `handle_handshake_request`: Exchange connection info (if requires_handshake=True)
+    - `handle_put_request`: Receive tensor data and return it for storage
+    - `handle_get_request`: Send stored tensor data back to client
+
+    Implementing a Custom TransportBuffer
+    -------------------------------------
+    Subclasses must implement:
+    - `handle_put_request`: How to receive data on the storage volume
+    - `handle_get_request`: How to send data from the storage volume
+    - `_handle_storage_volume_response`: How to extract data from response on client
+
+    Optionally override:
+    - `_pre_put_hook`: Custom buffer allocation for puts
+    - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
+    - `handle_handshake_request`: If `requires_handshake=True`
+    - `drop`: Resource cleanup (especially important for RDMA buffers)
+
+    Attributes
+    ----------
+    requires_handshake : bool
+        If True, a handshake call is made before put/get to exchange connection info.
+        Default is False.
+
+    Args
+    ----
+    storage_volume_ref : StorageVolumeRef
+        Reference to the target storage volume, including actor handle and transport context.
+
+    See Also
+    --------
+    MonarchRDMATransportBuffer : RDMA-based implementation for high-performance tensor transport.
+    MonarchTransportBuffer : Simple RPC-based implementation (slower but always works).
+    """
 
     requires_handshake: bool = False
 
@@ -113,99 +193,3 @@ class TransportBuffer:
         assert tensor.dtype == dtype, f"{tensor.dtype} != {dtype}"
         assert tensor.shape == shape, f"{tensor.shape} != {shape}"
         assert not must_be_contiguous or tensor.is_contiguous()
-
-
-# class TransportBuffer:
-#     finalize: bool = False
-#     is_object: bool = False
-#     objects: Optional[Any] = None
-#     requires_meta: bool = False
-
-#     def update(self, other_buffer: "TransportBuffer") -> None:
-#         self.finalize = other_buffer.finalize
-#         self.is_object = other_buffer.is_object
-#         self.objects = other_buffer.objects
-#         self.requires_meta = other_buffer.requires_meta
-
-#     def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
-#         """Allocates internal buffers based on either an existing tensor
-#         or a Tuple of (shape, dtype)
-#         """
-#         raise NotImplementedError()
-
-#     async def read_into(
-#         self, tensor: Optional[torch.Tensor], transport_context: TransportContext
-#     ) -> torch.Tensor:
-#         raise NotImplementedError()
-
-#     async def write_from(
-#         self, tensor: Optional[torch.Tensor], transport_context: TransportContext
-#     ) -> None:
-#         raise NotImplementedError()
-
-#     async def handshake(
-#         self, tensor: torch.Tensor, volume_ref: "StorageVolumeRef"
-#     ) -> None:
-#         """Establish a handshake with the remote volume, such as for RDMA."""
-#         pass
-
-#     async def recv_handshake(
-#         self, transport_context: TransportContext
-#     ) -> Optional[Any]:
-#         """Confirm a handshake initiated by the local client, and return some result."""
-#         pass
-
-#     async def drop(self) -> None:
-#         """Clean up any resources held by this buffer. Override in subclasses if needed."""
-#         pass
-
-#     def _assert_valid_tensor(
-#         self,
-#         tensor: torch.Tensor,
-#         dtype: torch.dtype,
-#         shape: torch.Size,
-#         must_be_contiguous=False,
-#     ) -> None:
-#         assert isinstance(tensor, torch.Tensor)
-#         assert tensor.dtype == dtype, f"{tensor.dtype} != {dtype}"
-#         assert tensor.shape == shape, f"{tensor.shape} != {shape}"
-#         assert not must_be_contiguous or tensor.is_contiguous()
-
-
-class MonarchTransportBuffer(TransportBuffer):
-    """This interface is mostly a noop, intended to be used with Monarch's regular RPC.
-    Not expected to be super fast, but always works.
-    """
-
-    finalize: bool = True
-
-    def __init__(self) -> None:
-        self.tensor: Optional[torch.Tensor] = None
-
-    def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
-        """In the case of using monarch comms, we don't do any allocation ahead of time"""
-        return None
-
-    # send
-    async def read_into(
-        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
-    ) -> torch.Tensor:
-        if tensor is not None:
-            # if there is a tensor here, likely this is the 'inplace' case,
-            # and we should return back a ptr to the original tensor
-            # (as opposed to the stored tensor, which we likely don't want to
-            # keep around)
-            tensor.copy_(self.tensor)
-            return tensor
-
-        return self.tensor
-
-    # recv
-    async def write_from(
-        self, tensor: Optional[torch.Tensor], transport_context: TransportContext
-    ) -> None:
-        self.tensor = tensor
-
-    def update(self, other_buffer: "TransportBuffer") -> None:
-        super().update(other_buffer)
-        self.tensor = other_buffer.tensor

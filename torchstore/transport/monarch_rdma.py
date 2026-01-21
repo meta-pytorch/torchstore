@@ -22,10 +22,10 @@ except ImportError:
 
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.pipe import Request
+from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
-    from torchstore.transport.pipe import StorageVolumeRef
+    from torchstore.strategy import StorageVolumeRef
 
 
 # TODO: we no longer need to chunk with monararch rdma buffer. Setting large chunk size for now,

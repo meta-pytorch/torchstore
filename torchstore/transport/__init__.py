@@ -9,12 +9,10 @@ from typing import TYPE_CHECKING
 
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.monarch_rdma import MonarchRDMATransportBuffer
-
-# from torchstore.transport.pipe import Pipe, Request, TensorSlice
-from torchstore.transport.pipe import Request, TensorSlice
+from torchstore.transport.types import Request, TensorSlice
 
 if TYPE_CHECKING:
-    from torchstore.transport.pipe import StorageVolumeRef
+    from torchstore.strategy import StorageVolumeRef
 
 
 class TransportType(Enum):

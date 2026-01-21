@@ -18,7 +18,7 @@ from torchstore.strategy import (
     SingletonStrategy,
     TorchStoreStrategy,
 )
-from torchstore.transport.pipe import TensorSlice
+from torchstore.transport.types import TensorSlice
 
 # I need to keep this somewhere, so here we go
 DEFAULT_TORCHSTORE_NAME: str = "TorchStore"

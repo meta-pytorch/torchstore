@@ -15,7 +15,7 @@ from monarch.actor import Actor, current_rank, endpoint
 # DTensor imports for DTensor slice testing
 from torch.distributed._tensor import Shard
 from torchstore.logging import init_logging
-from torchstore.transport.pipe import TensorSlice
+from torchstore.transport.types import TensorSlice
 from torchstore.utils import spawn_actors
 
 from .utils import (

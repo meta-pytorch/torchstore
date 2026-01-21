@@ -16,8 +16,8 @@ except ImportError:
     pass
 
 if TYPE_CHECKING:
+    from torchstore.strategy import StorageVolumeRef
     from torchstore.transport.buffers import TransportContext
-    from torchstore.transport.pipe import StorageVolumeRef
 
 
 class TorchCommsRdmaTransportBuffer(TransportBuffer):
