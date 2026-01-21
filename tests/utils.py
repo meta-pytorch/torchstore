@@ -21,23 +21,6 @@ from torchstore.transport import TransportType
 logger = getLogger(__name__)
 
 
-def set_transport_type(transport_type: TransportType) -> None:
-    """Set environment variables based on the transport type.
-
-    Args:
-        transport_type: A registered TransportType
-    """
-    if transport_type == TransportType.MonarchRDMA:
-        os.environ["TORCHSTORE_RDMA_ENABLED"] = "1"
-        os.environ["USE_TORCHCOMMS_RDMA"] = "0"
-    elif transport_type == TransportType.TorchCommsRDMA:
-        os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
-        os.environ["USE_TORCHCOMMS_RDMA"] = "1"
-    else:
-        os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
-        os.environ["USE_TORCHCOMMS_RDMA"] = "0"
-
-
 def main(file):
     ts.init_logging()
     pytest.main([file])
@@ -66,13 +49,16 @@ def transport_plus_strategy_params(with_host_strategy: bool = False):
     if with_host_strategy:
         strategies.append((1, ts.HostStrategy))
 
-    # Only run monarch/torchcomms tests if their respective env vars are set. Enabled by default.
-    enabled_transport_types = [TransportType.MonarchRDMA]
-    # enabled_transport_types = [TransportType.MonarchRPC]
-    # if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
-    #     enabled_transport_types.append(TransportType.MonarchRDMA)
-    # if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
-    #     enabled_transport_types.append(TransportType.TorchCommsRDMA)
+    # MonarchRPC always works (no special hardware needed)
+    enabled_transport_types = [TransportType.MonarchRPC]
+
+    # MonarchRDMA enabled by default, can be disabled with TORCHSTORE_RDMA_ENABLED=0
+    if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") != "0":
+        enabled_transport_types.append(TransportType.MonarchRDMA)
+
+    # TorchCommsRDMA disabled by default, enable with USE_TORCHCOMMS_RDMA=1
+    if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
+        enabled_transport_types.append(TransportType.TorchCommsRDMA)
 
     return "strategy_params, transport_type", list(
         product(strategies, enabled_transport_types)

@@ -28,6 +28,17 @@ if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
 
 
+def monarch_rdma_transport_available() -> bool:
+    """Check if Monarch RDMA transport is available for use.
+
+    Returns True if:
+    - TORCHSTORE_RDMA_ENABLED environment variable is set to "1" (default)
+    - The monarch RDMA library is available and functional
+    """
+    rdma_enabled = os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
+    return rdma_enabled and monarch_rdma_available()
+
+
 # TODO: we no longer need to chunk with monararch rdma buffer. Setting large chunk size for now,
 # but we should remove all chunking code
 RDMA_CHUNK_SIZE_MB: int = int(
@@ -39,10 +50,9 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     requires_handshake: bool = False
 
-    # # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
-    # # for now we utilize copies.
-    # # The major blocker for this is dealing with non-contiguous tensors
-    # requires_meta: bool = True
+    # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
+    # for now we utilize copies.
+    # The major blocker for this is dealing with non-contiguous tensors
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)

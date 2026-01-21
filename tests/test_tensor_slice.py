@@ -15,22 +15,17 @@ from monarch.actor import Actor, current_rank, endpoint
 # DTensor imports for DTensor slice testing
 from torch.distributed._tensor import Shard
 from torchstore.logging import init_logging
+from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 from torchstore.utils import spawn_actors
 
-from .utils import (
-    DTensorActor,
-    main,
-    set_transport_type,
-    transport_plus_strategy_params,
-)
+from .utils import DTensorActor, main, transport_plus_strategy_params
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_get_tensor_slice(strategy_params, transport_type):
     """Test tensor slice API functionality"""
-    set_transport_type(transport_type)
 
     class TensorSlicePutActor(Actor):
         """Actor for putting tensors."""
@@ -54,7 +49,9 @@ async def test_get_tensor_slice(strategy_params, transport_type):
             return await ts.get(key, tensor_slice_spec=tensor_slice_spec)
 
     volume_world_size, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy())
+    await ts.initialize(
+        num_storage_volumes=volume_world_size, strategy=strategy(transport_type)
+    )
 
     # Spawn test actors - separate meshes for put and get to test cross-process communication
     put_actor_mesh = await spawn_actors(
@@ -208,11 +205,12 @@ async def test_dtensor_fetch_slice():
         async def get_tensor(self, key, tensor_slice_spec=None):
             return await ts.get(key, tensor_slice_spec=tensor_slice_spec)
 
-    # Use LocalRankStrategy with 2 storage volumes (no RDMA, no parametrization)
-    set_transport_type("none")
+    # Use LocalRankStrategy with 2 storage volumes (MonarchRPC, no parametrization)
     os.environ["LOCAL_RANK"] = "0"  # Required by LocalRankStrategy
 
-    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
+    await ts.initialize(
+        num_storage_volumes=2, strategy=ts.LocalRankStrategy(TransportType.MonarchRPC)
+    )
 
     # Create a tensor that will be sharded across 2 volumes
     # 8x6 tensor, when sharded by 2 actors along dim 0 gives 4x6 slices per volume

@@ -15,12 +15,7 @@ from monarch.actor import Actor, current_rank, endpoint
 from torchstore.logging import init_logging
 from torchstore.utils import spawn_actors
 
-from .utils import (
-    main,
-    set_transport_type,
-    strategy_params,
-    transport_plus_strategy_params,
-)
+from .utils import main, strategy_params, transport_plus_strategy_params
 
 init_logging()
 logger = getLogger(__name__)
@@ -95,7 +90,6 @@ async def test_basic(strategy_params, transport_type):
 @pytest.mark.asyncio
 async def test_objects(strategy_params, transport_type):
     """Test put/get on arbitrary object"""
-    set_transport_type(transport_type)
 
     class ObjectActor(Actor):
         """Each instance of this actor represents a single process."""
@@ -162,7 +156,6 @@ async def test_objects(strategy_params, transport_type):
 @pytest.mark.asyncio
 async def test_exists(strategy_params, transport_type):
     """Test the exists() API functionality"""
-    set_transport_type(transport_type)
 
     class ExistsTestActor(Actor):
         """Actor for testing exists functionality."""

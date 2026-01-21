@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from monarch.actor import current_rank
 
-from torchstore.transport import TransportType
+from torchstore.transport import get_available_transport, TransportType
 from torchstore.transport.buffers import TransportContext
 
 if TYPE_CHECKING:
@@ -54,9 +54,7 @@ class TorchStoreStrategy:
     Subclasses must implement get_volume_id() and get_client_id() methods.
     """
 
-    def __init__(
-        self, default_transport_type: TransportType = TransportType.MonarchRDMA
-    ):
+    def __init__(self, default_transport_type: TransportType = TransportType.Unset):
         self.default_transport_type = default_transport_type
         logger.info(f"Initializing TorchStoreStrategy with {default_transport_type=}")
 
@@ -124,11 +122,16 @@ class TorchStoreStrategy:
             StorageVolume: The storage volume actor for the given ID.
         """
         volume_coord = self.volume_id_to_coord[volume_id]
+
+        transport_type = self.default_transport_type
+        if transport_type == TransportType.Unset:
+            transport_type = get_available_transport()
+
         return StorageVolumeRef(
             self.storage_volumes.slice(**volume_coord),
             volume_id,
             self.transport_context,
-            self.default_transport_type,
+            transport_type,
         )
 
 
@@ -241,9 +244,13 @@ class ControllerStorageVolumes(TorchStoreStrategy):
         return self.get_storage_volume(client_id)
 
     def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
+        transport_type = self.default_transport_type
+        if transport_type == TransportType.Unset:
+            transport_type = get_available_transport()
+
         return StorageVolumeRef(
             self.storage_volumes,
             volume_id,
             self.transport_context,
-            self.default_transport_type,
+            transport_type,
         )

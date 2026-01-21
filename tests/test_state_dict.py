@@ -27,7 +27,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 from torchstore.utils import spawn_actors
 
-from .utils import main, set_transport_type, transport_plus_strategy_params
+from .utils import main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -165,8 +165,6 @@ class DCPParityTest(Actor):
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_state_dict(strategy_params, transport_type):
-    set_transport_type(transport_type)
-
     class Trainer(Actor):
         # Monarch RDMA does not work outside of an actor, so we need
         # to wrapp this test first
@@ -197,7 +195,7 @@ async def test_state_dict(strategy_params, transport_type):
             return state_dict, fetched_state_dict
 
     _, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=1, strategy=strategy())
+    await ts.initialize(num_storage_volumes=1, strategy=strategy(transport_type))
     trainer = await spawn_actors(1, Trainer, "trainer")
     try:
         state_dict, fetched_state_dict = await trainer.do_test.call_one()
@@ -210,7 +208,6 @@ async def test_state_dict(strategy_params, transport_type):
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
 async def test_dcp_sharding_parity(strategy_params, transport_type):
-    set_transport_type(transport_type)
 
     for save_mesh_shape, get_mesh_shape in [
         ((2,), (4,)),
@@ -230,7 +227,7 @@ async def test_dcp_sharding_parity(strategy_params, transport_type):
             num_storage_volumes=(
                 save_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
             ),
-            strategy=strategy(),
+            strategy=strategy(transport_type),
         )
         try:
             with tempfile.TemporaryDirectory() as tmpdir:

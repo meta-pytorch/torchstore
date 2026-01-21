@@ -17,12 +17,7 @@ from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torchstore.utils import get_local_tensor, spawn_actors
 
-from .utils import (
-    DTensorActor,
-    main,
-    set_transport_type,
-    transport_plus_strategy_params,
-)
+from .utils import DTensorActor, main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -182,8 +177,6 @@ async def _test_resharding(
 
     # Rank0: dtensor._local_tensor == [0,1], Rank1: dtensor._local_tensor == [2,3]
     """
-    set_transport_type(transport_type)
-
     put_world_size = math.prod(put_mesh_shape)
     get_world_size = math.prod(get_mesh_shape)
     assert (
@@ -203,7 +196,7 @@ async def _test_resharding(
         num_storage_volumes=(
             put_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
         ),
-        strategy=strategy(),
+        strategy=strategy(transport_type),
     )
     with tempfile.TemporaryDirectory() as filesystem_store_dir:
         # each actor mesh represents a group of processes.
