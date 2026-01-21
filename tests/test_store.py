@@ -258,7 +258,7 @@ async def test_delete(strategy_params, transport_type):
             return await ts.get(key)
 
     volume_world_size, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy())
 
     # Spawn test actors
     actor_mesh = await spawn_actors(
@@ -319,13 +319,13 @@ async def test_key_miss():
                 value = torch.tensor([1, 2, 3])
                 await ts.put(key, value)
 
-                # # Get the value back
-                # retrieved_value = await ts.get(key)
-                # assert torch.equal(value, retrieved_value)
+                # `Get` the value back
+                retrieved_value = await ts.get(key)
+                assert torch.equal(value, retrieved_value)
 
-                # # Get a missing key
-                # with pytest.raises(KeyError):
-                #     await ts.get("bar")
+                # Get a missing key
+                with pytest.raises(KeyError):
+                    await ts.get("bar")
             except Exception as e:
                 return e
 

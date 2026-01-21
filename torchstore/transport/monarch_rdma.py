@@ -55,6 +55,9 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _pre_put_hook(self, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
+
+        if request.is_object:
+            return
         self.allocate(request.tensor_val)
 
     async def _pre_get_hook(self, key, request: Request) -> None:

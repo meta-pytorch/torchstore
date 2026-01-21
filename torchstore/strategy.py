@@ -55,7 +55,7 @@ class TorchStoreStrategy:
     """
 
     def __init__(
-        self, default_transport_type: TransportType = TransportType.MonarchRPC
+        self, default_transport_type: TransportType = TransportType.MonarchRDMA
     ):
         self.default_transport_type = default_transport_type
         logger.info(f"Initializing TorchStoreStrategy with {default_transport_type=}")

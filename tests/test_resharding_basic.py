@@ -200,8 +200,10 @@ async def _test_resharding(
         8, 8
     )  # 8x8 square, with ([[0...7],[8...15],[...]])
     await ts.initialize(
-        num_storage_volumes=put_world_size if strategy is not None else 1,
-        strategy=strategy,
+        num_storage_volumes=(
+            put_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
+        ),
+        strategy=strategy(),
     )
     with tempfile.TemporaryDirectory() as filesystem_store_dir:
         # each actor mesh represents a group of processes.

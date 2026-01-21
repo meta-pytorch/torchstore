@@ -54,7 +54,7 @@ async def test_get_tensor_slice(strategy_params, transport_type):
             return await ts.get(key, tensor_slice_spec=tensor_slice_spec)
 
     volume_world_size, strategy = strategy_params
-    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy)
+    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy())
 
     # Spawn test actors - separate meshes for put and get to test cross-process communication
     put_actor_mesh = await spawn_actors(
