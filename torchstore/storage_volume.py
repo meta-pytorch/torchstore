@@ -249,6 +249,9 @@ class InMemoryStore(StorageImpl):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
+
+        # import fbvscode
+        # fbvscode.set_trace()
         # passing existing object to allow for inplace puts with no new allocation
         current_data = self.kv.get(key, None)
 
@@ -278,7 +281,6 @@ class InMemoryStore(StorageImpl):
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
         data = self._get_data(request, key)
-        print(f"{key=}, {data=}")
         await transport_buffer.handle_get_request(data, self.transport_context)
 
         return transport_buffer

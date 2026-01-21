@@ -8,6 +8,7 @@ from typing import Any, Dict, TYPE_CHECKING
 
 import torch
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport.torchcomms.cache import RdmaTransportCache
 
 if TYPE_CHECKING:
@@ -127,15 +128,22 @@ class TransportBuffer:
     # Client-side interface. Called by the client to send/recv data to the storage volume.
     async def put_to_storage_volume(self, key, request: "Request"):
         try:
+            l = LatencyTracker("put")
             # _give concrete implementation a chance to parse the request
             await self._pre_put_hook(request)
+            l.track_step("pre hook")
 
             if self.requires_handshake:
                 await self.storage_volume_ref.volume.handshake.call(self)
+                l.track_step("handshake")
 
-            await self.storage_volume_ref.volume.put.call(key, self, request)
+            await self.storage_volume_ref.volume.put.call(
+                key, self, request.meta_only()
+            )
+            l.track_step("storage volume put")
         finally:
             await self.drop()
+            l.track_e2e()
 
     async def get_from_storage_volume(self, key, request: "Request"):
         try:

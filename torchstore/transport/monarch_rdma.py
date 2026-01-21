@@ -21,6 +21,7 @@ except ImportError:
         )
 
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.types import Request
 
@@ -89,32 +90,90 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         self.allocate(meta or request.tensor_val)
 
+    def _extract_existing_tensor(
+        self, current_object: Any, request: Request
+    ) -> torch.Tensor:
+        """Extract existing tensor from current_object for in-place update.
+
+        Uses fail-fast assertions to ensure type consistency between existing
+        data and incoming request.
+
+        Args:
+            current_object: The existing stored data (Tensor or dict, NOT None)
+            request: The incoming put request
+
+        Returns:
+            The existing tensor.
+
+        Raises:
+            AssertionError: If there's a type mismatch between existing data and request.
+        """
+        assert current_object is not None, "current_object must not be None"
+
+        if isinstance(current_object, torch.Tensor):
+            # Regular tensor - request must also be a regular tensor (no tensor_slice)
+            assert (
+                request.tensor_slice is None
+            ), "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
+            return current_object
+
+        if isinstance(current_object, dict):
+            # Object dicts should never reach here - objects are handled by early return
+            assert (
+                "obj" not in current_object
+            ), "Existing data is an object but request.is_object is False"
+            # DTensor shard dict - incoming request must also be a DTensor
+            assert (
+                request.tensor_slice is not None
+            ), "Existing data is DTensor shards but incoming request has no tensor_slice"
+            # Look up by coordinates
+            shard = current_object.get(request.tensor_slice.coordinates)
+            if shard is not None and "tensor" in shard:
+                return shard["tensor"]
+            # Coordinates don't match - new shard, return None to allocate new
+            return None
+
+        raise AssertionError(f"Unexpected current_object type: {type(current_object)}")
+
     async def handle_put_request(
         self, request: Request, current_object, storage_transport_context
     ):
-
-        # TODO:
-        # add support for writting directly to current_object (inplace update)
-
-        # TODO: clunky, this transport buffer should have something for
-        # objects as well.
         if request.is_object:
             self.is_object = True
             return request.objects
 
-        # allocate new tensor to return
-        tensor = torch.empty(self.shape, dtype=self.dtype, device=torch.device("cpu"))
-        chunked_byte_view = self._create_byte_views_from_tensor(tensor)
+        # Extract existing tensor for potential in-place update
+        tensor = None
+        if current_object is not None:
+            tensor = self._extract_existing_tensor(current_object, request)
 
-        # TODO: gather instead of reading sequentially
-        try:
-            for idx, chunk in enumerate(chunked_byte_view):
-                await self.rdma_buffers[idx].read_into(chunk)
-        except Exception as e:
-            logging.exception(
-                f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e
+        if tensor is None:
+            # happens when we haven't seen this tensor / dtensor before
+            tensor = torch.empty(
+                self.shape, dtype=self.dtype, device=torch.device("cpu")
             )
-            raise e
+            print("allocating new tensor")
+
+        self._assert_valid_tensor(tensor, self.dtype, self.shape)
+
+        l = LatencyTracker("sv-put")
+        byte_view = tensor.view(torch.uint8).flatten()
+        l.track_step("byte view")
+        await self.rdma_buffers.read_into(byte_view)
+        l.track_step("read intoo")
+        l.track_e2e()
+
+        # chunked_byte_view = self._create_byte_views_from_tensor(tensor)
+
+        # # TODO: gather instead of reading sequentially
+        # try:
+        #     for idx, chunk in enumerate(chunked_byte_view):
+        #         await self.rdma_buffers[idx].read_into(chunk)
+        # except Exception as e:
+        #     logging.exception(
+        #         f"Failed read_into, {tensor.shape=}, {tensor.dtype=}", exc_info=e
+        #     )
+        #     raise e
 
         return tensor
 
@@ -174,16 +233,16 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         pages remain pinned even after the Python objects are garbage collected,
         leading to a memory leak that manifests as unbounded Inactive(anon) growth.
         """
-        if self.rdma_buffers is not None:
-            for rdma_buf in self.rdma_buffers:
-                try:
-                    # Drop the RDMA buffer to deregister the memory region
-                    await rdma_buf.drop()
-                except Exception as e:
-                    # Log but don't raise - cleanup should be best-effort
-                    logging.warning(f"Failed to drop RDMA buffer during cleanup: {e}")
-            self.rdma_buffers = None
-            self.tensor_refs = None
+        # if self.rdma_buffers is not None:
+        #     for rdma_buf in self.rdma_buffers:
+        #         try:
+        #             # Drop the RDMA buffer to deregister the memory region
+        #             await rdma_buf.drop()
+        #         except Exception as e:
+        #             # Log but don't raise - cleanup should be best-effort
+        #             logging.warning(f"Failed to drop RDMA buffer during cleanup: {e}")
+        #     self.rdma_buffers = None
+        #     self.tensor_refs = None
 
     def __getstate__(self) -> Dict[str, Any]:
         # Any time that we serialize the transport buffer, the idea is
@@ -201,6 +260,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         # handle scalar values
         if tensor.dim() == 0:
             tensor = tensor.unsqueeze(0)
+
         byte_view = tensor.view(torch.uint8).flatten()
         chunk_size = RDMA_CHUNK_SIZE_MB * 1024 * 1024
         tensor_chunks = torch.split(byte_view, chunk_size, dim=0)
@@ -236,18 +296,19 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
 
-        byte_view_chunks = self._create_byte_views_from_tensor(tensor)
+        byte_view = tensor.view(torch.uint8).flatten()
+        self.tensor_refs = byte_view
+        self.rdma_buffers = RDMABuffer(byte_view)
+
+        # byte_view_chunks = self._create_byte_views_from_tensor(tensor)
         # self.tensor_refs = [
         #     torch.empty_like(chunk, device=torch.device("cpu"))
         #     for chunk in byte_view_chunks
         # ]
-        self.tensor_refs = byte_view_chunks  # TODO: just remove the chunking logic
-        self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
+        # self.tensor_refs = byte_view_chunks  # TODO: just remove the chunking logic
+        # self.rdma_buffers = [RDMABuffer(chunk) for chunk in self.tensor_refs]
 
-        chunk_sizes = set()
-        for chunk in self.tensor_refs:
-            chunk_sizes.add(chunk.shape)
-        logging.debug(f"Allocted {len(self.rdma_buffers)} rdma buffers {chunk_sizes=}")
-
-    def update(self, other_buffer: "TransportBuffer") -> None:
-        super().update(other_buffer)
+        # chunk_sizes = set()
+        # for chunk in self.tensor_refs:
+        # chunk_sizes.add(chunk.shape)
+        # logging.debug(f"Allocted {len(self.rdma_buffers)} rdma buffers {chunk_sizes=}")
