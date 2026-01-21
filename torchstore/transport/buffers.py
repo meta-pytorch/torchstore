@@ -127,7 +127,7 @@ class TransportBuffer:
     # Client-side interface. Called by the client to send/recv data to the storage volume.
     async def put_to_storage_volume(self, key, request: "Request"):
         try:
-            # _give concrete implementaiton a chance to parse the request
+            # _give concrete implementation a chance to parse the request
             await self._pre_put_hook(request)
 
             if self.requires_handshake:

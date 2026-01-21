@@ -94,7 +94,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
     ):
 
         # TODO:
-        # add support for writting diretly to current_object (inplace update)
+        # add support for writting directly to current_object (inplace update)
 
         # TODO: clunky, this transport buffer should have something for
         # objects as well.

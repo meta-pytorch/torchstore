@@ -249,13 +249,13 @@ class InMemoryStore(StorageImpl):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
+        # passing existing object to allow for inplace puts with no new allocation
+        current_data = self.kv.get(key, None)
 
         # fetch from remote
         data = await transport_buffer.handle_put_request(
             request,
-            self.kv.get(
-                key, None
-            ),  # passing existing object to allow for inplace puts with no new allocation
+            current_data,
             self.transport_context,
         )
 
