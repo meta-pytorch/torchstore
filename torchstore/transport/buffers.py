@@ -133,7 +133,9 @@ class TransportBuffer:
             if self.requires_handshake:
                 await self.storage_volume_ref.volume.handshake.call(self)
 
-            await self.storage_volume_ref.volume.put.call(key, self, request)
+            await self.storage_volume_ref.volume.put.call(
+                key, self, request.meta_only()
+            )
         finally:
             await self.drop()
 
@@ -147,7 +149,9 @@ class TransportBuffer:
             # when fetching data, we may need to handle the response from the storage volume
             # TODO: think of a good prefix to differentiate this between remote handlers
             response = await self._handle_storage_volume_response(
-                await self.storage_volume_ref.volume.get.call_one(key, self, request)
+                await self.storage_volume_ref.volume.get.call_one(
+                    key, self, request.meta_only()
+                )
             )
         finally:
             await self.drop()
