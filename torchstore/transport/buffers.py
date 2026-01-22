@@ -131,8 +131,8 @@ class TransportBuffer:
             await self._pre_put_hook(request)
 
             if await self._should_handshake(request):
-                handshake_result = await self.storage_volume_ref.volume.handshake.call_one(
-                    self
+                handshake_result = (
+                    await self.storage_volume_ref.volume.handshake.call_one(self)
                 )
                 await self._post_handshake(handshake_result)
 
@@ -147,8 +147,8 @@ class TransportBuffer:
             await self._pre_get_hook(key, request)
 
             if await self._should_handshake(request):
-                handshake_result = await self.storage_volume_ref.volume.handshake.call_one(
-                    self
+                handshake_result = (
+                    await self.storage_volume_ref.volume.handshake.call_one(self)
                 )
                 await self._post_handshake(handshake_result)
 
