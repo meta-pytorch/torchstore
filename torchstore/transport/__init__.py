@@ -13,6 +13,7 @@ from torchstore.transport.monarch_rdma import (
     MonarchRDMATransportBuffer,
 )
 from torchstore.transport.monarch_rpc import MonarchRPCTransportBuffer
+from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 from torchstore.transport.types import Request, TensorSlice
 
 if TYPE_CHECKING:
@@ -42,7 +43,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
     transport_map = {
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
-        # TorchCommsRDMA: Torch #TODO
+        TransportType.TorchCommsRDMA: TorchCommsRdmaTransportBuffer,
     }
 
     return transport_map[transport_type](storage_volume_ref)
