@@ -130,8 +130,11 @@ class TransportBuffer:
             # _give concrete implementation a chance to parse the request
             await self._pre_put_hook(request)
 
-            if self.requires_handshake:
-                await self.storage_volume_ref.volume.handshake.call(self)
+            if await self._should_handshake(request):
+                handshake_result = await self.storage_volume_ref.volume.handshake.call_one(
+                    self
+                )
+                await self._post_handshake(handshake_result)
 
             await self.storage_volume_ref.volume.put.call(
                 key, self, request.meta_only()
@@ -143,8 +146,11 @@ class TransportBuffer:
         try:
             await self._pre_get_hook(key, request)
 
-            if self.requires_handshake:
-                self.storage_volume_ref.volume.handshake.call(self)
+            if await self._should_handshake(request):
+                handshake_result = await self.storage_volume_ref.volume.handshake.call_one(
+                    self
+                )
+                await self._post_handshake(handshake_result)
 
             # when fetching data, we may need to handle the response from the storage volume
             # TODO: think of a good prefix to differentiate this between remote handlers
@@ -157,6 +163,22 @@ class TransportBuffer:
             await self.drop()
 
         return response
+
+    async def _should_handshake(self, request: "Request") -> bool:
+        """Determine if a handshake is needed before the operation.
+
+        Override this method for custom handshake logic (e.g., cached connections).
+        Default implementation returns self.requires_handshake.
+        """
+        return self.requires_handshake
+
+    async def _post_handshake(self, handshake_result: Any) -> None:
+        """Process the result of a handshake on the client side.
+
+        Called after the storage volume responds to a handshake request.
+        Override this to handle handshake results (e.g., connecting to peer).
+        """
+        pass
 
     async def _drop(self, response: Any):
         pass
