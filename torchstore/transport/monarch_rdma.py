@@ -70,7 +70,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         # keep request for later
         self.request = request
 
-        # rdma buffer requires we have a ore-existing memory space locally
+        # rdma buffer requires we have a pre-existing memory space locally
         # if the user has not provided a local tensor, we need to first
         # identify and allocate  ahead of time
         meta = None
