@@ -126,6 +126,55 @@ class InMemoryStore(StorageImpl):
     async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
         return await transport_buffer.recv_handshake(self.transport_context)
 
+    def _extract_existing(self, key: str, request: "Request") -> Optional[torch.Tensor]:
+        """Extract existing tensor from storage for in-place update.
+
+        Looks up the key in kv storage and extracts the tensor if it exists.
+        Only asserts on type mismatches between existing data and incoming request.
+
+        Args:
+            key: The storage key to look up
+            request: The incoming put request
+
+        Returns:
+            The existing tensor if found, None otherwise.
+
+        Raises:
+            AssertionError: If there's a type mismatch between existing data and request.
+        """
+        current_object = self.kv.get(key, None)
+
+        if current_object is None:
+            return None
+
+        if isinstance(current_object, torch.Tensor):
+            # Regular tensor - request must also be a regular tensor (no tensor_slice)
+            assert (
+                request.tensor_slice is None
+            ), "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
+            return current_object
+
+        if isinstance(current_object, dict):
+            if "obj" in current_object:
+                # Object dict - request must also be an object
+                assert (
+                    request.is_object
+                ), "Existing data is an object but request.is_object is False"
+                return None
+
+            # DTensor shard dict - incoming request must also be a DTensor
+            assert (
+                request.tensor_slice is not None
+            ), "Existing data is DTensor shards but incoming request has no tensor_slice"
+            # Look up by coordinates
+            shard = current_object.get(request.tensor_slice.coordinates)
+            if shard is not None and "tensor" in shard:
+                return shard["tensor"]
+            # Coordinates don't match - new shard, return None to allocate new
+            return None
+
+        raise AssertionError(f"Unexpected current_object type: {type(current_object)}")
+
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")
         # we can also consider in the future not requiring the full tensor to be
@@ -249,13 +298,13 @@ class InMemoryStore(StorageImpl):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
-        # passing existing object to allow for inplace puts with no new allocation
-        current_data = self.kv.get(key, None)
+        # Extract existing tensor for potential in-place update
+        current_obj = self._extract_existing(key, request)
 
         # fetch from remote
         data = await transport_buffer.handle_put_request(
             request,
-            current_data,
+            current_obj,
             self.transport_context,
         )
 

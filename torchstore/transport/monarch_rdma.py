@@ -82,51 +82,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         self.allocate(meta or request.tensor_val)
 
-    def _extract_existing_tensor(
-        self, current_object: Any, request: Request
-    ) -> torch.Tensor:
-        """Extract existing tensor from current_object for in-place update.
-
-        Uses fail-fast assertions to ensure type consistency between existing
-        data and incoming request.
-
-        Args:
-            current_object: The existing stored data (Tensor or dict, NOT None)
-            request: The incoming put request
-
-        Returns:
-            The existing tensor.
-
-        Raises:
-            AssertionError: If there's a type mismatch between existing data and request.
-        """
-        assert current_object is not None, "current_object must not be None"
-
-        if isinstance(current_object, torch.Tensor):
-            # Regular tensor - request must also be a regular tensor (no tensor_slice)
-            assert (
-                request.tensor_slice is None
-            ), "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
-            return current_object
-
-        if isinstance(current_object, dict):
-            # Object dicts should never reach here - objects are handled by early return
-            assert (
-                "obj" not in current_object
-            ), "Existing data is an object but request.is_object is False"
-            # DTensor shard dict - incoming request must also be a DTensor
-            assert (
-                request.tensor_slice is not None
-            ), "Existing data is DTensor shards but incoming request has no tensor_slice"
-            # Look up by coordinates
-            shard = current_object.get(request.tensor_slice.coordinates)
-            if shard is not None and "tensor" in shard:
-                return shard["tensor"]
-            # Coordinates don't match - new shard, return None to allocate new
-            return None
-
-        raise AssertionError(f"Unexpected current_object type: {type(current_object)}")
-
     async def handle_put_request(
         self, request: Request, current_object, storage_transport_context
     ):
@@ -134,10 +89,8 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             self.is_object = True
             return request.objects
 
-        # Extract existing tensor for potential in-place update
-        tensor = None
-        if current_object is not None:
-            tensor = self._extract_existing_tensor(current_object, request)
+        # current_object is now the extracted tensor (or None)
+        tensor = current_object
 
         if tensor is None:
             # happens when we haven't seen this tensor / dtensor before

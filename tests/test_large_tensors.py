@@ -12,10 +12,10 @@ import pytest
 import torch
 import torchstore as ts
 from monarch.actor import Actor, endpoint
-from tochstore.transport.monarch_rdma import monarch_rdma_transport_available
 from torchstore.logging import init_logging
 from torchstore.strategy import SingletonStrategy
 from torchstore.transport import TransportType
+from torchstore.transport.monarch_rdma import monarch_rdma_transport_available
 from torchstore.utils import spawn_actors
 
 from .utils import main
@@ -31,7 +31,7 @@ async def test_large_tensors():
     class LargeTensorActor(Actor):
         step_size: int = 100  # -> 400mb
         max_step: int = 600  # 4mb -> 2gb
-        repeat_test: int = 1
+        repeat_test: int = 2
 
         def __init__(self, generate_benchmark=False) -> None:
             self.generate_benchmark = generate_benchmark
