@@ -39,12 +39,12 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         self.data = request.objects if request.is_object else request.tensor_val
 
     async def handle_put_request(
-        self, request: Request, current_object, storage_transport_context
+        self, request: Request, current_object, context
     ) -> Any:
         """Return the data from the buffer to be stored."""
         return self.data
 
-    async def handle_get_request(self, data, storage_transport_context) -> None:
+    async def handle_get_request(self, data, context) -> None:
         """Store the data to be sent back to the client."""
         self.data = data
 

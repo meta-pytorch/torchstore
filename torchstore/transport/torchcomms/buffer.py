@@ -26,8 +26,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     Transport buffer implementation using TorchComms RDMA for efficient tensor transfer.
     """
 
-    requires_handshake: bool = True
-
     def __init__(self, storage_volume_ref: "StorageVolumeRef") -> None:
         super().__init__(storage_volume_ref)
 
@@ -68,7 +66,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             self.storage_volume_ref.volume_id, device
         )
 
-    async def _should_handshake(self, request: "Request") -> bool:
+    @property
+    def requires_handshake(self) -> bool:
         """Only handshake if RDMA was set up and connection is not already cached."""
         if self.address is None:
             return False
@@ -103,8 +102,10 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     async def _pre_put_hook(self, request: "Request") -> None:
         """Prepare buffers before sending put request (client-side)."""
-        if request.is_object or request.tensor_val is None:
+        if request.is_object:
             return
+
+        assert request.tensor_val is not None
 
         tensor = request.tensor_val
         self._setup_local_transport(tensor)
@@ -147,36 +148,33 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     async def handle_put_request(
         self,
         request: "Request",
-        current_object,
-        storage_transport_context: "TransportContext",
+        maybe_tensor,
+        context: "TransportContext",
     ) -> Any:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
         if request.is_object:
             return request.objects
 
-        tensor = current_object
-        if tensor is None:
-            tensor = torch.zeros(
+        if maybe_tensor is None:
+            maybe_tensor = torch.zeros(
                 self.shape, dtype=self.dtype, device=torch.device("cpu")
             )
 
         assert self.rdma_remote_buffer is not None
-        self._assert_valid_tensor(tensor, self.dtype, self.shape)
+        self._assert_valid_tensor(maybe_tensor, self.dtype, self.shape)
 
-        transport_cache = storage_transport_context.get_rdma_transport_cache()
+        transport_cache = context.get_rdma_transport_cache()
         transport = transport_cache.get(self.address, 0)[0]
 
-        receiving_buffer = RdmaMemory(tensor)
+        receiving_buffer = RdmaMemory(maybe_tensor)
         res = transport.read(
             receiving_buffer.to_mutable_view(), self.rdma_remote_buffer
         )
         assert res == 0, f"RDMA read failed: conn code {res}"
 
-        return tensor
+        return maybe_tensor
 
-    async def handle_get_request(
-        self, data, storage_transport_context: "TransportContext"
-    ) -> None:
+    async def handle_get_request(self, data, context: "TransportContext") -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
         if not isinstance(data, torch.Tensor):
             self.is_object = True
@@ -198,7 +196,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
         rdma_memory = RdmaMemory(tensor)
 
-        transport_cache = storage_transport_context.get_rdma_transport_cache()
+        transport_cache = context.get_rdma_transport_cache()
         transport, _ = transport_cache.get(self.address, 0)
         res = transport.write(rdma_memory.to_view(), self.rdma_remote_buffer)
         assert res == 0, f"RDMA write failed: conn code {res}"
@@ -207,7 +205,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self, transport_buffer: "TransportBuffer"
     ) -> Any:
         """Extract data from response buffer on client side."""
-        if hasattr(transport_buffer, "is_object") and transport_buffer.is_object:
+        if transport_buffer.is_object:
             return transport_buffer.objects
 
         # Data was written directly into self.tensor_ref via RDMA
