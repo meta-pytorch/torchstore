@@ -89,9 +89,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         self.allocate(meta or request.tensor_val)
 
-    async def handle_put_request(
-        self, request: Request, current_object, storage_transport_context
-    ):
+    async def handle_put_request(self, request: Request, current_object, context):
 
         # TODO:
         # add support for writting directly to current_object (inplace update)
@@ -118,7 +116,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         return tensor
 
-    async def handle_get_request(self, data, storage_transport_context):
+    async def handle_get_request(self, data, context):
         # add support for writting diretly to current_object (inplace update)
 
         # todo:handle objects better

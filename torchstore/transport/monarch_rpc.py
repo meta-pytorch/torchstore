@@ -32,39 +32,28 @@ class MonarchRPCTransportBuffer(TransportBuffer):
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
-        self.data: Any = None
+        self.data: Any = None  # Carries data for both PUT and GET
+
+    async def _pre_put_hook(self, request: Request) -> None:
+        """Store data from request to be serialized with this buffer."""
+        self.data = request.objects if request.is_object else request.tensor_val
 
     async def handle_put_request(
-        self, request: Request, current_object, storage_transport_context
+        self, request: Request, current_object, context
     ) -> Any:
-        """Return the data from the request to be stored.
+        """Return the data from the buffer to be stored."""
+        return self.data
 
-        For RPC transport, data is already available in the request
-        since it was serialized and sent via RPC.
-
-        """
-        if request.is_object:
-            return request.objects
-        return request.tensor_val
-
-    async def handle_get_request(self, data, storage_transport_context) -> None:
-        """Store the data to be sent back to the client.
-
-        For RPC transport, we just store the data as a member variable.
-        It will be serialized when this buffer is returned via RPC.
-        """
+    async def handle_get_request(self, data, context) -> None:
+        """Store the data to be sent back to the client."""
         self.data = data
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
     ) -> Any:
-        """Extract the data from the response buffer.
-
-        The transport_buffer is the same instance that was modified
-        on the storage volume side, with data stored in self.data.
-        """
+        """Extract the data from the response buffer."""
         return transport_buffer.data
 
     async def drop(self) -> None:
-        """No cleanup needed for RPC transport."""
+        """Clean up stored references for RPC transport."""
         self.data = None

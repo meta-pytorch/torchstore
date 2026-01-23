@@ -102,10 +102,11 @@ class TransportBuffer:
     - `handle_handshake_request`: If `requires_handshake=True`
     - `drop`: Resource cleanup (especially important for RDMA buffers)
 
-    Attributes
+    Properties
     ----------
     requires_handshake : bool
-        If True, a handshake call is made before put/get to exchange connection info.
+        Property that returns True if a handshake is needed before put/get.
+        Override this in subclasses to implement custom handshake logic.
         Default is False.
 
     Args
@@ -119,10 +120,17 @@ class TransportBuffer:
     MonarchTransportBuffer : Simple RPC-based implementation (slower but always works).
     """
 
-    requires_handshake: bool = False
-
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
+
+    @property
+    def requires_handshake(self) -> bool:
+        """Determine if a handshake is needed before the operation.
+
+        Override this property for custom handshake logic (e.g., cached connections).
+        Default implementation returns False.
+        """
+        return False
 
     # Client-side interface. Called by the client to send/recv data to the storage volume.
     async def put_to_storage_volume(self, key, request: "Request"):
@@ -131,7 +139,10 @@ class TransportBuffer:
             await self._pre_put_hook(request)
 
             if self.requires_handshake:
-                await self.storage_volume_ref.volume.handshake.call(self)
+                handshake_result = (
+                    await self.storage_volume_ref.volume.handshake.call_one(self)
+                )
+                await self._post_handshake(handshake_result)
 
             await self.storage_volume_ref.volume.put.call(
                 key, self, request.meta_only()
@@ -144,7 +155,10 @@ class TransportBuffer:
             await self._pre_get_hook(key, request)
 
             if self.requires_handshake:
-                self.storage_volume_ref.volume.handshake.call(self)
+                handshake_result = (
+                    await self.storage_volume_ref.volume.handshake.call_one(self)
+                )
+                await self._post_handshake(handshake_result)
 
             # when fetching data, we may need to handle the response from the storage volume
             # TODO: think of a good prefix to differentiate this between remote handlers
@@ -157,6 +171,14 @@ class TransportBuffer:
             await self.drop()
 
         return response
+
+    async def _post_handshake(self, handshake_result: Any) -> None:
+        """Process the result of a handshake on the client side.
+
+        Called after the storage volume responds to a handshake request.
+        Override this to handle handshake results (e.g., connecting to peer).
+        """
+        pass
 
     async def _drop(self, response: Any):
         pass
