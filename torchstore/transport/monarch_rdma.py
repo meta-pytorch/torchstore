@@ -97,7 +97,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             tensor = torch.empty(
                 self.shape, dtype=self.dtype, device=torch.device("cpu")
             )
-            print("allocating new tensor")
 
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
 
@@ -148,13 +147,14 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         pages remain pinned even after the Python objects are garbage collected,
         leading to a memory leak that manifests as unbounded Inactive(anon) growth.
         """
-        if self.rdma_buffer is not None:
-            try:
-                await self.rdma_buffer.drop()
-            except Exception as e:
-                logging.warning(f"Failed to drop RDMA buffer during cleanup: {e}")
-            self.rdma_buffer = None
-            self.byte_view = None
+        if self.rdma_buffer is None:
+            return
+        try:
+            await self.rdma_buffer.drop()
+        except Exception as e:
+            logging.warning(f"Failed to drop RDMA buffer during cleanup: {e}")
+        self.rdma_buffer = None
+        self.byte_view = None
 
     def __getstate__(self) -> Dict[str, Any]:
         # Any time that we serialize the transport buffer, the idea is
