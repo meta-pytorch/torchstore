@@ -180,12 +180,10 @@ class MonarchRDMATransportBuffer(TransportBuffer):
                 tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
             )
         else:
-            # we have an tensor, allocate a copy
-            # this copy is mostly to avoid contiguous tensors issues
-            # that show up during resharding
+            # note: .contiguous will return a copy if this tensor is not contiguous
+            # that usually shows up during resharding cases
             assert isinstance(tensor_like, torch.Tensor)
             tensor = tensor_like.contiguous()
-            # tensor = torch.empty_like(tensor_like, device=torch.device("cpu"))
 
         self.tensor = tensor
 
