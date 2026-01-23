@@ -102,7 +102,7 @@ async def test_large_tensors():
     actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
     try:
         await actor.put.call_one()
-        # await actor.get.call_one()
+        await actor.get.call_one()
         # TODO: assert equal tensors from put/get
     finally:
         # TODO: Investigate monarch bug with proc_mesh.stop()
