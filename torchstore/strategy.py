@@ -234,7 +234,7 @@ class ControllerStorageVolumes(TorchStoreStrategy):
         Returns:
             tuple: (StorageVolume actor, volume_id) for this client.
         """
-        # client_id is hardcded to a controller only volume
+        # client_id is hardcoded to a controller only volume
         client_id = self.get_client_id()
         if client_id not in self.volume_id_to_coord:
             raise KeyError(
