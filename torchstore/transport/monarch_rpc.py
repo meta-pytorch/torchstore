@@ -25,7 +25,7 @@ class MonarchRPCTransportBuffer(TransportBuffer):
     """Simple RPC-based transport that passes data through serialization.
 
     Unlike RDMA transport which requires explicit memory registration,
-    this transport simply stores data as member variables that are
+    this transport simply stores data as member variables on the buffer that are
     automatically serialized when the buffer is sent via RPC.
     """
 

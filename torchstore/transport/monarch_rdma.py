@@ -72,7 +72,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         # rdma buffer requires we have a pre-existing memory space locally
         # if the user has not provided a local tensor, we need to first
-        # identify and allocate  ahead of time
+        # identify and allocate ahead of time
         meta = None
         if not request.tensor_val:
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
