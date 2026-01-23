@@ -303,9 +303,9 @@ class InMemoryStore(StorageImpl):
 
         # fetch from remote
         data = await transport_buffer.handle_put_request(
+            self.transport_context,
             request,
             current_obj,
-            self.transport_context,
         )
 
         # store locally
@@ -327,7 +327,7 @@ class InMemoryStore(StorageImpl):
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
         data = self._get_data(request, key)
-        await transport_buffer.handle_get_request(data, self.transport_context)
+        await transport_buffer.handle_get_request(self.transport_context, data)
 
         return transport_buffer
 

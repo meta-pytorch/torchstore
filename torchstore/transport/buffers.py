@@ -208,14 +208,14 @@ class TransportBuffer:
 
     async def handle_put_request(
         self,
+        ctx: "TransportContext",
         request: "Request",
         maybe_tensor,
-        context: "TransportContext",
     ) -> Any:
         # called on the storage volume side
         raise NotImplementedError()
 
-    async def handle_get_request(self, data, context: "TransportContext") -> None:
+    async def handle_get_request(self, ctx: "TransportContext", data) -> None:
         # called on the storage volume side
         raise NotImplementedError()
 

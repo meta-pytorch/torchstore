@@ -147,9 +147,9 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     async def handle_put_request(
         self,
+        ctx: "TransportContext",
         request: "Request",
         maybe_tensor,
-        context: "TransportContext",
     ) -> Any:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
         if request.is_object:
@@ -163,7 +163,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         assert self.rdma_remote_buffer is not None
         self._assert_valid_tensor(maybe_tensor, self.dtype, self.shape)
 
-        transport_cache = context.get_rdma_transport_cache()
+        transport_cache = ctx.get_rdma_transport_cache()
         transport = transport_cache.get(self.address, 0)[0]
 
         receiving_buffer = RdmaMemory(maybe_tensor)
@@ -174,7 +174,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
         return maybe_tensor
 
-    async def handle_get_request(self, data, context: "TransportContext") -> None:
+    async def handle_get_request(self, ctx: "TransportContext", data) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
         if not isinstance(data, torch.Tensor):
             self.is_object = True
@@ -196,7 +196,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
         rdma_memory = RdmaMemory(tensor)
 
-        transport_cache = context.get_rdma_transport_cache()
+        transport_cache = ctx.get_rdma_transport_cache()
         transport, _ = transport_cache.get(self.address, 0)
         res = transport.write(rdma_memory.to_view(), self.rdma_remote_buffer)
         assert res == 0, f"RDMA write failed: conn code {res}"

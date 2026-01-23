@@ -18,6 +18,7 @@ from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
+    from torchstore.transport.buffers import TransportContext
 
 
 class MonarchRPCTransportBuffer(TransportBuffer):
@@ -39,12 +40,12 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         self.data = request.objects if request.is_object else request.tensor_val
 
     async def handle_put_request(
-        self, request: Request, current_object, context
+        self, ctx: "TransportContext", request: Request, current_object
     ) -> Any:
         """Return the data from the buffer to be stored."""
         return self.data
 
-    async def handle_get_request(self, data, context) -> None:
+    async def handle_get_request(self, ctx: "TransportContext", data) -> None:
         """Store the data to be sent back to the client."""
         self.data = data
 
