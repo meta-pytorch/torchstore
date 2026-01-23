@@ -315,7 +315,7 @@ async def test_key_miss():
                 value = torch.tensor([1, 2, 3])
                 await ts.put(key, value)
 
-                # `Get` the value back
+                # Get the value back
                 retrieved_value = await ts.get(key)
                 assert torch.equal(value, retrieved_value)
 
