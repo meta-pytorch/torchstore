@@ -83,7 +83,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         self.allocate(meta or request.tensor_val)
 
     async def handle_put_request(
-        self, request: Request, current_object, storage_transport_context
+        self, request: Request, current_object, context: "TransportContext"
     ):
         if request.is_object:
             self.is_object = True
@@ -106,7 +106,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         return tensor
 
-    async def handle_get_request(self, data, storage_transport_context):
+    async def handle_get_request(self, data, context: "TransportContext"):
         if not isinstance(data, torch.Tensor):
             self.is_object = True
             self.objects = data
