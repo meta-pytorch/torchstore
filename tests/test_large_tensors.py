@@ -13,6 +13,9 @@ import torch
 import torchstore as ts
 from monarch.actor import Actor, endpoint
 from torchstore.logging import init_logging
+from torchstore.strategy import SingletonStrategy
+from torchstore.transport import TransportType
+from torchstore.transport.monarch_rdma import monarch_rdma_transport_available
 from torchstore.utils import spawn_actors
 
 from .utils import main
@@ -28,6 +31,7 @@ async def test_large_tensors():
     class LargeTensorActor(Actor):
         step_size: int = 100  # -> 400mb
         max_step: int = 600  # 4mb -> 2gb
+        repeat_test: int = 2
 
         def __init__(self, generate_benchmark=False) -> None:
             self.generate_benchmark = generate_benchmark
@@ -36,24 +40,26 @@ async def test_large_tensors():
         @endpoint
         async def put(self):
             dps = []
-            for n in range(1, self.max_step, self.step_size):
-                shape = (1024, 1024 * n)
-                size_mbytes = (
-                    math.prod(shape) * 4 // (1024 * 1024)
-                )  # float32 is 4 bytes, // mb
-                tensor = torch.randn(shape, dtype=torch.float32)
+            for test_itr in range(self.repeat_test):
+                print(f"{test_itr=}\n")
+                for n in range(1, self.max_step, self.step_size):
+                    shape = (1024, 1024 * n)
+                    size_mbytes = (
+                        math.prod(shape) * 4 // (1024 * 1024)
+                    )  # float32 is 4 bytes, // mb
+                    tensor = torch.randn(shape, dtype=torch.float32)
 
-                logger.info(f"Put {n=} {size_mbytes=}")
-                t = time.perf_counter()
-                try:
-                    await ts.put(str(n), tensor)
-                except Exception as e:
-                    logger.exception(f"Test failed with {size_mbytes=}")
-                    raise e
+                    logger.info(f"Put {n=} {size_mbytes=}")
+                    t = time.perf_counter()
+                    try:
+                        await ts.put(str(n), tensor)
+                    except Exception as e:
+                        logger.exception(f"Test failed with {size_mbytes=}")
+                        raise e
 
-                delta = time.perf_counter() - t
-                dps.append((size_mbytes, delta))
-                logger.info(f"Took {delta} seconds to put")
+                    delta = time.perf_counter() - t
+                    dps.append((size_mbytes, delta))
+                    logger.info(f"Took {delta} seconds to put")
 
             if self.generate_benchmark:
                 with open("put_benchmark.csv", "w") as fp:
@@ -63,24 +69,26 @@ async def test_large_tensors():
 
         @endpoint
         async def get(self):
-            dps = []
-            for n in range(1, self.max_step, self.step_size):
-                shape = (1024, 1024 * n)
-                size_mbytes = (
-                    math.prod(shape) * 4 // (1024 * 1024)
-                )  # float32 is 4 bytes, // mb
+            for test_itr in range(self.repeat_test):
+                print(f"{test_itr=}\n")
+                dps = []
+                for n in range(1, self.max_step, self.step_size):
+                    shape = (1024, 1024 * n)
+                    size_mbytes = (
+                        math.prod(shape) * 4 // (1024 * 1024)
+                    )  # float32 is 4 bytes, // mb
 
-                logger.info(f"Get {n=} {size_mbytes=}")
-                t = time.perf_counter()
-                try:
-                    await ts.get(str(n))
-                except Exception as e:
-                    logger.exception(f"Test failed with {size_mbytes=}")
-                    raise e
+                    logger.info(f"Get {n=} {size_mbytes=}")
+                    t = time.perf_counter()
+                    try:
+                        await ts.get(str(n))
+                    except Exception as e:
+                        logger.exception(f"Test failed with {size_mbytes=}")
+                        raise e
 
-                delta = time.perf_counter() - t
-                dps.append((size_mbytes, delta))
-                logger.info(f"Took {delta} seconds to fetch")
+                    delta = time.perf_counter() - t
+                    dps.append((size_mbytes, delta))
+                    logger.info(f"Took {delta} seconds to fetch")
 
             if self.generate_benchmark:
                 with open("get_benchmark.csv", "w") as fp:
@@ -89,7 +97,15 @@ async def test_large_tensors():
                         fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
 
     # controller code
-    await ts.initialize()
+    await ts.initialize(
+        strategy=SingletonStrategy(
+            default_transport_type=(
+                TransportType.MonarchRDMA
+                if monarch_rdma_transport_available()
+                else TransportType.Unset
+            )
+        )
+    )
     actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
     try:
         await actor.put.call_one()

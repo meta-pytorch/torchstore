@@ -8,6 +8,7 @@ from typing import Any, Dict, TYPE_CHECKING
 
 import torch
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport.torchcomms.cache import RdmaTransportCache
 
 if TYPE_CHECKING:
@@ -134,21 +135,27 @@ class TransportBuffer:
 
     # Client-side interface. Called by the client to send/recv data to the storage volume.
     async def put_to_storage_volume(self, key, request: "Request"):
+        l = LatencyTracker("put")
         try:
             # _give concrete implementation a chance to parse the request
             await self._pre_put_hook(request)
+            l.track_step("_pre_put_hook")
 
             if self.requires_handshake:
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(self)
                 )
                 await self._post_handshake(handshake_result)
+                l.track_step("handshake")
 
             await self.storage_volume_ref.volume.put.call(
                 key, self, request.meta_only()
             )
+            l.track_step("volume.put.call")
         finally:
             await self.drop()
+            l.track_step("drop")
+            l.track_e2e()
 
     async def get_from_storage_volume(self, key, request: "Request"):
         try:
@@ -195,15 +202,20 @@ class TransportBuffer:
     # StorageVolume handlers -- must be implemented by concrete implementaiton
     # These methods are called by the StorageVolume on the remote side
 
-    async def handle_handshake_request(self):
+    async def handle_handshake_request(self) -> None:
         # called on the storage volume side
         raise NotImplementedError()
 
-    async def handle_put_request(self, key, request: "Request"):
+    async def handle_put_request(
+        self,
+        request: "Request",
+        maybe_tensor,
+        context: "TransportContext",
+    ) -> Any:
         # called on the storage volume side
         raise NotImplementedError()
 
-    async def handle_get_request(self, key, request: "Request"):
+    async def handle_get_request(self, data, context: "TransportContext") -> None:
         # called on the storage volume side
         raise NotImplementedError()
 
