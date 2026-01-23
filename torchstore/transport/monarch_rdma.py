@@ -21,7 +21,6 @@ except ImportError:
         )
 
 
-from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.types import Request
 
@@ -149,12 +148,8 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
 
-        l = LatencyTracker("sv-put")
         byte_view = tensor.view(torch.uint8).flatten()
-        l.track_step("byte view")
         await self.rdma_buffer.read_into(byte_view)
-        l.track_step("read intoo")
-        l.track_e2e()
 
         return tensor
 
@@ -185,7 +180,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         # vioalted since .contiguous is a copy
         if self.request.tensor_val is not None:
             if self.request.tensor_val.data_ptr() != self.tensor.data_ptr():
-                raise RuntimeError(" extra clowny shit")
                 self.request.tensor_val.copy_(self.tensor)
             return self.request.tensor_val
 

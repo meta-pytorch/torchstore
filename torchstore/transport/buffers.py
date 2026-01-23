@@ -127,11 +127,11 @@ class TransportBuffer:
 
     # Client-side interface. Called by the client to send/recv data to the storage volume.
     async def put_to_storage_volume(self, key, request: "Request"):
+        l = LatencyTracker("put")
         try:
-            l = LatencyTracker("put")
             # _give concrete implementation a chance to parse the request
             await self._pre_put_hook(request)
-            l.track_step("pre hook")
+            l.track_step("_pre_put_hook")
 
             if self.requires_handshake:
                 await self.storage_volume_ref.volume.handshake.call(self)
@@ -140,9 +140,10 @@ class TransportBuffer:
             await self.storage_volume_ref.volume.put.call(
                 key, self, request.meta_only()
             )
-            l.track_step("storage volume put")
+            l.track_step("volume.put.call")
         finally:
             await self.drop()
+            l.track_step("drop")
             l.track_e2e()
 
     async def get_from_storage_volume(self, key, request: "Request"):

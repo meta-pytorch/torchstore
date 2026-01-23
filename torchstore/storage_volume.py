@@ -249,9 +249,6 @@ class InMemoryStore(StorageImpl):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
-
-        # import fbvscode
-        # fbvscode.set_trace()
         # passing existing object to allow for inplace puts with no new allocation
         current_data = self.kv.get(key, None)
 
