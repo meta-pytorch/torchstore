@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
-# TEST_MODEL = "meta-llama/Llama-3.1-8B" # ~ 16GB
+# TEST_MODEL = "meta-llama/Llama-3.1-8B"  # ~ 16GB
 
 
 class ModelTest(Actor):
