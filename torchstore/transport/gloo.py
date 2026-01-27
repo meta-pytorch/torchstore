@@ -9,7 +9,7 @@ import socket
 import uuid
 from datetime import timedelta
 from logging import getLogger
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Dict, Tuple, TYPE_CHECKING
 
 import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
@@ -53,7 +53,7 @@ def gloo_available() -> bool:
 
     return True
 
-    
+
 def _find_free_port() -> int:
     """Find a free port on the local machine."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -76,7 +76,7 @@ def _gloo_factory(
     rank: int,
     world_size: int,
     timeout: timedelta,
-    device: Optional[torch.device] = None,
+    device: torch.device | None = None,
 ) -> ProcessGroup:
     """
     Create a ProcessGroup with Gloo backend.
@@ -119,24 +119,30 @@ class GlooTransportBuffer(TransportBuffer):
         super().__init__(storage_volume_ref)
 
         # Tensor metadata
-        self.shape: Optional[torch.Size] = None
-        self.dtype: Optional[torch.dtype] = None
+        self.shape: torch.Size | None = None
+        self.dtype: torch.dtype | None = None
 
         # Process group coordination
-        self.master_addr: Optional[str] = None
-        self.master_port: Optional[int] = None
-        self.store_key: Optional[str] = None  # Unique key for this connection
+        self.master_addr: str | None = None
+        self.master_port: int | None = None
+        self.store_key: str | None = None  # Unique key for this connection
 
         # Flag for object (non-tensor) transport
         self.is_object: bool = False
         self.objects: Any = None  # For object transport in GET operations
 
         # TCPStore reference (kept alive until PG is created)
-        self._tcp_store: Optional[TCPStore] = None
-        self._connection_exists: bool = False # Whether a handshake has already been performed
-        self._pg_task: Optional[asyncio.Task] = None  # Background task for PG creation
-        self._send_task: Optional[asyncio.Task] = None  # Background task for sending tensor
-        self._recv_task: Optional[asyncio.Task] = None  # Background task for receiving tensor
+        self._tcp_store: TCPStore | None = None
+        self._connection_exists: bool = (
+            False  # Whether a handshake has already been performed
+        )
+        self._pg_task: asyncio.Task | None = None  # Background task for PG creation
+        self._send_task: asyncio.Task | None = (
+            None  # Background task for sending tensor
+        )
+        self._recv_task: asyncio.Task | None = (
+            None  # Background task for receiving tensor
+        )
 
     @property
     def requires_handshake(self) -> bool:
@@ -154,7 +160,7 @@ class GlooTransportBuffer(TransportBuffer):
         return state
 
     async def _pre_handshake(self, request: "Request") -> None:
-        """Prepare for handshake. Create TCPStore and start PG creation on 
+        """Prepare for handshake. Create TCPStore and start PG creation on
         client side (rank 0).
 
         The TCPStore is created here so it's ready to accept connections
@@ -207,10 +213,7 @@ class GlooTransportBuffer(TransportBuffer):
 
         self._pg_task = asyncio.create_task(asyncio.to_thread(create_pg))
 
-
-    async def recv_handshake(
-        self, transport_context: "TransportContext"
-    ) -> Optional[Any]:
+    async def recv_handshake(self, transport_context: "TransportContext") -> Any | None:
         """Called on storage volume side to set up the process group.
 
         Creates TCPStore and ProcessGroup on storage side (rank 1).
@@ -282,7 +285,6 @@ class GlooTransportBuffer(TransportBuffer):
         self._pg_task = None
 
         logger.info(f"Finished gloo handshake with StorageVolume:[{volume_id}]")
-
 
     async def _pre_put_hook(self, request: "Request") -> None:
         """Start sending tensor before put RPC.
@@ -382,7 +384,9 @@ class GlooTransportBuffer(TransportBuffer):
         # Send the tensor to client via gloo
         await self.send_tensor(data, ctx)
 
-    async def _handle_storage_volume_response(self, transport_buffer: "TransportBuffer") -> Any:
+    async def _handle_storage_volume_response(
+        self, transport_buffer: "TransportBuffer"
+    ) -> Any:
         """Process the response from storage volume after get.
 
         The tensor data was received via gloo in the background recv task.
@@ -401,9 +405,7 @@ class GlooTransportBuffer(TransportBuffer):
                 )
             return tensor
 
-        raise RuntimeError(
-            f"No recv task available (is_object={self.is_object})"
-        )
+        raise RuntimeError(f"No recv task available (is_object={self.is_object})")
 
     async def receive_tensor(
         self, tensor: torch.Tensor, transport_context: "TransportContext"
