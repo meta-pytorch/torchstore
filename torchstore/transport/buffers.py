@@ -137,9 +137,8 @@ class TransportBuffer:
     async def put_to_storage_volume(self, key, request: "Request"):
         l = LatencyTracker("put")
         try:
-            # _give concrete implementation a chance to parse the request
-            await self._pre_put_hook(request)
-            l.track_step("_pre_put_hook")
+            await self._pre_handshake(request)
+            l.track_step("_pre_handshake")
 
             if self.requires_handshake:
                 handshake_result = (
@@ -147,6 +146,9 @@ class TransportBuffer:
                 )
                 await self._post_handshake(handshake_result)
                 l.track_step("handshake")
+
+            await self._pre_put_hook(request)
+            l.track_step("_pre_put_hook")
 
             await self.storage_volume_ref.volume.put.call(
                 key, self, request.meta_only()
@@ -159,13 +161,15 @@ class TransportBuffer:
 
     async def get_from_storage_volume(self, key, request: "Request"):
         try:
-            await self._pre_get_hook(key, request)
+            await self._pre_handshake(request)
 
             if self.requires_handshake:
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(self)
                 )
                 await self._post_handshake(handshake_result)
+
+            await self._pre_get_hook(key, request)
 
             # when fetching data, we may need to handle the response from the storage volume
             # TODO: think of a good prefix to differentiate this between remote handlers
@@ -178,6 +182,15 @@ class TransportBuffer:
             await self.drop()
 
         return response
+
+    async def _pre_handshake(self, request: "Request") -> None:
+        """Prepare for handshake on the client side.
+
+        Called before the handshake RPC is sent to the storage volume.
+        Override this for setup that must happen before handshake
+        (e.g., create TCPStore, start PG creation for Gloo).
+        """
+        pass
 
     async def _post_handshake(self, handshake_result: Any) -> None:
         """Process the result of a handshake on the client side.

@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from torchstore.transport.gloo import GlooTransportBuffer
 from enum import auto, Enum
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,7 @@ class TransportType(Enum):
     MonarchRPC = auto()
     MonarchRDMA = auto()
     TorchCommsRDMA = auto()
+    Gloo = auto()
 
 
 def get_available_transport() -> TransportType:
@@ -44,6 +46,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
         TransportType.TorchCommsRDMA: TorchCommsRdmaTransportBuffer,
+        TransportType.Gloo: GlooTransportBuffer,
     }
 
     return transport_map[transport_type](storage_volume_ref)
