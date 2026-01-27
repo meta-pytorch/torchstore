@@ -50,7 +50,7 @@ def transport_plus_strategy_params(with_host_strategy: bool = False):
         strategies.append((1, ts.HostStrategy))
 
     # MonarchRPC always works (no special hardware needed)
-    enabled_transport_types = [TransportType.MonarchRPC]
+    enabled_transport_types = [TransportType.MonarchRDMA]
 
     # MonarchRDMA enabled by default, can be disabled with TORCHSTORE_RDMA_ENABLED=0
     if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":

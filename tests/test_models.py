@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(
     reason="HF_TOKEN not available - skipping Transformers model tests",
 )
 
-TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
+TEST_MODEL = "Qwen/Qwen3-30B-A3B"  # ~4GB
 # TEST_MODEL = "meta-llama/Llama-3.1-8B"  # ~ 16GB
 
 
