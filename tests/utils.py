@@ -56,7 +56,7 @@ def transport_plus_strategy_params(with_host_strategy: bool = False):
     if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") != "1":
         enabled_transport_types.append(TransportType.MonarchRDMA)
 
-    # TorchCommsRDMA enabled by default, disable with USE_TORCHCOMMS_RDMA=0
+    # TorchCommsRDMA enabled by default, enable with USE_TORCHCOMMS_RDMA=1
     if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
         enabled_transport_types.append(TransportType.TorchCommsRDMA)
 

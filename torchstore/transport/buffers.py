@@ -187,8 +187,7 @@ class TransportBuffer:
         """Prepare for handshake on the client side.
 
         Called before the handshake RPC is sent to the storage volume.
-        Override this for setup that must happen before handshake
-        (e.g., create TCPStore, start PG creation for Gloo).
+        Override this for setup that must happen before handshake.
         """
         pass
 

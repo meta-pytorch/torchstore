@@ -52,6 +52,8 @@ def gloo_available() -> bool:
         return False
 
     return True
+
+    
 def _find_free_port() -> int:
     """Find a free port on the local machine."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
