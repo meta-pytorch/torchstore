@@ -60,6 +60,10 @@ def transport_plus_strategy_params(with_host_strategy: bool = False):
     if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
         enabled_transport_types.append(TransportType.TorchCommsRDMA)
 
+    # Gloo enabled by default, disable with USE_GLOO=0
+    if os.environ.get("USE_GLOO", "1") == "1":
+        enabled_transport_types.append(TransportType.Gloo)
+
     # convenient to do stuff like this for testing.
     # enabled_transport_types = [TransportType.MonarchRDMA]
     # strategies = [
