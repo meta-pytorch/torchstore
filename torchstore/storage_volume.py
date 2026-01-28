@@ -6,7 +6,7 @@
 
 from itertools import product
 from logging import getLogger
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any
 
 import torch
 from monarch.actor import Actor, endpoint
@@ -52,7 +52,7 @@ class StorageVolume(Actor):
         return self.volume_id
 
     @endpoint
-    async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
+    async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
         return await self.store.handshake(transport_buffer)
 
     @endpoint
@@ -71,8 +71,8 @@ class StorageVolume(Actor):
     async def get_meta(
         self,
         key: str,
-        request: Optional[Request] = None,
-    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
+        request: Request | None = None,
+    ) -> tuple[torch.Size, torch.dtype] | str:
         return await self.store.get_meta(key, request)
 
     @endpoint
@@ -92,7 +92,7 @@ class StorageImpl:
 
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
-    ) -> Optional[TransportBuffer]:
+    ) -> TransportBuffer | None:
         """Store data in the storage backend."""
         raise NotImplementedError()
 
@@ -103,8 +103,8 @@ class StorageImpl:
         raise NotImplementedError()
 
     async def get_meta(
-        self, key: str, request: Optional[Request] = None
-    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
+        self, key: str, request: Request | None = None
+    ) -> tuple[torch.Size, torch.dtype] | str:
         """Get metadata about stored data."""
         raise NotImplementedError()
 
@@ -112,7 +112,7 @@ class StorageImpl:
         """Delete data from the storage backend."""
         raise NotImplementedError()
 
-    async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
+    async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
         raise NotImplementedError()
 
 
@@ -120,10 +120,10 @@ class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
     def __init__(self) -> None:
-        self.kv: Dict[str, Any] = {}
+        self.kv: dict[str, Any] = {}
         super().__init__()
 
-    async def handshake(self, transport_buffer: TransportBuffer) -> Optional[Any]:
+    async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
         return await transport_buffer.recv_handshake(self.transport_context)
 
     def _extract_existing(self, key: str, request: "Request") -> Optional[torch.Tensor]:
@@ -251,7 +251,7 @@ class InMemoryStore(StorageImpl):
             "tensor": tensor,
         }
 
-    def _get_sharded_tensor(self, request: Request, key: str) -> Optional[torch.Tensor]:
+    def _get_sharded_tensor(self, request: Request, key: str) -> torch.Tensor | None:
         """
         Searches stored shards and returns one which completely contains the requested tensor slice
 
@@ -351,8 +351,8 @@ class InMemoryStore(StorageImpl):
     async def get_meta(
         self,
         key: str,
-        request: Optional[Request] = None,
-    ) -> Union[Tuple[torch.Size, torch.dtype], str]:
+        request: Request | None = None,
+    ) -> tuple[torch.Size, torch.dtype] | str:
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 

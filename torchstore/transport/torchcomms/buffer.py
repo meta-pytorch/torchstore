@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -42,8 +42,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             None  # remote reference of rdma memory
         )
 
-        self.shape: Optional[torch.Size] = None
-        self.dtype: Optional[torch.dtype] = None
+        self.shape: torch.Size | None = None
+        self.dtype: torch.dtype | None = None
 
         # Object handling fields (non-tensor data)
         self.is_object: bool = False
@@ -53,7 +53,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self._local_transport: Any = None
         self._connection_exists: bool = False
 
-    def _setup_local_transport(self, tensor: Optional[torch.Tensor]) -> None:
+    def _setup_local_transport(self, tensor: torch.Tensor | None) -> None:
         """Get local transport from cache and check if connection exists."""
         device = tensor.device if tensor is not None else 0
         transport_cache = (
@@ -77,16 +77,14 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         """Connect local transport to peer after handshake."""
         self._local_transport.connect(handshake_result)
 
-    async def recv_handshake(
-        self, transport_context: "TransportContext"
-    ) -> Optional[Any]:
+    async def recv_handshake(self, transport_context: "TransportContext") -> Any | None:
         """Confirm a handshake initiated by the local client (storage volume side)."""
         transport_cache = transport_context.get_rdma_transport_cache()
         transport, addr = transport_cache.put(self.address, device=0)
         transport.connect(self.address)
         return addr
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         """Serialize the state of the buffer, excluding non-serializable components."""
         state = self.__dict__.copy()
         state["rdma_memory"] = None

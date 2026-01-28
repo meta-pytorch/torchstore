@@ -4,10 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import torch
-from monarch.actor import get_or_spawn_controller
+from monarch.actor import get_or_spawn_controller, HostMesh
 
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient
@@ -24,14 +24,14 @@ from torchstore.transport.types import TensorSlice
 DEFAULT_TORCHSTORE_NAME: str = "TorchStore"
 
 # cache for local clients
-_local_clent_map: Dict[str, LocalClient] = {}
+_local_clent_map: dict[str, LocalClient] = {}
 
 
 async def initialize(
     num_storage_volumes: int = 1,
-    strategy: Optional[TorchStoreStrategy] = None,
+    strategy: TorchStoreStrategy | None = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
-    mesh=None,
+    mesh: HostMesh | None = None,
 ) -> None:
     """Initialize the TorchStore distributed storage system.
 
@@ -42,6 +42,7 @@ async def initialize(
         strategy (TorchStoreStrategy, optional): Strategy for distributing tensors across volumes.
             Uses SingletonStrategy if None and num_storage_volumes=1.
         store_name (str): Unique name for this store instance. Defaults to DEFAULT_TORCHSTORE_NAME.
+        mesh (HostMesh, optional): Monarch HostMesh on which to spawn StorageVolumes
 
     Raises:
         RuntimeError: If num_storage_volumes > 1 but no strategy is provided.
@@ -138,7 +139,7 @@ async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
 
 
 async def put(
-    key: str, value: Union[torch.Tensor, Any], store_name: str = DEFAULT_TORCHSTORE_NAME
+    key: str, value: torch.Tensor | Any, store_name: str = DEFAULT_TORCHSTORE_NAME
 ) -> None:
     """Store a tensor or object in the distributed store.
 
@@ -158,10 +159,10 @@ async def put(
 
 async def get(
     key: str,
-    inplace_tensor: Optional[torch.Tensor] = None,
-    tensor_slice_spec: Optional[TensorSlice] = None,
+    inplace_tensor: torch.Tensor | None = None,
+    tensor_slice_spec: TensorSlice | None = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
-) -> Union[torch.Tensor, Any]:
+) -> torch.Tensor | Any:
     """Retrieve a tensor or object from the distributed store.
 
     Args:
@@ -222,7 +223,7 @@ async def delete(
 
 async def keys(
     prefix: str | None = None,
-) -> List[str]:
+) -> list[str]:
     """
     Get all keys that match the given prefix.
 
@@ -265,7 +266,7 @@ async def exists(key: str, store_name: str = DEFAULT_TORCHSTORE_NAME) -> bool:
 
 
 async def put_state_dict(
-    state_dict: Dict[str, Any], key: str, store_name: str = DEFAULT_TORCHSTORE_NAME
+    state_dict: dict[str, Any], key: str, store_name: str = DEFAULT_TORCHSTORE_NAME
 ) -> None:
     """Store a PyTorch model state_dict in the distributed store.
 
@@ -286,10 +287,10 @@ async def put_state_dict(
 
 async def get_state_dict(
     key: str,
-    user_state_dict: Optional[Dict[str, Any]] = None,
+    user_state_dict: dict[str, Any] | None = None,
     strict: bool = True,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Retrieve a PyTorch model state_dict from the distributed store.
 
     Args:

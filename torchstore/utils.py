@@ -7,7 +7,7 @@
 import math
 import uuid
 from logging import getLogger
-from typing import List, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 import torch
 from monarch.actor import this_host
@@ -37,7 +37,7 @@ async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
 def get_local_tensor(
     global_tensor: "torch.Tensor",
     local_shape: "ShapeType",
-    global_offset: Tuple[int, ...],
+    global_offset: tuple[int, ...],
 ):
     # Calculate the slices for each dimension
     slices = tuple(
@@ -51,9 +51,9 @@ def get_local_tensor(
 
 
 def assemble_tensor(
-    local_tensors: List[torch.Tensor],
+    local_tensors: list[torch.Tensor],
     global_shape: "ShapeType",  # TODO: unused, cleanup
-    global_offsets: List["ShapeType"],
+    global_offsets: list["ShapeType"],
 ) -> torch.Tensor:
     """
     Assemble a global tensor from local tensors based on their shapes and offsets. The final shape of the returned
@@ -87,9 +87,9 @@ def assemble_tensor(
 
 
 def get_target_tensor_shape_and_offset(
-    local_tensor_shapes: List["ShapeType"],
-    global_offsets: List["ShapeType"],
-) -> Tuple["ShapeType", "ShapeType"]:
+    local_tensor_shapes: list["ShapeType"],
+    global_offsets: list["ShapeType"],
+) -> tuple["ShapeType", "ShapeType"]:
     """
     Get the target tensor shape and offset based on the local tensor shapes and global offsets.
 

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, Dict, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -22,7 +22,7 @@ class TransportContext:
     def __init__(self):
         self.transport_context = {}
 
-    def get_transport_context(self) -> Dict[Any, Any]:
+    def get_transport_context(self) -> dict[Any, Any]:
         return self.transport_context
 
     def get_rdma_transport_cache(self) -> RdmaTransportCache:

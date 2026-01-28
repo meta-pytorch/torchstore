@@ -8,7 +8,6 @@ import math
 import os
 import tempfile
 from logging import getLogger
-from typing import List, Tuple, Union
 
 import pytest
 import torch
@@ -148,10 +147,10 @@ async def test_data_parallel(strategy_params, transport_type):
 
 
 async def _test_resharding(
-    put_mesh_shape: Tuple[int],
-    put_placements: List[Union[Replicate, Shard]],
-    get_mesh_shape: Tuple[int],
-    get_placements: List[Union[Replicate, Shard]],
+    put_mesh_shape: tuple[int],
+    put_placements: list[Replicate | Shard],
+    get_mesh_shape: tuple[int],
+    get_placements: list[Replicate | Shard],
     strategy: ts.TorchStoreStrategy,
     transport_type: str,
 ):
