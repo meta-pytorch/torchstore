@@ -33,9 +33,19 @@ class LatencyTracker:
         self.name = name
         self.last_step = self.start_time = time.perf_counter()
 
-    def track_step(self, step_name: str) -> None:
+    def _format_throughput(self, elapsed: float, tensor) -> str:
+        """Format throughput string if tensor is provided."""
+        if tensor is None or elapsed <= 0:
+            return ""
+        nbytes = tensor.numel() * tensor.element_size()
+        throughput_gbps = (nbytes / 1e9) / elapsed
+        return f" ({throughput_gbps:.2f} GB/s)"
+
+    def track_step(self, step_name: str, tensor=None) -> None:
         now = time.perf_counter()
-        logging.debug(f"{self.name}:{step_name} took {now - self.last_step} seconds")
+        elapsed = now - self.last_step
+        throughput = self._format_throughput(elapsed, tensor)
+        logging.debug(f"{self.name}:{step_name} took {elapsed:.4f}s{throughput}")
         self.last_step = now
 
     def track_e2e(self) -> None:
