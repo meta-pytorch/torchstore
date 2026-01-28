@@ -458,6 +458,5 @@ async def test_fully_local_dtensor_put_get():
             await ts.shutdown()
 
 
-
 if __name__ == "__main__":
     main(__file__)

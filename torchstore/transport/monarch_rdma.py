@@ -29,21 +29,6 @@ if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
 
 
-_rdma_controller_exists: bool = False
-
-
-async def ensure_rdma_controller():
-    from monarch._src.rdma.rdma import RdmaController
-    from monarch.actor import get_or_spawn_controller
-
-    global _rdma_controller_exists
-    if _rdma_controller_exists:
-        return
-
-    print("Initializing RDMA controller")
-    await get_or_spawn_controller("rdma_controller", RdmaController)
-    _rdma_controller_exists = True
-
 
 def monarch_rdma_transport_available() -> bool:
     """Check if Monarch RDMA transport is available for use.
@@ -81,8 +66,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _pre_get_hook(self, key, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        #await ensure_rdma_controller()
-
         # keep request for later
         self.request = request
 

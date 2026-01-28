@@ -6,8 +6,8 @@
 
 import copy
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, TYPE_CHECKING
 from logging import getLogger
+from typing import Any, Optional, Tuple, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -56,6 +56,7 @@ class TensorSlice:
                 self.mesh_shape,
             )
         )
+
 
 def _is_dtensor_fully_local(dtensor: DTensor) -> bool:
     """
