@@ -29,7 +29,6 @@ if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
 
 
-
 def monarch_rdma_transport_available() -> bool:
     """Check if Monarch RDMA transport is available for use.
 
