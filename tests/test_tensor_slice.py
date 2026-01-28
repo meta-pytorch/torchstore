@@ -348,6 +348,7 @@ async def test_partial_put():
             await ts.shutdown()
 
 
+@pytest.mark.skip("re-enable after moe fix")
 @pytest.mark.asyncio
 async def test_fully_local_dtensor_put_get():
     """

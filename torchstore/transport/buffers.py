@@ -35,7 +35,7 @@ class TransportBuffer:
     """Abstract base class for transporting tensor data between clients and storage volumes.
 
     TransportBuffer provides the interface for moving tensor data across process boundaries
-    in TorchStore's distributed architecture. Concrete implementations (e.g., MonarchRDMATransportBuffer)
+    in TorchStore's distributed architecture. Concrete implementations
     handle the actual data transport using different mechanisms (RDMA, RPC, etc.).
 
     Architecture Overview
@@ -49,19 +49,19 @@ class TransportBuffer:
 
     Lifecycle: PUT Operation
     ------------------------
-    1. Client creates TransportBuffer via TransportBufferFactory
+    1. Client creates TransportBuffer
     2. Client calls `put_to_storage_volume(key, request)` which:
        a. Invokes `_pre_put_hook(request)` [CLIENT] - allocate local buffers, prepare data
        b. Optionally performs handshake if `requires_handshake=True`
        c. Serializes self and sends to StorageVolume
     3. StorageVolume receives buffer and calls `handle_put_request(...)` [STORAGE VOLUME]
-       - Reads data from transport mechanism (e.g., RDMA read) into local tensor
+       - Reads data from transport mechanism (e.g., RDMA read) into a local tensor
        - Returns the tensor to be stored
     4. Client calls `drop()` [CLIENT] - cleanup resources (e.g., deregister RDMA memory)
 
     Lifecycle: GET Operation
     ------------------------
-    1. Client creates TransportBuffer via TransportBufferFactory
+    1. Client creates TransportBuffer
     2. Client calls `get_from_storage_volume(key, request)` which:
        a. Invokes `_pre_get_hook(key, request)` [CLIENT] - allocate receive buffers
        b. Optionally performs handshake if `requires_handshake=True`
@@ -79,6 +79,7 @@ class TransportBuffer:
     - `__init__`: Initialize buffer with reference to target storage volume
     - `put_to_storage_volume`: Entry point for put operations
     - `get_from_storage_volume`: Entry point for get operations
+    - _post_handshake: Process handshake result (if requires_handshake=True)
     - `_pre_put_hook`: Prepare buffers before sending put request
     - `_pre_get_hook`: Prepare buffers before sending get request
     - `_handle_storage_volume_response`: Process response from storage volume
@@ -86,7 +87,7 @@ class TransportBuffer:
 
     Methods Called on STORAGE VOLUME (Remote Process)
     -------------------------------------------------
-    - `handle_handshake_request`: Exchange connection info (if requires_handshake=True)
+    - `recv_handshake`: Exchange connection info (if requires_handshake=True)
     - `handle_put_request`: Receive tensor data and return it for storage
     - `handle_get_request`: Send stored tensor data back to client
 
@@ -100,7 +101,7 @@ class TransportBuffer:
     Optionally override:
     - `_pre_put_hook`: Custom buffer allocation for puts
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
-    - `handle_handshake_request`: If `requires_handshake=True`
+    - `recv_handshake`: If `requires_handshake=True`
     - `drop`: Resource cleanup (especially important for RDMA buffers)
 
     Properties
@@ -115,10 +116,6 @@ class TransportBuffer:
     storage_volume_ref : StorageVolumeRef
         Reference to the target storage volume, including actor handle and transport context.
 
-    See Also
-    --------
-    MonarchRDMATransportBuffer : RDMA-based implementation from Monarch
-    MonarchTransportBuffer : Simple RPC-based implementation (slower but always works).
     """
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
@@ -202,7 +199,7 @@ class TransportBuffer:
     # StorageVolume handlers -- must be implemented by concrete implementaiton
     # These methods are called by the StorageVolume on the remote side
 
-    async def handle_handshake_request(self) -> None:
+    async def recv_handshake(self, ctx: "TransportContext") -> None:
         # called on the storage volume side
         raise NotImplementedError()
 

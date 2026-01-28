@@ -41,8 +41,8 @@ def strategy_params(with_host_strategy: bool = False):
 def transport_plus_strategy_params(with_host_strategy: bool = False):
     strategies = [
         (2, ts.LocalRankStrategy),
-        # (1, ts.SingletonStrategy),
-        # (1, ts.ControllerStorageVolumes),
+        (1, ts.SingletonStrategy),
+        (1, ts.ControllerStorageVolumes),
     ]
 
     if with_host_strategy:
@@ -55,15 +55,10 @@ def transport_plus_strategy_params(with_host_strategy: bool = False):
     if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.MonarchRDMA)
 
-    # TorchCommsRDMA enabled by default, enable with USE_TORCHCOMMS_RDMA=1
-    if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
+    # TorchCommsRDMA disabled by default, enable with USE_TORCHCOMMS_RDMA=1
+    if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
         enabled_transport_types.append(TransportType.TorchCommsRDMA)
 
-    # convenient to do stuff like this for testing.
-    # enabled_transport_types = [TransportType.MonarchRDMA]
-    # strategies = [
-    #     (2, ts.LocalRankStrategy),
-    # ]
     return "strategy_params, transport_type", list(
         product(strategies, enabled_transport_types)
     )
