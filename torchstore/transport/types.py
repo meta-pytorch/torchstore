@@ -6,7 +6,7 @@
 
 import copy
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -28,11 +28,11 @@ class TensorSlice:
         mesh_shape: The shape of the device mesh used for sharding.
     """
 
-    offsets: Tuple
-    coordinates: Tuple
-    global_shape: Tuple
-    local_shape: Tuple
-    mesh_shape: Tuple
+    offsets: tuple
+    coordinates: tuple
+    global_shape: tuple
+    local_shape: tuple
+    mesh_shape: tuple
 
     def __post_init__(self):
         if self.coordinates is not None:
@@ -67,9 +67,9 @@ class Request:
         is_object (bool): Flag indicating whether this request contains a non-tensor object.
     """
 
-    tensor_val: Optional[torch.Tensor] = None
-    tensor_slice: Optional[TensorSlice] = None
-    objects: Optional[Any] = None
+    tensor_val: torch.Tensor | None = None
+    tensor_slice: TensorSlice | None = None
+    objects: Any | None = None
     is_object: bool = False
 
     @classmethod
