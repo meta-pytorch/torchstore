@@ -14,7 +14,7 @@ from monarch.actor import Actor, endpoint
 from torchstore.storage_utils.trie import Trie
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import TorchStoreStrategy
-from torchstore.transport.pipe import Request, TensorSlice
+from torchstore.transport.types import Request, TensorSlice
 
 
 # TODO: move this into request as a field

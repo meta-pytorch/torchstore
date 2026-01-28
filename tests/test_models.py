@@ -20,7 +20,7 @@ from torchstore.state_dict_utils import _state_dict_size
 from torchstore.utils import spawn_actors
 from transformers import AutoModelForCausalLM
 
-from .utils import main, set_transport_type, transport_plus_strategy_params
+from .utils import main, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 TEST_MODEL = "Qwen/Qwen3-1.7B"  # ~4GB
-# TEST_MODEL = "meta-llama/Llama-3.1-8B" # ~ 16GB
+# TEST_MODEL = "meta-llama/Llama-3.1-8B"  # ~ 16GB
 
 
 class ModelTest(Actor):
@@ -137,15 +137,15 @@ async def test_resharding(strategy_params, transport_type):
 
 
 async def _do_test(put_mesh_shape, get_mesh_shape, strategy, transport_type):
-    set_transport_type(transport_type)
-
     ts.init_logging()
     logger.info(f"Testing with strategy: {strategy}")
 
     put_world_size = math.prod(put_mesh_shape)
     await ts.initialize(
-        num_storage_volumes=put_world_size if strategy is not None else 1,
-        strategy=strategy,
+        num_storage_volumes=(
+            put_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
+        ),
+        strategy=strategy(transport_type),
     )
     try:
         with tempfile.TemporaryDirectory() as tmpdir:

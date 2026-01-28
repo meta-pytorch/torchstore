@@ -23,6 +23,7 @@ from torchstore.api import (
 from torchstore.logging import init_logging
 from torchstore.strategy import (
     ControllerStorageVolumes,
+    HostStrategy,
     LocalRankStrategy,
     SingletonStrategy,
     TorchStoreStrategy,
@@ -50,6 +51,7 @@ __all__ = [
     "shutdown",
     "TorchStoreStrategy",
     "LocalRankStrategy",
+    "HostStrategy",
     "SingletonStrategy",
     "ControllerStorageVolumes",
     "put_state_dict",
