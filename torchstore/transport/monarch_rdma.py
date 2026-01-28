@@ -201,9 +201,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             # note: .contiguous will return a copy if this tensor is not contiguous
             # that usually shows up during resharding cases
             assert isinstance(tensor_like, torch.Tensor)
-            tensor = torch.zeros_like(tensor_like, device=torch.device("cpu"))
-            tensor = tensor.contiguous()
-
+            #tensor = torch.zeros_like(tensor_like, device=torch.device("cpu"))
+            tensor = tensor_like.contiguous()
+            if not tensor.is_cpu:
+                tensor = tensor.cpu()
+                
         self.tensor = tensor
 
         # store tensor meta
