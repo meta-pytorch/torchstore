@@ -6,7 +6,7 @@
 
 import logging
 import os
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -28,21 +28,7 @@ if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
     from torchstore.transport.buffers import TransportContext
 
-
-_rdma_controller_exists: bool = False
-
-
-async def ensure_rdma_controller():
-    from monarch._src.rdma.rdma import RdmaController
-    from monarch.actor import get_or_spawn_controller
-
-    global _rdma_controller_exists
-    if _rdma_controller_exists:
-        return
-
-    print("Initializing RDMA controller")
-    await get_or_spawn_controller("rdma_controller", RdmaController)
-    _rdma_controller_exists = True
+MONARCH_RDMA_EAGER_D2H = os.environ.get("TORCHSTORE_MONARCH_RDMA_EAGER_D2H", "1") == "1"
 
 
 def monarch_rdma_transport_available() -> bool:
@@ -67,15 +53,14 @@ class MonarchRDMATransportBuffer(TransportBuffer):
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
 
-        self.rdma_buffer: Optional[Any] = None
-        self.byte_view: Optional[torch.Tensor] = None
-        self.shape: Optional[torch.Size] = None
-        self.dtype: Optional[torch.dtype] = None
+        self.rdma_buffer: Any | None = None
+        self.byte_view: torch.Tensor | None = None
+        self.shape: torch.Size | None = None
+        self.dtype: torch.dtype | None = None
         self.is_object: bool = False
 
     async def _pre_put_hook(self, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        await ensure_rdma_controller()
 
         if request.is_object:
             return
@@ -83,7 +68,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _pre_get_hook(self, key, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        await ensure_rdma_controller()
 
         # keep request for later
         self.request = request
@@ -175,7 +159,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         self.rdma_buffer = None
         self.byte_view = None
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         # Any time that we serialize the transport buffer, the idea is
         # that tensors will be transported via tensor_enginer.RDMABuffer, so it makes
         # no sense to hold this reference when we are serializing
@@ -185,13 +169,13 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         state["request"] = None
         return state
 
-    def allocate(self, tensor_like: Union[torch.Tensor, Tuple]) -> None:
+    def allocate(self, tensor_like: torch.Tensor | tuple) -> None:
         """Allocates internal buffers based on either an existing tensor
         or a Tuple of (shape, dtype)
         """
         logging.debug("Allocating rdma buffer")
 
-        if isinstance(tensor_like, Tuple):
+        if isinstance(tensor_like, tuple):
             # Happens only on get if we don't have an inplace tensor.
             # In that case, we know the size of the tensor from fetching metadata
             tensor = torch.empty(
@@ -201,6 +185,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             # note: .contiguous will return a copy if this tensor is not contiguous
             # that usually shows up during resharding cases
             assert isinstance(tensor_like, torch.Tensor)
+
+            # monarch sometimes really doesn't like gpu tensors, so we convert to cpu
+            # this makes things way slower, and hopefully will be fixed in the future
+            if MONARCH_RDMA_EAGER_D2H:
+                tensor = tensor_like.cpu()
             tensor = tensor_like.contiguous()
 
         self.tensor = tensor

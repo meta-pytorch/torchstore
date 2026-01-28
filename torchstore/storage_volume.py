@@ -126,7 +126,7 @@ class InMemoryStore(StorageImpl):
     async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
         return await transport_buffer.recv_handshake(self.transport_context)
 
-    def _extract_existing(self, key: str, request: "Request") -> Optional[torch.Tensor]:
+    def _extract_existing(self, key: str, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
 
         Looks up the key in kv storage and extracts the tensor if it exists.
