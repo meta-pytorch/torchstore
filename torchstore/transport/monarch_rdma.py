@@ -75,7 +75,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _pre_put_hook(self, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        await ensure_rdma_controller()
+        #await ensure_rdma_controller()
 
         if request.is_object:
             return
@@ -83,7 +83,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _pre_get_hook(self, key, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        await ensure_rdma_controller()
+        #await ensure_rdma_controller()
 
         # keep request for later
         self.request = request
