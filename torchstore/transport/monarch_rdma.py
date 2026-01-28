@@ -29,22 +29,6 @@ if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
 
 
-_rdma_controller_exists: bool = False
-
-
-async def ensure_rdma_controller():
-    from monarch._src.rdma.rdma import RdmaController
-    from monarch.actor import get_or_spawn_controller
-
-    global _rdma_controller_exists
-    if _rdma_controller_exists:
-        return
-
-    print("Initializing RDMA controller")
-    await get_or_spawn_controller("rdma_controller", RdmaController)
-    _rdma_controller_exists = True
-
-
 def monarch_rdma_transport_available() -> bool:
     """Check if Monarch RDMA transport is available for use.
 
@@ -75,16 +59,12 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _pre_put_hook(self, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        await ensure_rdma_controller()
-
         if request.is_object:
             return
         self.allocate(request.tensor_val)
 
     async def _pre_get_hook(self, key, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        await ensure_rdma_controller()
-
         # keep request for later
         self.request = request
 
@@ -148,7 +128,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             return transport_buffer.objects
 
         # if we had to call .contiguous on the tensor during alloc, this assertion is
-        # vioalted since .contiguous is a copy
+        # violated since .contiguous is a copy
         if self.request.tensor_val is not None:
             if self.request.tensor_val.data_ptr() != self.tensor.data_ptr():
                 self.request.tensor_val.copy_(self.tensor)
@@ -202,6 +182,8 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             # that usually shows up during resharding cases
             assert isinstance(tensor_like, torch.Tensor)
             tensor = tensor_like.contiguous()
+            if not tensor.is_cpu:
+                tensor = tensor.cpu()
 
         self.tensor = tensor
 
