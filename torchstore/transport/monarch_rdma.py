@@ -75,8 +75,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _pre_put_hook(self, request: Request) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        #await ensure_rdma_controller()
-
         if request.is_object:
             return
         self.allocate(request.tensor_val)
@@ -148,7 +146,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             return transport_buffer.objects
 
         # if we had to call .contiguous on the tensor during alloc, this assertion is
-        # vioalted since .contiguous is a copy
+        # violated since .contiguous is a copy
         if self.request.tensor_val is not None:
             if self.request.tensor_val.data_ptr() != self.tensor.data_ptr():
                 self.request.tensor_val.copy_(self.tensor)
@@ -201,11 +199,10 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             # note: .contiguous will return a copy if this tensor is not contiguous
             # that usually shows up during resharding cases
             assert isinstance(tensor_like, torch.Tensor)
-            #tensor = torch.zeros_like(tensor_like, device=torch.device("cpu"))
             tensor = tensor_like.contiguous()
             if not tensor.is_cpu:
                 tensor = tensor.cpu()
-                
+
         self.tensor = tensor
 
         # store tensor meta
