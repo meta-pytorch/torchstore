@@ -4,13 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+import socket
 from itertools import product
 from logging import getLogger
 from typing import Any
 
 import torch
 from monarch.actor import Actor, endpoint
-
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
@@ -48,8 +49,9 @@ class StorageVolume(Actor):
         return actors
 
     @endpoint
-    async def get_id(self) -> str:
-        return self.volume_id
+    async def get_id(self) -> Tuple[str, str]:
+        hostname = os.environ.get("HOSTNAME", socket.gethostname())
+        return (self.volume_id, hostname)
 
     @endpoint
     async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
@@ -384,6 +386,12 @@ class InMemoryStore(StorageImpl):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
         del self.kv[key]
+        # Clean up shared memory segment if it exists
+        shm_cache = self.transport_context.get_shm_cache()
+        shm_cache.delete(key)
 
     def reset(self) -> None:
         self.kv = {}
+        # Clean up all shared memory segments
+        shm_cache = self.transport_context.get_shm_cache()
+        shm_cache.reset()

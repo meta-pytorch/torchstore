@@ -7,17 +7,18 @@
 from typing import Any, TYPE_CHECKING
 
 import torch
-
 from torchstore.logging import LatencyTracker
 from torchstore.transport.torchcomms.cache import RdmaTransportCache
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
+    from torchstore.transport.shared_memory import SharedMemoryCache
     from torchstore.transport.types import Request
 
 
 class TransportContext:
     RDMA_TRANSPORT_CACHE = "rdma_transport_cache"
+    SHM_CACHE = "shm_cache"
 
     def __init__(self):
         self.transport_context = {}
@@ -29,6 +30,18 @@ class TransportContext:
         if self.RDMA_TRANSPORT_CACHE not in self.transport_context:
             self.transport_context[self.RDMA_TRANSPORT_CACHE] = RdmaTransportCache()
         return self.transport_context[self.RDMA_TRANSPORT_CACHE]
+
+    def get_shm_cache(self) -> "SharedMemoryCache":
+        """Get shared memory cache, lazily initializing if needed.
+
+        Note: Import is inside function to avoid cyclic import
+        Slight refactor is needed to avoid this
+        """
+        from torchstore.transport.shared_memory import SharedMemoryCache
+
+        if self.SHM_CACHE not in self.transport_context:
+            self.transport_context[self.SHM_CACHE] = SharedMemoryCache()
+        return self.transport_context[self.SHM_CACHE]
 
 
 class TransportBuffer:
@@ -142,8 +155,9 @@ class TransportBuffer:
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(self)
                 )
+                l.track_step("volume.handshake.call")
                 await self._post_handshake(handshake_result)
-                l.track_step("handshake")
+                l.track_step("post_handshake", request.tensor_val)
 
             await self.storage_volume_ref.volume.put.call(
                 key, self, request.meta_only()

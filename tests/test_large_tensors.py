@@ -29,8 +29,7 @@ async def test_large_tensors():
     """Test basic put/get functionality for large tensors"""
 
     class LargeTensorActor(Actor):
-        step_size: int = 100  # -> 400mb
-        max_step: int = 600  # 4mb -> 2gb
+        steps = [1, 15, 250, 2500]
         repeat_test: int = 2
 
         def __init__(self, generate_benchmark=False) -> None:
@@ -42,7 +41,7 @@ async def test_large_tensors():
             dps = []
             for test_itr in range(self.repeat_test):
                 print(f"{test_itr=}\n")
-                for n in range(1, self.max_step, self.step_size):
+                for n in self.steps:
                     shape = (1024, 1024 * n)
                     size_mbytes = (
                         math.prod(shape) * 4 // (1024 * 1024)
@@ -72,7 +71,7 @@ async def test_large_tensors():
             for test_itr in range(self.repeat_test):
                 print(f"{test_itr=}\n")
                 dps = []
-                for n in range(1, self.max_step, self.step_size):
+                for n in self.steps:
                     shape = (1024, 1024 * n)
                     size_mbytes = (
                         math.prod(shape) * 4 // (1024 * 1024)
@@ -98,13 +97,7 @@ async def test_large_tensors():
 
     # controller code
     await ts.initialize(
-        strategy=SingletonStrategy(
-            default_transport_type=(
-                TransportType.MonarchRDMA
-                if monarch_rdma_transport_available()
-                else TransportType.Unset
-            )
-        )
+        strategy=SingletonStrategy(default_transport_type=(TransportType.SharedMemory))
     )
     actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
     try:
