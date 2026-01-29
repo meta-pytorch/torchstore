@@ -6,11 +6,15 @@
 
 import copy
 from dataclasses import dataclass
+from logging import getLogger
 from typing import Any, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
+from torch.distributed.tensor.placement_types import Replicate
+
+logger = getLogger(__name__)
 
 if TYPE_CHECKING:
     pass
@@ -54,6 +58,36 @@ class TensorSlice:
         )
 
 
+def _is_dtensor_fully_local(dtensor: DTensor) -> bool:
+    """
+    Check if a DTensor is fully local (not actually distributed).
+
+    A DTensor is considered fully local if:
+    1. All placements are Replicate(), OR
+    2. The device mesh has only 1 device total
+
+    In these cases, the DTensor doesn't need collective operations
+    and can be treated as a regular tensor for storage purposes.
+
+    Args:
+        dtensor: The DTensor to check
+
+    Returns:
+        True if the DTensor is fully local, False otherwise
+    """
+    # Check if mesh has only 1 device
+    mesh_size = dtensor.device_mesh.size()
+    if mesh_size == 1:
+        return True
+
+    # Check if all placements are Replicate
+    all_replicate = all(isinstance(p, Replicate) for p in dtensor.placements)
+    if all_replicate:
+        return True
+
+    return False
+
+
 @dataclass
 class Request:
     """Request object encapsulating data to be stored or retrieved from TorchStore.
@@ -75,7 +109,20 @@ class Request:
     @classmethod
     def from_any(cls, value: torch.Tensor | DTensor | None) -> "Request":
         if isinstance(value, DTensor):
-            request = cls.from_dtensor(value)
+            # Check if DTensor is fully local (not actually distributed)
+            # If so, treat it as a regular tensor to avoid collective requirements
+            # Note: this is due to behavior in torchtitan, where we have Replicate()
+            # placement which is not actually replicated along device-mesh
+            # todo: Revisit this if this is fixed in torchtitan
+            if _is_dtensor_fully_local(value):
+                logger.debug(
+                    f"DTensor with shape {value.shape} is fully local "
+                    f"(placements: {value.placements}, mesh size: {value.device_mesh.size()}). "
+                    "Treating as regular tensor for storage."
+                )
+                request = cls.from_tensor(value._local_tensor)
+            else:
+                request = cls.from_dtensor(value)
         elif isinstance(value, torch.Tensor):
             request = cls.from_tensor(value)
         else:
