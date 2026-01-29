@@ -14,7 +14,7 @@ from torch.distributed.tensor import DTensor
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
-from torchstore.transport import Pipe, Request, TensorSlice
+from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.transport.buffers import TransportContext
 from torchstore.utils import assemble_tensor, get_local_tensor, get_slice_intersection
 
@@ -22,8 +22,11 @@ logger = getLogger(__name__)
 
 
 class LocalClient:
-    """This class represents the local store, which exists on every process. Remote storage
-    is handled by the client.
+    """Client-side interface for TorchStore operations.
+
+    LocalClient runs in the user's process and coordinates with remote StorageVolumes
+    via TransportBuffers. It handles put/get operations by selecting appropriate storage
+    volumes through the configured strategy and managing data transport.
     """
 
     def __init__(
@@ -46,18 +49,17 @@ class LocalClient:
     async def put(self, key: str, value: torch.Tensor | Any):
         latency_tracker = LatencyTracker(f"put:{key}")
         request = Request.from_any(value)
-        # for now, we only write to one storage volume.
-        # we probably don't need a remote call for this case since
-        # it will never be dynamic. e.g. it's always based on the
-        # TorchstoreStrategy defined during intiailization
-        storage_volume, volume_id = self.strategy.select_storage_volume()
 
-        pipe = Pipe(storage_volume)
+        storage_volume_ref = self.strategy.select_storage_volume()
+        transport_buffer = create_transport_buffer(storage_volume_ref)
+        latency_tracker.track_step("create transport buffer")
 
-        await pipe.put_to_storage_volume(key, request)
+        await transport_buffer.put_to_storage_volume(key, request)
         latency_tracker.track_step("put_to_storage_volume")
 
-        await self._controller.notify_put.call(key, request.meta_only(), volume_id)
+        await self._controller.notify_put.call(
+            key, request.meta_only(), storage_volume_ref.volume_id
+        )
         latency_tracker.track_step("notify_put")
         latency_tracker.track_e2e()
 
@@ -101,8 +103,7 @@ class LocalClient:
             # Here full tensor should be the part of interest.
             fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
 
-        # Pipe does not have support for inplace copies of fetched tensors yet,
-        # so we just copy
+        # TODO: This should be removed and handled in tranpsort buffer
         if inplace_tensor is not None:
             if hasattr(inplace_tensor, "_local_tensor"):
                 # DTensor case - copy to the local tensor to avoid type mismatch
@@ -238,9 +239,11 @@ class LocalClient:
         volume_map = await self._locate_volumes(key)
         volume_id, _ = volume_map.popitem()
         volume_ref = self.strategy.get_storage_volume(volume_id)
-        pipe = Pipe(volume_ref)
-        request = Request.from_any(None)
-        return await pipe.get_from_storage_volume(key, request)
+        transport_buffer = create_transport_buffer(volume_ref)
+
+        return await transport_buffer.get_from_storage_volume(
+            key, Request.from_any(None)
+        )
 
     async def _get_tensor(self, key: str) -> torch.Tensor:
         """Fetches the tensor which is stored in one volume storage"""
@@ -249,11 +252,9 @@ class LocalClient:
         # if the storage is a Tensor instead of DTensor, just fetch and return it.
         for volume_id, _ in volume_map.items():
             volume_ref = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(volume_ref)
-            # TODO: consolidate the logic here - None indicates it is an object request,
-            # which is sematically inappropriate here.
+            transport_buffer = create_transport_buffer(volume_ref)
             request = Request.from_any(None)
-            return await pipe.get_from_storage_volume(key, request)
+            return await transport_buffer.get_from_storage_volume(key, request)
 
     async def _get_and_assemble_tensor(
         self, key: str, tensor_slice_spec: TensorSlice | None = None
@@ -273,11 +274,12 @@ class LocalClient:
         partial_results = []
         for volume_id, storage_info in volume_map.items():
             volume_ref = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(volume_ref)
 
-            # fetch from all storage volumes, something like this
+            transport_buffer = create_transport_buffer(volume_ref)
+
+            # fetch from all storage volumes
             # TODO: fix so we can request all tensor slices from a storage volume
-            # at once, this is silly
+            # at once, this is silly !
             for tensor_slice in storage_info.tensor_slices:
                 # Intersect the tensor slice with the DTensor slice to optimize fetching
                 if tensor_slice_spec is not None:
@@ -292,7 +294,7 @@ class LocalClient:
 
                 tensor_slice_request = Request.from_tensor_slice(tensor_slice)
 
-                local_tensor = await pipe.get_from_storage_volume(
+                local_tensor = await transport_buffer.get_from_storage_volume(
                     key, tensor_slice_request
                 )
                 partial_results.append((local_tensor, tensor_slice))

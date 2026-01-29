@@ -11,32 +11,13 @@ from logging import getLogger
 
 import pytest
 import torch
-
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
-from torchstore.strategy import HostStrategy
 from torchstore.transport import TransportType
 
 logger = getLogger(__name__)
-
-
-def set_transport_type(transport_type: TransportType) -> None:
-    """Set environment variables based on the transport type.
-
-    Args:
-        transport_type: A registered TransportType
-    """
-    if transport_type == TransportType.MonarchRDMA:
-        os.environ["TORCHSTORE_RDMA_ENABLED"] = "1"
-        os.environ["USE_TORCHCOMMS_RDMA"] = "0"
-    elif transport_type == TransportType.TorchCommsRDMA:
-        os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
-        os.environ["USE_TORCHCOMMS_RDMA"] = "1"
-    else:
-        os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
-        os.environ["USE_TORCHCOMMS_RDMA"] = "0"
 
 
 def main(file):
@@ -44,21 +25,38 @@ def main(file):
     pytest.main([file])
 
 
-def transport_plus_strategy_params(with_host_strategy: bool = False):
+def strategy_params(with_host_strategy: bool = False):
     strategies = [
-        (2, ts.LocalRankStrategy()),
-        (1, None),  # ts.SingletonStrategy
-        (1, ts.ControllerStorageVolumes()),
+        (2, ts.LocalRankStrategy),
+        (1, ts.SingletonStrategy),
+        (1, ts.ControllerStorageVolumes),
     ]
 
     if with_host_strategy:
-        strategies.append((1, HostStrategy()))
+        strategies.append((1, ts.HostStrategy))
 
-    # Only run monarch/torchcomms tests if their respective env vars are set. Enabled by default.
+    return "strategy_params", strategies
+
+
+def transport_plus_strategy_params(with_host_strategy: bool = False):
+    strategies = [
+        (2, ts.LocalRankStrategy),
+        (1, ts.SingletonStrategy),
+        (1, ts.ControllerStorageVolumes),
+    ]
+
+    if with_host_strategy:
+        strategies.append((1, ts.HostStrategy))
+
+    # MonarchRPC always works (no special hardware needed)
     enabled_transport_types = [TransportType.MonarchRPC]
+
+    # MonarchRDMA enabled by default, can be disabled with TORCHSTORE_RDMA_ENABLED=0
     if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.MonarchRDMA)
-    if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
+
+    # TorchCommsRDMA disabled by default, enable with USE_TORCHCOMMS_RDMA=1
+    if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
         enabled_transport_types.append(TransportType.TorchCommsRDMA)
 
     return "strategy_params, transport_type", list(
@@ -80,8 +78,9 @@ class DTensorActor(Actor):
         placements,
         file_store_name,
         visible_devices="0,1,2,3,4,5,6,7",
-        ranks_to_skip_put: list[int]
-        | None = None,  # ranks that should skip put operation
+        ranks_to_skip_put: (
+            list[int] | None
+        ) = None,  # ranks that should skip put operation
     ):
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape
