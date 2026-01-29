@@ -4,11 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchstore.transport.gloo import GlooTransportBuffer
 from enum import auto, Enum
 from typing import TYPE_CHECKING
 
 from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.gloo import GlooTransportBuffer
 from torchstore.transport.monarch_rdma import (
     monarch_rdma_transport_available,
     MonarchRDMATransportBuffer,

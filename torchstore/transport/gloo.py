@@ -9,7 +9,7 @@ import socket
 import uuid
 from datetime import timedelta
 from logging import getLogger
-from typing import Any, Dict, Tuple, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
@@ -27,8 +27,8 @@ import torch.distributed as dist
 logger = getLogger(__name__)
 
 # Global cache
-_store_addrs: Dict[
-    str, Tuple[str, int]
+_store_addrs: dict[
+    str, tuple[str, int]
 ] = {}  # volume_id -> (master_addr, master_port, store_key)
 
 
@@ -149,7 +149,7 @@ class GlooTransportBuffer(TransportBuffer):
         """Only handshake if connection is not already cached."""
         return not self._connection_exists
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         """Serialize state, excluding non-serializable fields."""
         state = self.__dict__.copy()
         state["storage_volume_ref"] = None
