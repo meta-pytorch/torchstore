@@ -146,7 +146,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             _trace_logger.info(
                 f"[CLIENT _pre_put_hook] RdmaMemory created from {tensor.device} tensor"
             )
-
     async def _pre_get_hook(self, key: str, request: "Request") -> None:
         """Prepare buffers before sending get request (client-side)."""
         # Fetch metadata if no tensor provided
@@ -224,7 +223,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
         if TRACE_TRANSFERS:
             t0 = time.perf_counter()
-
         receiving_buffer = RdmaMemory(maybe_tensor)
         res = transport.read(
             receiving_buffer.to_mutable_view(), self.rdma_remote_buffer
@@ -241,7 +239,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             )
 
         return maybe_tensor
-
     async def handle_get_request(self, ctx: "TransportContext", data) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
         if not isinstance(data, torch.Tensor):
