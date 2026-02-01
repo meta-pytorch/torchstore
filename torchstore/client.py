@@ -14,7 +14,7 @@ from torch.distributed.tensor import DTensor
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
-from torchstore.transport import Pipe, Request, TensorSlice
+from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.transport.buffers import TransportContext
 from torchstore.utils import assemble_tensor, get_local_tensor, get_slice_intersection
 
@@ -22,8 +22,11 @@ logger = getLogger(__name__)
 
 
 class LocalClient:
-    """This class represents the local store, which exists on every process. Remote storage
-    is handled by the client.
+    """Client-side interface for TorchStore operations.
+
+    LocalClient runs in the user's process and coordinates with remote StorageVolumes
+    via TransportBuffers. It handles put/get operations by selecting appropriate storage
+    volumes through the configured strategy and managing data transport.
     """
 
     def __init__(
@@ -46,18 +49,89 @@ class LocalClient:
     async def put(self, key: str, value: torch.Tensor | Any):
         latency_tracker = LatencyTracker(f"put:{key}")
         request = Request.from_any(value)
-        # for now, we only write to one storage volume.
-        # we probably don't need a remote call for this case since
-        # it will never be dynamic. e.g. it's always based on the
-        # TorchstoreStrategy defined during intiailization
-        storage_volume, volume_id = self.strategy.select_storage_volume()
 
-        pipe = Pipe(storage_volume)
+        storage_volume_ref = self.strategy.select_storage_volume()
+        transport_buffer = create_transport_buffer(storage_volume_ref)
+        latency_tracker.track_step("create transport buffer")
 
-        await pipe.put_to_storage_volume(key, request)
+        await transport_buffer.put_to_storage_volume(key, request)
         latency_tracker.track_step("put_to_storage_volume")
 
-        await self._controller.notify_put.call(key, request.meta_only(), volume_id)
+        await self._controller.notify_put.call(
+            key, request.meta_only(), storage_volume_ref.volume_id
+        )
+        latency_tracker.track_step("notify_put")
+        latency_tracker.track_e2e()
+
+    @torch.no_grad
+    async def put_batch(self, items: dict[str, torch.Tensor | Any]) -> None:
+        """Store multiple tensors or objects in a single batched call.
+
+        This is significantly more efficient than calling put() multiple times as it
+        parallelizes storage operations and batches controller notifications.
+
+        Args:
+            items: Dictionary mapping keys to values to store.
+        """
+        if not items:
+            return
+
+        latency_tracker = LatencyTracker(f"put_batch:{len(items)}_keys")
+
+        # Select storage volume (all items go to same volume)
+        storage_volume_ref = self.strategy.select_storage_volume()
+        transport_buffer = create_transport_buffer(storage_volume_ref)
+        latency_tracker.track_step("create transport buffer")
+
+        # Put all items in parallel using asyncio.gather
+        async def put_single(key: str, value: torch.Tensor | Any):
+            request = Request.from_any(value)
+            await transport_buffer.put_to_storage_volume(key, request)
+            return key, request
+
+        put_results = await asyncio.gather(
+            *[put_single(key, value) for key, value in items.items()]
+        )
+        latency_tracker.track_step("put_to_storage_volume_batch")
+
+        # Notify controller with a single batched RPC call (not individual calls)
+        notifications = [
+            (key, request.meta_only(), storage_volume_ref.volume_id)
+            for key, request in put_results
+        ]
+        await self._controller.notify_put_batch.call(notifications)
+        latency_tracker.track_step("notify_put_batch")
+        latency_tracker.track_e2e()
+
+    @torch.no_grad
+    async def put_slice(
+        self, key: str, tensor: torch.Tensor, tensor_slice: TensorSlice
+    ):
+        """Store a tensor slice with distributed metadata.
+
+        Unlike put(), this explicitly stores the tensor as part of a distributed tensor,
+        with metadata about its position in the global tensor.
+
+        Args:
+            key: Unique identifier for the distributed tensor.
+            tensor: Local shard to store.
+            tensor_slice: Metadata describing shard's position in global tensor.
+        """
+        latency_tracker = LatencyTracker(f"put_slice:{key}")
+
+        # Create request with both tensor data and slice metadata
+        request = Request(tensor_val=tensor, tensor_slice=tensor_slice)
+
+        storage_volume_ref = self.strategy.select_storage_volume()
+        transport_buffer = create_transport_buffer(storage_volume_ref)
+        latency_tracker.track_step("create transport buffer")
+
+        await transport_buffer.put_to_storage_volume(key, request)
+        latency_tracker.track_step("put_to_storage_volume")
+
+        await self._controller.notify_put.call(
+            key, request.meta_only(), storage_volume_ref.volume_id
+        )
         latency_tracker.track_step("notify_put")
         latency_tracker.track_e2e()
 
@@ -101,8 +175,7 @@ class LocalClient:
             # Here full tensor should be the part of interest.
             fetched_tensor = await self._get_and_assemble_tensor(key, tensor_slice)
 
-        # Pipe does not have support for inplace copies of fetched tensors yet,
-        # so we just copy
+        # TODO: This should be removed and handled in tranpsort buffer
         if inplace_tensor is not None:
             if hasattr(inplace_tensor, "_local_tensor"):
                 # DTensor case - copy to the local tensor to avoid type mismatch
@@ -115,6 +188,88 @@ class LocalClient:
 
         latency_tracker.track_e2e()
         return fetched_tensor
+
+    @torch.no_grad
+    async def get_batch(
+        self,
+        keys: list[str],
+    ) -> dict[str, torch.Tensor | Any]:
+        """Retrieve multiple tensors or objects from the distributed store in a single batched call.
+
+        This is significantly more efficient than calling get() multiple times as it
+        batches RPC calls to minimize round-trip overhead.
+
+        Args:
+            keys: List of unique identifiers of the values to retrieve.
+
+        Returns:
+            A dictionary mapping keys to their retrieved values (tensors or objects).
+        """
+        if not keys:
+            return {}
+
+        latency_tracker = LatencyTracker(f"get_batch:{len(keys)}_keys")
+
+        # Group keys by volume to minimize RPC calls
+        volume_to_keys: dict[str, list[str]] = {}
+        for key in keys:
+            try:
+                volume_map = await self._locate_volumes(key)
+                for volume_id in volume_map:
+                    if volume_id not in volume_to_keys:
+                        volume_to_keys[volume_id] = []
+                    volume_to_keys[volume_id].append(key)
+                    break  # Use first volume for non-slice data
+            except KeyError:
+                logger.warning(f"Key {key} not found in store")
+                continue
+
+        latency_tracker.track_step("locate_volumes")
+
+        # Fetch from all volumes in parallel
+        async def fetch_from_volume(
+            volume_id: str, volume_keys: list[str]
+        ) -> dict[str, torch.Tensor | Any]:
+            volume_ref = self.strategy.get_storage_volume(volume_id)
+            transport_buffer = create_transport_buffer(volume_ref)
+
+            # Fetch all keys from this volume
+            results = {}
+            fetch_tasks = []
+            for key in volume_keys:
+                request = Request.from_any(None)
+                fetch_tasks.append(
+                    transport_buffer.get_from_storage_volume(key, request)
+                )
+
+            # Execute all fetches in parallel
+            fetched = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+            for key, result in zip(volume_keys, fetched):
+                if isinstance(result, Exception):
+                    logger.warning(f"Failed to fetch {key}: {result}")
+                else:
+                    results[key] = result
+
+            return results
+
+        # Fetch from all volumes in parallel
+        volume_results = await asyncio.gather(
+            *[
+                fetch_from_volume(vid, vkeys)
+                for vid, vkeys in volume_to_keys.items()
+            ]
+        )
+
+        latency_tracker.track_step("fetch_from_volumes")
+
+        # Merge results
+        all_results = {}
+        for result_dict in volume_results:
+            all_results.update(result_dict)
+
+        latency_tracker.track_e2e()
+        return all_results
 
     async def keys(self, prefix: str | None = None) -> list[str]:
         """
@@ -238,9 +393,11 @@ class LocalClient:
         volume_map = await self._locate_volumes(key)
         volume_id, _ = volume_map.popitem()
         volume_ref = self.strategy.get_storage_volume(volume_id)
-        pipe = Pipe(volume_ref)
-        request = Request.from_any(None)
-        return await pipe.get_from_storage_volume(key, request)
+        transport_buffer = create_transport_buffer(volume_ref)
+
+        return await transport_buffer.get_from_storage_volume(
+            key, Request.from_any(None)
+        )
 
     async def _get_tensor(self, key: str) -> torch.Tensor:
         """Fetches the tensor which is stored in one volume storage"""
@@ -249,11 +406,9 @@ class LocalClient:
         # if the storage is a Tensor instead of DTensor, just fetch and return it.
         for volume_id, _ in volume_map.items():
             volume_ref = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(volume_ref)
-            # TODO: consolidate the logic here - None indicates it is an object request,
-            # which is sematically inappropriate here.
+            transport_buffer = create_transport_buffer(volume_ref)
             request = Request.from_any(None)
-            return await pipe.get_from_storage_volume(key, request)
+            return await transport_buffer.get_from_storage_volume(key, request)
 
     async def _get_and_assemble_tensor(
         self, key: str, tensor_slice_spec: TensorSlice | None = None
@@ -273,11 +428,12 @@ class LocalClient:
         partial_results = []
         for volume_id, storage_info in volume_map.items():
             volume_ref = self.strategy.get_storage_volume(volume_id)
-            pipe = Pipe(volume_ref)
 
-            # fetch from all storage volumes, something like this
+            transport_buffer = create_transport_buffer(volume_ref)
+
+            # fetch from all storage volumes
             # TODO: fix so we can request all tensor slices from a storage volume
-            # at once, this is silly
+            # at once, this is silly !
             for tensor_slice in storage_info.tensor_slices:
                 # Intersect the tensor slice with the DTensor slice to optimize fetching
                 if tensor_slice_spec is not None:
@@ -292,7 +448,7 @@ class LocalClient:
 
                 tensor_slice_request = Request.from_tensor_slice(tensor_slice)
 
-                local_tensor = await pipe.get_from_storage_volume(
+                local_tensor = await transport_buffer.get_from_storage_volume(
                     key, tensor_slice_request
                 )
                 partial_results.append((local_tensor, tensor_slice))

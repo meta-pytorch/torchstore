@@ -18,8 +18,7 @@ from torchstore.strategy import (
     SingletonStrategy,
     TorchStoreStrategy,
 )
-from torchstore.transport.pipe import TensorSlice
-
+from torchstore.transport.types import TensorSlice
 
 # I need to keep this somewhere, so here we go
 DEFAULT_TORCHSTORE_NAME: str = "TorchStore"
@@ -156,6 +155,30 @@ async def put(
     """
     cl = await client(store_name)
     return await cl.put(key, value)
+
+
+async def put_batch(
+    items: dict[str, torch.Tensor | Any],
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> None:
+    """Store multiple tensors or objects in the distributed store in a single batched call.
+
+    This is significantly more efficient than calling put() multiple times as it
+    batches RPC calls to minimize round-trip overhead.
+
+    Args:
+        items (dict[str, torch.Tensor | Any]): Dictionary mapping keys to values to store.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Example:
+        >>> tensors = {
+        ...     "param.weight": torch.randn(100, 100),
+        ...     "param.bias": torch.randn(100),
+        ... }
+        >>> await put_batch(tensors)
+    """
+    cl = await client(store_name)
+    return await cl.put_batch(items)
 
 
 async def get(
@@ -311,3 +334,111 @@ async def get_state_dict(
     return await torchstore.state_dict_utils.get_state_dict(
         cl, key, user_state_dict, strict
     )
+
+
+async def put_slice(
+    key: str,
+    tensor: torch.Tensor,
+    tensor_slice: TensorSlice,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> None:
+    """Store a tensor slice with distributed metadata.
+
+    Unlike put(), this stores the tensor as part of a distributed tensor,
+    with metadata about its position in the global tensor. Multiple ranks
+    can store different slices of the same key.
+
+    Args:
+        key (str): Unique identifier for the distributed tensor.
+        tensor (torch.Tensor): Local shard to store (can be on GPU for GPU RDMA).
+        tensor_slice (TensorSlice): Metadata describing shard's position in global tensor.
+        store_name (str): TorchStore instance name. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Example:
+        >>> # FSDP rank 0 stores first half of rows
+        >>> from torchstore.transport.types import TensorSlice
+        >>> slice_0 = TensorSlice(
+        ...     offsets=(0, 0),
+        ...     coordinates=(0,),
+        ...     global_shape=(4096, 4096),
+        ...     local_shape=(2048, 4096),
+        ...     mesh_shape=(2,),
+        ... )
+        >>> await put_slice("layer.weight", local_shard, slice_0)
+    """
+    from torchstore.transport.types import Request
+
+    cl = await client(store_name)
+    await cl.put_slice(key, tensor, tensor_slice)
+
+
+async def get_batch(
+    keys: list[str],
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> dict[str, torch.Tensor | Any]:
+    """Retrieve multiple tensors or objects from the distributed store in a single batched call.
+
+    This is significantly more efficient than calling get() multiple times as it
+    batches RPC calls to minimize round-trip overhead.
+
+    Args:
+        keys (list[str]): List of unique identifiers of the values to retrieve.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Returns:
+        dict: A dictionary mapping keys to their retrieved values (tensors or objects).
+
+    Example:
+        >>> keys = ["param.weight", "param.bias", "layer.weight"]
+        >>> tensors = await get_batch(keys)
+        >>> for key, tensor in tensors.items():
+        ...     print(f"{key}: {tensor.shape}")
+    """
+    cl = await client(store_name)
+    return await cl.get_batch(keys)
+
+
+async def get_slice(
+    key: str,
+    tensor_slice_spec: TensorSlice,
+    target_device: torch.device | str | None = None,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> torch.Tensor:
+    """Fetch a specific slice of a distributed tensor.
+
+    Automatically fetches only the portions that intersect with the
+    requested slice from all storage volumes, then assembles them.
+
+    Args:
+        key (str): Unique identifier for the distributed tensor.
+        tensor_slice_spec (TensorSlice): The slice you need (e.g., for your TP rank).
+        target_device (torch.device | str | None): Device for output tensor.
+            If specified, the returned tensor will be on this device.
+        store_name (str): TorchStore instance name. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Returns:
+        torch.Tensor: Tensor of shape tensor_slice_spec.local_shape on target_device.
+
+    Example:
+        >>> # TP rank 0 needs first half of columns
+        >>> from torchstore.transport.types import TensorSlice
+        >>> my_slice = TensorSlice(
+        ...     offsets=(0, 0),
+        ...     coordinates=(0,),
+        ...     global_shape=(4096, 4096),
+        ...     local_shape=(4096, 2048),
+        ...     mesh_shape=(2,),
+        ... )
+        >>> tensor = await get_slice("layer.weight", my_slice, target_device="cuda:0")
+    """
+    cl = await client(store_name)
+    result = await cl.get(key, tensor_slice_spec=tensor_slice_spec)
+
+    # Move to target device if specified
+    if target_device is not None:
+        if isinstance(target_device, str):
+            target_device = torch.device(target_device)
+        if result.device != target_device:
+            result = result.to(target_device)
+
+    return result

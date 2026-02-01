@@ -12,7 +12,7 @@ import torch
 from monarch.actor import Actor, endpoint
 
 from torchstore.transport.buffers import TransportBuffer, TransportContext
-from torchstore.transport.pipe import Request, TensorSlice
+from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
 
 logger = getLogger(__name__)
@@ -62,6 +62,17 @@ class StorageVolume(Actor):
         await self.store.put(key, transport_buffer, request)
 
     @endpoint
+    async def put_batch_direct(
+        self, items: dict[str, torch.Tensor]
+    ) -> None:
+        """Store multiple tensors directly in a single RPC call.
+
+        This bypasses the transport buffer mechanism for maximum efficiency
+        when tensors are already on the correct device.
+        """
+        await self.store.put_batch_direct(items)
+
+    @endpoint
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> TransportBuffer:
@@ -96,6 +107,10 @@ class StorageImpl:
         """Store data in the storage backend."""
         raise NotImplementedError()
 
+    async def put_batch_direct(self, items: dict[str, torch.Tensor]) -> None:
+        """Store multiple tensors directly without transport buffers."""
+        raise NotImplementedError()
+
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> TransportBuffer:
@@ -125,6 +140,55 @@ class InMemoryStore(StorageImpl):
 
     async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
         return await transport_buffer.recv_handshake(self.transport_context)
+
+    def _extract_existing(self, key: str, request: "Request") -> torch.Tensor | None:
+        """Extract existing tensor from storage for in-place update.
+
+        Looks up the key in kv storage and extracts the tensor if it exists.
+        Only asserts on type mismatches between existing data and incoming request.
+
+        Args:
+            key: The storage key to look up
+            request: The incoming put request
+
+        Returns:
+            The existing tensor if found, None otherwise.
+
+        Raises:
+            AssertionError: If there's a type mismatch between existing data and request.
+        """
+        current_object = self.kv.get(key, None)
+
+        if current_object is None:
+            return None
+
+        if isinstance(current_object, torch.Tensor):
+            # Regular tensor - request must also be a regular tensor (no tensor_slice)
+            assert (
+                request.tensor_slice is None
+            ), "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
+            return current_object
+
+        if isinstance(current_object, dict):
+            if "obj" in current_object:
+                # Object dict - request must also be an object
+                assert (
+                    request.is_object
+                ), "Existing data is an object but request.is_object is False"
+                return None
+
+            # DTensor shard dict - incoming request must also be a DTensor
+            assert (
+                request.tensor_slice is not None
+            ), "Existing data is DTensor shards but incoming request has no tensor_slice"
+            # Look up by coordinates
+            shard = current_object.get(request.tensor_slice.coordinates)
+            if shard is not None and "tensor" in shard:
+                return shard["tensor"]
+            # Coordinates don't match - new shard, return None to allocate new
+            return None
+
+        raise AssertionError(f"Unexpected current_object type: {type(current_object)}")
 
     def _build_full_tensor(self, key: str) -> None:
         logger.debug(f"Building full tensor for {key}")
@@ -249,19 +313,37 @@ class InMemoryStore(StorageImpl):
     async def put(
         self, key: str, transport_buffer: TransportBuffer, request: Request
     ) -> None:
+        # Extract existing tensor for potential in-place update
+        current_obj = self._extract_existing(key, request)
 
+        # fetch from remote
+        data = await transport_buffer.handle_put_request(
+            self.transport_context,
+            request,
+            current_obj,
+        )
+
+        # store locally
         if request.is_object:
-            self.kv[key] = {"obj": request.objects}
+            self.kv[key] = {"obj": data}
             return
 
-        # since we pass tensor=None to the transport buffer,
-        # we allocate on the fly
-        tensor = await transport_buffer.read_into(None, self.transport_context)
         if request.tensor_slice is not None:
-            self._handle_dtensor(key, request.tensor_slice, tensor)
+            # tensor is actually part of a DTensor
+            self._handle_dtensor(key, request.tensor_slice, data)
             return
 
-        self.kv[key] = tensor
+        self.kv[key] = data
+
+    async def put_batch_direct(self, items: dict[str, torch.Tensor]) -> None:
+        """Store multiple tensors directly without transport buffers.
+
+        This is optimized for bulk storage when tensors don't need
+        transport buffer processing (e.g., already on correct device).
+        """
+        for key, tensor in items.items():
+            # Store tensors directly - they're already in the right format
+            self.kv[key] = tensor
 
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request
@@ -269,22 +351,23 @@ class InMemoryStore(StorageImpl):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
-        # TODO: clean up
+        data = self._get_data(request, key)
+        await transport_buffer.handle_get_request(self.transport_context, data)
+
+        return transport_buffer
+
+    def _get_data(self, request, key):
         val = self.kv[key]
         if isinstance(val, dict) and "obj" in val:
-            transport_buffer.is_object = True
-            transport_buffer.objects = val["obj"]
-            return transport_buffer
+            return val["obj"]
 
         if request.tensor_slice is None:
-            await transport_buffer.write_from(self.kv[key], self.transport_context)
-            return transport_buffer
+            return self.kv[key]
 
         extracted_tensor = self._get_sharded_tensor(request, key)
 
         if extracted_tensor is not None:
-            await transport_buffer.write_from(extracted_tensor, self.transport_context)
-            return transport_buffer
+            return extracted_tensor
 
         raise RuntimeError(
             f"Tensor slice {request.tensor_slice} not found in any stored shards for {key}"
