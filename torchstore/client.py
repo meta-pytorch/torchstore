@@ -80,11 +80,14 @@ class LocalClient:
 
         # Select storage volume (all items go to same volume)
         storage_volume_ref = self.strategy.select_storage_volume()
-        transport_buffer = create_transport_buffer(storage_volume_ref)
-        latency_tracker.track_step("create transport buffer")
+        latency_tracker.track_step("select storage volume")
 
         # Put all items in parallel using asyncio.gather
+        # NOTE: Each operation needs its own transport buffer to avoid race conditions.
+        # Transport buffers maintain internal state (ipc_handle, tensor_ref, shape, dtype, etc.)
+        # that gets corrupted when multiple concurrent operations share the same instance.
         async def put_single(key: str, value: torch.Tensor | Any):
+            transport_buffer = create_transport_buffer(storage_volume_ref)
             request = Request.from_any(value)
             await transport_buffer.put_to_storage_volume(key, request)
             return key, request
@@ -227,24 +230,27 @@ class LocalClient:
         latency_tracker.track_step("locate_volumes")
 
         # Fetch from all volumes in parallel
+        # NOTE: Each operation needs its own transport buffer to avoid race conditions.
+        # Transport buffers maintain internal state (ipc_handle, tensor_ref, shape, dtype, etc.)
+        # that gets corrupted when multiple concurrent operations share the same instance.
         async def fetch_from_volume(
             volume_id: str, volume_keys: list[str]
         ) -> dict[str, torch.Tensor | Any]:
             volume_ref = self.strategy.get_storage_volume(volume_id)
-            transport_buffer = create_transport_buffer(volume_ref)
 
-            # Fetch all keys from this volume
-            results = {}
-            fetch_tasks = []
-            for key in volume_keys:
+            # Fetch all keys from this volume - create a new transport buffer per key
+            async def fetch_single_key(key: str):
+                transport_buffer = create_transport_buffer(volume_ref)
                 request = Request.from_any(None)
-                fetch_tasks.append(
-                    transport_buffer.get_from_storage_volume(key, request)
-                )
+                return await transport_buffer.get_from_storage_volume(key, request)
 
             # Execute all fetches in parallel
-            fetched = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+            fetched = await asyncio.gather(
+                *[fetch_single_key(key) for key in volume_keys],
+                return_exceptions=True
+            )
 
+            results = {}
             for key, result in zip(volume_keys, fetched):
                 if isinstance(result, Exception):
                     logger.warning(f"Failed to fetch {key}: {result}")
