@@ -10,7 +10,6 @@ import pytest
 import torch
 from torchstore.utils import assemble_tensor, get_local_tensor
 
-
 logger = getLogger(__name__)
 
 
