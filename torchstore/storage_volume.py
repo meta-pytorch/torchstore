@@ -11,14 +11,15 @@ from typing import Any
 import torch
 from monarch.actor import Actor, endpoint
 
-from torchstore.transport.buffers import TransportBuffer, TransportContext
-from torchstore.transport.types import Request, TensorSlice
-from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
 from torchstore.state_dict_utils import (
     DELIM,
     TensorMetadata,
     unpack_metadata_state_dict,
 )
+
+from torchstore.transport.buffers import TransportBuffer, TransportContext
+from torchstore.transport.types import Request, TensorSlice
+from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
 
 logger = getLogger(__name__)
 
@@ -314,19 +315,19 @@ class InMemoryStore(StorageImpl):
             request,
             current_obj,
         )
-        
+
         # key is for example: 'v0/TORCHSTORE_STATE_DICT'
         key_prefix = key.split(DELIM)[0]  # key_prefix is 'v0
         if request.is_tssd:
             # latency_tracker = LatencyTracker(f"put_tssd: {key_prefix}")
             tensor_blob = data
-            #latency_tracker.track_step("read_into")
+            # latency_tracker.track_step("read_into")
             metadata_state_dict = request.objects
 
-            flattened_state_dict= unpack_metadata_state_dict(
+            flattened_state_dict = unpack_metadata_state_dict(
                 metadata_state_dict, tensor_blob
             )
-            #latency_tracker.track_step("unpack_metadata_state_dict")
+            # latency_tracker.track_step("unpack_metadata_state_dict")
             for flattened_key, value in flattened_state_dict.items():
                 key_to_store = f"{key_prefix}{DELIM}{flattened_key}"
                 metadata = metadata_state_dict[flattened_key]

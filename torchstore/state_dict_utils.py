@@ -7,7 +7,7 @@
 import os
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 from torch.distributed.checkpoint._nested_dict import (
@@ -68,7 +68,7 @@ async def put_state_dict_batch(store, state_dict, key):
     # Get storage volume info for notify_put
     storage_volume_ref = store.strategy.select_storage_volume()
     volume_id = storage_volume_ref.volume_id
-    
+
     # Store the TorchStoreStateDict object
     await store.put(f"{key}{DELIM}{TORCHSTORE_STATE_DICT}", torchstore_state_dict)
     latency_tracker.track_step("store_put_tssd")
@@ -91,9 +91,7 @@ async def put_state_dict_batch(store, state_dict, key):
     latency_tracker.track_e2e()
 
 
-async def get_state_dict(
-    store, key, user_state_dict: Optional[dict] = None, strict=True
-):
+async def get_state_dict(store, key, user_state_dict: dict | None = None, strict=True):
     """Unflatten the state dict from the store"""
 
     try:
@@ -144,7 +142,7 @@ async def get_state_dict(
 class TensorMetadata:
     """Metadata for a tensor in a tensor blob"""
 
-    shape: Tuple[int, ...]
+    shape: tuple[int, ...]
     dtype: torch.dtype
     offset: int  # Byte offset in the blob
     size: int  # Size in bytes
@@ -174,22 +172,22 @@ class TorchStoreStateDict:
     def __init__(
         self,
         tensor_blob: torch.Tensor,
-        metadata_state_dict: Dict[str, Any],
-        mapping: Dict[str, Any],
+        metadata_state_dict: dict[str, Any],
+        mapping: dict[str, Any],
     ):
         self.tensor_blob = tensor_blob
         self.metadata_state_dict = metadata_state_dict
         self.mapping = mapping
 
     @classmethod
-    def from_state_dict(cls, state_dict: Dict[str, Any]) -> "TorchStoreStateDict":
+    def from_state_dict(cls, state_dict: dict[str, Any]) -> "TorchStoreStateDict":
         """Create a TorchStoreStateDict from a state_dict."""
         # store the tensors in one blob
         # 1. flatten the state dict
         flattened_state_dict, mapping = flatten_state_dict(state_dict)
 
         # 2. iterate through the flattened state dict, collect all tensors and replace them with TensorMetadata objects
-        tensor_list: List[Tuple[torch.Tensor, TensorMetadata]] = []
+        tensor_list: list[tuple[torch.Tensor, TensorMetadata]] = []
         metadata_state_dict = {}
         current_offset = 0
 
@@ -269,7 +267,7 @@ def reconstruct_dtensor_from_local_tensor(
     local_tensor: torch.Tensor,
     tensor_slice: "TensorSlice",
     device_mesh: torch.distributed.DeviceMesh,
-    placements: Tuple[Placement, ...],
+    placements: tuple[Placement, ...],
 ) -> DTensor:
     """
     Reconstruct a DTensor from local tensor data and TensorSlice metadata.
@@ -291,9 +289,9 @@ def reconstruct_dtensor_from_local_tensor(
 
 
 def unpack_metadata_state_dict(
-    metadata_state_dict: Dict[str, Any],
+    metadata_state_dict: dict[str, Any],
     tensor_blob: torch.Tensor,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Takes a metadata_state_dict and replaces all TensorMetadata objects with
     the corresponding tensors from the tensor blob.

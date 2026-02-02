@@ -56,7 +56,7 @@ class TensorSlice:
                 self.mesh_shape,
             )
         )
-    
+
     @classmethod
     def from_dtensor(cls, dtensor: DTensor) -> "TensorSlice":
         coordinates = dtensor.device_mesh.get_coordinate()
@@ -74,7 +74,6 @@ class TensorSlice:
             local_shape=dtensor._local_tensor.shape,
             mesh_shape=dtensor.device_mesh.shape,
         )
-
 
 
 def _is_dtensor_fully_local(dtensor: DTensor) -> bool:
@@ -130,6 +129,7 @@ class Request:
     @classmethod
     def from_any(cls, value: torch.Tensor | DTensor | None) -> "Request":
         from torchstore.state_dict_utils import TorchStoreStateDict
+
         if isinstance(value, DTensor):
             # Check if DTensor is fully local (not actually distributed)
             # If so, treat it as a regular tensor to avoid collective requirements

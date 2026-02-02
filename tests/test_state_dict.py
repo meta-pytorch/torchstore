@@ -9,7 +9,6 @@ import math
 import os
 import tempfile
 from logging import getLogger
-from typing import Union
 
 import pytest
 import torch
