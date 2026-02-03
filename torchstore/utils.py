@@ -52,15 +52,36 @@ def get_local_tensor(
 
 def assemble_tensor(
     local_tensors: list[torch.Tensor],
-    global_shape: "ShapeType",  # TODO: unused, cleanup
     global_offsets: list["ShapeType"],
 ) -> torch.Tensor:
     """
-    Assemble a global tensor from local tensors based on their shapes and offsets. The final shape of the returned
+    Assemble a tensor from local tensors based on their shapes and offsets. The final shape of the returned
     tensor is the union of local tensors.
 
+    N.B. global_offsets are relative to the original tensor, which is not necessarily the assembled tensor. The only
+    requirement is that all local_tensors and global offsets create one continuous region within the tensor.
+
+    Example: Assembling a 2x2 square from the bottom-right corner of a 4x4 tensor.
+        Suppose we have a 4x4 global tensor and want to assemble just the bottom-right 2x2 region:
+
+            Original 4x4 tensor:          We want to assemble this region:
+            ┌───┬───┬───┬───┐             (offsets refer to original tensor)
+            │   │   │   │   │
+            ├───┼───┼───┼───┤             local_tensors = [
+            │   │   │   │   │                 tensor([[A, B]]),    # shape (1, 2)
+            ├───┼───┼───┼───┤                 tensor([[C, D]]),    # shape (1, 2)
+            │   │   │ A │ B │             ]
+            ├───┼───┼───┼───┤             global_offsets = [
+            │   │   │ C │ D │                 (2, 2),  # A,B starts at row 2, col 2
+            └───┴───┴───┴───┘                 (3, 2),  # C,D starts at row 3, col 2
+                                          ]
+
+            Result: 2x2 tensor [[A, B], [C, D]]
+
+        The function computes the bounding box of all local tensors (rows 2-4, cols 2-4)
+        and returns only that region, not the full 4x4 tensor.
+
     :param local_tensors: List of local tensors
-    :param global_shape: Shape of the final global tensor
     :param global_offsets: List of offsets for each local tensor in the global tensor
     :return: The assembled global tensor
     """

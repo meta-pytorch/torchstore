@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from itertools import product
 from logging import getLogger
 from typing import Any
 
@@ -13,7 +12,7 @@ from monarch.actor import Actor, endpoint
 
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.types import Request, TensorSlice
-from torchstore.utils import assemble_tensor, get_slice_intersection, spawn_actors
+from torchstore.utils import get_slice_intersection, spawn_actors
 
 logger = getLogger(__name__)
 
@@ -175,71 +174,6 @@ class InMemoryStore(StorageImpl):
 
         raise AssertionError(f"Unexpected current_object type: {type(current_object)}")
 
-    def _build_full_tensor(self, key: str) -> None:
-        logger.debug(f"Building full tensor for {key}")
-        # we can also consider in the future not requiring the full tensor to be
-        # assembled, and instead only that the requested offsets are available
-        # this is a performance optimization, but could be tricky to implement.
-        assert self._has_full_tensor(key)
-
-        # Early return if full tensor is already built
-        if FULL_TENSOR in self.kv[key]:
-            return
-
-        # TODO: Utility fucntions may make more sense in a
-        # a "PendingTensor" class and have these functions
-        # defined there instead. should also totally simplify the logic here
-        local_tensors = []
-        global_offsets = []
-        global_shape = None
-        device_mesh_shape = None
-        for shard in self.kv[key].values():
-
-            local_tensors.append(shard["tensor"])
-            tensor_shard = shard["slice"]
-
-            global_offsets.append(tensor_shard.offsets)
-            if global_shape is None:
-                global_shape = tensor_shard.global_shape
-            else:
-                assert global_shape == tensor_shard.global_shape
-
-            if device_mesh_shape is None:
-                device_mesh_shape = tensor_shard.mesh_shape
-            else:
-                assert device_mesh_shape == tensor_shard.mesh_shape
-
-        assert local_tensors and global_offsets and global_shape
-
-        # TODO: doing it this way has peek 2x tensor size in memory :(
-        full_tensor = assemble_tensor(
-            local_tensors,
-            global_shape,
-            global_offsets,
-        )
-
-        self.kv[key] = {FULL_TENSOR: full_tensor}
-        logger.debug(f"Finished full tensor for {key}")
-
-    def _has_full_tensor(self, key: str) -> bool:
-        if key not in self.kv:
-            return False
-
-        if FULL_TENSOR in self.kv[key]:
-            return True
-
-        # TODO: there's probably a smarter way to do this,
-        # but for now we check that every "coordinate" in device mesh
-        # has checked in a tensor shard, which _should_ imply all
-        # pieces are received.
-        mesh_shape = next(iter(self.kv[key].values()))["slice"].mesh_shape
-        # iterate through all possible coordinates
-        for coord in product(*(range(s) for s in mesh_shape)):
-            if coord not in self.kv[key]:
-                return False
-
-        return True
-
     def _handle_dtensor(
         self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
     ) -> None:
@@ -250,6 +184,25 @@ class InMemoryStore(StorageImpl):
             "slice": tensor_slice,
             "tensor": tensor,
         }
+
+    def _extract_slice_from_tensor(
+        self, tensor: torch.Tensor, tensor_slice: TensorSlice
+    ) -> torch.Tensor:
+        """Extract a slice from a full tensor.
+
+        Args:
+            tensor: The full stored tensor.
+            tensor_slice: The slice specification to extract.
+
+        Returns:
+            The extracted tensor slice.
+        """
+        indices = []
+        for dim in range(len(tensor_slice.global_shape)):
+            start = tensor_slice.offsets[dim]
+            end = start + tensor_slice.local_shape[dim]
+            indices.append(slice(start, end))
+        return tensor[tuple(indices)]
 
     def _get_sharded_tensor(self, request: Request, key: str) -> torch.Tensor | None:
         """
@@ -336,8 +289,21 @@ class InMemoryStore(StorageImpl):
         if isinstance(val, dict) and "obj" in val:
             return val["obj"]
 
+        # Full tensor stored - return it (possibly sliced)
+        if isinstance(val, torch.Tensor):
+            if request.tensor_slice is None:
+                return val
+            # User wants a slice of the full tensor - extract it
+            return self._extract_slice_from_tensor(val, request.tensor_slice)
+
+        # Must be sharded tensor dict - delegate to _get_sharded_tensor
         if request.tensor_slice is None:
-            return self.kv[key]
+            # TODO: currently, it seems we only support requested a subsection of a shard.
+            # this needs to be made more general, such that we can request any region of the stored tensor
+            # (with the most useful case really being even to fetch all shards at once, so we can recreate them locally)
+            raise RuntimeError(
+                f"Key '{key}' contains sharded tensor but no tensor_slice was requested"
+            )
 
         extracted_tensor = self._get_sharded_tensor(request, key)
 
