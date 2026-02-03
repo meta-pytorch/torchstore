@@ -101,12 +101,16 @@ class LocalClient:
         fetched = await self._fetch(key, request)
         latency_tracker.track_step("fetch")
 
-        # Handle in-place tensor case
-        if inplace_tensor is not None:
-            # Transport buffer is responsible for writing in-place
-            assert (
-                fetched.data_ptr() == request.tensor_val.data_ptr()
-            ), "Transport buffer must write in-place when inplace_tensor is provided"
+        # TODO: remove this copy and instead assert.
+        # unfortunately, during resharding cases, we don't yet support writting inplace
+        # from multiple regions into the inplace tensor, which leads to _fetch returning
+        # a new tensor.
+        if (
+            inplace_tensor is not None
+            and fetched.data_ptr() != request.tensor_val.data_ptr()
+        ):
+            # request tensor_val is a ref to _local_tensor if inplace is dtensor.
+            request.tensor_val.copy_(fetched)
             latency_tracker.track_e2e()
             return inplace_tensor
 
@@ -140,6 +144,7 @@ class LocalClient:
 
             # Has tensor slices - fetch each relevant slice
             for stored_slice in storage_info.tensor_slices:
+                fetch_slice = stored_slice
                 if request.tensor_slice is not None:
                     # TODO: we should also return only if we have already fetched this region in a previous call
                     fetch_slice = get_slice_intersection(
@@ -150,7 +155,7 @@ class LocalClient:
 
                 # TODO: We should optimize this.
                 # this unfortunately creates a new allocation on every fetch. (and fetches each slice separately)
-                slice_request = Request.from_tensor_slice(stored_slice)
+                slice_request = Request.from_tensor_slice(fetch_slice)
                 local_tensor = await transport_buffer.get_from_storage_volume(
                     key, slice_request
                 )
@@ -170,7 +175,10 @@ class LocalClient:
             global_offsets.append(slice_info.offsets)
 
         # this is yet another new allocation on every fetch.
-        return assemble_tensor(local_tensors, global_offsets)
+        assembled_tensor = assemble_tensor(local_tensors, global_offsets)
+        if request.tensor_slice is not None:
+            assert assembled_tensor.shape == request.tensor_slice.local_shape
+        return assembled_tensor
 
     async def keys(self, prefix: str | None = None) -> list[str]:
         """

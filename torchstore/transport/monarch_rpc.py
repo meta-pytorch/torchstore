@@ -13,6 +13,8 @@ member variables and serialized/deserialized automatically.
 
 from typing import Any, TYPE_CHECKING
 
+import torch
+
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.types import Request
 
@@ -34,10 +36,24 @@ class MonarchRPCTransportBuffer(TransportBuffer):
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
         self.data: Any = None  # Carries data for both PUT and GET
+        self.inplace_tensor: torch.Tensor | None = None  # For in-place GET operations
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Any time that we serialize the transport buffer, the idea is
+        # that tensors will be transported via tensor_enginer.RDMABuffer, so it makes
+        # no sense to hold this reference when we are serializing
+        state = self.__dict__.copy()
+        state["inplace_tensor"] = None
+        return state
 
     async def _pre_put_hook(self, request: Request) -> None:
         """Store data from request to be serialized with this buffer."""
         self.data = request.objects if request.is_object else request.tensor_val
+
+    async def _pre_get_hook(self, key: str, request: Request) -> None:
+        """Store data from request to be serialized with this buffer."""
+        # tensor_val is None if not Tensor or not inplace
+        self.inplace_tensor = request.tensor_val
 
     async def handle_put_request(
         self, ctx: "TransportContext", request: Request, current_object
@@ -53,6 +69,10 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         self, transport_buffer: "TransportBuffer"
     ) -> Any:
         """Extract the data from the response buffer."""
+        if self.inplace_tensor is not None:
+            self.inplace_tensor.copy_(transport_buffer.data)
+            return self.inplace_tensor
+
         return transport_buffer.data
 
     async def drop(self) -> None:
