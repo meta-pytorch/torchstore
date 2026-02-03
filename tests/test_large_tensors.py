@@ -31,7 +31,9 @@ async def test_large_tensors():
     class LargeTensorActor(Actor):
         step_size: int = 100  # -> 400mb
         max_step: int = 600  # 4mb -> 2gb
-        repeat_test: int = 2
+        repeat_test: int = 1  # repeating test causes put to write inplace
+        get_inplace: bool = False
+        device: str = "cpu"
 
         def __init__(self, generate_benchmark=False) -> None:
             self.generate_benchmark = generate_benchmark
@@ -47,7 +49,7 @@ async def test_large_tensors():
                     size_mbytes = (
                         math.prod(shape) * 4 // (1024 * 1024)
                     )  # float32 is 4 bytes, // mb
-                    tensor = torch.randn(shape, dtype=torch.float32)
+                    tensor = torch.randn(shape, dtype=torch.float32, device=self.device)
 
                     logger.info(f"Put {n=} {size_mbytes=}")
                     t = time.perf_counter()
@@ -65,7 +67,7 @@ async def test_large_tensors():
                 with open("put_benchmark.csv", "w") as fp:
                     fp.write("size_mbytes, delta\n")
                     for size_mbytes, delta in dps:
-                        fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
+                        fp.write(f"{size_mbytes}, {delta}, {size_mbytes / delta}\n")
 
         @endpoint
         async def get(self):
@@ -79,9 +81,14 @@ async def test_large_tensors():
                     )  # float32 is 4 bytes, // mb
 
                     logger.info(f"Get {n=} {size_mbytes=}")
+                    inplace_tensor = (
+                        None
+                        if not self.get_inplace
+                        else torch.randn(shape, dtype=torch.float32, device=self.device)
+                    )
                     t = time.perf_counter()
                     try:
-                        await ts.get(str(n))
+                        await ts.get(str(n), inplace_tensor)
                     except Exception as e:
                         logger.exception(f"Test failed with {size_mbytes=}")
                         raise e
@@ -94,7 +101,7 @@ async def test_large_tensors():
                 with open("get_benchmark.csv", "w") as fp:
                     fp.write("size_mbytes, delta\n")
                     for size_mbytes, delta in dps:
-                        fp.write(f"{size_mbytes}, {delta}, {size_mbytes/delta}\n")
+                        fp.write(f"{size_mbytes}, {delta}, {size_mbytes / delta}\n")
 
     # controller code
     await ts.initialize(

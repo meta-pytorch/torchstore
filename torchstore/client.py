@@ -11,6 +11,7 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor
 
+from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer, Request, TensorSlice
@@ -97,7 +98,7 @@ class LocalClient:
         request = Request.from_any(inplace_tensor, tensor_slice_spec)
 
         # Fetch the data
-        fetched = await self._fetch(key, request.tensor_slice, request.tensor_val)
+        fetched = await self._fetch(key, request)
         latency_tracker.track_step("fetch")
 
         # Handle in-place tensor case
@@ -115,15 +116,13 @@ class LocalClient:
     async def _fetch(
         self,
         key: str,
-        tensor_slice: TensorSlice | None = None,
-        inplace_tensor: torch.Tensor | None = None,
+        request: Request,
     ) -> torch.Tensor | Any:
         """Unified fetch that handles tensors, objects, and tensor slices.
 
         Args:
             key: Storage key to fetch.
-            tensor_slice: If provided, fetches this specific slice.
-            inplace_tensor: Optional pre-allocated tensor for in-place writes.
+            request: Request containing tensor_slice and optional inplace tensor.
 
         Returns:
             The fetched data (tensor, assembled tensor, or object).
@@ -135,25 +134,25 @@ class LocalClient:
             volume_ref = self.strategy.get_storage_volume(volume_id)
             transport_buffer = create_transport_buffer(volume_ref)
 
-            # No tensor slices means it's a simple tensor or object - fetch and return
-            if not storage_info.tensor_slices:
-                request = Request(tensor_val=inplace_tensor, tensor_slice=tensor_slice)
+            # no sharding for objects or slices.
+            if storage_info.object_type in (ObjectType.TENSOR, ObjectType.OBJECT):
                 return await transport_buffer.get_from_storage_volume(key, request)
 
             # Has tensor slices - fetch each relevant slice
             for stored_slice in storage_info.tensor_slices:
-                fetch_slice = stored_slice
-
-                if tensor_slice is not None:
+                if request.tensor_slice is not None:
                     # TODO: we should also return only if we have already fetched this region in a previous call
-                    fetch_slice = get_slice_intersection(stored_slice, tensor_slice)
+                    fetch_slice = get_slice_intersection(
+                        stored_slice, request.tensor_slice
+                    )
                     if fetch_slice is None:
                         continue
 
-                # this unfortunately creates a new allocation on every fetch.
-                request = Request.from_tensor_slice(fetch_slice)
+                # TODO: We should optimize this.
+                # this unfortunately creates a new allocation on every fetch. (and fetches each slice separately)
+                slice_request = Request.from_tensor_slice(stored_slice)
                 local_tensor = await transport_buffer.get_from_storage_volume(
-                    key, request
+                    key, slice_request
                 )
                 partial_results.append((local_tensor, fetch_slice))
 
