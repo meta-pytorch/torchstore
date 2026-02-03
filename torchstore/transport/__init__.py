@@ -14,9 +14,7 @@ from torchstore.transport.monarch_rdma import (
     MonarchRDMATransportBuffer,
 )
 from torchstore.transport.monarch_rpc import MonarchRPCTransportBuffer
-from torchstore.transport.torchcomms.buffer import (
-    TorchCommsRdmaTransportBuffer,
-)
+from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
 from torchstore.transport.types import Request, TensorSlice
 
