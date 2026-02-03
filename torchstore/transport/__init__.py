@@ -8,13 +8,16 @@ from enum import auto, Enum
 from typing import TYPE_CHECKING
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.gloo import GlooTransportBuffer
+from torchstore.transport.gloo import gloo_available, GlooTransportBuffer
 from torchstore.transport.monarch_rdma import (
     monarch_rdma_transport_available,
     MonarchRDMATransportBuffer,
 )
 from torchstore.transport.monarch_rpc import MonarchRPCTransportBuffer
-from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
+from torchstore.transport.torchcomms.buffer import (
+    TorchCommsRdmaTransportBuffer,
+)
+from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
 from torchstore.transport.types import Request, TensorSlice
 
 if TYPE_CHECKING:
@@ -36,6 +39,10 @@ def get_available_transport() -> TransportType:
     """
     if monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
+    elif torchcomms_rdma_available():
+        return TransportType.TorchCommsRDMA
+    elif gloo_available():
+        return TransportType.Gloo
     return TransportType.MonarchRPC
 
 

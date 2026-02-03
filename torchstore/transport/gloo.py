@@ -11,6 +11,8 @@ from datetime import timedelta
 from logging import getLogger
 from typing import Any, TYPE_CHECKING
 
+import portpicker
+
 import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
 
@@ -32,17 +34,22 @@ _store_addrs: dict[
 ] = {}  # volume_id -> (master_addr, master_port, store_key)
 
 
+TORCHSTORE_GLOO_ENABLED = os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1"
+TORCHSTORE_GLOO_INIT_TIMEOUT = int(
+    os.environ.get("TORCHSTORE_GLOO_INIT_TIMEOUT", "120")
+)
+
+
 def gloo_available() -> bool:
     """Check if gloo transport is available and enabled.
 
     Returns True if:
-    1. USE_GLOO environment variable is set to "1"
+    1. TORCHSTORE_GLOO_ENABLED environment variable is set to "1"
     2. torch.distributed is available
     3. gloo backend is available
 
     """
-    gloo_enabled = os.environ.get("USE_GLOO", "0") == "1"
-    if not gloo_enabled:
+    if not TORCHSTORE_GLOO_ENABLED:
         return False
 
     if not dist.is_available():
@@ -52,15 +59,6 @@ def gloo_available() -> bool:
         return False
 
     return True
-
-
-def _find_free_port() -> int:
-    """Find a free port on the local machine."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-    return port
 
 
 def _get_hostname() -> str:
@@ -111,7 +109,7 @@ class GlooTransportBuffer(TransportBuffer):
     and storage volume for each connection using TCPStore for coordination.
 
     Prerequisites:
-    - USE_GLOO=1 environment variable must be set
+    - TORCHSTORE_GLOO_ENABLED=1 environment variable must be set
     - Network connectivity between client and storage (for TCPStore)
     """
 
@@ -182,7 +180,7 @@ class GlooTransportBuffer(TransportBuffer):
         # Generate unique store key and find free port
         self.store_key = f"torchstore_gloo_{str(uuid.uuid4())[:8]}"
         self.master_addr = _get_hostname()
-        self.master_port = _find_free_port()
+        self.master_port = portpicker.pick_unused_port()
 
         logger.info(
             f"Initiating gloo handshake with StorageVolume:[{volume_id}] "
@@ -195,7 +193,7 @@ class GlooTransportBuffer(TransportBuffer):
             port=self.master_port,
             world_size=2,
             is_master=True,
-            timeout=timedelta(seconds=120),
+            timeout=timedelta(seconds=TORCHSTORE_GLOO_INIT_TIMEOUT),
             wait_for_workers=False,
         )
 
@@ -207,7 +205,7 @@ class GlooTransportBuffer(TransportBuffer):
                 store=tcp_store,
                 rank=0,
                 world_size=2,
-                timeout=timedelta(seconds=120),
+                timeout=timedelta(seconds=TORCHSTORE_GLOO_INIT_TIMEOUT),
                 device=torch.device("cpu"),
             )
 
@@ -222,9 +220,6 @@ class GlooTransportBuffer(TransportBuffer):
 
         """
         ctx = transport_context.get_transport_context()
-
-        if self.store_key in ctx:
-            raise RuntimeError("this shouldnt happen")
 
         logger.info(
             f"Storage volume setting up gloo process group with TCPStore at "
@@ -242,13 +237,13 @@ class GlooTransportBuffer(TransportBuffer):
                 port=master_port,
                 world_size=2,
                 is_master=False,
-                timeout=timedelta(seconds=120),
+                timeout=timedelta(seconds=TORCHSTORE_GLOO_INIT_TIMEOUT),
             )
             return _gloo_factory(
                 store=tcp_store,
                 rank=1,
                 world_size=2,
-                timeout=timedelta(seconds=120),
+                timeout=timedelta(seconds=TORCHSTORE_GLOO_INIT_TIMEOUT),
                 device=torch.device("cpu"),
             )
 
@@ -308,7 +303,7 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Start send in background - will run concurrently with put RPC
         self._send_task = asyncio.create_task(
-            self.send_tensor(
+            self._send_tensor(
                 tensor,
                 self.storage_volume_ref.transport_context,
             )
@@ -333,7 +328,7 @@ class GlooTransportBuffer(TransportBuffer):
             )
 
         # Receive tensor from client via gloo
-        tensor = await self.receive_tensor(tensor, ctx)
+        tensor = await self._receive_tensor(tensor, ctx)
 
         return tensor
 
@@ -368,7 +363,7 @@ class GlooTransportBuffer(TransportBuffer):
         # Start recv in background - will run concurrently with get RPC
         # The storage volume will send the tensor in handle_get_request
         self._recv_task = asyncio.create_task(
-            self.receive_tensor(
+            self._receive_tensor(
                 tensor,
                 self.storage_volume_ref.transport_context,
             )
@@ -382,7 +377,7 @@ class GlooTransportBuffer(TransportBuffer):
             return
 
         # Send the tensor to client via gloo
-        await self.send_tensor(data, ctx)
+        await self._send_tensor(data, ctx)
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
@@ -407,7 +402,7 @@ class GlooTransportBuffer(TransportBuffer):
 
         raise RuntimeError(f"No recv task available (is_object={self.is_object})")
 
-    async def receive_tensor(
+    async def _receive_tensor(
         self, tensor: torch.Tensor, transport_context: "TransportContext"
     ) -> torch.Tensor:
         """Receive tensor via gloo. Waits for recv to complete before returning.
@@ -449,7 +444,7 @@ class GlooTransportBuffer(TransportBuffer):
 
         return tensor
 
-    async def send_tensor(
+    async def _send_tensor(
         self, tensor: torch.Tensor, transport_context: "TransportContext"
     ) -> None:
         """Send tensor via gloo. Waits for send to complete before returning.
