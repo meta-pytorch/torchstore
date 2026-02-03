@@ -94,34 +94,18 @@ class LocalClient:
         logger.debug(f"Fetching {key}")
         latency_tracker = LatencyTracker(f"get:{key}")
 
-        # Build request from inplace_tensor with optional tensor_slice_spec.
-        # For DTensors, from_any extracts both _local_tensor and tensor_slice from sharding info.
-        # For regular tensors, tensor_slice_spec is used if provided.
-        # from_any will raise ValueError if both DTensor and tensor_slice_spec are provided.
         request = Request.from_any(inplace_tensor, tensor_slice_spec)
 
-        # Get the actual tensor to write into (for in-place support)
-        # For DTensor, we write into _local_tensor
-        local_inplace_tensor = None
-        if inplace_tensor is not None:
-            if hasattr(inplace_tensor, "_local_tensor"):
-                local_inplace_tensor = inplace_tensor._local_tensor
-            else:
-                local_inplace_tensor = inplace_tensor
-
         # Fetch the data
-        fetched = await self._fetch(key, request.tensor_slice, local_inplace_tensor)
+        fetched = await self._fetch(key, request.tensor_slice, request.tensor_val)
         latency_tracker.track_step("fetch")
 
         # Handle in-place tensor case
         if inplace_tensor is not None:
-            target = local_inplace_tensor
-            # Only copy if transport didn't already write in-place
-            if (
-                isinstance(fetched, torch.Tensor)
-                and fetched.data_ptr() != target.data_ptr()
-            ):
-                target.copy_(fetched)
+            # Transport buffer is responsible for writing in-place
+            assert (
+                fetched.data_ptr() == request.tensor_val.data_ptr()
+            ), "Transport buffer must write in-place when inplace_tensor is provided"
             latency_tracker.track_e2e()
             return inplace_tensor
 
@@ -166,6 +150,7 @@ class LocalClient:
                     if fetch_slice is None:
                         continue
 
+                # this unfortunately creates a new allocation on every fetch.
                 request = Request.from_tensor_slice(fetch_slice)
                 local_tensor = await transport_buffer.get_from_storage_volume(
                     key, request
@@ -185,6 +170,7 @@ class LocalClient:
             local_tensors.append(local_tensor)
             global_offsets.append(slice_info.offsets)
 
+        # this is yet another new allocation on every fetch.
         return assemble_tensor(local_tensors, global_offsets)
 
     async def keys(self, prefix: str | None = None) -> list[str]:
