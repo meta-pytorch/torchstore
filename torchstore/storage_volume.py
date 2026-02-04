@@ -387,7 +387,7 @@ class InMemoryStore(StorageImpl):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
         del self.kv[key]
-        # Clean up shared memory segment if it exists
+        # Clean up shared memory segments if they exist
         shm_cache = self.transport_context.get_shm_cache()
         shm_cache.delete(key)
 

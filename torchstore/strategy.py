@@ -13,7 +13,7 @@ multiple storage volumes. Strategies map client processes to storage volumes.
 import logging
 import os
 import socket
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from monarch.actor import current_rank
 
@@ -41,7 +41,7 @@ class StorageVolumeRef:
         volume_id: str,
         transport_context: TransportContext,
         default_transport_type: TransportType,
-        volume_hostname: Optional[str] = None,
+        volume_hostname: str | None = None,
     ):
         self.volume = volume
         self.volume_id = volume_id

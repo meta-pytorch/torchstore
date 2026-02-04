@@ -200,6 +200,9 @@ async def test_state_dict(strategy_params, transport_type):
         state_dict, fetched_state_dict = await trainer.do_test.call_one()
     finally:
         await ts.shutdown()
+        # Free any GPU memory that may have been allocated
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     _assert_equal_state_dict(state_dict, fetched_state_dict)
 
 
@@ -263,6 +266,9 @@ async def test_dcp_sharding_parity(strategy_params, transport_type):
             # await save_world._proc_mesh.stop()
             # await get_world._proc_mesh.stop()
             await ts.shutdown()
+            # Free any GPU memory accumulated during this iteration
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _assert_equal_state_dict(state_dict1, state_dict2):

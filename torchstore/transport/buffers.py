@@ -36,7 +36,6 @@ class TransportContext:
         """Get shared memory cache, lazily initializing if needed.
 
         This cache is used by both storage (for allocation) and client (for attachment).
-        Storage operations use default scope="", client operations use scope=volume_id.
 
         Note: Import is inside function to avoid cyclic import
         """

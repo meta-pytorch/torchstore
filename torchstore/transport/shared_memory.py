@@ -17,7 +17,7 @@ import logging
 import os
 import socket
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -69,7 +69,7 @@ class SharedMemoryEntry:
 
     storage: torch.UntypedStorage
     descriptor: SharedMemoryDescriptor
-    _tensor: Optional[torch.Tensor] = field(default=None, repr=False)
+    _tensor: torch.Tensor | None = field(default=None, repr=False)
 
     @property
     def name(self) -> str:
@@ -92,44 +92,77 @@ class SharedMemoryEntry:
             )
         return self._tensor
 
-    def close(self) -> None:
-        """Detach from shared storage (client-side cleanup)."""
-        self._tensor = None
-
 
 class SharedMemoryCache:
     """Unified cache for shared memory segments.
 
-    Storage uses allocate() with scope="" (default).
-    Client uses attach() with scope=volume_id.
+    Storage uses allocate() with volume_id=None (default).
+    Client uses attach() with volume_id set.
     """
 
     def __init__(self):
-        self._entries: Dict[Tuple[str, str], SharedMemoryEntry] = {}
+        # _entries: (volume_id, key) -> {coordinates -> entry}
+        # coordinates: DTensor shard coordinates (None for regular tensors)
+        self._entries: dict[
+            tuple[str | None, str], dict[tuple | None, SharedMemoryEntry]
+        ] = {}
 
-    # === Common Operations ===
-
-    def get(self, key: str, scope: str = "") -> Optional[SharedMemoryEntry]:
+    def get(
+        self,
+        key: str,
+        volume_id: str | None = None,
+        coordinates: tuple | None = None,
+    ) -> SharedMemoryEntry | None:
         """Return existing segment or None."""
-        return self._entries.get((scope, key))
+        tensor_key = (volume_id, key)
+        entries = self._entries.get(tensor_key)
+        if entries is None:
+            return None
+        return entries.get(coordinates)
 
-    def delete(self, key: str, scope: str = "") -> None:
-        """Remove segment from cache."""
-        cache_key = (scope, key)
-        if cache_key in self._entries:
-            entry = self._entries.pop(cache_key)
-            entry.close()
+    def delete(
+        self,
+        key: str,
+        volume_id: str | None = None,
+        coordinates: tuple | None = None,
+    ) -> None:
+        """Remove segment(s) from cache."""
+        tensor_key = (volume_id, key)
+        entries = self._entries.get(tensor_key)
+        # should we fail hard?
+        if not entries or coordinates not in entries:
+            return
+
+        if coordinates is None or len(entries) == 1:
+            # delete all entries
+            del self._entries[tensor_key]
+        else:
+            # delete specific shard
+            del self._entries[tensor_key][coordinates]
 
     def reset(self) -> None:
-        """Clean up all segments."""
-        for entry in self._entries.values():
-            entry.close()
         self._entries.clear()
 
-    # === Storage-Side: Allocation ===
+    def _put(
+        self,
+        key: str,
+        entry: SharedMemoryEntry,
+        volume_id: str | None = None,
+        coordinates: tuple | None = None,
+    ) -> None:
+        """Add entry to cache."""
+        tensor_key = (volume_id, key)
+        if tensor_key not in self._entries:
+            self._entries[tensor_key] = {}
+        self._entries[tensor_key][coordinates] = entry
 
     def allocate(
-        self, key: str, shape: torch.Size, dtype: torch.dtype, scope: str = ""
+        self,
+        key: str,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        volume_id: str | None = None,
+        coordinates: tuple | None = None,
     ) -> SharedMemoryEntry:
         """Allocate a new segment or return existing one.
 
@@ -138,15 +171,14 @@ class SharedMemoryCache:
         Raises:
             AssertionError: If key exists with different shape/dtype. Delete first.
         """
-        cache_key = (scope, key)
-        if cache_key in self._entries:
-            entry = self._entries[cache_key]
+        existing = self.get(key, volume_id, coordinates)
+        if existing is not None:
             # Shape/dtype must match - segments are immutable once created
-            assert entry.shape == shape and entry.dtype == dtype, (
-                f"Key '{key}' exists with shape={entry.shape}, dtype={entry.dtype}. "
+            assert existing.shape == shape and existing.dtype == dtype, (
+                f"Key '{key}' exists with shape={existing.shape}, dtype={existing.dtype}. "
                 f"Cannot overwrite with shape={shape}, dtype={dtype}. Delete first."
             )
-            return entry
+            return existing
 
         # Allocate directly in shared memory
         size_bytes = shape.numel() * dtype.itemsize
@@ -167,7 +199,7 @@ class SharedMemoryCache:
         entry = SharedMemoryEntry(
             storage=storage, descriptor=descriptor, _tensor=tensor
         )
-        self._entries[cache_key] = entry
+        self._put(key, entry, volume_id, coordinates)
         return entry
 
     # === Client-Side: Attachment ===
@@ -176,7 +208,8 @@ class SharedMemoryCache:
         self,
         key: str,
         descriptor: SharedMemoryDescriptor,
-        scope: str = "",
+        volume_id: str | None = None,
+        coordinates: tuple | None = None,
     ) -> SharedMemoryEntry:
         """Attach to an existing shared memory segment.
 
@@ -186,25 +219,23 @@ class SharedMemoryCache:
         Args:
             key: The key for the tensor
             descriptor: The shared memory descriptor from the storage volume
-            scope: Namespace for cache keys (typically volume_id for client)
+            volume_id: Storage volume ID for cache namespacing
+            coordinates: DTensor shard coordinates (None for regular tensors)
 
         Returns:
             Cached or newly attached SharedMemoryEntry
         """
-        cache_key = (scope, key)
-
-        cached = self._entries.get(cache_key)
+        cached = self.get(key, volume_id, coordinates)
         if cached is not None:
             # Validate: storage_handle must match
             if cached.descriptor.storage_handle == descriptor.storage_handle:
                 return cached
             # Stale - invalidate
-            cached.close()
-            del self._entries[cache_key]
+            self.delete(key, volume_id, coordinates)
 
         # Attach and cache
         entry = descriptor.attach()
-        self._entries[cache_key] = entry
+        self._put(key, entry, volume_id, coordinates)
         return entry
 
 
@@ -218,35 +249,36 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
-        # Serialized state (metadata only)
-        self.shm_descriptor: Optional[SharedMemoryDescriptor] = None
+        self.shm_descriptor: SharedMemoryDescriptor | None = None
         self.is_object: bool = False
-        self.objects: Any = None  # only for python objects, never tensors
-        self._key: Optional[str] = None
+        self.objects: Any = None  # Python objects use RPC, not shared memory
 
-        # For PUT: metadata before handshake
-        self.shape: Optional[torch.Size] = None
-        self.dtype: Optional[torch.dtype] = None
+        # Request metadata (serialized)
+        self._key: str | None = None
+        self._coordinates: tuple | None = None  # DTensor shard coordinates
+        self.shape: torch.Size | None = None  # For PUT: tensor shape
+        self.dtype: torch.dtype | None = None  # For PUT: tensor dtype
 
-        # Client-side only (not serialized)
-        self._request: Optional["Request"] = None
-        self._source_tensor: Optional[torch.Tensor] = None  # For PUT: tensor to write
-        self._client_entry: Optional[SharedMemoryEntry] = None  # Attached entry
+        # Client-side only (excluded from serialization)
+        self._client_tensor: torch.Tensor | None = None
+        self._needs_handshake: bool = False
 
     @property
     def requires_handshake(self) -> bool:
         """Handshake needed for tensor PUT to get segment allocation."""
-        # Putting this in handshake is a little ugly, ideally we have a _post_put instead
-        # Need handshake for PUT (to get segment name from storage)
-        # _source_tensor is set in _pre_put_hook for tensor PUTs
-        return self._source_tensor is not None
+        return self._needs_handshake
 
     async def recv_handshake(self, ctx: "TransportContext") -> "SharedMemoryDescriptor":
         """Storage volume: allocate shared memory segment, return descriptor."""
+        # We can only allocate after talking to the storage volume once, to see if a shared memory
+        # descriptor already exists. Open to other ways to go about this so its not in handshake.
+
         assert not self.is_object
 
         shm_cache = ctx.get_shm_cache()
-        entry = shm_cache.allocate(self._key, self.shape, self.dtype)
+        entry = shm_cache.allocate(
+            self._key, self.shape, self.dtype, coordinates=self._coordinates
+        )
         return entry.descriptor
 
     async def _post_handshake(self, handshake_result: Any) -> None:
@@ -255,23 +287,22 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         # Use client cache to avoid repeated mmap/munmap overhead
         shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
-        self._client_entry = shm_cache.attach(
+        client_entry = shm_cache.attach(
             self._key,
             descriptor,
-            scope=self.storage_volume_ref.volume_id,
+            volume_id=self.storage_volume_ref.volume_id,
+            coordinates=self._coordinates,
         )
 
         # Copy tensor data to shared memory
-        shm_tensor = self._client_entry.get_tensor()
-        shm_tensor.copy_(self._source_tensor)
+        shm_tensor = client_entry.get_tensor()
+        shm_tensor.copy_(self._client_tensor)
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         """Exclude non-serializable objects when sending buffer to storage volume."""
         state = self.__dict__.copy()
         # Exclude client-side handles
-        state["_client_entry"] = None
-        state["_request"] = None
-        state["_source_tensor"] = None
+        state["_client_tensor"] = None
         state["storage_volume_ref"] = None
         return state
 
@@ -283,7 +314,9 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     async def _pre_put_hook(self, request: "Request") -> None:
         """Store tensor metadata; actual copy happens in _post_handshake."""
-        self._request = request
+        # Extract coordinates for DTensor shards
+        if request.tensor_slice is not None:
+            self._coordinates = request.tensor_slice.coordinates
 
         if request.is_object:
             self.is_object = True
@@ -300,7 +333,9 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
 
-        self._source_tensor = tensor
+        self._client_tensor = tensor
+        # Need handshake for PUT (to get segment name from storage)
+        self._needs_handshake = True
 
     async def handle_put_request(
         self,
@@ -315,27 +350,19 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # Data is already in shared memory (written by client in _post_handshake)
         # Just return the tensor backed by the segment
         shm_cache = ctx.get_shm_cache()
-        entry = shm_cache.get(self._key)
+        entry = shm_cache.get(self._key, coordinates=self._coordinates)
 
         assert entry is not None, f"Segment for {self._key} not found after handshake"
         return entry.get_tensor()
 
     async def _pre_get_hook(self, key: str, request: "Request") -> None:
         """Prepare for receiving - may fetch metadata if not provided."""
-        self._request = request
         self._key = key
+        self._client_tensor = request.tensor_val
 
-        if request.tensor_val is not None:
-            self.shape = request.tensor_val.shape
-            self.dtype = request.tensor_val.dtype
-        else:
-            meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                key, request.meta_only()
-            )
-            if isinstance(meta, str) or meta is None:
-                # object - will use RPC fallback
-                return
-            self.shape, self.dtype = meta
+        # Extract coordinates for DTensor shards
+        if request.tensor_slice is not None:
+            self._coordinates = request.tensor_slice.coordinates
 
     async def handle_get_request(self, ctx: "TransportContext", data: Any) -> None:
         """Data is already in shared memory - store descriptor for client."""
@@ -346,48 +373,51 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         # Check if we have this key's segment in the cache
         shm_cache = ctx.get_shm_cache()
-        entry = shm_cache.get(self._key)
+        entry = shm_cache.get(self._key, coordinates=self._coordinates)
 
         if entry is not None:
-            # Tensor is backed by shared memory - send descriptor
-            self.shm_descriptor = entry.descriptor
-        else:
-            # If the tensor was written by a different transport, it is not backed
-            # by shared memory so we can't handle it appropriately by this stage.
-            # We need to consider a design for this, like maybe a "force_shm" param
-            # on other transports to back their memory by SHM
+            if entry.shape == data.shape:
+                self.shm_descriptor = entry.descriptor
+                return
+            else:
+                # we run into this for resharded retrieval...
+                logger.debug(
+                    f"Key {self._key} cache shape mismatch: cached={entry.shape}, "
+                    f"requested={data.shape}, using RPC fallback"
+                )
+
+        # If the tensor was written by a different transport, it is not backed
+        # by shared memory so we can't handle it appropriately at this stage.
+        # We need to consider a design for this, like maybe a "force_shm" param
+        # on request to force transports to back their memory by SHM
+        if entry is None:
             logger.debug(
                 f"Key {self._key} not in shared memory cache, using RPC fallback"
             )
-            self.shm_descriptor = None
-            self.objects = data
+        self.shm_descriptor = None
+        self.objects = data
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
     ) -> Any:
-        """Extract tensor from shared memory or return object."""
+        """Client-side: extract tensor from shared memory or handle RPC fallback."""
         if transport_buffer.is_object:
             return transport_buffer.objects
 
-        # If the tensor was written by a different transport, it is not backed
-        # by shared memory so we can't handle it appropriately by this stage.
-        # We need to consider a design for this, like maybe a "force_shm" param
-        # on other transports to back their memory by SHM
+        # RPC fallback path (no shared memory descriptor, stored by another transport)
         if transport_buffer.shm_descriptor is None:
-            if transport_buffer.objects is not None:
-                if self._request is not None and self._request.tensor_val is not None:
-                    self._request.tensor_val.copy_(transport_buffer.objects)
-                    return self._request.tensor_val
-                return transport_buffer.objects
-            raise RuntimeError("No shm_descriptor or objects in response")
+            if self._client_tensor is not None:
+                self._client_tensor.copy_(transport_buffer.objects)
+                return self._client_tensor
+            return transport_buffer.objects
 
         try:
-            # Use client cache to avoid repeated mmap/munmap overhead
             shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
-            self._client_entry = shm_cache.attach(
+            client_entry = shm_cache.attach(
                 self._key,
                 transport_buffer.shm_descriptor,
-                scope=self.storage_volume_ref.volume_id,
+                volume_id=self.storage_volume_ref.volume_id,
+                coordinates=self._coordinates,
             )
         except RuntimeError as e:
             if "No such file" in str(e):
@@ -397,22 +427,18 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                 ) from e
             raise
 
-        shm_tensor = self._client_entry.get_tensor()
+        shm_tensor = client_entry.get_tensor()
 
         # Copy to client's tensor if provided (inplace), otherwise clone
-        if self._request is not None and self._request.tensor_val is not None:
-            self._request.tensor_val.copy_(shm_tensor)
-            return self._request.tensor_val
+        if self._client_tensor is not None:
+            self._client_tensor.copy_(shm_tensor)
+            return self._client_tensor
         else:
             return shm_tensor.clone()
 
     async def drop(self) -> None:
-        """Client-side cleanup.
-
-        Note: We don't close _client_entry here - the client cache owns its
-        lifetime. This allows cached entries to be reused across operations.
         """
-        self._client_entry = None
-        self._source_tensor = None
+        Drop some references, but even this is not necessary if the transport object as a whole is dropped
+        """
+        self._client_tensor = None
         self.objects = None
-        self._request = None

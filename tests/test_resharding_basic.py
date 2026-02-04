@@ -168,7 +168,7 @@ async def _test_resharding(
     # Rank0: dtensor._local_tensor == [0], Rank1: dtensor._local_tensor == [1], Rank2: dtensor._local_tensor == [2], ...
     self.store.put("shared_key", dtensor)
 
-    #Our "put" world starts with something like this:
+    #Our "get" world starts with something like this:
     original_Tensor = [0, 0, 0, 0], world_size=2
     dtensor = distribute_tensor(original_tensor)
     # Rank0: dtensor._local_tensor == [0,0], Rank1: dtensor._local_tensor == [0,0]
