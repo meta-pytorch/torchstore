@@ -50,6 +50,52 @@ def allocate_shared_tensor(shape: torch.Size, dtype: torch.dtype) -> torch.Tenso
     return tensor
 
 
+SHOULD_PIN_SHM = os.environ.get("TORCHSTORE_PIN_SHM", 1)
+
+
+def pin_memory(tensor: torch.Tensor) -> None:
+    """Pin tensor's memory for faster CUDA transfers.
+
+    Uses cudaHostRegister with cudaHostRegisterPortable flag to make the
+    memory accessible from all CUDA contexts.
+    """
+    if not SHOULD_PIN_SHM or not torch.cuda.is_available():
+        return
+
+    cudart = torch.cuda.cudart()
+    if cudart is None:
+        return  # No CUDA runtime available, skip pinning
+
+    data_ptr = tensor.data_ptr()
+    size = tensor.numel() * tensor.element_size()
+    err = int(cudart.cudaHostRegister(data_ptr, size, 1))  # cudaHostRegisterPortable
+    if err == 712:  # cudaErrorHostMemoryAlreadyRegistered
+        logger.info("[SHM] Tensor is already pinned.")
+        return
+    if err != 0:
+        raise RuntimeError(
+            f"[SHM] cudaHostRegister failed with error {err}. "
+            "Consider launching with CUDA_LAUNCH_BLOCKING=1 to debug."
+        )
+
+
+def unpin_memory(tensor: torch.Tensor) -> None:
+    """Unpin tensor's memory."""
+    if not SHOULD_PIN_SHM or not torch.cuda.is_available():
+        return
+
+    cudart = torch.cuda.cudart()
+    if cudart is None:
+        return
+
+    err = int(cudart.cudaHostUnregister(tensor.data_ptr()))
+    if err == 713:  # cudaErrorHostMemoryNotRegistered
+        logger.info("[SHM] Tensor is already unpinned.")
+        return
+    if err != 0:
+        logger.warning(f"cudaHostUnregister failed with error {err}")
+
+
 @dataclass
 class SharedMemoryDescriptor:
     """Serializable descriptor for PyTorch shared memory storage.
@@ -161,12 +207,18 @@ class SharedMemoryCache:
             return self._entries[cache_key]
 
         entry = descriptor.attach()
+        pin_memory(entry.get_tensor())
         self._entries[cache_key] = entry
         return entry
 
     def clear(self) -> None:
         """Clear all entries."""
+        for entry in self._entries.values():
+            unpin_memory(entry.get_tensor())
         self._entries.clear()
+
+    def __del__(self):
+        self.clear()
 
 
 class SharedMemoryTransportBuffer(TransportBuffer):
