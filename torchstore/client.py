@@ -115,7 +115,10 @@ class LocalClient:
             return inplace_tensor
 
         latency_tracker.track_e2e()
-        return fetched
+
+        # returning inplace_tensor since fetched will point to _local_tensor in
+        # the case of DTensor.
+        return inplace_tensor if inplace_tensor is not None else fetched
 
     async def _fetch(
         self,
