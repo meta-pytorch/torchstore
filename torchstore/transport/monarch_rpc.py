@@ -39,9 +39,6 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         self.inplace_tensor: torch.Tensor | None = None  # For in-place GET operations
 
     def __getstate__(self) -> dict[str, Any]:
-        # Any time that we serialize the transport buffer, the idea is
-        # that tensors will be transported via tensor_enginer.RDMABuffer, so it makes
-        # no sense to hold this reference when we are serializing
         state = self.__dict__.copy()
         state["inplace_tensor"] = None
         return state
@@ -69,6 +66,8 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         self, transport_buffer: "TransportBuffer"
     ) -> Any:
         """Extract the data from the response buffer."""
+
+        # Satisfies requirement that transport buffers handle writing inplace
         if self.inplace_tensor is not None:
             self.inplace_tensor.copy_(transport_buffer.data)
             return self.inplace_tensor

@@ -92,6 +92,10 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             if isinstance(meta, str) or meta is None:
                 return  # objects don't get handled
 
+            # if we are fetching a tensor slice, the local shape is already known
+            if request.tensor_slice is not None:
+                meta = (request.tensor_slice.local_shape, *meta[1:])
+
         self.allocate(meta or request.tensor_val)
 
     async def handle_put_request(

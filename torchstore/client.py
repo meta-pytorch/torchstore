@@ -149,7 +149,9 @@ class LocalClient:
             for stored_slice in storage_info.tensor_slices:
                 fetch_slice = stored_slice
                 if request.tensor_slice is not None:
-                    # TODO: we should also return only if we have already fetched this region in a previous call
+                    # TODO: we should also continue if we have already fetched this region in a previous call
+                    # and also return completely if we've already fetched all regions. This is extra inneficient
+                    # in the case of DP, where we fetch all Replicate shards unnecessarily
                     fetch_slice = get_slice_intersection(
                         stored_slice, request.tensor_slice
                     )
@@ -172,12 +174,11 @@ class LocalClient:
 
         local_tensors = []
         global_offsets = []
-
         for local_tensor, slice_info in partial_results:
             local_tensors.append(local_tensor)
             global_offsets.append(slice_info.offsets)
 
-        # this is yet another new allocation on every fetch.
+        # TODO: this is yet another new allocation on every fetch.
         assembled_tensor = assemble_tensor(local_tensors, global_offsets)
         if request.tensor_slice is not None:
             assert assembled_tensor.shape == request.tensor_slice.local_shape

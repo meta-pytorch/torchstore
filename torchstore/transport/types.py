@@ -133,8 +133,8 @@ class Request:
         if isinstance(value, DTensor):
             if tensor_slice is not None:
                 raise ValueError(
-                    "Cannot specify tensor_slice with a DTensor. "
-                    "The DTensor's sharding info will be used instead."
+                    "Cannot specify tensor_slice with a DTensor since "
+                    "DTensor already has its own sharding info."
                 )
             # Check if DTensor is fully local (not actually distributed)
             # If so, treat it as a regular tensor to avoid collective requirements
@@ -161,6 +161,7 @@ class Request:
             request.tensor_slice = tensor_slice
         elif value is None:
             # Mostly empty request - used for GET when we don't know the stored type
+            # (passing tensor_slice implies the user knows a tensor is stored)
             request = cls(tensor_slice=tensor_slice)
         else:
             raise TypeError(
