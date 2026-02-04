@@ -17,7 +17,7 @@ import logging
 import os
 import socket
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
 from torchstore.transport.buffers import TransportBuffer
@@ -97,22 +97,55 @@ class SharedMemoryEntry:
 
 
 class SharedMemoryCache:
-    """Cache for persistent shared memory segments on storage volume."""
+    """Unified cache for shared memory segments.
+
+    Storage uses allocate() with scope="" (default).
+    Client uses attach() with scope=volume_id.
+    """
 
     def __init__(self):
-        self.segments: Dict[str, SharedMemoryEntry] = {}
+        self._entries: Dict[Tuple[str, str], SharedMemoryEntry] = {}
 
-    def get_or_create(
-        self, key: str, shape: torch.Size, dtype: torch.dtype
+    # === Common Operations ===
+
+    def get(self, key: str, scope: str = "") -> Optional[SharedMemoryEntry]:
+        """Return existing segment or None."""
+        return self._entries.get((scope, key))
+
+    def delete(self, key: str, scope: str = "") -> None:
+        """Remove segment from cache."""
+        cache_key = (scope, key)
+        if cache_key in self._entries:
+            entry = self._entries.pop(cache_key)
+            entry.close()
+
+    def reset(self) -> None:
+        """Clean up all segments."""
+        for entry in self._entries.values():
+            entry.close()
+        self._entries.clear()
+
+    # === Storage-Side: Allocation ===
+
+    def allocate(
+        self, key: str, shape: torch.Size, dtype: torch.dtype, scope: str = ""
     ) -> SharedMemoryEntry:
-        """Return existing segment or create new one."""
-        if key in self.segments:
-            entry = self.segments[key]
-            # shape and dtype match
-            if entry.shape == shape and entry.dtype == dtype:
-                return entry
-            # Shape/dtype changed - recreate
-            self.delete(key)
+        """Allocate a new segment or return existing one.
+
+        Used by storage volume to create shared memory segments.
+
+        Raises:
+            AssertionError: If key exists with different shape/dtype. Delete first.
+        """
+        cache_key = (scope, key)
+        if cache_key in self._entries:
+            entry = self._entries[cache_key]
+            # Shape/dtype must match - segments are immutable once created
+            assert entry.shape == shape and entry.dtype == dtype, (
+                f"Key '{key}' exists with shape={entry.shape}, dtype={entry.dtype}. "
+                f"Cannot overwrite with shape={shape}, dtype={dtype}. Delete first."
+            )
+            return entry
 
         # Allocate directly in shared memory
         size_bytes = shape.numel() * dtype.itemsize
@@ -133,23 +166,45 @@ class SharedMemoryCache:
         entry = SharedMemoryEntry(
             storage=storage, descriptor=descriptor, _tensor=tensor
         )
-        self.segments[key] = entry
+        self._entries[cache_key] = entry
         return entry
 
-    def get(self, key: str) -> Optional[SharedMemoryEntry]:
-        """Return existing segment or None."""
-        return self.segments.get(key)
+    # === Client-Side: Attachment ===
 
-    def delete(self, key: str) -> None:
-        """Remove segment from cache."""
-        if key in self.segments:
-            entry = self.segments.pop(key)
-            entry.close()
+    def attach(
+        self,
+        key: str,
+        descriptor: SharedMemoryDescriptor,
+        scope: str = "",
+    ) -> SharedMemoryEntry:
+        """Attach to an existing shared memory segment.
 
-    def reset(self) -> None:
-        """Clean up all segments."""
-        for key in list(self.segments.keys()):
-            self.delete(key)
+        Used by client to connect to storage volume's shared memory.
+        Handles staleness validation by comparing storage_handle.
+
+        Args:
+            key: The key for the tensor
+            descriptor: The shared memory descriptor from the storage volume
+            scope: Namespace for cache keys (typically volume_id for client)
+
+        Returns:
+            Cached or newly attached SharedMemoryEntry
+        """
+        cache_key = (scope, key)
+
+        cached = self._entries.get(cache_key)
+        if cached is not None:
+            # Validate: storage_handle must match
+            if cached.descriptor.storage_handle == descriptor.storage_handle:
+                return cached
+            # Stale - invalidate
+            cached.close()
+            del self._entries[cache_key]
+
+        # Attach and cache
+        entry = descriptor.attach()
+        self._entries[cache_key] = entry
+        return entry
 
 
 class SharedMemoryTransportBuffer(TransportBuffer):
@@ -190,13 +245,20 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         assert not self.is_object
 
         shm_cache = ctx.get_shm_cache()
-        entry = shm_cache.get_or_create(self._key, self.shape, self.dtype)
+        entry = shm_cache.allocate(self._key, self.shape, self.dtype)
         return entry.descriptor
 
     async def _post_handshake(self, handshake_result: Any) -> None:
         """Client: attach to segment and write tensor data."""
         descriptor: SharedMemoryDescriptor = handshake_result
-        self._client_entry = descriptor.attach()
+
+        # Use client cache to avoid repeated mmap/munmap overhead
+        shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
+        self._client_entry = shm_cache.attach(
+            self._key,
+            descriptor,
+            scope=self.storage_volume_ref.volume_id,
+        )
 
         # Copy tensor data to shared memory
         shm_tensor = self._client_entry.get_tensor()
@@ -319,7 +381,13 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             raise RuntimeError("No shm_descriptor or objects in response")
 
         try:
-            self._client_entry = transport_buffer.shm_descriptor.attach()
+            # Use client cache to avoid repeated mmap/munmap overhead
+            shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
+            self._client_entry = shm_cache.attach(
+                self._key,
+                transport_buffer.shm_descriptor,
+                scope=self.storage_volume_ref.volume_id,
+            )
         except RuntimeError as e:
             if "No such file" in str(e):
                 raise RuntimeError(
@@ -338,11 +406,12 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             return shm_tensor.clone()
 
     async def drop(self) -> None:
-        """Client-side cleanup (detach from segment, don't unlink)."""
-        if self._client_entry is not None:
-            self._client_entry.close()
-            self._client_entry = None
+        """Client-side cleanup.
 
+        Note: We don't close _client_entry here - the client cache owns its
+        lifetime. This allows cached entries to be reused across operations.
+        """
+        self._client_entry = None
         self._source_tensor = None
         self.objects = None
         self._request = None

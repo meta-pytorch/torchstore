@@ -34,8 +34,10 @@ class TransportContext:
     def get_shm_cache(self) -> "SharedMemoryCache":
         """Get shared memory cache, lazily initializing if needed.
 
+        This cache is used by both storage (for allocation) and client (for attachment).
+        Storage operations use default scope="", client operations use scope=volume_id.
+
         Note: Import is inside function to avoid cyclic import
-        Slight refactor is needed to avoid this
         """
         from torchstore.transport.shared_memory import SharedMemoryCache
 

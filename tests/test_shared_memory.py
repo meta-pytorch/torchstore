@@ -18,11 +18,26 @@ from torchstore.transport.shared_memory import (
 )
 
 
+class MockTransportContext:
+    """Mock TransportContext for testing."""
+
+    def __init__(self):
+        self._shm_cache = SharedMemoryCache()
+
+    def get_shm_cache(self):
+        return self._shm_cache
+
+    def reset(self):
+        self._shm_cache.reset()
+
+
 class MockStorageVolumeRef:
     """Mock StorageVolumeRef for testing."""
 
-    def __init__(self, volume_hostname=None):
+    def __init__(self, volume_hostname=None, volume_id="test_volume"):
         self.volume_hostname = volume_hostname
+        self.volume_id = volume_id
+        self.transport_context = MockTransportContext()
 
 
 class TestHelperFunctions:
@@ -66,7 +81,7 @@ class TestSharedMemoryEntry:
             shape = torch.Size([4, 8])
             dtype = torch.float32
 
-            entry = cache.get_or_create("test_key", shape, dtype)
+            entry = cache.allocate("test_key", shape, dtype)
 
             tensor = entry.get_tensor()
             assert tensor.shape == shape
@@ -84,9 +99,7 @@ class TestSharedMemoryEntry:
         """Test closing shared memory entry."""
         cache = SharedMemoryCache()
         try:
-            entry = cache.get_or_create(
-                "test_key", torch.Size([16]), torch.float32
-            )
+            entry = cache.allocate("test_key", torch.Size([16]), torch.float32)
 
             # Close should not raise
             entry.close()
@@ -100,7 +113,7 @@ class TestSharedMemoryEntry:
             shape = torch.Size([16])
             dtype = torch.float32
 
-            entry = cache.get_or_create("test_key", shape, dtype)
+            entry = cache.allocate("test_key", shape, dtype)
 
             # Descriptor should have correct fields
             assert isinstance(entry.descriptor, SharedMemoryDescriptor)
@@ -124,7 +137,7 @@ class TestSharedMemoryDescriptor:
             dtype = torch.float32
 
             # Create entry via cache
-            entry = cache.get_or_create("test_key", shape, dtype)
+            entry = cache.allocate("test_key", shape, dtype)
 
             # Write some data
             original = torch.randn(10, 10)
@@ -152,37 +165,40 @@ class TestSharedMemoryDescriptor:
 class TestSharedMemoryCache:
     """Test SharedMemoryCache."""
 
-    def test_get_or_create(self):
+    def test_allocate(self):
         """Test creating a new segment."""
         cache = SharedMemoryCache()
         try:
             shape = torch.Size([10, 10])
             dtype = torch.float32
 
-            entry = cache.get_or_create("test_key", shape, dtype)
+            entry = cache.allocate("test_key", shape, dtype)
             assert entry is not None
             assert entry.shape == shape
             assert entry.dtype == dtype
 
             # Should return the same entry for the same key
-            entry2 = cache.get_or_create("test_key", shape, dtype)
+            entry2 = cache.allocate("test_key", shape, dtype)
             assert entry2.name == entry.name
         finally:
             cache.reset()
 
-    def test_get_or_create_recreates_on_shape_change(self):
-        """Test that segment is recreated when shape changes."""
+    def test_allocate_raises_on_shape_mismatch(self):
+        """Test that AssertionError is raised when shape/dtype changes."""
         cache = SharedMemoryCache()
         try:
             shape1 = torch.Size([10, 10])
             shape2 = torch.Size([20, 20])
             dtype = torch.float32
 
-            entry1 = cache.get_or_create("test_key", shape1, dtype)
+            cache.allocate("test_key", shape1, dtype)
 
-            entry2 = cache.get_or_create("test_key", shape2, dtype)
-            # New segment created with new shape
-            assert entry2.shape == shape2
+            # Attempting to use different shape should raise AssertionError
+            with pytest.raises(AssertionError) as exc_info:
+                cache.allocate("test_key", shape2, dtype)
+
+            assert "Cannot overwrite" in str(exc_info.value)
+            assert "Delete first" in str(exc_info.value)
         finally:
             cache.reset()
 
@@ -196,7 +212,7 @@ class TestSharedMemoryCache:
             # Create an entry
             shape = torch.Size([5, 5])
             dtype = torch.float32
-            cache.get_or_create("test_key", shape, dtype)
+            cache.allocate("test_key", shape, dtype)
 
             # Now it should exist
             entry = cache.get("test_key")
@@ -211,7 +227,7 @@ class TestSharedMemoryCache:
         try:
             shape = torch.Size([5, 5])
             dtype = torch.float32
-            cache.get_or_create("test_key", shape, dtype)
+            cache.allocate("test_key", shape, dtype)
 
             cache.delete("test_key")
 
@@ -226,14 +242,138 @@ class TestSharedMemoryCache:
 
         shape = torch.Size([5, 5])
         dtype = torch.float32
-        cache.get_or_create("key1", shape, dtype)
-        cache.get_or_create("key2", shape, dtype)
+        cache.allocate("key1", shape, dtype)
+        cache.allocate("key2", shape, dtype)
 
         cache.reset()
 
         # All keys should be gone
         assert cache.get("key1") is None
         assert cache.get("key2") is None
+
+
+class TestSharedMemoryCacheAttach:
+    """Test SharedMemoryCache attachment functionality for client-side handle caching."""
+
+    def test_attach_caches_entry(self):
+        """Test that entries are cached after first attach."""
+        storage_cache = SharedMemoryCache()
+        client_cache = SharedMemoryCache()
+        try:
+            # Create a segment on "storage"
+            shape = torch.Size([10, 10])
+            dtype = torch.float32
+            entry = storage_cache.allocate("test_key", shape, dtype)
+            descriptor = entry.descriptor
+
+            # Client attaches
+            client_entry1 = client_cache.attach("test_key", descriptor, scope="vol1")
+            assert client_entry1 is not None
+            assert client_entry1.shape == shape
+
+            # Second call should return cached entry (same object)
+            client_entry2 = client_cache.attach("test_key", descriptor, scope="vol1")
+            assert client_entry2 is client_entry1
+        finally:
+            client_cache.reset()
+            storage_cache.reset()
+
+    def test_attach_different_volumes(self):
+        """Test that different volumes have separate cache entries."""
+        storage_cache = SharedMemoryCache()
+        client_cache = SharedMemoryCache()
+        try:
+            shape = torch.Size([10, 10])
+            dtype = torch.float32
+            entry = storage_cache.allocate("test_key", shape, dtype)
+            descriptor = entry.descriptor
+
+            # Attach from two different volumes
+            client_entry1 = client_cache.attach("test_key", descriptor, scope="vol1")
+            client_entry2 = client_cache.attach("test_key", descriptor, scope="vol2")
+
+            # Should be different cache entries (different volume_ids)
+            assert client_entry1 is not client_entry2
+        finally:
+            client_cache.reset()
+            storage_cache.reset()
+
+    def test_attach_invalidates_stale_entry(self):
+        """Test that stale entries are invalidated when storage_handle changes."""
+        storage_cache = SharedMemoryCache()
+        client_cache = SharedMemoryCache()
+        try:
+            shape = torch.Size([10, 10])
+            dtype = torch.float32
+
+            # Create first segment
+            entry1 = storage_cache.allocate("test_key", shape, dtype)
+            descriptor1 = entry1.descriptor
+
+            # Client attaches
+            client_entry1 = client_cache.attach("test_key", descriptor1, scope="vol1")
+            original_handle = client_entry1.descriptor.storage_handle
+
+            # Simulate storage recreating the segment (e.g., after delete)
+            storage_cache.delete("test_key")
+            entry2 = storage_cache.allocate("test_key", shape, dtype)
+            descriptor2 = entry2.descriptor
+
+            # The storage_handle should be different
+            assert descriptor2.storage_handle != original_handle
+
+            # Client re-attaches - should get new entry
+            client_entry2 = client_cache.attach("test_key", descriptor2, scope="vol1")
+            assert client_entry2 is not client_entry1
+            assert client_entry2.descriptor.storage_handle == descriptor2.storage_handle
+        finally:
+            client_cache.reset()
+            storage_cache.reset()
+
+    def test_delete_with_scope(self):
+        """Test deleting a specific cache entry with scope."""
+        storage_cache = SharedMemoryCache()
+        client_cache = SharedMemoryCache()
+        try:
+            shape = torch.Size([10, 10])
+            dtype = torch.float32
+            entry = storage_cache.allocate("test_key", shape, dtype)
+            descriptor = entry.descriptor
+
+            # Attach and cache
+            client_entry1 = client_cache.attach("test_key", descriptor, scope="vol1")
+
+            # Delete
+            client_cache.delete("test_key", scope="vol1")
+
+            # Next attach should create new entry
+            client_entry2 = client_cache.attach("test_key", descriptor, scope="vol1")
+            assert client_entry2 is not client_entry1
+        finally:
+            client_cache.reset()
+            storage_cache.reset()
+
+    def test_reset_clears_all_entries(self):
+        """Test that reset clears all cached entries."""
+        storage_cache = SharedMemoryCache()
+        client_cache = SharedMemoryCache()
+        try:
+            shape = torch.Size([5, 5])
+            dtype = torch.float32
+
+            # Create and cache entries from two volumes
+            entry = storage_cache.allocate("key1", shape, dtype)
+            client_cache.attach("key1", entry.descriptor, scope="vol1")
+            client_cache.attach("key1", entry.descriptor, scope="vol2")
+
+            assert len(client_cache._entries) == 2
+
+            # Reset
+            client_cache.reset()
+
+            assert len(client_cache._entries) == 0
+        finally:
+            storage_cache.reset()
 
 
 class TestSharedMemoryTransportBuffer:
@@ -277,7 +417,7 @@ class TestTensorRoundtrip:
             original = torch.randn(100, 100)
 
             # Create shared memory entry
-            entry = cache.get_or_create("test", original.shape, original.dtype)
+            entry = cache.allocate("test", original.shape, original.dtype)
             shm_tensor = entry.get_tensor()
 
             # Copy tensor to shared memory
@@ -313,7 +453,7 @@ class TestTensorRoundtrip:
                     original = torch.randn(10, 10, dtype=dtype)
 
                 key = f"test_{dtype}"
-                entry = cache.get_or_create(key, original.shape, original.dtype)
+                entry = cache.allocate(key, original.shape, original.dtype)
                 shm_tensor = entry.get_tensor()
                 shm_tensor.copy_(original)
 
@@ -326,7 +466,7 @@ class TestTensorRoundtrip:
         cache = SharedMemoryCache()
         try:
             original = torch.randn(50, 50)
-            entry = cache.get_or_create("persistent", original.shape, original.dtype)
+            entry = cache.allocate("persistent", original.shape, original.dtype)
 
             # Write to shared memory
             shm_tensor = entry.get_tensor()
@@ -338,19 +478,6 @@ class TestTensorRoundtrip:
                 assert torch.allclose(tensor, original)
         finally:
             cache.reset()
-
-
-class MockTransportContext:
-    """Mock TransportContext for testing."""
-
-    def __init__(self):
-        self._shm_cache = SharedMemoryCache()
-
-    def get_shm_cache(self):
-        return self._shm_cache
-
-    def reset(self):
-        self._shm_cache.reset()
 
 
 class MockRequest:
@@ -524,7 +651,7 @@ class TestSharedMemoryTransportBufferIntegration:
             buffer._source_tensor = tensor
 
             # Create segment (simulating what storage does in recv_handshake)
-            entry = cache.get_or_create("test_key", tensor.shape, tensor.dtype)
+            entry = cache.allocate("test_key", tensor.shape, tensor.dtype)
             descriptor = entry.descriptor
 
             # Client receives descriptor and writes data
@@ -536,11 +663,8 @@ class TestSharedMemoryTransportBufferIntegration:
             # Verify data was written to shared memory
             shm_tensor = entry.get_tensor()
             assert torch.allclose(shm_tensor, tensor)
-
-            # Cleanup client entry
-            if buffer._client_entry is not None:
-                buffer._client_entry.close()
         finally:
+            ref.transport_context.reset()
             cache.reset()
 
     @pytest.mark.asyncio
@@ -558,9 +682,7 @@ class TestSharedMemoryTransportBufferIntegration:
             buffer.dtype = tensor.dtype
 
             # Create segment and write data (simulating handshake + _post_handshake)
-            entry = ctx.get_shm_cache().get_or_create(
-                "test_key", tensor.shape, tensor.dtype
-            )
+            entry = ctx.get_shm_cache().allocate("test_key", tensor.shape, tensor.dtype)
             shm_tensor = entry.get_tensor()
             shm_tensor.copy_(tensor)
 
@@ -637,6 +759,7 @@ class TestSharedMemoryTransportBufferIntegration:
             await get_buffer.drop()
 
         finally:
+            ref.transport_context.reset()
             ctx.reset()
 
     @pytest.mark.asyncio
@@ -696,7 +819,7 @@ class TestSharedMemoryTransportBufferGPU:
             buffer._source_tensor = tensor
 
             # Create segment (simulating what storage does in recv_handshake)
-            entry = cache.get_or_create("test_key", tensor.shape, tensor.dtype)
+            entry = cache.allocate("test_key", tensor.shape, tensor.dtype)
             descriptor = entry.descriptor
 
             # Client receives descriptor and writes data (GPU -> shm copy)
@@ -705,11 +828,8 @@ class TestSharedMemoryTransportBufferGPU:
             # Verify data was copied correctly to shared memory
             shm_tensor = entry.get_tensor()
             assert torch.allclose(shm_tensor, tensor.cpu())
-
-            # Cleanup
-            if buffer._client_entry is not None:
-                buffer._client_entry.close()
         finally:
+            ref.transport_context.reset()
             cache.reset()
 
 
