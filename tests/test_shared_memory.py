@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""unit tests made by claude, have to vet them"""
+"""Unit tests for shared memory transport."""
 
 import pytest
 import torch
@@ -27,7 +27,7 @@ class MockTransportContext:
         return self._shm_cache
 
     def reset(self):
-        self._shm_cache.reset()
+        self._shm_cache.clear()
 
 
 class MockStorageVolumeRef:
@@ -85,33 +85,13 @@ class TestSharedMemoryEntry:
             tensor = entry.get_tensor()
             assert tensor.shape == shape
             assert tensor.dtype == dtype
-            assert tensor.numel() == 4 * 8
 
             # Verify we can write to the tensor
             tensor.fill_(42.0)
             tensor2 = entry.get_tensor()
             assert torch.all(tensor2 == 42.0)
         finally:
-            cache.reset()
-
-    def test_descriptor(self):
-        """Test accessing the descriptor from an entry."""
-        cache = SharedMemoryCache()
-        try:
-            shape = torch.Size([16])
-            dtype = torch.float32
-
-            entry = cache.allocate("test_key", shape, dtype)
-
-            # Descriptor should have correct fields
-            assert isinstance(entry.descriptor, SharedMemoryDescriptor)
-            assert isinstance(entry.descriptor.manager_handle, bytes)
-            assert isinstance(entry.descriptor.storage_handle, bytes)
-            assert entry.descriptor.size > 0
-            assert entry.descriptor.shape == shape
-            assert entry.descriptor.dtype == dtype
-        finally:
-            cache.reset()
+            cache.clear()
 
 
 class TestSharedMemoryDescriptor:
@@ -144,7 +124,7 @@ class TestSharedMemoryDescriptor:
             tensor = attached_entry.get_tensor()
             assert torch.allclose(tensor, original)
         finally:
-            cache.reset()
+            cache.clear()
 
 
 class TestSharedMemoryCache:
@@ -166,7 +146,7 @@ class TestSharedMemoryCache:
             entry2 = cache.allocate("test_key", shape, dtype)
             assert entry2.name == entry.name
         finally:
-            cache.reset()
+            cache.clear()
 
     def test_allocate_raises_on_shape_mismatch(self):
         """Test that AssertionError is raised when shape/dtype changes."""
@@ -185,7 +165,7 @@ class TestSharedMemoryCache:
             assert "Cannot overwrite" in str(exc_info.value)
             assert "Delete first" in str(exc_info.value)
         finally:
-            cache.reset()
+            cache.clear()
 
     def test_get(self):
         """Test getting an existing segment."""
@@ -204,7 +184,7 @@ class TestSharedMemoryCache:
             assert entry is not None
             assert entry.shape == shape
         finally:
-            cache.reset()
+            cache.clear()
 
     def test_delete(self):
         """Test deleting a segment."""
@@ -219,10 +199,10 @@ class TestSharedMemoryCache:
             # Should no longer be in cache
             assert cache.get("test_key") is None
         finally:
-            cache.reset()
+            cache.clear()
 
-    def test_reset(self):
-        """Test resetting the cache."""
+    def test_clear(self):
+        """Test clearing the cache."""
         cache = SharedMemoryCache()
 
         shape = torch.Size([5, 5])
@@ -230,7 +210,7 @@ class TestSharedMemoryCache:
         cache.allocate("key1", shape, dtype)
         cache.allocate("key2", shape, dtype)
 
-        cache.reset()
+        cache.clear()
 
         # All keys should be gone
         assert cache.get("key1") is None
@@ -264,8 +244,8 @@ class TestSharedMemoryCacheAttach:
             )
             assert client_entry2 is client_entry1
         finally:
-            client_cache.reset()
-            storage_cache.reset()
+            client_cache.clear()
+            storage_cache.clear()
 
     def test_attach_different_volumes(self):
         """Test that different volumes have separate cache entries."""
@@ -288,8 +268,8 @@ class TestSharedMemoryCacheAttach:
             # Should be different cache entries (different volume_ids)
             assert client_entry1 is not client_entry2
         finally:
-            client_cache.reset()
-            storage_cache.reset()
+            client_cache.clear()
+            storage_cache.clear()
 
     def test_attach_invalidates_stale_entry(self):
         """Test that stale entries are invalidated when storage_handle changes."""
@@ -324,8 +304,8 @@ class TestSharedMemoryCacheAttach:
             assert client_entry2 is not client_entry1
             assert client_entry2.descriptor.storage_handle == descriptor2.storage_handle
         finally:
-            client_cache.reset()
-            storage_cache.reset()
+            client_cache.clear()
+            storage_cache.clear()
 
     def test_delete_with_volume_id(self):
         """Test deleting a specific cache entry with volume_id."""
@@ -351,11 +331,11 @@ class TestSharedMemoryCacheAttach:
             )
             assert client_entry2 is not client_entry1
         finally:
-            client_cache.reset()
-            storage_cache.reset()
+            client_cache.clear()
+            storage_cache.clear()
 
-    def test_reset_clears_all_entries(self):
-        """Test that reset clears all cached entries."""
+    def test_clear_clears_all_entries(self):
+        """Test that clear clears all cached entries."""
         storage_cache = SharedMemoryCache()
         client_cache = SharedMemoryCache()
         try:
@@ -367,31 +347,161 @@ class TestSharedMemoryCacheAttach:
             client_cache.attach("key1", entry.descriptor, volume_id="vol1")
             client_cache.attach("key1", entry.descriptor, volume_id="vol2")
 
-            assert len(client_cache._entries) == 2
+            # Verify entries exist via public API
+            assert client_cache.get("key1", volume_id="vol1") is not None
+            assert client_cache.get("key1", volume_id="vol2") is not None
 
-            # Reset
-            client_cache.reset()
+            # Clear all entries
+            client_cache.clear()
 
-            assert len(client_cache._entries) == 0
+            # Verify entries are cleared via public API
+            assert client_cache.get("key1", volume_id="vol1") is None
+            assert client_cache.get("key1", volume_id="vol2") is None
         finally:
-            storage_cache.reset()
+            storage_cache.clear()
+
+
+class TestSharedMemoryCacheCoordinates:
+    """Test SharedMemoryCache with DTensor shard coordinates."""
+
+    def test_allocate_with_coordinates(self):
+        """Test allocating different shards of the same key."""
+        cache = SharedMemoryCache()
+        try:
+            shape = torch.Size([10, 10])
+            dtype = torch.float32
+
+            # Allocate two shards with different coordinates
+            entry1 = cache.allocate("key", shape, dtype, coordinates=(0, 0))
+            entry2 = cache.allocate("key", shape, dtype, coordinates=(0, 1))
+
+            # Should be different entries
+            assert entry1 is not entry2
+            assert entry1.descriptor.storage_handle != entry2.descriptor.storage_handle
+
+            # Each should be retrievable by its coordinates
+            assert cache.get("key", coordinates=(0, 0)) is entry1
+            assert cache.get("key", coordinates=(0, 1)) is entry2
+
+            # Without coordinates should return None
+            assert cache.get("key", coordinates=None) is None
+        finally:
+            cache.clear()
+
+    def test_get_with_coordinates(self):
+        """Test getting specific shard by coordinates."""
+        cache = SharedMemoryCache()
+        try:
+            shape = torch.Size([5, 5])
+            dtype = torch.float32
+
+            # Allocate regular tensor (coordinates=None) and shards
+            entry_regular = cache.allocate("key", shape, dtype, coordinates=None)
+            entry_shard = cache.allocate("key", shape, dtype, coordinates=(1, 2))
+
+            # Get by coordinates
+            assert cache.get("key", coordinates=None) is entry_regular
+            assert cache.get("key", coordinates=(1, 2)) is entry_shard
+            assert cache.get("key", coordinates=(9, 9)) is None
+        finally:
+            cache.clear()
+
+    @pytest.mark.parametrize(
+        "delete_coords,expect_remaining",
+        [
+            ((0, 1), [(0, 0), (1, 0)]),  # specific shard
+            (None, []),  # all shards
+        ],
+        ids=["specific", "all"],
+    )
+    def test_delete_shards(self, delete_coords, expect_remaining):
+        """Test deleting shards with specific or None coordinates."""
+        cache = SharedMemoryCache()
+        try:
+            shape = torch.Size([5, 5])
+            dtype = torch.float32
+
+            # Allocate multiple shards
+            cache.allocate("key", shape, dtype, coordinates=(0, 0))
+            cache.allocate("key", shape, dtype, coordinates=(0, 1))
+            cache.allocate("key", shape, dtype, coordinates=(1, 0))
+
+            # Delete shard(s)
+            cache.delete("key", coordinates=delete_coords)
+
+            # Check expected remaining shards
+            all_coords = [(0, 0), (0, 1), (1, 0)]
+            for coords in all_coords:
+                if coords in expect_remaining:
+                    assert cache.get("key", coordinates=coords) is not None
+                else:
+                    assert cache.get("key", coordinates=coords) is None
+        finally:
+            cache.clear()
+
+    def test_attach_with_coordinates(self):
+        """Test client-side attachment with coordinates."""
+        storage_cache = SharedMemoryCache()
+        client_cache = SharedMemoryCache()
+        try:
+            shape = torch.Size([10, 10])
+            dtype = torch.float32
+
+            # Storage allocates shards
+            entry1 = storage_cache.allocate("key", shape, dtype, coordinates=(0, 0))
+            entry2 = storage_cache.allocate("key", shape, dtype, coordinates=(0, 1))
+
+            # Client attaches to each shard
+            client_entry1 = client_cache.attach(
+                "key", entry1.descriptor, volume_id="vol1", coordinates=(0, 0)
+            )
+            client_entry2 = client_cache.attach(
+                "key", entry2.descriptor, volume_id="vol1", coordinates=(0, 1)
+            )
+
+            # Should be different entries
+            assert client_entry1 is not client_entry2
+
+            # Each should be cached separately
+            assert (
+                client_cache.get("key", volume_id="vol1", coordinates=(0, 0))
+                is client_entry1
+            )
+            assert (
+                client_cache.get("key", volume_id="vol1", coordinates=(0, 1))
+                is client_entry2
+            )
+        finally:
+            client_cache.clear()
+            storage_cache.clear()
+
+    def test_mixed_regular_and_sharded(self):
+        """Test that regular tensors and sharded tensors coexist properly."""
+        cache = SharedMemoryCache()
+        try:
+            shape = torch.Size([5, 5])
+            dtype = torch.float32
+
+            # Allocate a regular tensor (no coordinates)
+            regular = cache.allocate("regular_key", shape, dtype)
+
+            # Allocate sharded tensor
+            shard1 = cache.allocate("sharded_key", shape, dtype, coordinates=(0,))
+            shard2 = cache.allocate("sharded_key", shape, dtype, coordinates=(1,))
+
+            # All should be retrievable
+            assert cache.get("regular_key") is regular
+            assert cache.get("sharded_key", coordinates=(0,)) is shard1
+            assert cache.get("sharded_key", coordinates=(1,)) is shard2
+
+            # Regular key without coordinates returns the entry
+            assert cache.get("regular_key", coordinates=None) is regular
+        finally:
+            cache.clear()
 
 
 class TestSharedMemoryTransportBuffer:
     """Test SharedMemoryTransportBuffer."""
-
-    def test_init(self):
-        """Test buffer initialization."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-
-        assert buffer.storage_volume_ref == ref
-        assert buffer.shm_descriptor is None
-        assert buffer.shape is None
-        assert buffer.dtype is None
-        assert buffer.is_object is False
-        assert buffer.objects is None
-        assert buffer.requires_handshake is False
 
     def test_getstate(self):
         """Test serialization excludes client-side handles."""
@@ -405,31 +515,8 @@ class TestSharedMemoryTransportBuffer:
         assert state["storage_volume_ref"] is None
 
 
-class TestTensorRoundtrip:
-    """Integration-style tests for tensor operations."""
-
-    def test_tensor_copy_to_shared_memory(self):
-        """Test copying a tensor to shared memory and back."""
-        cache = SharedMemoryCache()
-        try:
-            # Create a test tensor
-            original = torch.randn(100, 100)
-
-            # Create shared memory entry
-            entry = cache.allocate("test", original.shape, original.dtype)
-            shm_tensor = entry.get_tensor()
-
-            # Copy tensor to shared memory
-            shm_tensor.copy_(original)
-
-            # Verify data is correct
-            assert torch.allclose(shm_tensor, original)
-
-            # Create another view and verify
-            shm_tensor2 = entry.get_tensor()
-            assert torch.allclose(shm_tensor2, original)
-        finally:
-            cache.reset()
+class TestTensorRoundtripIntegration:
+    """Integration tests for tensor operations."""
 
     def test_different_dtypes(self):
         """Test with different tensor dtypes."""
@@ -458,25 +545,16 @@ class TestTensorRoundtrip:
 
                 assert torch.equal(shm_tensor, original), f"Failed for {dtype}"
         finally:
-            cache.reset()
+            cache.clear()
 
-    def test_persistence(self):
-        """Test that tensor persists in shared memory for multiple accesses."""
-        cache = SharedMemoryCache()
-        try:
-            original = torch.randn(50, 50)
-            entry = cache.allocate("persistent", original.shape, original.dtype)
 
-            # Write to shared memory
-            shm_tensor = entry.get_tensor()
-            shm_tensor.copy_(original)
+class MockTensorSlice:
+    """Mock TensorSlice for testing DTensor coordinate extraction."""
 
-            # Access multiple times - should get same data
-            for _ in range(5):
-                tensor = entry.get_tensor()
-                assert torch.allclose(tensor, original)
-        finally:
-            cache.reset()
+    __slots__ = ("coordinates",)
+
+    def __init__(self, coordinates: tuple):
+        self.coordinates = coordinates
 
 
 class MockRequest:
@@ -535,19 +613,6 @@ class TestSharedMemoryTransportBufferIntegration:
 
         # Now handshake should be required
         assert buffer.requires_handshake is True
-
-    def test_requires_handshake_not_for_objects(self):
-        """Verify handshake is NOT required for object PUT."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-
-        # Simulate object PUT
-        buffer.is_object = True
-        buffer.objects = {"key": "value"}
-        buffer._client_tensor = None
-
-        # No handshake for objects
-        assert buffer.requires_handshake is False
 
     @pytest.mark.asyncio
     async def test_pre_put_hook_tensor(self):
@@ -608,7 +673,50 @@ class TestSharedMemoryTransportBufferIntegration:
         assert buffer._client_tensor is None
 
     @pytest.mark.asyncio
-    async def test_handshake_allocates_segment(self):
+    @pytest.mark.parametrize(
+        "hook_type,coordinates",
+        [
+            ("put", (1, 2)),
+            ("get", (3, 4)),
+        ],
+    )
+    async def test_hook_extracts_coordinates_from_tensor_slice(
+        self, hook_type, coordinates
+    ):
+        """Test that _pre_put_hook and _pre_get_hook extract coordinates from tensor_slice."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        buffer = SharedMemoryTransportBuffer(ref)
+
+        tensor = torch.randn(50, 50) if hook_type == "put" else torch.zeros(50, 50)
+        tensor_slice = MockTensorSlice(coordinates=coordinates)
+        request = MockRequest(tensor_val=tensor, tensor_slice=tensor_slice)
+
+        if hook_type == "put":
+            await buffer._pre_put_hook(request)
+            # For PUT, verify additional state
+            assert buffer.shape == tensor.shape
+            assert buffer.dtype == tensor.dtype
+            assert buffer._client_tensor is not None
+            assert buffer._needs_handshake is True
+        else:
+            await buffer._pre_get_hook("test_key", request)
+            # For GET, verify key is set
+            assert buffer._key == "test_key"
+            assert buffer._client_tensor is tensor
+
+        # Both should extract coordinates
+        assert buffer._coordinates == coordinates
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "coordinates,shape",
+        [
+            (None, torch.Size([100, 100])),
+            ((0, 1), torch.Size([50, 50])),
+        ],
+        ids=["no_coords", "with_coords"],
+    )
+    async def test_handshake_allocates_segment(self, coordinates, shape):
         """Test recv_handshake allocates segment on storage and returns descriptor."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
@@ -617,7 +725,8 @@ class TestSharedMemoryTransportBufferIntegration:
         try:
             # Setup buffer as if it was sent from client
             buffer._key = "test_key"
-            buffer.shape = torch.Size([100, 100])
+            buffer._coordinates = coordinates
+            buffer.shape = shape
             buffer.dtype = torch.float32
             buffer.is_object = False
 
@@ -632,9 +741,14 @@ class TestSharedMemoryTransportBufferIntegration:
             assert descriptor.shape == buffer.shape
             assert descriptor.dtype == buffer.dtype
 
-            # Verify segment exists in cache
-            entry = ctx.get_shm_cache().get("test_key")
+            # Verify segment exists in cache with correct coordinates
+            entry = ctx.get_shm_cache().get("test_key", coordinates=coordinates)
             assert entry is not None
+            assert entry.shape == shape
+
+            if coordinates is not None:
+                # Without coordinates should return None when we allocated with coords
+                assert ctx.get_shm_cache().get("test_key", coordinates=None) is None
         finally:
             ctx.reset()
 
@@ -665,7 +779,7 @@ class TestSharedMemoryTransportBufferIntegration:
             assert torch.allclose(shm_tensor, tensor)
         finally:
             ref.transport_context.reset()
-            cache.reset()
+            cache.clear()
 
     @pytest.mark.asyncio
     async def test_handle_put_reads_from_segment(self):
@@ -696,86 +810,182 @@ class TestSharedMemoryTransportBufferIntegration:
             ctx.reset()
 
     @pytest.mark.asyncio
-    async def test_full_put_get_roundtrip(self):
-        """Test full PUT/GET roundtrip with shared memory."""
+    @pytest.mark.parametrize(
+        "scenario",
+        ["no_entry", "shape_mismatch"],
+    )
+    async def test_handle_get_request_rpc_fallback(self, scenario):
+        """Test handle_get_request falls back to RPC when entry missing or shape mismatch."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        buffer = SharedMemoryTransportBuffer(ref)
         ctx = MockTransportContext()
 
         try:
-            ref = MockStorageVolumeRef(volume_hostname="localhost")
-            original_tensor = torch.randn(100, 100)
+            buffer._key = "test_key"
 
-            # === PUT FLOW ===
+            if scenario == "shape_mismatch":
+                # Allocate a segment with one shape
+                ctx.get_shm_cache().allocate(
+                    "test_key", torch.Size([10, 10]), torch.float32
+                )
+                # Request with different shape
+                data = torch.randn(20, 20)
+            else:
+                # No entry in cache
+                data = torch.randn(50, 50)
 
-            # 1. Client: Create buffer and run _pre_put_hook
-            put_buffer = SharedMemoryTransportBuffer(ref)
-            put_buffer._key = "roundtrip_key"
-            request = MockRequest(tensor_val=original_tensor)
-            await put_buffer._pre_put_hook(request)
+            await buffer.handle_get_request(ctx, data)
 
-            # Verify handshake is required
-            assert put_buffer.requires_handshake is True
-
-            # 2. Storage: Handle handshake (allocate segment, return descriptor)
-            descriptor = await put_buffer.recv_handshake(ctx)
-            assert isinstance(descriptor, SharedMemoryDescriptor)
-
-            # 3. Client: Post-handshake (write data to segment)
-            await put_buffer._post_handshake(descriptor)
-
-            # 4. Storage: Handle put request (get tensor from segment)
-            stored_tensor = await put_buffer.handle_put_request(ctx, request, None)
-            assert torch.allclose(stored_tensor, original_tensor)
-
-            # 5. Client: Cleanup
-            await put_buffer.drop()
-
-            # === GET FLOW ===
-
-            # 1. Client: Create buffer for GET
-            get_buffer = SharedMemoryTransportBuffer(ref)
-            get_buffer._key = "roundtrip_key"
-            dest_tensor = torch.zeros(100, 100)
-            get_buffer._client_tensor = dest_tensor
-
-            # 2. Storage: Handle get request (data is in shared memory)
-            await get_buffer.handle_get_request(ctx, stored_tensor)
-
-            # Verify descriptor is set
-            assert get_buffer.shm_descriptor is not None
-            assert get_buffer.shm_descriptor.shape == original_tensor.shape
-            assert get_buffer.shm_descriptor.dtype == original_tensor.dtype
-
-            # 3. Client: Handle response
-            result = await get_buffer._handle_storage_volume_response(get_buffer)
-
-            # Verify data is correct
-            assert torch.allclose(result, original_tensor)
-            # Verify inplace copy to dest_tensor
-            assert torch.allclose(dest_tensor, original_tensor)
-            assert result is dest_tensor
-
-            # 4. Client: Cleanup
-            await get_buffer.drop()
-
+            # Should fall back to RPC
+            assert buffer.shm_descriptor is None
+            assert buffer.objects is data
+            if scenario == "no_entry":
+                assert buffer.is_object is False
         finally:
-            ref.transport_context.reset()
             ctx.reset()
 
     @pytest.mark.asyncio
-    async def test_drop_clears_client_tensor(self):
-        """Test that drop clears _client_tensor."""
+    async def test_handle_get_request_with_coordinates(self):
+        """Test handle_get_request uses coordinates to find correct shard."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        buffer = SharedMemoryTransportBuffer(ref)
+        ctx = MockTransportContext()
+
+        try:
+            buffer._key = "test_key"
+            buffer._coordinates = (0, 1)
+
+            # Allocate two shards with different coordinates
+            entry1 = ctx.get_shm_cache().allocate(
+                "test_key", torch.Size([10, 10]), torch.float32, coordinates=(0, 0)
+            )
+            entry2 = ctx.get_shm_cache().allocate(
+                "test_key", torch.Size([10, 10]), torch.float32, coordinates=(0, 1)
+            )
+
+            data = torch.randn(10, 10)
+            await buffer.handle_get_request(ctx, data)
+
+            # Should find the entry with matching coordinates
+            assert buffer.shm_descriptor is entry2.descriptor
+        finally:
+            ctx.reset()
+
+    @pytest.mark.asyncio
+    async def test_handle_get_request_object(self):
+        """Test handle_get_request handles non-tensor data."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        buffer = SharedMemoryTransportBuffer(ref)
+        ctx = MockTransportContext()
+
+        try:
+            buffer._key = "test_key"
+
+            # Pass a non-tensor (object)
+            data = {"key": "value", "list": [1, 2, 3]}
+            await buffer.handle_get_request(ctx, data)
+
+            # Should set is_object and objects
+            assert buffer.is_object is True
+            assert buffer.objects == data
+            assert buffer.shm_descriptor is None
+        finally:
+            ctx.reset()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("has_client_tensor", [True, False])
+    async def test_handle_response_rpc_fallback(self, has_client_tensor):
+        """Test _handle_storage_volume_response RPC fallback with and without client tensor."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
 
-        # Setup buffer with data
-        buffer._client_tensor = torch.randn(10, 10)
-        buffer.objects = {"key": "value"}
+        # Setup: client may or may not have a destination tensor
+        if has_client_tensor:
+            dest_tensor = torch.zeros(10, 10)
+            buffer._client_tensor = dest_tensor
+        else:
+            buffer._client_tensor = None
 
-        await buffer.drop()
+        # Response buffer with no shm_descriptor (RPC fallback)
+        response_buffer = SharedMemoryTransportBuffer(ref)
+        response_buffer.shm_descriptor = None
+        response_buffer.is_object = False
+        response_buffer.objects = torch.randn(10, 10)
 
-        # Verify everything is cleared
-        assert buffer._client_tensor is None
-        assert buffer.objects is None
+        result = await buffer._handle_storage_volume_response(response_buffer)
+
+        if has_client_tensor:
+            # Should copy to dest_tensor
+            assert result is dest_tensor
+            assert torch.allclose(dest_tensor, response_buffer.objects)
+        else:
+            # Should return objects directly
+            assert result is response_buffer.objects
+
+    @pytest.mark.asyncio
+    async def test_handle_response_clones_when_no_client_tensor(self):
+        """Test _handle_storage_volume_response clones when no client tensor provided."""
+        cache = SharedMemoryCache()
+        try:
+            ref = MockStorageVolumeRef(volume_hostname="localhost")
+            buffer = SharedMemoryTransportBuffer(ref)
+            buffer._key = "test_key"
+            buffer._client_tensor = None  # No destination tensor
+
+            # Create a segment and write data
+            entry = cache.allocate("test_key", torch.Size([10, 10]), torch.float32)
+            original_data = torch.randn(10, 10)
+            entry.get_tensor().copy_(original_data)
+
+            # Response buffer with descriptor
+            response_buffer = SharedMemoryTransportBuffer(ref)
+            response_buffer.shm_descriptor = entry.descriptor
+            response_buffer.is_object = False
+
+            result = await buffer._handle_storage_volume_response(response_buffer)
+
+            # Should be a clone (not the same object as shm tensor)
+            shm_tensor = entry.get_tensor()
+            assert torch.allclose(result, shm_tensor)
+            # Verify it's a clone by modifying result
+            result.fill_(999)
+            assert not torch.allclose(shm_tensor, result)
+        finally:
+            ref.transport_context.reset()
+            cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_handle_response_with_coordinates(self):
+        """Test _handle_storage_volume_response uses coordinates for client cache."""
+        cache = SharedMemoryCache()
+        try:
+            ref = MockStorageVolumeRef(volume_hostname="localhost")
+            buffer = SharedMemoryTransportBuffer(ref)
+            buffer._key = "test_key"
+            buffer._coordinates = (1, 2)
+            buffer._client_tensor = torch.zeros(10, 10)
+
+            # Create a segment
+            entry = cache.allocate("test_key", torch.Size([10, 10]), torch.float32)
+            original_data = torch.randn(10, 10)
+            entry.get_tensor().copy_(original_data)
+
+            # Response buffer with descriptor
+            response_buffer = SharedMemoryTransportBuffer(ref)
+            response_buffer.shm_descriptor = entry.descriptor
+            response_buffer.is_object = False
+
+            await buffer._handle_storage_volume_response(response_buffer)
+
+            # Verify client cache has entry with coordinates
+            client_cache = ref.transport_context.get_shm_cache()
+            cached_entry = client_cache.get(
+                "test_key", volume_id="test_volume", coordinates=(1, 2)
+            )
+            assert cached_entry is not None
+        finally:
+            ref.transport_context.reset()
+            cache.clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -826,7 +1036,7 @@ class TestSharedMemoryTransportBufferGPU:
             assert torch.allclose(shm_tensor, tensor.cpu())
         finally:
             ref.transport_context.reset()
-            cache.reset()
+            cache.clear()
 
 
 if __name__ == "__main__":

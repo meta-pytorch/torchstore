@@ -395,4 +395,4 @@ class InMemoryStore(StorageImpl):
         self.kv = {}
         # Clean up all shared memory segments
         shm_cache = self.transport_context.get_shm_cache()
-        shm_cache.reset()
+        shm_cache.clear()

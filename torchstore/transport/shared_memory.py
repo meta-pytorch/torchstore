@@ -130,17 +130,20 @@ class SharedMemoryCache:
         tensor_key = (volume_id, key)
         entries = self._entries.get(tensor_key)
         # should we fail hard?
-        if not entries or coordinates not in entries:
+        if not entries:
             return
 
-        if coordinates is None or len(entries) == 1:
-            # delete all entries
+        if coordinates is None:
+            # Delete all entries for this key
             del self._entries[tensor_key]
-        else:
-            # delete specific shard
-            del self._entries[tensor_key][coordinates]
+        elif coordinates in entries:
+            # Delete specific shard
+            del entries[coordinates]
+            # Clean up outer dict if no shards remain
+            if not entries:
+                del self._entries[tensor_key]
 
-    def reset(self) -> None:
+    def clear(self) -> None:
         self._entries.clear()
 
     def _put(
