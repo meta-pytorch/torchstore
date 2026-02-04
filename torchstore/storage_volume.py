@@ -49,7 +49,7 @@ class StorageVolume(Actor):
         return actors
 
     @endpoint
-    async def get_id(self) -> Tuple[str, str]:
+    async def get_id(self) -> tuple[str, str]:
         hostname = os.environ.get("HOSTNAME", socket.gethostname())
         return (self.volume_id, hostname)
 

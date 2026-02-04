@@ -13,12 +13,10 @@ in shared memory, allowing:
 - Persistence - stored tensor remains in shared memory for O(1) subsequent access
 """
 
-import hashlib
 import logging
 import os
 import socket
-from dataclasses import dataclass
-from multiprocessing import shared_memory
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 import torch
@@ -44,32 +42,37 @@ def is_local_to_volume(storage_volume_ref: "StorageVolumeRef") -> bool:
 
 @dataclass
 class SharedMemoryDescriptor:
-    """Lightweight, serializable descriptor for a shared memory segment.
+    """Serializable descriptor for PyTorch shared memory storage.
 
     This is sent from storage volume to client. The client uses attach()
-    to connect to the segment and get a usable entry.
+    to connect to the storage and get a usable entry.
     """
 
-    name: str
+    manager_handle: bytes  # Path to PyTorch shared memory manager socket
+    storage_handle: bytes  # Shared memory segment name
+    size: int  # Size in bytes
     shape: torch.Size
     dtype: torch.dtype
 
     def attach(self) -> "SharedMemoryEntry":
-        """Client-side: attach to segment and return usable entry."""
-        segment = shared_memory.SharedMemory(name=self.name)
-        return SharedMemoryEntry(segment=segment, descriptor=self)
+        """Client-side: attach to shared storage."""
+        storage = torch.UntypedStorage._new_shared_filename_cpu(
+            self.manager_handle, self.storage_handle, self.size
+        )
+        return SharedMemoryEntry(storage=storage, descriptor=self)
 
 
 @dataclass
 class SharedMemoryEntry:
-    """Entry in the shared memory cache (storage-volume side, not serializable)."""
+    """Entry wrapping PyTorch shared storage."""
 
-    segment: shared_memory.SharedMemory
+    storage: torch.UntypedStorage
     descriptor: SharedMemoryDescriptor
+    _tensor: Optional[torch.Tensor] = field(default=None, repr=False)
 
     @property
     def name(self) -> str:
-        return self.descriptor.name
+        return self.descriptor.storage_handle.decode()
 
     @property
     def shape(self) -> torch.Size:
@@ -80,24 +83,17 @@ class SharedMemoryEntry:
         return self.descriptor.dtype
 
     def get_tensor(self) -> torch.Tensor:
-        """Create a tensor view backed by this shared memory segment."""
-        return torch.frombuffer(
-            self.segment.buf, dtype=self.dtype, count=self.shape.numel()
-        ).reshape(self.shape)
+        """Create tensor view backed by shared storage."""
+        if self._tensor is None:
+            # Create tensor from storage with proper dtype/shape
+            self._tensor = (
+                torch.empty(0, dtype=self.dtype).set_(self.storage).view(self.shape)
+            )
+        return self._tensor
 
     def close(self) -> None:
-        """Detach from the shared memory segment (don't unlink)."""
-        try:
-            self.segment.close()
-        except Exception as e:
-            logger.warning(f"Failed to close shared memory segment {self.name}: {e}")
-
-    def unlink(self) -> None:
-        """Unlink (delete) the shared memory segment."""
-        try:
-            self.segment.unlink()
-        except Exception as e:
-            logger.warning(f"Failed to unlink shared memory segment {self.name}: {e}")
+        """Detach from shared storage (client-side cleanup)."""
+        self._tensor = None
 
 
 class SharedMemoryCache:
@@ -105,13 +101,6 @@ class SharedMemoryCache:
 
     def __init__(self):
         self.segments: Dict[str, SharedMemoryEntry] = {}
-        self._pid = os.getpid()
-
-    def _segment_name(self, key: str) -> str:
-        """Generate segment name scoped to this process."""
-        # Include PID to prevent collisions between different storage volumes
-        scoped_key = f"{self._pid}:{key}"
-        return f"ts_{hashlib.sha256(scoped_key.encode()).hexdigest()[:16]}"
 
     def get_or_create(
         self, key: str, shape: torch.Size, dtype: torch.dtype
@@ -125,26 +114,25 @@ class SharedMemoryCache:
             # Shape/dtype changed - recreate
             self.delete(key)
 
-        segment_name = self._segment_name(key)
+        # Allocate directly in shared memory
         size_bytes = shape.numel() * dtype.itemsize
+        storage = torch.UntypedStorage._new_using_filename_cpu(size_bytes)
+        tensor = torch.empty(0, dtype=dtype).set_(storage).view(shape)
+        tensor.fill_(0)  # Prefault the memory
 
-        # Try to unlink any existing segment with this name
-        try:
-            existing = shared_memory.SharedMemory(name=segment_name)
-            existing.close()
-            existing.unlink()
-        except FileNotFoundError:
-            pass
+        # Get handles for serialization
+        manager_handle, storage_handle, size = storage._share_filename_cpu_()
 
-        segment = shared_memory.SharedMemory(
-            name=segment_name, create=True, size=size_bytes
-        )
         descriptor = SharedMemoryDescriptor(
-            name=segment_name,
+            manager_handle=manager_handle,
+            storage_handle=storage_handle,
+            size=size,
             shape=shape,
             dtype=dtype,
         )
-        entry = SharedMemoryEntry(segment=segment, descriptor=descriptor)
+        entry = SharedMemoryEntry(
+            storage=storage, descriptor=descriptor, _tensor=tensor
+        )
         self.segments[key] = entry
         return entry
 
@@ -153,11 +141,10 @@ class SharedMemoryCache:
         return self.segments.get(key)
 
     def delete(self, key: str) -> None:
-        """Unlink and remove segment."""
+        """Remove segment from cache."""
         if key in self.segments:
             entry = self.segments.pop(key)
             entry.close()
-            entry.unlink()
 
     def reset(self) -> None:
         """Clean up all segments."""
@@ -333,11 +320,13 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         try:
             self._client_entry = transport_buffer.shm_descriptor.attach()
-        except FileNotFoundError:
-            raise RuntimeError(
-                f"Shared memory segment {transport_buffer.shm_descriptor.name} not found. "
-                "This may indicate the storage volume is on a different host."
-            )
+        except RuntimeError as e:
+            if "No such file" in str(e):
+                raise RuntimeError(
+                    "Shared memory storage not found. "
+                    "This may indicate the storage volume is on a different host."
+                ) from e
+            raise
 
         shm_tensor = self._client_entry.get_tensor()
 

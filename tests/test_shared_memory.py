@@ -6,8 +6,6 @@
 
 """unit tests made by claude, have to vet them"""
 
-from multiprocessing import shared_memory
-
 import pytest
 import torch
 from torchstore.transport.shared_memory import (
@@ -57,106 +55,62 @@ class TestHelperFunctions:
         ref = MockStorageVolumeRef(volume_hostname=None)
         assert is_local_to_volume(ref) is False
 
-    def test_segment_name_for_key(self):
-        """Test segment name generation is deterministic within same cache."""
-        cache = SharedMemoryCache()
-        name1 = cache._segment_name("test_key")
-        name2 = cache._segment_name("test_key")
-        assert name1 == name2
-        assert name1.startswith("ts_")
-        assert len(name1) == 19  # "ts_" + 16 hex chars
-
-    def test_segment_name_for_different_keys(self):
-        """Test segment names are unique for different keys."""
-        cache = SharedMemoryCache()
-        name1 = cache._segment_name("key1")
-        name2 = cache._segment_name("key2")
-        assert name1 != name2
-
-    def test_segment_name_includes_pid(self):
-        """Test segment names include process ID to prevent collisions."""
-        import os
-
-        cache = SharedMemoryCache()
-        # Verify the cache captured the current PID
-        assert cache._pid == os.getpid()
-        # The segment name should be based on pid:key
-        name = cache._segment_name("test_key")
-        assert name.startswith("ts_")
-
 
 class TestSharedMemoryEntry:
     """Test SharedMemoryEntry dataclass."""
 
     def test_get_tensor(self):
         """Test creating a tensor from shared memory entry."""
-        shape = torch.Size([4, 8])
-        dtype = torch.float32
-        numel = 4 * 8
-        size_bytes = numel * 4  # float32 = 4 bytes
-
-        segment = shared_memory.SharedMemory(create=True, size=size_bytes)
+        cache = SharedMemoryCache()
         try:
-            descriptor = SharedMemoryDescriptor(
-                name=segment.name,
-                shape=shape,
-                dtype=dtype,
-            )
-            entry = SharedMemoryEntry(segment=segment, descriptor=descriptor)
+            shape = torch.Size([4, 8])
+            dtype = torch.float32
+
+            entry = cache.get_or_create("test_key", shape, dtype)
 
             tensor = entry.get_tensor()
             assert tensor.shape == shape
             assert tensor.dtype == dtype
-            assert tensor.numel() == numel
+            assert tensor.numel() == 4 * 8
 
             # Verify we can write to the tensor
             tensor.fill_(42.0)
             tensor2 = entry.get_tensor()
             assert torch.all(tensor2 == 42.0)
         finally:
-            segment.close()
-            segment.unlink()
+            cache.reset()
 
-    def test_close_and_unlink(self):
-        """Test closing and unlinking shared memory entry."""
-        segment = shared_memory.SharedMemory(create=True, size=64)
-        name = segment.name
-        descriptor = SharedMemoryDescriptor(
-            name=name,
-            shape=torch.Size([16]),
-            dtype=torch.float32,
-        )
-        entry = SharedMemoryEntry(segment=segment, descriptor=descriptor)
+    def test_close(self):
+        """Test closing shared memory entry."""
+        cache = SharedMemoryCache()
+        try:
+            entry = cache.get_or_create(
+                "test_key", torch.Size([16]), torch.float32
+            )
 
-        entry.close()
-        entry.unlink()
-
-        # Segment should no longer exist
-        with pytest.raises(FileNotFoundError):
-            shared_memory.SharedMemory(name=name)
+            # Close should not raise
+            entry.close()
+        finally:
+            cache.reset()
 
     def test_descriptor(self):
         """Test accessing the descriptor from an entry."""
-        segment = shared_memory.SharedMemory(create=True, size=64)
+        cache = SharedMemoryCache()
         try:
             shape = torch.Size([16])
             dtype = torch.float32
-            descriptor = SharedMemoryDescriptor(
-                name=segment.name,
-                shape=shape,
-                dtype=dtype,
-            )
-            entry = SharedMemoryEntry(segment=segment, descriptor=descriptor)
 
-            # Descriptor should be the same object
-            assert entry.descriptor is descriptor
+            entry = cache.get_or_create("test_key", shape, dtype)
+
+            # Descriptor should have correct fields
             assert isinstance(entry.descriptor, SharedMemoryDescriptor)
-            assert entry.descriptor.name == segment.name
+            assert isinstance(entry.descriptor.manager_handle, bytes)
+            assert isinstance(entry.descriptor.storage_handle, bytes)
+            assert entry.descriptor.size > 0
             assert entry.descriptor.shape == shape
             assert entry.descriptor.dtype == dtype
         finally:
-            segment.close()
-            segment.unlink()
+            cache.reset()
 
 
 class TestSharedMemoryDescriptor:
@@ -164,43 +118,35 @@ class TestSharedMemoryDescriptor:
 
     def test_attach(self):
         """Test attaching to a segment via descriptor."""
-        # First create a segment
-        shape = torch.Size([10, 10])
-        dtype = torch.float32
-        numel = 10 * 10
-        size_bytes = numel * 4
-
-        segment = shared_memory.SharedMemory(create=True, size=size_bytes)
+        cache = SharedMemoryCache()
         try:
+            shape = torch.Size([10, 10])
+            dtype = torch.float32
+
+            # Create entry via cache
+            entry = cache.get_or_create("test_key", shape, dtype)
+
             # Write some data
             original = torch.randn(10, 10)
-            shm_tensor = torch.frombuffer(
-                segment.buf, dtype=dtype, count=numel
-            ).reshape(shape)
+            shm_tensor = entry.get_tensor()
             shm_tensor.copy_(original)
 
-            # Create descriptor and attach
-            descriptor = SharedMemoryDescriptor(
-                name=segment.name,
-                shape=shape,
-                dtype=dtype,
-            )
-            entry = descriptor.attach()
+            # Create new entry via descriptor attach
+            descriptor = entry.descriptor
+            attached_entry = descriptor.attach()
 
             # Verify entry is valid
-            assert entry.name == segment.name
-            assert entry.shape == shape
-            assert entry.dtype == dtype
+            assert attached_entry.shape == shape
+            assert attached_entry.dtype == dtype
 
             # Verify we can read the data
-            tensor = entry.get_tensor()
+            tensor = attached_entry.get_tensor()
             assert torch.allclose(tensor, original)
 
             # Cleanup
-            entry.close()
+            attached_entry.close()
         finally:
-            segment.close()
-            segment.unlink()
+            cache.reset()
 
 
 class TestSharedMemoryCache:
@@ -233,11 +179,9 @@ class TestSharedMemoryCache:
             dtype = torch.float32
 
             entry1 = cache.get_or_create("test_key", shape1, dtype)
-            name1 = entry1.name
 
             entry2 = cache.get_or_create("test_key", shape2, dtype)
-            # Same segment name (based on key), but new segment created
-            assert entry2.name == name1
+            # New segment created with new shape
             assert entry2.shape == shape2
         finally:
             cache.reset()
@@ -267,17 +211,12 @@ class TestSharedMemoryCache:
         try:
             shape = torch.Size([5, 5])
             dtype = torch.float32
-            entry = cache.get_or_create("test_key", shape, dtype)
-            segment_name = entry.name
+            cache.get_or_create("test_key", shape, dtype)
 
             cache.delete("test_key")
 
             # Should no longer be in cache
             assert cache.get("test_key") is None
-
-            # Segment should be unlinked
-            with pytest.raises(FileNotFoundError):
-                shared_memory.SharedMemory(name=segment_name)
         finally:
             cache.reset()
 
@@ -287,20 +226,14 @@ class TestSharedMemoryCache:
 
         shape = torch.Size([5, 5])
         dtype = torch.float32
-        entry1 = cache.get_or_create("key1", shape, dtype)
-        entry2 = cache.get_or_create("key2", shape, dtype)
-        names = [entry1.name, entry2.name]
+        cache.get_or_create("key1", shape, dtype)
+        cache.get_or_create("key2", shape, dtype)
 
         cache.reset()
 
         # All keys should be gone
         assert cache.get("key1") is None
         assert cache.get("key2") is None
-
-        # All segments should be unlinked
-        for name in names:
-            with pytest.raises(FileNotFoundError):
-                shared_memory.SharedMemory(name=name)
 
 
 class TestSharedMemoryTransportBuffer:
@@ -563,14 +496,15 @@ class TestSharedMemoryTransportBufferIntegration:
 
             # Verify descriptor was returned
             assert isinstance(descriptor, SharedMemoryDescriptor)
-            assert descriptor.name.startswith("ts_")
+            assert isinstance(descriptor.manager_handle, bytes)
+            assert isinstance(descriptor.storage_handle, bytes)
+            assert descriptor.size > 0
             assert descriptor.shape == buffer.shape
             assert descriptor.dtype == buffer.dtype
 
             # Verify segment exists in cache
             entry = ctx.get_shm_cache().get("test_key")
             assert entry is not None
-            assert entry.name == descriptor.name
         finally:
             ctx.reset()
 
@@ -687,7 +621,6 @@ class TestSharedMemoryTransportBufferIntegration:
 
             # Verify descriptor is set
             assert get_buffer.shm_descriptor is not None
-            assert get_buffer.shm_descriptor.name == descriptor.name
             assert get_buffer.shm_descriptor.shape == original_tensor.shape
             assert get_buffer.shm_descriptor.dtype == original_tensor.dtype
 
