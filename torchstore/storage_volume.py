@@ -55,8 +55,10 @@ class StorageVolume(Actor):
         return (self.volume_id, hostname)
 
     @endpoint
-    async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
-        return await self.store.handshake(transport_buffer)
+    async def handshake(
+        self, transport_buffer: TransportBuffer, key: str, request: Request
+    ) -> Any | None:
+        return await self.store.handshake(transport_buffer, key, request)
 
     @endpoint
     async def put(
@@ -115,7 +117,9 @@ class StorageImpl:
         """Delete data from the storage backend."""
         raise NotImplementedError()
 
-    async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
+    async def handshake(
+        self, transport_buffer: TransportBuffer, key: str, request: "Request"
+    ) -> Any | None:
         raise NotImplementedError()
 
 
@@ -126,8 +130,13 @@ class InMemoryStore(StorageImpl):
         self.kv: dict[str, Any] = {}
         super().__init__()
 
-    async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
-        return await transport_buffer.recv_handshake(self.transport_context)
+    async def handshake(
+        self, transport_buffer: TransportBuffer, key: str, request: "Request"
+    ) -> Any | None:
+        current_object = self._extract_existing(key, request)
+        return await transport_buffer.recv_handshake(
+            self.transport_context, current_object
+        )
 
     def _extract_existing(self, key: str, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
@@ -387,12 +396,6 @@ class InMemoryStore(StorageImpl):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
         del self.kv[key]
-        # Clean up shared memory segments if they exist
-        shm_cache = self.transport_context.get_shm_cache()
-        shm_cache.delete(key)
 
     def reset(self) -> None:
         self.kv = {}
-        # Clean up all shared memory segments
-        shm_cache = self.transport_context.get_shm_cache()
-        shm_cache.clear()

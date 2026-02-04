@@ -155,7 +155,9 @@ class TransportBuffer:
 
             if self.requires_handshake:
                 handshake_result = (
-                    await self.storage_volume_ref.volume.handshake.call_one(self)
+                    await self.storage_volume_ref.volume.handshake.call_one(
+                        self, key, request.meta_only()
+                    )
                 )
                 l.track_step("volume.handshake.call")
                 await self._post_handshake(handshake_result)
@@ -215,7 +217,9 @@ class TransportBuffer:
     # StorageVolume handlers -- must be implemented by concrete implementaiton
     # These methods are called by the StorageVolume on the remote side
 
-    async def recv_handshake(self, ctx: "TransportContext") -> None:
+    async def recv_handshake(
+        self, ctx: "TransportContext", current_object: Any = None
+    ) -> None:
         # called on the storage volume side
         raise NotImplementedError()
 
