@@ -59,6 +59,10 @@ def transport_plus_strategy_params(with_host_strategy: bool = False):
     if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
         enabled_transport_types.append(TransportType.TorchCommsRDMA)
 
+    # SharedMemory enabled by default for same-host transfers
+    if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
+        enabled_transport_types.append(TransportType.SharedMemory)
+
     return "strategy_params, transport_type", list(
         product(strategies, enabled_transport_types)
     )
