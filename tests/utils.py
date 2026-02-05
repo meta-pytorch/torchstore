@@ -28,7 +28,7 @@ def main(file):
 def strategy_params(with_host_strategy: bool = False):
     strategies = [
         (2, ts.LocalRankStrategy),
-        (1, ts.SingletonStrategy),
+        # (1, ts.SingletonStrategy), essentially same as ControllerStorageVolumes
         (1, ts.ControllerStorageVolumes),
     ]
 
@@ -38,26 +38,25 @@ def strategy_params(with_host_strategy: bool = False):
     return "strategy_params", strategies
 
 
-def transport_plus_strategy_params(with_host_strategy: bool = False):
-    strategies = [
-        (2, ts.LocalRankStrategy),
-        (1, ts.SingletonStrategy),
-        (1, ts.ControllerStorageVolumes),
-    ]
-
-    if with_host_strategy:
-        strategies.append((1, ts.HostStrategy))
-
-    # MonarchRPC always works (no special hardware needed)
+def transport_params():
+    """Return transport types for parameterization without strategy."""
     enabled_transport_types = [TransportType.MonarchRPC]
 
-    # MonarchRDMA enabled by default, can be disabled with TORCHSTORE_RDMA_ENABLED=0
     if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.MonarchRDMA)
 
-    # TorchCommsRDMA disabled by default, enable with USE_TORCHCOMMS_RDMA=1
     if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
         enabled_transport_types.append(TransportType.TorchCommsRDMA)
+
+    if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
+        enabled_transport_types.append(TransportType.SharedMemory)
+
+    return "transport_type", enabled_transport_types
+
+
+def transport_plus_strategy_params(with_host_strategy: bool = False):
+    _, strategies = strategy_params(with_host_strategy)
+    _, enabled_transport_types = transport_params()
 
     return "strategy_params, transport_type", list(
         product(strategies, enabled_transport_types)
