@@ -15,13 +15,13 @@ in shared memory, allowing:
 
 import logging
 import os
-import socket
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 import torch
 
 from torchstore.transport.buffers import TransportBuffer
+from torchstore.utils import get_local_hostname
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -29,11 +29,6 @@ if TYPE_CHECKING:
     from torchstore.transport.types import Request
 
 logger = logging.getLogger(__name__)
-
-
-def get_local_hostname() -> str:
-    """Get the current machine's hostname."""
-    return os.environ.get("HOSTNAME", socket.gethostname())
 
 
 def is_local_to_volume(storage_volume_ref: "StorageVolumeRef") -> bool:
@@ -50,7 +45,8 @@ def allocate_shared_tensor(shape: torch.Size, dtype: torch.dtype) -> torch.Tenso
     return tensor
 
 
-SHOULD_PIN_SHM = os.environ.get("TORCHSTORE_PIN_SHM", 1)
+SHOULD_PIN_SHM = os.environ.get("TORCHSTORE_PIN_SHM", "1") == "1"
+MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "0") == "1"
 
 
 def pin_memory(tensor: torch.Tensor) -> None:
@@ -262,6 +258,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         # Client-side only (excluded from serialization)
         self._client_tensor: torch.Tensor | None = None
+        # Put needs a handshake, get does not
         self._needs_handshake: bool = False
 
     @property
@@ -413,7 +410,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             self._client_tensor.copy_(shm_tensor)
             return self._client_tensor
         else:
-            return shm_tensor.clone()
+            return shm_tensor if MUTABLE_SHM else shm_tensor.clone()
 
     async def drop(self) -> None:
         """

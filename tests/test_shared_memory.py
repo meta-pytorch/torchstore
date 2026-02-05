@@ -10,12 +10,12 @@ import pytest
 import torch
 from torchstore.transport.shared_memory import (
     allocate_shared_tensor,
-    get_local_hostname,
     is_local_to_volume,
     SharedMemoryCache,
     SharedMemoryDescriptor,
     SharedMemoryTransportBuffer,
 )
+from torchstore.utils import get_local_hostname
 
 
 class MockTransportContext:
@@ -51,11 +51,6 @@ class MockRequest:
         self.is_object = is_object
 
 
-# =============================================================================
-# 1. TestHelperFunctions (3 tests)
-# =============================================================================
-
-
 class TestHelperFunctions:
     """Test helper functions."""
 
@@ -87,11 +82,6 @@ class TestHelperFunctions:
         assert is_local_to_volume(ref) is False
 
 
-# =============================================================================
-# 2. TestAllocateSharedTensor (1 test)
-# =============================================================================
-
-
 class TestAllocateSharedTensor:
     """Test allocate_shared_tensor helper function."""
 
@@ -107,11 +97,6 @@ class TestAllocateSharedTensor:
         assert tensor.is_shared()
         # Verify memory is prefaulted (initialized to 0)
         assert torch.all(tensor == 0)
-
-
-# =============================================================================
-# 3. TestSharedMemoryDescriptor (4 tests)
-# =============================================================================
 
 
 class TestSharedMemoryDescriptor:
@@ -179,11 +164,6 @@ class TestSharedMemoryDescriptor:
         result.fill_(42.0)
         result2 = entry.get_tensor()
         assert torch.all(result2 == 42.0)
-
-
-# =============================================================================
-# 4. TestSharedMemoryCache (3 tests)
-# =============================================================================
 
 
 class TestSharedMemoryCache:
@@ -256,10 +236,43 @@ class TestSharedMemoryCache:
 
         assert len(cache._entries) == 0
 
+    @pytest.mark.asyncio
+    async def test_cache_reuse_on_same_key_puts(self):
+        """Test that putting twice to same key with same-spec tensor reuses cache entry."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        shm_cache = ref.transport_context.get_shm_cache()
 
-# =============================================================================
-# 5. TestSharedMemoryTransportBuffer (1 test)
-# =============================================================================
+        # First PUT: allocate new shared memory
+        buffer1 = SharedMemoryTransportBuffer(ref)
+        buffer1._key = "test_key"
+        tensor1 = torch.randn(50, 50)
+        buffer1._client_tensor = tensor1
+
+        await buffer1._post_handshake(None)  # No existing descriptor, allocates new
+
+        # Verify cache has 1 entry after first PUT
+        assert len(shm_cache._entries) == 1
+        first_descriptor = buffer1.shm_descriptor
+
+        # Second PUT: reuse existing shared memory
+        buffer2 = SharedMemoryTransportBuffer(ref)
+        buffer2._key = "test_key"
+        tensor2 = torch.randn(50, 50)
+        buffer2._client_tensor = tensor2
+
+        await buffer2._post_handshake(
+            first_descriptor
+        )  # Existing descriptor from handshake
+
+        # Verify cache still has only 1 entry (same SHM reused)
+        assert len(shm_cache._entries) == 1
+        assert buffer2.shm_descriptor.storage_handle == first_descriptor.storage_handle
+
+        # Verify the data was updated
+        entry = shm_cache._entries[("test_key", first_descriptor.storage_handle)]
+        assert torch.allclose(entry.get_tensor(), tensor2)
+
+        ref.transport_context.reset()
 
 
 class TestSharedMemoryTransportBuffer:
@@ -275,11 +288,6 @@ class TestSharedMemoryTransportBuffer:
 
         assert state["_client_tensor"] is None
         assert state["storage_volume_ref"] is None
-
-
-# =============================================================================
-# 6. TestSharedMemoryTransportBufferPUT (6 tests)
-# =============================================================================
 
 
 class TestSharedMemoryTransportBufferPUT:
@@ -428,11 +436,6 @@ class TestSharedMemoryTransportBufferPUT:
         assert result2 is shm_tensor
 
 
-# =============================================================================
-# 7. TestSharedMemoryTransportBufferGET (6 tests)
-# =============================================================================
-
-
 class TestSharedMemoryTransportBufferGET:
     """Tests for SharedMemoryTransportBuffer GET flow."""
 
@@ -570,10 +573,61 @@ class TestSharedMemoryTransportBufferGET:
         result2 = await buffer2._handle_storage_volume_response(response2)
         assert result2 is response2.objects
 
+    @pytest.mark.asyncio
+    async def test_mutable_shm_env_var(self, monkeypatch):
+        """Test TORCHSTORE_MUTABLE_SHM env var controls clone behavior."""
+        import torchstore.transport.shared_memory as shm_module
 
-# =============================================================================
-# 8. TestSharedMemoryTransportBufferGPU
-# =============================================================================
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+
+        # Create shared memory segment with data
+        shm_tensor = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
+        original_data = torch.randn(10, 10)
+        shm_tensor.copy_(original_data)
+        descriptor = SharedMemoryDescriptor.from_tensor(shm_tensor)
+
+        # Test with MUTABLE_SHM=False (default) - should return cloned tensor
+        monkeypatch.setattr(shm_module, "MUTABLE_SHM", False)
+        buffer1 = SharedMemoryTransportBuffer(ref)
+        buffer1._key = "test_key"
+        buffer1._client_tensor = None
+
+        response1 = SharedMemoryTransportBuffer(ref)
+        response1.shm_descriptor = descriptor
+        response1.is_object = False
+
+        result1 = await buffer1._handle_storage_volume_response(response1)
+
+        # Should be a clone (different storage)
+        assert not result1.is_shared()  # Clone is not in shared memory
+        assert torch.allclose(result1, original_data)
+
+        # Modifying the clone should NOT affect original shared memory
+        result1.fill_(999.0)
+        assert torch.allclose(shm_tensor, original_data)
+
+        # Test with MUTABLE_SHM=True - should return tensor backed by shared memory
+        monkeypatch.setattr(shm_module, "MUTABLE_SHM", True)
+        ref.transport_context.reset()  # Clear cache to force re-attach
+        buffer2 = SharedMemoryTransportBuffer(ref)
+        buffer2._key = "test_key"
+        buffer2._client_tensor = None
+
+        response2 = SharedMemoryTransportBuffer(ref)
+        response2.shm_descriptor = descriptor
+        response2.is_object = False
+
+        result2 = await buffer2._handle_storage_volume_response(response2)
+
+        # Should share storage with the shared memory segment
+        assert result2.is_shared()
+        assert torch.allclose(result2, original_data)
+
+        # Modifying the result SHOULD affect original shared memory
+        result2.fill_(123.0)
+        assert torch.all(shm_tensor == 123.0)
+
+        ref.transport_context.reset()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

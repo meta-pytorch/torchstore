@@ -222,7 +222,6 @@ async def test_dcp_sharding_parity(transport_type):
 
         # put_state_dict from multiple clients to a single storage volume runs into same-key
         # race conditions (contains non sharded elements)
-        # any real FSDP/HSDP use case should use LocalRankStrategy, but we can revisit this later
         strategy = ts.LocalRankStrategy
         await ts.initialize(
             num_storage_volumes=(
