@@ -16,6 +16,7 @@ from torchstore.transport.monarch_rpc import MonarchRPCTransportBuffer
 from torchstore.transport.shared_memory import (
     is_local_to_volume,
     SharedMemoryTransportBuffer,
+    SHM_ENABLED,
 )
 from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 from torchstore.transport.types import Request, TensorSlice
@@ -39,7 +40,7 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
     otherwise falls back to MonarchRPC.
     """
     # Prefer SharedMemory for same-host transfers
-    if is_local_to_volume(storage_volume_ref):
+    if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
         return TransportType.SharedMemory
 
     # Fall back to RDMA if available

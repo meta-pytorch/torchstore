@@ -47,6 +47,8 @@ def allocate_shared_tensor(shape: torch.Size, dtype: torch.dtype) -> torch.Tenso
 
 SHOULD_PIN_SHM = os.environ.get("TORCHSTORE_PIN_SHM", "1") == "1"
 MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "0") == "1"
+# Disabling by default on initial release
+SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "0") == "1"
 
 
 def pin_memory(tensor: torch.Tensor) -> None:
