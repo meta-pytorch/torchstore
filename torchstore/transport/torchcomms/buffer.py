@@ -156,6 +156,10 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             )
             if isinstance(meta, str) or meta is None:
                 return  # Objects don't need RDMA setup
+            # if we are fetching a tensor slice, the local shape is already known
+            if request.tensor_slice is not None:
+                meta = (request.tensor_slice.local_shape, *meta[1:])
+
             tensor_like = meta  # (shape, dtype) tuple
 
         # Setup local transport - use tensor device if available, else use default
