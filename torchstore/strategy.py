@@ -143,35 +143,6 @@ class TorchStoreStrategy:
         )
 
 
-class SingletonStrategy(TorchStoreStrategy):
-    """There can be only one. Likely to OOM if used unwisely.
-
-    Used when only one storage volume is needed. All operations are routed
-    to the single volume. This is the default strategy for simple setups.
-    """
-
-    strategy_id: str = "Singleton"
-
-    @classmethod
-    def get_volume_id(cls):
-        """Return the singleton volume ID.
-
-        Returns:
-            str: Always returns "Singleton" for the single volume.
-        """
-        return cls.strategy_id
-
-    @classmethod
-    def get_client_id(cls):
-        return cls.strategy_id
-
-    async def set_storage_volumes(self, storage_volumes):
-        assert (
-            len(storage_volumes) == 1
-        ), f"{self.__class__.__name__} support only one storage volume"
-        await super().set_storage_volumes(storage_volumes)
-
-
 class HostStrategy(TorchStoreStrategy):
     """Assumes one storage volume per host.
 
@@ -196,6 +167,11 @@ class LocalRankStrategy(TorchStoreStrategy):
     Each process uses its LOCAL_RANK to determine which storage volume to connect to.
     This strategy requires the LOCAL_RANK environment variable to be set and assumes
     one storage volume per local rank.
+
+    When using this strategy, data is moved to a storage volume that is spawned on the
+    mesh passed into ``ts.initialize(mesh=...)``. The storage volumes are distributed
+    across the mesh, and each client process connects to its corresponding volume based
+    on its LOCAL_RANK.
     """
 
     @classmethod

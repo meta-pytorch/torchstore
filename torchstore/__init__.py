@@ -25,7 +25,6 @@ from torchstore.strategy import (
     ControllerStorageVolumes,
     HostStrategy,
     LocalRankStrategy,
-    SingletonStrategy,
     TorchStoreStrategy,
 )
 
@@ -52,7 +51,6 @@ __all__ = [
     "TorchStoreStrategy",
     "LocalRankStrategy",
     "HostStrategy",
-    "SingletonStrategy",
     "ControllerStorageVolumes",
     "put_state_dict",
     "get_state_dict",
