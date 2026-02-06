@@ -112,7 +112,7 @@ async def test_large_tensors():
                 if monarch_rdma_transport_available()
                 else TransportType.Unset
             )
-        )
+        ),
     )
     actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
     try:
