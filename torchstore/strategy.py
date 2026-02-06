@@ -12,6 +12,7 @@ multiple storage volumes. Strategies map client processes to storage volumes.
 
 import logging
 import os
+import socket
 from typing import TYPE_CHECKING
 
 from monarch.actor import current_rank
@@ -181,8 +182,6 @@ class HostStrategy(TorchStoreStrategy):
 
     @classmethod
     def get_volume_id(cls):
-        import socket
-
         # Note: this should only called at spawn, which makes this safe.
         return os.environ.get("HOSTNAME", socket.gethostname())
 
