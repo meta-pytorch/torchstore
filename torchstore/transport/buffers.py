@@ -159,8 +159,6 @@ class TransportBuffer:
 
     async def get_from_storage_volume(self, key, request: "Request"):
         try:
-            await self._pre_handshake(request)
-
             if self.requires_handshake:
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(self)

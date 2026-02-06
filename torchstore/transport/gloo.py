@@ -131,9 +131,6 @@ class GlooTransportBuffer(TransportBuffer):
 
         # TCPStore reference (kept alive until PG is created)
         self._tcp_store: TCPStore | None = None
-        self._connection_exists: bool = (
-            False  # Whether a handshake has already been performed
-        )
         self._pg_task: asyncio.Task | None = None  # Background task for PG creation
         self._send_task: asyncio.Task | None = (
             None  # Background task for sending tensor
@@ -144,20 +141,6 @@ class GlooTransportBuffer(TransportBuffer):
 
     @property
     def requires_handshake(self) -> bool:
-        """Only handshake if connection is not already cached."""
-        return not self._connection_exists
-
-    def __getstate__(self) -> dict[str, Any]:
-        """Serialize state, excluding non-serializable fields."""
-        state = self.__dict__.copy()
-        state["storage_volume_ref"] = None
-        state["_tcp_store"] = None
-        state["_pg_task"] = None
-        state["_send_task"] = None
-        state["_recv_task"] = None
-        return state
-
-    async def _pre_handshake(self, request: "Request") -> None:
         """Prepare for handshake. Create TCPStore and start PG creation on
         client side (rank 0).
 
@@ -170,12 +153,11 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Check if connection already exists
         if volume_id in _store_addrs:
-            self._connection_exists = True
             cached_addr = _store_addrs[volume_id]
             self.master_addr = cached_addr[0]
             self.master_port = cached_addr[1]
             self.store_key = cached_addr[2]
-            return
+            return False
 
         # Generate unique store key and find free port
         self.store_key = f"torchstore_gloo_{str(uuid.uuid4())[:8]}"
@@ -210,6 +192,18 @@ class GlooTransportBuffer(TransportBuffer):
             )
 
         self._pg_task = asyncio.create_task(asyncio.to_thread(create_pg))
+
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize state, excluding non-serializable fields."""
+        state = self.__dict__.copy()
+        state["storage_volume_ref"] = None
+        state["_tcp_store"] = None
+        state["_pg_task"] = None
+        state["_send_task"] = None
+        state["_recv_task"] = None
+        return state
+
 
     async def recv_handshake(self, transport_context: "TransportContext") -> Any | None:
         """Called on storage volume side to set up the process group.
