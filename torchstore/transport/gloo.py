@@ -193,7 +193,6 @@ class GlooTransportBuffer(TransportBuffer):
 
         self._pg_task = asyncio.create_task(asyncio.to_thread(create_pg))
 
-
     def __getstate__(self) -> dict[str, Any]:
         """Serialize state, excluding non-serializable fields."""
         state = self.__dict__.copy()
@@ -203,7 +202,6 @@ class GlooTransportBuffer(TransportBuffer):
         state["_send_task"] = None
         state["_recv_task"] = None
         return state
-
 
     async def recv_handshake(self, transport_context: "TransportContext") -> Any | None:
         """Called on storage volume side to set up the process group.

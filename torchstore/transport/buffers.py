@@ -94,7 +94,6 @@ class TransportBuffer:
     - `__init__`: Initialize buffer with reference to target storage volume
     - `put_to_storage_volume`: Entry point for put operations
     - `get_from_storage_volume`: Entry point for get operations
-    - `_pre_handshake`: Prepare for handshake (called before handshake RPC)
     - `_post_handshake`: Process handshake result (if requires_handshake=True)
     - `_pre_put_hook`: Prepare buffers before sending put request
     - `_pre_get_hook`: Prepare buffers before sending get request
@@ -196,14 +195,6 @@ class TransportBuffer:
             await self.drop()
 
         return response
-
-    async def _pre_handshake(self, request: "Request") -> None:
-        """Prepare for handshake on the client side.
-
-        Called before the handshake RPC is sent to the storage volume.
-        Override this for setup that must happen before handshake.
-        """
-        pass
 
     async def _post_handshake(self, handshake_result: Any) -> None:
         """Process the result of a handshake on the client side.
