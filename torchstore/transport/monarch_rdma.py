@@ -28,7 +28,9 @@ if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
     from torchstore.transport.buffers import TransportContext
 
-MONARCH_RDMA_EAGER_D2H = os.environ.get("TORCHSTORE_MONARCH_RDMA_EAGER_D2H", "1") == "1"
+# For some reason, monarch sometimes doesn't like gpu tensors, so we convert to cpu. We noticed this in larger
+# models, like qwen32B
+MONARCH_RDMA_EAGER_D2H = os.environ.get("TORCHSTORE_MONARCH_RDMA_EAGER_D2H", "0") == "1"
 
 
 def monarch_rdma_transport_available() -> bool:
@@ -45,10 +47,6 @@ def monarch_rdma_transport_available() -> bool:
 class MonarchRDMATransportBuffer(TransportBuffer):
 
     requires_handshake: bool = False
-
-    # TODO: when we try this with rdma, I should be able to write rdma directly to the tensor
-    # for now we utilize copies.
-    # The major blocker for this is dealing with non-contiguous tensors
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
@@ -87,12 +85,16 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         # if the user has not provided a local tensor, we need to first
         # identify and allocate ahead of time
         meta = None
-        if not request.tensor_val:
+        if request.tensor_val is None:
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
                 key, request.meta_only()
             )
             if isinstance(meta, str) or meta is None:
                 return  # objects don't get handled
+
+            # if we are fetching a tensor slice, the local shape is already known
+            if request.tensor_slice is not None:
+                meta = (request.tensor_slice.local_shape, *meta[1:])
 
         self.allocate(meta or request.tensor_val)
 

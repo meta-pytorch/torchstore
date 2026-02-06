@@ -58,8 +58,8 @@ async def test_2d_get_local_tensor():
     _test_get_local_tensor(global_tensor, test_cases)
 
 
-def _test_assemble_tensor(local_tensors, global_shape, global_offsets, expected_output):
-    assembled_tensor = assemble_tensor(local_tensors, global_shape, global_offsets)
+def _test_assemble_tensor(local_tensors, global_offsets, expected_output):
+    assembled_tensor = assemble_tensor(local_tensors, global_offsets)
     assert torch.equal(
         assembled_tensor,
         expected_output,
@@ -75,7 +75,6 @@ async def test_1d_assemble_tensor():
             torch.tensor([2]),
             torch.tensor([3]),
         ],
-        global_shape=(4,),
         global_offsets=[(0,), (1,), (2,), (3,)],
         expected_output=torch.tensor([0, 1, 2, 3]),
     )
@@ -88,7 +87,6 @@ async def test_1d_assemble_tensor_slice():
             torch.tensor([1]),
             torch.tensor([2]),
         ],
-        global_shape=(4,),
         global_offsets=[(1,), (2,)],
         expected_output=torch.tensor([1, 2]),
     )
@@ -103,7 +101,6 @@ async def test_2d_assemble_tensor():
             torch.tensor([[3], [13]]),
             torch.tensor([[4], [14]]),
         ],
-        global_shape=(2, 5),
         global_offsets=[(0, 0), (0, 2), (0, 3), (0, 4)],
         expected_output=torch.tensor([[0, 1, 2, 3, 4], [10, 11, 12, 13, 14]]),
     )
@@ -117,7 +114,6 @@ async def test_2d_assemble_tensor_slice():
             torch.tensor([[2], [12]]),
             torch.tensor([[20, 21, 22]]),
         ],
-        global_shape=(100, 100),
         global_offsets=[(1, 1), (1, 3), (3, 1)],
         expected_output=torch.tensor([[0, 1, 2], [10, 11, 12], [20, 21, 22]]),
     )
@@ -126,7 +122,7 @@ async def test_2d_assemble_tensor_slice():
 def test_assemble_tensor_empty_list_assertion():
     """Test that assemble_tensor raises assertion error for empty local_tensors list."""
     with pytest.raises(AssertionError):
-        assemble_tensor([], (4,), [])
+        assemble_tensor([], [])
 
 
 def test_assemble_tensor_overlapping_tensors():
@@ -145,7 +141,6 @@ def test_assemble_tensor_overlapping_tensors():
             (0, 0),
             (1, 0),
         ],  # Second tensor starts at (1,0), causing overlap
-        global_shape=(10, 10),
         expected_output=torch.tensor([[1, 2], [5, 6], [7, 8]]),
     )
 
@@ -158,7 +153,6 @@ def test_assemble_tensor_with_gaps():
         torch.tensor([7, 8]),  # At positions (5, 6) - 2 elements
     ]
     global_offsets = [(0,), (5,)]  # Gap between positions 2 and 5
-    global_shape = (10,)
 
     # This should now fail the assertion because:
     # - Total local tensor elements: 2 + 2 = 4
@@ -167,7 +161,7 @@ def test_assemble_tensor_with_gaps():
     with pytest.raises(
         AssertionError, match="Local tensor sizes doesn't match target tensor"
     ):
-        assemble_tensor(local_tensors, global_shape, global_offsets)
+        assemble_tensor(local_tensors, global_offsets)
 
 
 def test_assemble_tensor_size_mismatch():
@@ -178,7 +172,6 @@ def test_assemble_tensor_size_mismatch():
         torch.tensor([[4], [5]]),  # Shape (2,1) = 2 elements
     ]
     global_offsets = [(0, 0), (1, 0)]  # No overlap
-    global_shape = (10, 10)
 
     # This should raise an assertion error because:
     # - Total local tensor elements: 3 + 2 = 5
@@ -187,7 +180,7 @@ def test_assemble_tensor_size_mismatch():
     with pytest.raises(
         AssertionError, match="Local tensor sizes doesn't match target tensor"
     ):
-        assemble_tensor(local_tensors, global_shape, global_offsets)
+        assemble_tensor(local_tensors, global_offsets)
 
 
 def test_assemble_tensor_perfect_fit():
@@ -198,12 +191,11 @@ def test_assemble_tensor_perfect_fit():
         torch.tensor([[3, 4]]),  # Shape (1,2) at (1,0)
     ]
     global_offsets = [(0, 0), (1, 0)]
-    global_shape = (10, 10)
 
     # This should work because:
     # - Total local tensor elements: 2 + 2 = 4
     # - Target tensor size: 2x2 = 4 (from offset (0,0) to (2,2))
     # - Since 4 == 4, assertion passes
-    result = assemble_tensor(local_tensors, global_shape, global_offsets)
+    result = assemble_tensor(local_tensors, global_offsets)
     expected = torch.tensor([[1, 2], [3, 4]])
     assert torch.equal(result, expected)
