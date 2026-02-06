@@ -192,6 +192,7 @@ class GlooTransportBuffer(TransportBuffer):
             )
 
         self._pg_task = asyncio.create_task(asyncio.to_thread(create_pg))
+        return True
 
     def __getstate__(self) -> dict[str, Any]:
         """Serialize state, excluding non-serializable fields."""
@@ -203,7 +204,9 @@ class GlooTransportBuffer(TransportBuffer):
         state["_recv_task"] = None
         return state
 
-    async def recv_handshake(self, transport_context: "TransportContext") -> Any | None:
+    async def recv_handshake(
+        self, ctx: "TransportContext", current_object: Any = None
+    ) -> None:
         """Called on storage volume side to set up the process group.
 
         Creates TCPStore and ProcessGroup on storage side (rank 1).
@@ -211,7 +214,7 @@ class GlooTransportBuffer(TransportBuffer):
         transport_context: the TransportContext from the StorageVolume to which the pg will be added
 
         """
-        ctx = transport_context.get_transport_context()
+        ctx = ctx.get_transport_context()
 
         logger.info(
             f"Storage volume setting up gloo process group with TCPStore at "

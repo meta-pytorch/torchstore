@@ -175,7 +175,9 @@ class TransportBuffer:
         try:
             if self.requires_handshake:
                 handshake_result = (
-                    await self.storage_volume_ref.volume.handshake.call_one(self)
+                    await self.storage_volume_ref.volume.handshake.call_one(
+                        self, key, request.meta_only()
+                    )
                 )
                 await self._post_handshake(handshake_result)
 

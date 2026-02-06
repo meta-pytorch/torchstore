@@ -51,6 +51,7 @@ def transport_params():
     # Gloo disabled by default, enable with TORCHSTORE_GLOO_ENABLED=1
     if os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.Gloo)
+        
     if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.SharedMemory)
 
