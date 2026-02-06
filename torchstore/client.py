@@ -69,6 +69,38 @@ class LocalClient:
         latency_tracker.track_e2e()
 
     @torch.no_grad
+    async def put_slice(
+        self, key: str, tensor: torch.Tensor, tensor_slice: TensorSlice
+    ):
+        """Store a tensor slice with distributed metadata.
+
+        Unlike put(), this explicitly stores the tensor as part of a distributed tensor,
+        with metadata about its position in the global tensor.
+
+        Args:
+            key: Unique identifier for the distributed tensor.
+            tensor: Local shard to store.
+            tensor_slice: Metadata describing shard's position in global tensor.
+        """
+        latency_tracker = LatencyTracker(f"put_slice:{key}")
+
+        # Create request with both tensor data and slice metadata
+        request = Request(tensor_val=tensor, tensor_slice=tensor_slice)
+
+        storage_volume_ref = self.strategy.select_storage_volume()
+        transport_buffer = create_transport_buffer(storage_volume_ref)
+        latency_tracker.track_step("create transport buffer")
+
+        await transport_buffer.put_to_storage_volume(key, request)
+        latency_tracker.track_step("put_to_storage_volume")
+
+        await self._controller.notify_put.call(
+            key, request.meta_only(), storage_volume_ref.volume_id
+        )
+        latency_tracker.track_step("notify_put")
+        latency_tracker.track_e2e()
+
+    @torch.no_grad
     async def get(
         self,
         key: str,
