@@ -223,6 +223,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
         if TRACE_TRANSFERS:
             t0 = time.perf_counter()
+
         receiving_buffer = RdmaMemory(maybe_tensor)
         res = transport.read(
             receiving_buffer.to_mutable_view(), self.rdma_remote_buffer
@@ -239,6 +240,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             )
 
         return maybe_tensor
+
     async def handle_get_request(self, ctx: "TransportContext", data) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
         if not isinstance(data, torch.Tensor):
