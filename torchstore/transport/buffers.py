@@ -149,9 +149,6 @@ class TransportBuffer:
     async def put_to_storage_volume(self, key, request: "Request"):
         l = LatencyTracker("put")
         try:
-            await self._pre_handshake(request)
-            l.track_step("_pre_handshake")
-
             if self.requires_handshake:
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(
