@@ -102,7 +102,7 @@ class LocalClient:
         latency_tracker.track_step("fetch")
 
         # TODO: remove this copy and instead assert.
-        # unfortunately, during resharding cases, we don't yet support writting inplace
+        # unfortunately, during resharding cases, we don't yet support writing inplace
         # from multiple regions into the inplace tensor, which leads to _fetch returning
         # a new tensor.
         if (

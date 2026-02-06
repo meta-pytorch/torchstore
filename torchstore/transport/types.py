@@ -149,6 +149,11 @@ class Request:
                 )
                 request = cls.from_tensor(value._local_tensor)
             else:
+                logger.debug(
+                    f"DTensor with shape {value.shape} is distributed "
+                    f"(placements: {value.placements}, mesh size: {value.device_mesh.size()}). "
+                    "Storing as tensor slices."
+                )
                 request = cls.from_dtensor(value)
         elif isinstance(value, torch.Tensor):
             # Validate shape match if both tensor and slice are provided
