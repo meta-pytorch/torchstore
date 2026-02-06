@@ -141,8 +141,11 @@ class LocalClient:
             volume_ref = self.strategy.get_storage_volume(volume_id)
             transport_buffer = create_transport_buffer(volume_ref)
 
-            # no sharding for objects or slices.
-            if storage_info.object_type in (ObjectType.TENSOR, ObjectType.OBJECT):
+            # no sharding for objects or regular tensors.
+            if storage_info.object_type == ObjectType.OBJECT:
+                request.is_object = True
+                return await transport_buffer.get_from_storage_volume(key, request)
+            if storage_info.object_type == ObjectType.TENSOR:
                 return await transport_buffer.get_from_storage_volume(key, request)
 
             # Has tensor slices - fetch each relevant slice

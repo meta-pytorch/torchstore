@@ -29,7 +29,7 @@ def strategy_params(with_host_strategy: bool = False):
     strategies = [
         (2, ts.LocalRankStrategy),
         # (1, ts.SingletonStrategy), essentially same as ControllerStorageVolumes
-        #(1, ts.ControllerStorageVolumes),
+        # (1, ts.ControllerStorageVolumes),
     ]
 
     if with_host_strategy:

@@ -334,26 +334,19 @@ class GlooTransportBuffer(TransportBuffer):
         Starts the recv as a background task so it runs concurrently
         with the storage volume's send in handle_get_request.
         """
-        # If user provided a destination tensor, use it
-        if request.tensor_val is not None:
-            tensor = request.tensor_val
-            self.shape = request.tensor_val.shape
-            self.dtype = request.tensor_val.dtype
-        else:
-            # Need to fetch metadata to know shape/dtype for allocation
-            meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                key, request.meta_only()
-            )
-            if isinstance(meta, str) or meta is None:
-                # It's an object, not a tensor
-                self.is_object = True
-                return
-            # meta is (shape, dtype)
-            self.shape = meta[0]
-            self.dtype = meta[1]
-            tensor = torch.empty(
-                self.shape, dtype=self.dtype, device=torch.device("cpu")
-            )
+        # TODO: support in place get with receiving directly to request.tensor_val
+        # Need to fetch metadata to know shape/dtype for allocation
+        meta = await self.storage_volume_ref.volume.get_meta.call_one(
+            key, request.meta_only()
+        )
+        if isinstance(meta, str) or meta is None:
+            # It's an object, not a tensor
+            self.is_object = True
+            return
+        # meta is (shape, dtype)
+        self.shape = meta[0]
+        self.dtype = meta[1]
+        tensor = torch.empty(self.shape, dtype=self.dtype, device=torch.device("cpu"))
 
         # Start recv in background - will run concurrently with get RPC
         # The storage volume will send the tensor in handle_get_request
