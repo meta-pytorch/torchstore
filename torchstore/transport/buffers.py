@@ -66,8 +66,8 @@ class TransportBuffer:
     ------------------------
     1. Client creates TransportBuffer
     2. Client calls `put_to_storage_volume(key, request)` which:
-       a. Invokes `_pre_put_hook(request)` [CLIENT] - allocate local buffers, prepare data
-       b. Optionally performs handshake if `requires_handshake=True`
+       a. Optionally performs handshake if `requires_handshake(request)` returns True
+       b. Invokes `_pre_put_hook(request)` [CLIENT] - allocate local buffers, prepare data
        c. Serializes self and sends to StorageVolume
     3. StorageVolume receives buffer and calls `handle_put_request(...)` [STORAGE VOLUME]
        - Reads data from transport mechanism (e.g., RDMA read) into a local tensor
@@ -78,8 +78,8 @@ class TransportBuffer:
     ------------------------
     1. Client creates TransportBuffer
     2. Client calls `get_from_storage_volume(key, request)` which:
-       a. Invokes `_pre_get_hook(key, request)` [CLIENT] - allocate receive buffers
-       b. Optionally performs handshake if `requires_handshake=True`
+       a. Optionally performs handshake if `requires_handshake(request)` returns True
+       b. Invokes `_pre_get_hook(key, request)` [CLIENT] - allocate receive buffers
        c. Serializes self and sends to StorageVolume
     3. StorageVolume receives buffer and calls `handle_get_request(...)` [STORAGE VOLUME]
        - Writes stored tensor data into the transport buffer (e.g., RDMA write)
@@ -94,7 +94,7 @@ class TransportBuffer:
     - `__init__`: Initialize buffer with reference to target storage volume
     - `put_to_storage_volume`: Entry point for put operations
     - `get_from_storage_volume`: Entry point for get operations
-    - `_post_handshake`: Process handshake result (if requires_handshake=True)
+    - `_post_handshake`: Process handshake result (if requires_handshake() returns True)
     - `_pre_put_hook`: Prepare buffers before sending put request
     - `_pre_get_hook`: Prepare buffers before sending get request
     - `_handle_storage_volume_response`: Process response from storage volume
@@ -102,7 +102,7 @@ class TransportBuffer:
 
     Methods Called on STORAGE VOLUME (Remote Process)
     -------------------------------------------------
-    - `recv_handshake`: Exchange connection info (if requires_handshake=True)
+    - `recv_handshake`: Exchange connection info (if requires_handshake() returns True)
     - `handle_put_request`: Receive tensor data and return it for storage
     - `handle_get_request`: Send stored tensor data back to client
 
@@ -116,14 +116,15 @@ class TransportBuffer:
     Optionally override:
     - `_pre_put_hook`: Custom buffer allocation for puts
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
-    - `recv_handshake`: If `requires_handshake=True`
+    - `recv_handshake`: If `requires_handshake()` returns True
     - `drop`: Resource cleanup (especially important for RDMA buffers)
 
-    Properties
-    ----------
-    requires_handshake : bool
-        Property that returns True if a handshake is needed before put/get.
+    Methods
+    -------
+    requires_handshake(request) -> bool
+        Returns True if a handshake is needed before put/get.
         Override this in subclasses to implement custom handshake logic.
+        Receives the request so transports can inspect it (e.g., tensor device).
         Default is False.
 
     Args
@@ -136,11 +137,11 @@ class TransportBuffer:
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
 
-    def requires_handshake(self) -> bool:
+    def requires_handshake(self, request: "Request") -> bool:
         """Determine if a handshake is needed before the operation.
 
         Override this method for custom handshake logic (e.g., cached connections).
-        This method may have side effects (e.g., allocating resources for the handshake).
+        Receives the request so transports can inspect it (e.g., tensor device).
         Default implementation returns False.
         """
         return False
@@ -149,7 +150,7 @@ class TransportBuffer:
     async def put_to_storage_volume(self, key, request: "Request"):
         l = LatencyTracker("put")
         try:
-            if self.requires_handshake():
+            if self.requires_handshake(request):
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(
                         self, key, request.meta_only()
@@ -173,7 +174,7 @@ class TransportBuffer:
 
     async def get_from_storage_volume(self, key, request: "Request"):
         try:
-            if self.requires_handshake():
+            if self.requires_handshake(request):
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(
                         self, key, request.meta_only()

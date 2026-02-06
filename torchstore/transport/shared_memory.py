@@ -263,13 +263,15 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # Put needs a handshake, get does not
         self._needs_handshake: bool = False
 
-    def requires_handshake(self) -> bool:
+    def requires_handshake(self, request: "Request") -> bool:
         """Handshake needed for tensor PUT to get segment allocation."""
         return self._needs_handshake
 
     async def put_to_storage_volume(self, key, request: "Request"):
         """Override to capture the key for shared memory segment naming."""
         self._key = key
+        if not request.is_object:
+            self._needs_handshake = True
         await super().put_to_storage_volume(key, request)
 
     async def _pre_put_hook(self, request: "Request") -> None:
@@ -285,9 +287,6 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # Handle non-contiguous tensors
         if not self._client_tensor.is_contiguous():
             self._client_tensor = self._client_tensor.contiguous()
-
-        # Need handshake for PUT (to get existing SHM handle from storage)
-        self._needs_handshake = True
 
     async def recv_handshake(
         self, ctx: "TransportContext", current_object: Any = None

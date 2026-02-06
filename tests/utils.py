@@ -45,15 +45,15 @@ def transport_params():
     # if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
     #     enabled_transport_types.append(TransportType.MonarchRDMA)
 
-    # if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
-    #     enabled_transport_types.append(TransportType.TorchCommsRDMA)
+    if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
+        enabled_transport_types.append(TransportType.TorchCommsRDMA)
 
     # # Gloo disabled by default, enable with TORCHSTORE_GLOO_ENABLED=1
     # if os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1":
     #     enabled_transport_types.append(TransportType.Gloo)
 
-    # if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
-    #     enabled_transport_types.append(TransportType.SharedMemory)
+    if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
+        enabled_transport_types.append(TransportType.SharedMemory)
 
     return "transport_type", enabled_transport_types
 
