@@ -8,6 +8,10 @@ from enum import auto, Enum
 from typing import TYPE_CHECKING
 
 from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.cuda_ipc import (
+    cuda_ipc_available,
+    CudaIPCTransportBuffer,
+)
 from torchstore.transport.monarch_rdma import (
     monarch_rdma_transport_available,
     MonarchRDMATransportBuffer,
@@ -30,14 +34,18 @@ class TransportType(Enum):
     MonarchRPC = auto()
     MonarchRDMA = auto()
     TorchCommsRDMA = auto()
+    CudaIPC = auto()  # CUDA IPC for intra-node GPU-direct transfers
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
 
 
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
-    Prefers SharedMemory for same-host transfers, then MonarchRDMA if available,
-    otherwise falls back to MonarchRPC.
+    Priority order:
+    1. SharedMemory for same-host transfers
+    2. MonarchRDMA (if InfiniBand available)
+    3. CudaIPC (if single-node with CUDA)
+    4. MonarchRPC (fallback)
     """
     # Prefer SharedMemory for same-host transfers
     if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
@@ -46,6 +54,10 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
     # Fall back to RDMA if available
     if monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
+
+    # Check CUDA IPC for GPU-direct transfers
+    if cuda_ipc_available():
+        return TransportType.CudaIPC
 
     return TransportType.MonarchRPC
 
@@ -60,6 +72,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
         TransportType.TorchCommsRDMA: TorchCommsRdmaTransportBuffer,
+        TransportType.CudaIPC: CudaIPCTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
 
