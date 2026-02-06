@@ -200,9 +200,7 @@ async def _test_resharding(
         8, 8
     )  # 8x8 square, with ([[0...7],[8...15],[...]])
     await ts.initialize(
-        num_storage_volumes=(
-            put_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
-        ),
+        num_storage_volumes=put_world_size,
         strategy=strategy(transport_type),
     )
     with tempfile.TemporaryDirectory() as filesystem_store_dir:

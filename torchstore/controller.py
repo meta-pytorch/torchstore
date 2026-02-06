@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import auto, Enum
@@ -13,7 +14,7 @@ from monarch.actor import Actor, endpoint
 
 from torchstore.storage_utils.trie import Trie
 from torchstore.storage_volume import StorageVolume
-from torchstore.strategy import TorchStoreStrategy
+from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import Request, TensorSlice
 
 
@@ -111,6 +112,15 @@ class Controller(Actor):
     ) -> None:
         if self.is_initialized:
             raise RuntimeError("TorchStore is already initialized")
+
+        if isinstance(strategy, ControllerStorageVolumes):
+            warnings.warn(
+                "ControllerStorageVolumes is deprecated and will be removed in a future "
+                "release. It spawns a singleton storage volume on the controller, which "
+                "may become a bottleneck. Use LocalRankStrategy for better scalability.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         self.strategy = strategy
         self.storage_volumes = storage_volumes

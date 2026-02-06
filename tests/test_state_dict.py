@@ -224,9 +224,7 @@ async def test_dcp_sharding_parity(transport_type):
         # race conditions (contains non sharded elements)
         strategy = ts.LocalRankStrategy
         await ts.initialize(
-            num_storage_volumes=(
-                save_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
-            ),
+            num_storage_volumes=save_world_size,
             strategy=strategy(transport_type),
         )
         try:
