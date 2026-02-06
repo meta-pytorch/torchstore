@@ -105,6 +105,7 @@ async def test_large_tensors():
 
     # controller code
     await ts.initialize(
+        num_storage_volumes=1,
         strategy=HostStrategy(
             default_transport_type=(
                 TransportType.MonarchRDMA
