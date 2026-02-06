@@ -16,7 +16,7 @@ from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torchstore.utils import get_local_tensor, spawn_actors
 
-from .utils import DTensorActor, main, transport_plus_strategy_params
+from .utils import DTensorActor, main, transport_params, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -112,12 +112,13 @@ async def test_2d_to_1d_resharding(strategy_params, transport_type):
         )
 
 
-@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.parametrize(*transport_params())
 @pytest.mark.asyncio
-async def test_data_parallel(strategy_params, transport_type):
-    _, strategy = strategy_params
+async def test_data_parallel_replicate_only(transport_type):
+    """Test pure Replicate resharding - only meaningful for LocalRankStrategy."""
+    strategy = ts.LocalRankStrategy
 
-    # # 1d
+    # 1d: 2 ranks with full tensor each → 4 ranks with full tensor each
     put_mesh_shape = (2,)
     get_mesh_shape = (4,)
     placements = [Replicate()]
@@ -130,7 +131,14 @@ async def test_data_parallel(strategy_params, transport_type):
         transport_type=transport_type,
     )
 
-    # 2d -> 1d
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_data_parallel_with_sharding(strategy_params, transport_type):
+    """Test 2D→1D resharding with mixed Replicate/Shard placements."""
+    _, strategy = strategy_params
+
+    # 2d -> 1d with sharding
     put_mesh_shape = (2, 2)
     get_mesh_shape = (4,)
     await _test_resharding(
@@ -168,7 +176,7 @@ async def _test_resharding(
     # Rank0: dtensor._local_tensor == [0], Rank1: dtensor._local_tensor == [1], Rank2: dtensor._local_tensor == [2], ...
     self.store.put("shared_key", dtensor)
 
-    #Our "put" world starts with something like this:
+    #Our "get" world starts with something like this:
     original_Tensor = [0, 0, 0, 0], world_size=2
     dtensor = distribute_tensor(original_tensor)
     # Rank0: dtensor._local_tensor == [0,0], Rank1: dtensor._local_tensor == [0,0]

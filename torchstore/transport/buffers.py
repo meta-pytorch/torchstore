@@ -13,11 +13,13 @@ from torchstore.transport.torchcomms.cache import RdmaTransportCache
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
+    from torchstore.transport.shared_memory import SharedMemoryCache
     from torchstore.transport.types import Request
 
 
 class TransportContext:
     RDMA_TRANSPORT_CACHE = "rdma_transport_cache"
+    SHM_CACHE = "shm_cache"
 
     def __init__(self):
         self.transport_context = {}
@@ -29,6 +31,19 @@ class TransportContext:
         if self.RDMA_TRANSPORT_CACHE not in self.transport_context:
             self.transport_context[self.RDMA_TRANSPORT_CACHE] = RdmaTransportCache()
         return self.transport_context[self.RDMA_TRANSPORT_CACHE]
+
+    def get_shm_cache(self) -> "SharedMemoryCache":
+        """Get shared memory cache, lazily initializing if needed.
+
+        This cache is used by both storage (for allocation) and client (for attachment).
+
+        Note: Import is inside function to avoid cyclic import
+        """
+        from torchstore.transport.shared_memory import SharedMemoryCache
+
+        if self.SHM_CACHE not in self.transport_context:
+            self.transport_context[self.SHM_CACHE] = SharedMemoryCache()
+        return self.transport_context[self.SHM_CACHE]
 
 
 class TransportBuffer:
@@ -140,10 +155,13 @@ class TransportBuffer:
 
             if self.requires_handshake:
                 handshake_result = (
-                    await self.storage_volume_ref.volume.handshake.call_one(self)
+                    await self.storage_volume_ref.volume.handshake.call_one(
+                        self, key, request.meta_only()
+                    )
                 )
+                l.track_step("volume.handshake.call")
                 await self._post_handshake(handshake_result)
-                l.track_step("handshake")
+                l.track_step("post_handshake", request.tensor_val)
 
             await self._pre_put_hook(request)
             l.track_step("_pre_put_hook")
@@ -210,7 +228,9 @@ class TransportBuffer:
     # StorageVolume handlers -- must be implemented by concrete implementaiton
     # These methods are called by the StorageVolume on the remote side
 
-    async def recv_handshake(self, ctx: "TransportContext") -> None:
+    async def recv_handshake(
+        self, ctx: "TransportContext", current_object: Any = None
+    ) -> None:
         # called on the storage volume side
         raise NotImplementedError()
 
