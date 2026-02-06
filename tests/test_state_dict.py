@@ -26,7 +26,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 from torchstore.utils import spawn_actors
 
-from .utils import main, transport_plus_strategy_params
+from .utils import main, transport_params, transport_plus_strategy_params
 
 logger = getLogger(__name__)
 
@@ -203,9 +203,9 @@ async def test_state_dict(strategy_params, transport_type):
     _assert_equal_state_dict(state_dict, fetched_state_dict)
 
 
-@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.parametrize(*transport_params())
 @pytest.mark.asyncio
-async def test_dcp_sharding_parity(strategy_params, transport_type):
+async def test_dcp_sharding_parity(transport_type):
 
     for save_mesh_shape, get_mesh_shape in [
         ((2,), (4,)),
@@ -220,7 +220,9 @@ async def test_dcp_sharding_parity(strategy_params, transport_type):
             f"Testing -- save_mesh_shape: {save_mesh_shape} get_mesh_shape: {get_mesh_shape}"
         )
 
-        _, strategy = strategy_params
+        # put_state_dict from multiple clients to a single storage volume runs into same-key
+        # race conditions (contains non sharded elements)
+        strategy = ts.LocalRankStrategy
         await ts.initialize(
             num_storage_volumes=(
                 save_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1

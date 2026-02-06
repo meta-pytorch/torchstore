@@ -13,6 +13,7 @@ import torch
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torchstore.logging import init_logging
+from torchstore.transport import TransportType
 from torchstore.utils import spawn_actors
 
 from .utils import main, strategy_params, transport_plus_strategy_params
@@ -333,6 +334,58 @@ async def test_key_miss():
     assert err is None
 
     await ts.shutdown()
+
+
+@pytest.mark.parametrize(*strategy_params())
+@pytest.mark.asyncio
+async def test_shm_cache_reuse_on_same_key_puts(strategy_params):
+    """Test that SharedMemory transport reuses cache entries for same-key same-spec PUTs."""
+
+    class CacheReuseActor(Actor):
+        """Actor that puts same key twice and checks cache reuse."""
+
+        def __init__(self):
+            init_logging()
+            self.rank = current_rank().rank
+            os.environ["LOCAL_RANK"] = str(self.rank)
+            os.environ["HOSTNAME"] = socket.gethostname()
+
+        @endpoint
+        async def put_twice_and_check_cache(self, key: str):
+            """Put to the same key twice with same-spec tensor and return cache size."""
+            # First PUT
+            tensor1 = torch.randn(50, 50)
+            await ts.put(key, tensor1)
+
+            # Second PUT to same key with same shape/dtype
+            tensor2 = torch.randn(50, 50)
+            await ts.put(key, tensor2)
+
+            # Get the cache from the strategy's transport context
+            local_client = await ts.client()
+            shm_cache = local_client.strategy.transport_context.get_shm_cache()
+            entries_for_key = [k for k in shm_cache._entries.keys() if k[0] == key]
+            return len(entries_for_key)
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(
+        num_storage_volumes=volume_world_size,
+        strategy=strategy(TransportType.SharedMemory),
+    )
+
+    actor_mesh = await spawn_actors(
+        volume_world_size, CacheReuseActor, "cache_reuse_actor"
+    )
+
+    try:
+        # Put twice to same key, should reuse same cache entry
+        results = await actor_mesh.put_twice_and_check_cache.call("test_key")
+        for _, cache_entry_count in results:
+            assert (
+                cache_entry_count == 1
+            ), f"Expected 1 cache entry for key, got {cache_entry_count}"
+    finally:
+        await ts.shutdown()
 
 
 if __name__ == "__main__":

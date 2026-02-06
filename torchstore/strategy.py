@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from monarch.actor import current_rank
 
-from torchstore.transport import get_available_transport, TransportType
+from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
 
 if TYPE_CHECKING:
@@ -26,7 +26,13 @@ logger = logging.getLogger(__name__)
 
 
 class StorageVolumeRef:
-    __slots__ = ("volume", "volume_id", "transport_context", "default_transport_type")
+    __slots__ = (
+        "volume",
+        "volume_id",
+        "transport_context",
+        "default_transport_type",
+        "volume_hostname",
+    )
 
     def __init__(
         self,
@@ -34,12 +40,14 @@ class StorageVolumeRef:
         volume_id: str,
         transport_context: TransportContext,
         default_transport_type: TransportType,
+        volume_hostname: str | None = None,
     ):
         self.volume = volume
         self.volume_id = volume_id
         # useful for caching elements that should survive the lifetime of the client/volume
         self.transport_context = transport_context
         self.default_transport_type = default_transport_type
+        self.volume_hostname = volume_hostname
 
 
 class TorchStoreStrategy:
@@ -59,6 +67,7 @@ class TorchStoreStrategy:
 
         self.storage_volumes = None
         self.volume_id_to_coord = {}
+        self.volume_id_to_hostname = {}
         self.transport_context = TransportContext()
 
     def __str__(self) -> str:
@@ -92,15 +101,17 @@ class TorchStoreStrategy:
             storage_volumes: Actor mesh of storage volume actors.
         """
         self.storage_volumes = storage_volumes
-        self.volume_id_to_coord = {
-            val: coord for coord, val in await self.storage_volumes.get_id.call()
-        }
+        self.volume_id_to_coord = {}
+        self.volume_id_to_hostname = {}
+        for coord, (volume_id, hostname) in await self.storage_volumes.get_id.call():
+            self.volume_id_to_coord[volume_id] = coord
+            self.volume_id_to_hostname[volume_id] = hostname
 
-    def select_storage_volume(self):
+    def select_storage_volume(self) -> StorageVolumeRef:
         """Select the storage volume for the current client process.
 
         Returns:
-            tuple: (StorageVolume actor, volume_id) for this client.
+            StorageVolumeRef: Reference to the storage volume for this client.
         """
         # client_id == volume_id for this strategy
         client_id = self.get_client_id()
@@ -118,19 +129,16 @@ class TorchStoreStrategy:
             volume_id (str): The volume ID to look up.
 
         Returns:
-            StorageVolume: The storage volume actor for the given ID.
+            StorageVolumeRef: Reference to the storage volume actor.
         """
         volume_coord = self.volume_id_to_coord[volume_id]
-
-        transport_type = self.default_transport_type
-        if transport_type == TransportType.Unset:
-            transport_type = get_available_transport()
 
         return StorageVolumeRef(
             self.storage_volumes.slice(**volume_coord),
             volume_id,
             self.transport_context,
-            transport_type,
+            self.default_transport_type,
+            volume_hostname=self.volume_id_to_hostname.get(volume_id),
         )
 
 
@@ -228,12 +236,16 @@ class ControllerStorageVolumes(TorchStoreStrategy):
         """
         self.storage_volumes = storage_volumes
         self.volume_id_to_coord = {"0"}
+        # For controller storage volumes, get hostname from the single volume
+        self.volume_id_to_hostname = {}
+        volume_id, hostname = await self.storage_volumes.get_id.call_one()
+        self.volume_id_to_hostname[volume_id] = hostname
 
-    def select_storage_volume(self):
+    def select_storage_volume(self) -> StorageVolumeRef:
         """Select the storage volume for the current client process.
 
         Returns:
-            tuple: (StorageVolume actor, volume_id) for this client.
+            StorageVolumeRef: Reference to the storage volume for this client.
         """
         # client_id is hardcoded to a controller only volume
         client_id = self.get_client_id()
@@ -245,13 +257,10 @@ class ControllerStorageVolumes(TorchStoreStrategy):
         return self.get_storage_volume(client_id)
 
     def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
-        transport_type = self.default_transport_type
-        if transport_type == TransportType.Unset:
-            transport_type = get_available_transport()
-
         return StorageVolumeRef(
             self.storage_volumes,
             volume_id,
             self.transport_context,
-            transport_type,
+            self.default_transport_type,
+            volume_hostname=self.volume_id_to_hostname.get(volume_id),
         )

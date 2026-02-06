@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+import os
+import socket
 import uuid
 from logging import getLogger
 from typing import TYPE_CHECKING
@@ -12,12 +14,17 @@ from typing import TYPE_CHECKING
 import torch
 from monarch.actor import this_host
 
-from torchstore.transport import TensorSlice
-
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
 
+    from torchstore.transport import TensorSlice
+
 logger = getLogger(__name__)
+
+
+def get_local_hostname() -> str:
+    """Get the current machine's hostname."""
+    return os.environ.get("HOSTNAME", socket.gethostname())
 
 
 async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
@@ -141,8 +148,8 @@ def get_target_tensor_shape_and_offset(
 
 
 def get_slice_intersection(
-    tensor_slice: TensorSlice, dtensor_slice: TensorSlice
-) -> TensorSlice | None:
+    tensor_slice: "TensorSlice", dtensor_slice: "TensorSlice"
+) -> "TensorSlice | None":
     """
     Compute the intersection of two tensor slices for optimized fetching.
 
@@ -162,6 +169,8 @@ def get_slice_intersection(
     Raises:
         None: Returns None instead of raising when slices don't intersect
     """
+    from torchstore.transport import TensorSlice
+
     # Ensure both slices have the same global shape
     if tensor_slice.global_shape != dtensor_slice.global_shape:
         return None

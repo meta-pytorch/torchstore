@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+import socket
 from logging import getLogger
 from typing import Any
 
@@ -47,12 +49,15 @@ class StorageVolume(Actor):
         return actors
 
     @endpoint
-    async def get_id(self) -> str:
-        return self.volume_id
+    async def get_id(self) -> tuple[str, str]:
+        hostname = os.environ.get("HOSTNAME", socket.gethostname())
+        return (self.volume_id, hostname)
 
     @endpoint
-    async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
-        return await self.store.handshake(transport_buffer)
+    async def handshake(
+        self, transport_buffer: TransportBuffer, key: str, request: Request
+    ) -> Any | None:
+        return await self.store.handshake(transport_buffer, key, request)
 
     @endpoint
     async def put(
@@ -111,7 +116,9 @@ class StorageImpl:
         """Delete data from the storage backend."""
         raise NotImplementedError()
 
-    async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
+    async def handshake(
+        self, transport_buffer: TransportBuffer, key: str, request: "Request"
+    ) -> Any | None:
         raise NotImplementedError()
 
 
@@ -122,8 +129,13 @@ class InMemoryStore(StorageImpl):
         self.kv: dict[str, Any] = {}
         super().__init__()
 
-    async def handshake(self, transport_buffer: TransportBuffer) -> Any | None:
-        return await transport_buffer.recv_handshake(self.transport_context)
+    async def handshake(
+        self, transport_buffer: TransportBuffer, key: str, request: "Request"
+    ) -> Any | None:
+        current_object = self._extract_existing(key, request)
+        return await transport_buffer.recv_handshake(
+            self.transport_context, current_object
+        )
 
     def _extract_existing(self, key: str, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
