@@ -49,16 +49,7 @@ def gloo_available() -> bool:
     3. gloo backend is available
 
     """
-    if not TORCHSTORE_GLOO_ENABLED:
-        return False
-
-    if not dist.is_available():
-        return False
-
-    if not dist.is_gloo_available():
-        return False
-
-    return True
+    return TORCHSTORE_GLOO_ENABLED and dist.is_available() and dist.is_gloo_available()
 
 
 def _get_hostname() -> str:
@@ -139,7 +130,6 @@ class GlooTransportBuffer(TransportBuffer):
             None  # Background task for receiving tensor
         )
 
-    @property
     def requires_handshake(self) -> bool:
         """Prepare for handshake. Create TCPStore and start PG creation on
         client side (rank 0).

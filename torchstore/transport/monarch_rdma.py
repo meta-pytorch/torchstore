@@ -45,9 +45,6 @@ def monarch_rdma_transport_available() -> bool:
 
 
 class MonarchRDMATransportBuffer(TransportBuffer):
-
-    requires_handshake: bool = False
-
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
 
