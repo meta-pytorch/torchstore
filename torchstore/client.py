@@ -93,7 +93,11 @@ class LocalClient:
         # that gets corrupted when multiple concurrent operations share the same instance.
         async def put_single(key: str, value: torch.Tensor | Any):
             transport_buffer = create_transport_buffer(storage_volume_ref)
-            request = Request.from_any(value)
+            # Create request based on value type (same logic as put method)
+            if isinstance(value, (torch.Tensor, DTensor)):
+                request = Request.from_any(value)
+            else:
+                request = Request.from_objects(value)
             await transport_buffer.put_to_storage_volume(key, request)
             return key, request
 
