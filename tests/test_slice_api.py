@@ -110,18 +110,23 @@ class TestSliceAPI:
             result = await ts.get_slice("test_fsdp_shards", tp_slice)
 
             # Verify shape
-            assert result.shape == (512, 256), f"Expected (512, 256), got {result.shape}"
+            assert result.shape == (
+                512,
+                256,
+            ), f"Expected (512, 256), got {result.shape}"
 
             # Verify data integrity
             # Top half should come from shard_0[:, :256]
             expected_top = shard_0[:, :256]
-            assert torch.allclose(result[:256], expected_top, atol=1e-5), \
-                "Top half data mismatch"
+            assert torch.allclose(
+                result[:256], expected_top, atol=1e-5
+            ), "Top half data mismatch"
 
             # Bottom half should come from shard_1[:, :256]
             expected_bottom = shard_1[:, :256]
-            assert torch.allclose(result[256:], expected_bottom, atol=1e-5), \
-                "Bottom half data mismatch"
+            assert torch.allclose(
+                result[256:], expected_bottom, atol=1e-5
+            ), "Bottom half data mismatch"
 
             # Clean up
             await ts.delete("test_fsdp_shards")
@@ -184,8 +189,9 @@ class TestSliceAPI:
             # Fetch to GPU
             result = await ts.get_slice("test_gpu", slice_spec, target_device="cuda:0")
 
-            assert result.device == torch.device("cuda:0"), \
-                f"Expected cuda:0, got {result.device}"
+            assert result.device == torch.device(
+                "cuda:0"
+            ), f"Expected cuda:0, got {result.device}"
             assert result.shape == (128, 256)
 
             # Verify data (compare on CPU)
@@ -252,8 +258,8 @@ class TestTPSliceComputation:
 
     def test_fsdp_to_tp_intersection(self):
         """Test intersection of FSDP (row) shard with TP (column) slice."""
-        from torchstore.utils import get_slice_intersection
         from torchstore.transport.types import TensorSlice
+        from torchstore.utils import get_slice_intersection
 
         global_shape = (1000, 1000)
 
@@ -279,8 +285,10 @@ class TestTPSliceComputation:
         intersection = get_slice_intersection(fsdp_shard, tp_slice)
 
         assert intersection is not None
-        assert intersection.local_shape == (500, 500), \
-            f"Expected (500, 500), got {intersection.local_shape}"
+        assert intersection.local_shape == (
+            500,
+            500,
+        ), f"Expected (500, 500), got {intersection.local_shape}"
         assert intersection.offsets == (0, 0)
 
 

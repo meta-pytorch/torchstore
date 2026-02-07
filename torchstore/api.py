@@ -342,8 +342,6 @@ async def put_slice(
         ... )
         >>> await put_slice("layer.weight", local_shard, slice_0)
     """
-    from torchstore.transport.types import Request
-
     cl = await client(store_name)
     await cl.put_slice(key, tensor, tensor_slice)
 
