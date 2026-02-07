@@ -8,7 +8,7 @@
 Test the new put_slice() and get_slice() APIs for GPU-direct weight sync.
 
 Run with:
-    cd /home/dev/framework/torchstore
+    cd ./torchstore
     TORCHSTORE_LOG_LEVEL=DEBUG pytest -vs tests/test_slice_api.py
 """
 
