@@ -49,7 +49,7 @@ def gloo_available() -> bool:
     3. gloo backend is available
 
     """
-    return TORCHSTORE_GLOO_ENABLED and dist.is_available() and dist.is_gloo_available()
+    return TORCHSTORE_GLOO_ENABLED and dist.is_gloo_available()
 
 
 def _get_hostname() -> str:

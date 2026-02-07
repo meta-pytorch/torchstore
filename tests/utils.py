@@ -29,7 +29,7 @@ def strategy_params(with_host_strategy: bool = False):
     strategies = [
         (2, ts.LocalRankStrategy),
         # (1, ts.SingletonStrategy), essentially same as ControllerStorageVolumes
-        # (1, ts.ControllerStorageVolumes),
+        (1, ts.ControllerStorageVolumes),
     ]
 
     if with_host_strategy:
@@ -40,20 +40,19 @@ def strategy_params(with_host_strategy: bool = False):
 
 def transport_params():
     """Return transport types for parameterization without strategy."""
-    enabled_transport_types = [TransportType.Gloo]
+    enabled_transport_types = [TransportType.MonarchRPC]
 
-    # if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
-    #     enabled_transport_types.append(TransportType.MonarchRDMA)
+    if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
+        enabled_transport_types.append(TransportType.MonarchRDMA)
 
-    # if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
-    #     enabled_transport_types.append(TransportType.TorchCommsRDMA)
+    if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
+        enabled_transport_types.append(TransportType.TorchCommsRDMA)
 
-    # # Gloo disabled by default, enable with TORCHSTORE_GLOO_ENABLED=1
-    # if os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1":
-    #     enabled_transport_types.append(TransportType.Gloo)
+    if os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1":
+        enabled_transport_types.append(TransportType.Gloo)
 
-    # if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
-    #     enabled_transport_types.append(TransportType.SharedMemory)
+    if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
+        enabled_transport_types.append(TransportType.SharedMemory)
 
     return "transport_type", enabled_transport_types
 

@@ -142,6 +142,11 @@ class Request:
             # placement which is not actually replicated along device-mesh
             # todo: Revisit this if this is fixed in torchtitan
             if _is_dtensor_fully_local(value):
+                logger.debug(
+                    f"DTensor with shape {value.shape} is fully local "
+                    f"(placements: {value.placements}, mesh size: {value.device_mesh.size()}). "
+                    "Treating as regular tensor for storage."
+                )
                 request = cls.from_tensor(value._local_tensor)
             else:
                 request = cls.from_dtensor(value)
