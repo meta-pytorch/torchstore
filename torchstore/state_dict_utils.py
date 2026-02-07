@@ -35,8 +35,10 @@ async def put_state_dict(store, state_dict, key):
 
     # Automatically batch all tensor/parameter puts for efficiency
     # This parallelizes storage and uses a single RPC to notify the controller
-    items = {f"{key}{DELIM}{flattened_key}": value
-             for flattened_key, value in flattened_state_dict.items()}
+    items = {
+        f"{key}{DELIM}{flattened_key}": value
+        for flattened_key, value in flattened_state_dict.items()
+    }
     await store._put_batch(items)
 
     # Store mapping last to indicate completion
