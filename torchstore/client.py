@@ -69,6 +69,49 @@ class LocalClient:
         latency_tracker.track_e2e()
 
     @torch.no_grad
+    async def _put_batch(self, items: dict[str, torch.Tensor | Any]) -> None:
+        """Internal method to store multiple tensors or objects in a single batched call.
+
+        This is significantly more efficient than calling put() multiple times as it
+        parallelizes storage operations and batches controller notifications.
+
+        Args:
+            items: Dictionary mapping keys to values to store.
+        """
+        if not items:
+            return
+
+        latency_tracker = LatencyTracker(f"put_batch:{len(items)}_keys")
+
+        # Select storage volume (all items go to same volume)
+        storage_volume_ref = self.strategy.select_storage_volume()
+        latency_tracker.track_step("select storage volume")
+
+        # Put all items in parallel using asyncio.gather
+        # NOTE: Each operation needs its own transport buffer to avoid race conditions.
+        # Transport buffers maintain internal state (ipc_handle, tensor_ref, shape, dtype, etc.)
+        # that gets corrupted when multiple concurrent operations share the same instance.
+        async def put_single(key: str, value: torch.Tensor | Any):
+            transport_buffer = create_transport_buffer(storage_volume_ref)
+            request = Request.from_any(value)
+            await transport_buffer.put_to_storage_volume(key, request)
+            return key, request
+
+        put_results = await asyncio.gather(
+            *[put_single(key, value) for key, value in items.items()]
+        )
+        latency_tracker.track_step("put_to_storage_volume_batch")
+
+        # Notify controller with a single batched RPC call (not individual calls)
+        notifications = [
+            (key, request.meta_only(), storage_volume_ref.volume_id)
+            for key, request in put_results
+        ]
+        await self._controller.notify_put_batch.call(notifications)
+        latency_tracker.track_step("notify_put_batch")
+        latency_tracker.track_e2e()
+
+    @torch.no_grad
     async def get(
         self,
         key: str,
