@@ -8,10 +8,7 @@ from enum import auto, Enum
 from typing import TYPE_CHECKING
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.cuda_ipc import (
-    cuda_ipc_available,
-    CudaIPCTransportBuffer,
-)
+from torchstore.transport.cuda_ipc import cuda_ipc_available, CudaIPCTransportBuffer
 from torchstore.transport.monarch_rdma import (
     monarch_rdma_transport_available,
     MonarchRDMATransportBuffer,

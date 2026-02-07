@@ -24,6 +24,8 @@ Performance characteristics:
 import logging
 import os
 import time
+import uuid
+import weakref
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -100,24 +102,35 @@ class CudaIPCHandle:
 
     def reconstruct_tensor(self) -> torch.Tensor:
         """Reconstruct the tensor on the receiving process using CUDA IPC."""
-        # Use PyTorch's official rebuild function
-        return rebuild_cuda_tensor(
-            torch.Tensor,  # tensor_cls
-            self.tensor_size,
-            self.tensor_stride,
-            self.tensor_offset,
-            torch.storage.TypedStorage,  # storage_cls
-            self.dtype,
-            self.storage_device,
-            self.storage_handle,
-            self.storage_size_bytes,
-            self.storage_offset_bytes,
-            self.requires_grad,
-            self.ref_counter_handle,
-            self.ref_counter_offset,
-            self.event_handle,
-            self.event_sync_required,
-        )
+        try:
+            # Use PyTorch's official rebuild function
+            return rebuild_cuda_tensor(
+                torch.Tensor,  # tensor_cls
+                self.tensor_size,
+                self.tensor_stride,
+                self.tensor_offset,
+                torch.storage.TypedStorage,  # storage_cls
+                self.dtype,
+                self.storage_device,
+                self.storage_handle,
+                self.storage_size_bytes,
+                self.storage_offset_bytes,
+                self.requires_grad,
+                self.ref_counter_handle,
+                self.ref_counter_offset,
+                self.event_handle,
+                self.event_sync_required,
+            )
+        except Exception as e:
+            # Log the error with context for debugging
+            _trace_logger.error(
+                f"Failed to reconstruct CUDA IPC tensor: {e}. "
+                f"Handle details - device: {self.storage_device}, "
+                f"size: {self.tensor_size}, dtype: {self.dtype}"
+            )
+            # Clean up any partial resources - the underlying CUDA handles
+            # will be cleaned up by PyTorch's garbage collection
+            raise RuntimeError(f"CUDA IPC tensor reconstruction failed: {e}") from e
 
 
 def create_ipc_handle(tensor: torch.Tensor) -> CudaIPCHandle:
@@ -173,6 +186,10 @@ class CudaIPCTransportBuffer(TransportBuffer):
 
     requires_handshake: bool = False
 
+    # Class-level registry to prevent tensor deallocation during IPC transfers
+    _active_tensors: dict[str, torch.Tensor] = {}
+    _tensor_refs: dict[str, weakref.ReferenceType] = {}
+
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
 
@@ -190,8 +207,49 @@ class CudaIPCTransportBuffer(TransportBuffer):
         # Keep reference to source tensor to prevent premature deallocation
         self._source_tensor: torch.Tensor | None = None
 
+        # Unique ID for tracking tensor lifetime in the registry
+        self._tensor_id: str | None = None
+
         # Request stored for get operations
         self.request: Any = None
+
+    def _register_tensor(self, tensor: torch.Tensor) -> str:
+        """Register tensor in class registry to prevent deallocation during IPC transfer."""
+        tensor_id = str(uuid.uuid4())
+
+        # Store strong reference to prevent deallocation
+        self._active_tensors[tensor_id] = tensor
+
+        # Also store weak reference for cleanup detection
+        def cleanup_callback(ref):
+            self._active_tensors.pop(tensor_id, None)
+            self._tensor_refs.pop(tensor_id, None)
+            if TRACE_TRANSFERS:
+                _trace_logger.debug(
+                    f"[CUDA_IPC] Cleaned up tensor registry entry {tensor_id}"
+                )
+
+        self._tensor_refs[tensor_id] = weakref.ref(tensor, cleanup_callback)
+
+        if TRACE_TRANSFERS:
+            _trace_logger.debug(
+                f"[CUDA_IPC] Registered tensor {tensor_id} in lifetime registry"
+            )
+
+        return tensor_id
+
+    def _unregister_tensor(self, tensor_id: str | None) -> None:
+        """Unregister tensor from class registry after IPC transfer complete."""
+        if tensor_id is None:
+            return
+
+        self._active_tensors.pop(tensor_id, None)
+        self._tensor_refs.pop(tensor_id, None)
+
+        if TRACE_TRANSFERS:
+            _trace_logger.debug(
+                f"[CUDA_IPC] Unregistered tensor {tensor_id} from lifetime registry"
+            )
 
     async def _pre_put_hook(self, request: "Request") -> None:
         """Prepare IPC handle before sending put request (client-side)."""
@@ -201,7 +259,8 @@ class CudaIPCTransportBuffer(TransportBuffer):
             return
 
         tensor = request.tensor_val
-        assert tensor is not None
+        if tensor is None:
+            raise ValueError("tensor_val must not be None for non-object requests")
 
         if TRACE_TRANSFERS:
             _trace_logger.info(
@@ -214,13 +273,14 @@ class CudaIPCTransportBuffer(TransportBuffer):
         if not tensor.is_cuda:
             tensor = tensor.cuda()
             if TRACE_TRANSFERS:
-                _trace_logger.info(f"[CUDA_IPC _pre_put_hook] Moved tensor to GPU")
+                _trace_logger.info("[CUDA_IPC _pre_put_hook] Moved tensor to GPU")
 
         # Make contiguous if needed
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
 
-        # Keep reference to prevent deallocation
+        # Register tensor to prevent deallocation during IPC transfer
+        self._tensor_id = self._register_tensor(tensor)
         self._source_tensor = tensor
 
         # Create IPC handle
@@ -304,7 +364,8 @@ class CudaIPCTransportBuffer(TransportBuffer):
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
 
-        # Keep reference and create handle
+        # Register tensor to prevent deallocation during IPC transfer
+        self._tensor_id = self._register_tensor(tensor)
         self._source_tensor = tensor
         self.ipc_handle = create_ipc_handle(tensor)
         self.shape = tensor.shape
@@ -341,7 +402,11 @@ class CudaIPCTransportBuffer(TransportBuffer):
 
     async def drop(self) -> None:
         """Clean up resources."""
+        # Unregister tensor from lifetime management
+        self._unregister_tensor(self._tensor_id)
+
         self.ipc_handle = None
         self._source_tensor = None
+        self._tensor_id = None
         self.objects = None
         self.request = None
