@@ -263,7 +263,6 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # Put needs a handshake, get does not
         self._needs_handshake: bool = False
 
-    @property
     def requires_handshake(self) -> bool:
         """Handshake needed for tensor PUT to get segment allocation."""
         return self._needs_handshake

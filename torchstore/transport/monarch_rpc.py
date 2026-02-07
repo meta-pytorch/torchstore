@@ -31,8 +31,6 @@ class MonarchRPCTransportBuffer(TransportBuffer):
     automatically serialized when the buffer is sent via RPC.
     """
 
-    requires_handshake: bool = False
-
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
         self.data: Any = None  # Carries data for both PUT and GET

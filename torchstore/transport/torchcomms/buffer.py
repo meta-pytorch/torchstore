@@ -66,7 +66,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             self.storage_volume_ref.volume_id, device
         )
 
-    @property
     def requires_handshake(self) -> bool:
         """Only handshake if RDMA was set up and connection is not already cached."""
         if self.address is None:

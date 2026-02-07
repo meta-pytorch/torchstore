@@ -8,6 +8,7 @@ from enum import auto, Enum
 from typing import TYPE_CHECKING
 
 from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.gloo import gloo_available, GlooTransportBuffer
 from torchstore.transport.monarch_rdma import (
     monarch_rdma_transport_available,
     MonarchRDMATransportBuffer,
@@ -19,6 +20,7 @@ from torchstore.transport.shared_memory import (
     SHM_ENABLED,
 )
 from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
+from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
 from torchstore.transport.types import Request, TensorSlice
 
 if TYPE_CHECKING:
@@ -30,6 +32,7 @@ class TransportType(Enum):
     MonarchRPC = auto()
     MonarchRDMA = auto()
     TorchCommsRDMA = auto()
+    Gloo = auto()
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
 
 
@@ -46,6 +49,10 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
     # Fall back to RDMA if available
     if monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
+    elif torchcomms_rdma_available():
+        return TransportType.TorchCommsRDMA
+    elif gloo_available():
+        return TransportType.Gloo
 
     return TransportType.MonarchRPC
 
@@ -60,6 +67,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
         TransportType.TorchCommsRDMA: TorchCommsRdmaTransportBuffer,
+        TransportType.Gloo: GlooTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
 
