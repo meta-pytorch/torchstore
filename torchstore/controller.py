@@ -210,6 +210,37 @@ class Controller(Actor):
             self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
 
     @endpoint
+    async def notify_put_batch(
+        self, notifications: list[tuple[str, Request, str]]
+    ) -> None:
+        """Notify the controller about multiple stored items in a single RPC call.
+
+        This is used internally by put_state_dict to efficiently batch notifications
+        when storing multiple tensors, reducing RPC overhead.
+
+        Args:
+            notifications: List of (key, request, storage_volume_id) tuples.
+        """
+        self.assert_initialized()
+        for key, request, storage_volume_id in notifications:
+            assert (
+                request.tensor_val is None
+            ), "request should not contain tensor data"
+
+            if key not in self.keys_to_storage_volumes:
+                self.keys_to_storage_volumes[key] = {}
+
+            storage_info = StorageInfo(
+                object_type=ObjectType.from_request(request),
+                tensor_slices={request.tensor_slice},
+            )
+
+            if storage_volume_id not in self.keys_to_storage_volumes[key]:
+                self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
+            else:
+                self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
+
+    @endpoint
     async def teardown(self) -> None:
         self.is_initialized = False
         self.keys_to_storage_volumes = Trie()
