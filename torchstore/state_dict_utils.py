@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 from logging import getLogger
 
 import torch
@@ -19,19 +20,26 @@ logger = getLogger(__name__)
 
 
 async def put_state_dict(store, state_dict, key):
-    """
-    We have an option here. Either we can "flatten state dict", by turning state dict names into a single key,
-    or I can actually just maintain the dictionary representation of the state dict, and we can allow some
-    recursive behavior in the store.
+    """Store a PyTorch state_dict using automatic batching for efficiency.
 
-    Overall, this might not even be something we want to solve for in the TorchStore, but I'm adding this
-    utility so we can test sharding models.
+    This function automatically batches all tensor storage operations into a single
+    RPC call to minimize overhead, making it significantly faster than individual
+    put() calls for each parameter.
 
+    Args:
+        store: TorchStore client instance
+        state_dict: PyTorch model state_dict to store
+        key: Unique identifier for this state_dict
     """
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
-    for flattened_key, value in flattened_state_dict.items():
-        await store.put(f"{key}{DELIM}{flattened_key}", value)
 
+    # Automatically batch all tensor/parameter puts for efficiency
+    # This parallelizes storage and uses a single RPC to notify the controller
+    items = {f"{key}{DELIM}{flattened_key}": value
+             for flattened_key, value in flattened_state_dict.items()}
+    await store._put_batch(items)
+
+    # Store mapping last to indicate completion
     await store.put(f"{key}{DELIM}{MAPPING}", mapping)
 
 
@@ -54,30 +62,22 @@ async def get_state_dict(store, key, user_state_dict: dict | None = None, strict
     if strict and user_mapping is not None:
         assert user_mapping == fetched_mapping
 
-    fetched_state_dict = {}
+    # Fetch all tensors in parallel for efficiency
+    coros = []
+    keys = []
     for flattened_key in fetched_mapping.keys():
         inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
-        fetched_state_dict[flattened_key] = await store.get(
-            f"{key}{DELIM}{flattened_key}",
-            inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
+        keys.append(flattened_key)
+        coros.append(
+            store.get(
+                f"{key}{DELIM}{flattened_key}",
+                inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
+            )
         )
-
-    # # Prepare all the coroutines first
-    # coros = []
-    # keys = []
-    # for flattened_key in fetched_mapping.keys():
-    #     inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
-    #     keys.append(flattened_key)
-    #     coros.append(
-    #         store.get(
-    #             f"{key}{DELIM}{flattened_key}",
-    #             inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
-    #         )
-    #     )
-    # # Run all requests concurrently
-    # results = await asyncio.gather(*coros)
-    # # Build the result dictionary
-    # fetched_state_dict = dict(zip(keys, results))
+    # Run all requests concurrently
+    results = await asyncio.gather(*coros)
+    # Build the result dictionary
+    fetched_state_dict = dict(zip(keys, results))
 
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
 
