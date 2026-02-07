@@ -66,19 +66,25 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             self.storage_volume_ref.volume_id, device
         )
 
-    def requires_handshake(self) -> bool:
-        """Only handshake if RDMA was set up and connection is not already cached."""
-        if self.address is None:
+    def requires_handshake(self, request: "Request") -> bool:
+        """Setup transport with correct device and check if handshake is needed."""
+        if request.is_object:
             return False
+        tensor = (
+            request.tensor_val if isinstance(request.tensor_val, torch.Tensor) else None
+        )
+        self._setup_local_transport(tensor)
         return not self._connection_exists
 
     async def _post_handshake(self, handshake_result: Any) -> None:
         """Connect local transport to peer after handshake."""
         self._local_transport.connect(handshake_result)
 
-    async def recv_handshake(self, transport_context: "TransportContext") -> Any | None:
+    async def recv_handshake(
+        self, ctx: "TransportContext", current_object: Any = None
+    ) -> Any | None:
         """Confirm a handshake initiated by the local client (storage volume side)."""
-        transport_cache = transport_context.get_rdma_transport_cache()
+        transport_cache = ctx.get_rdma_transport_cache()
         transport, addr = transport_cache.put(self.address, device=0)
         transport.connect(self.address)
         return addr
@@ -105,7 +111,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         assert request.tensor_val is not None
 
         tensor = request.tensor_val
-        self._setup_local_transport(tensor)
 
         # allocate_source logic
         self.shape = tensor.shape
@@ -127,11 +132,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                 meta = (request.tensor_slice.local_shape, *meta[1:])
 
             tensor_like = meta  # (shape, dtype) tuple
-
-        # Setup local transport - use tensor device if available, else use default
-        self._setup_local_transport(
-            tensor_like if isinstance(tensor_like, torch.Tensor) else None
-        )
 
         # allocate_dest logic
         if isinstance(tensor_like, tuple):

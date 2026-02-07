@@ -306,9 +306,6 @@ class TestSharedMemoryTransportBufferPUT:
 
         # Verify tensor is stored locally
         assert torch.equal(buffer._client_tensor, tensor)
-        # Verify handshake is required
-        assert buffer._needs_handshake is True
-        assert buffer.requires_handshake is True
         # Verify objects is NOT set
         assert buffer.objects is None
         assert buffer.is_object is False
