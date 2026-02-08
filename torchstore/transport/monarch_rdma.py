@@ -203,7 +203,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             if MONARCH_RDMA_EAGER_D2H:
                 tensor = tensor_like.cpu()
             # note: .contiguous will return a copy if this tensor is not contiguous
-            # that usually shows up during resharding cases
+            # this usually shows up during resharding cases
             tensor = tensor_like.contiguous()
 
         self.tensor = tensor
