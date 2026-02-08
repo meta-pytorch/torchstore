@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
 
 # For some reason, monarch sometimes doesn't like gpu tensors, so we convert to cpu. We noticed this in larger
-# models, like qwen32B
+# models, like qwen3-30BA3B
 MONARCH_RDMA_EAGER_D2H = os.environ.get("TORCHSTORE_MONARCH_RDMA_EAGER_D2H", "0") == "1"
 
 
@@ -76,7 +76,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         self.allocate(request.tensor_val)
 
     async def _pre_get_hook(self, key, request: Request) -> None:
-        """Hook to perform any pre-put operations on the buffer."""
+        """Hook to perform any pre-get operations on the buffer."""
 
         # keep request for later
         self.request = request
@@ -144,8 +144,9 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         if transport_buffer.is_object:
             return transport_buffer.objects
 
-        # if we had to call .contiguous on the tensor during alloc, this assertion is
-        # vioalted since .contiguous is a copy
+        # If user provided an inplace tensor but we had to make a contiguous copy
+        # during allocate(), the RDMA data landed in self.tensor (the copy), not
+        # in the user's original tensor. We need to copy the data back.
         if self.request.tensor_val is not None:
             if self.request.tensor_val.data_ptr() != self.tensor.data_ptr():
                 self.request.tensor_val.copy_(self.tensor)
@@ -195,14 +196,14 @@ class MonarchRDMATransportBuffer(TransportBuffer):
                 tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
             )
         else:
-            # note: .contiguous will return a copy if this tensor is not contiguous
-            # that usually shows up during resharding cases
             assert isinstance(tensor_like, torch.Tensor)
 
             # monarch sometimes really doesn't like gpu tensors, so we convert to cpu
             # this makes things way slower, and hopefully will be fixed in the future
             if MONARCH_RDMA_EAGER_D2H:
                 tensor = tensor_like.cpu()
+            # note: .contiguous will return a copy if this tensor is not contiguous
+            # that usually shows up during resharding cases
             tensor = tensor_like.contiguous()
 
         self.tensor = tensor
