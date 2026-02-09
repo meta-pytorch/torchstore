@@ -235,7 +235,7 @@ async def test_state_dict(strategy_params, transport_type):
 @pytest.mark.parametrize(*transport_params())
 @pytest.mark.asyncio
 async def test_dcp_sharding_parity(transport_type):
-    
+
     for save_mesh_shape, get_mesh_shape in [
         ((2,), (4,)),
         ((4,), (2,)),
