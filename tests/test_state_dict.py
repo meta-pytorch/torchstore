@@ -190,9 +190,9 @@ class DCPParityTest(Actor):
         return dcp_state_dict, torchstore_state_dict
 
 
-@pytest.mark.parametrize(*transport_params())
+@pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_dcp_sharding_parity(transport_type):
+async def test_state_dict(strategy_params, transport_type):
     class Trainer(Actor):
         # Monarch RDMA does not work outside of an actor, so we need
         # to wrap this test first
@@ -232,9 +232,9 @@ async def test_dcp_sharding_parity(transport_type):
     _assert_equal_state_dict(state_dict, fetched_state_dict)
 
 
-@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.parametrize(*transport_params())
 @pytest.mark.asyncio
-async def test_state_dict(strategy_params, transport_type):
+async def test_dcp_sharding_parity(transport_type):
     for save_mesh_shape, get_mesh_shape in [
         ((2,), (4,)),
         ((4,), (2,)),
