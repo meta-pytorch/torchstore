@@ -119,7 +119,6 @@ class Request:
         is_object (bool): Flag indicating whether this request contains a non-tensor object.
         is_tssd (bool): Flag indicating whether this request contains a TorchStoreStateDict object.
     """
-
     tensor_val: torch.Tensor | None = None
     tensor_slice: TensorSlice | None = None
     objects: Any | None = None
@@ -150,6 +149,8 @@ class Request:
             ValueError: If tensor_slice.local_shape doesn't match value.shape for tensors.
             TypeError: If value is not a Tensor, DTensor, or None.
         """
+        from torchstore.state_dict_utils import TorchStoreStateDict
+
         if isinstance(value, DTensor):
             if tensor_slice is not None:
                 raise ValueError(
