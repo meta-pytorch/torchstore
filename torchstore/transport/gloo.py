@@ -12,7 +12,6 @@ from logging import getLogger
 from typing import Any, TYPE_CHECKING
 
 import portpicker
-
 import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
 
@@ -29,9 +28,9 @@ import torch.distributed as dist
 logger = getLogger(__name__)
 
 # Global cache
-_store_addrs: dict[
-    str, tuple[str, int]
-] = {}  # volume_id -> (master_addr, master_port, store_key)
+_store_addrs: dict[str, tuple[str, int]] = (
+    {}
+)  # volume_id -> (master_addr, master_port, store_key)
 
 
 TORCHSTORE_GLOO_ENABLED = os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1"
@@ -130,7 +129,7 @@ class GlooTransportBuffer(TransportBuffer):
             None  # Background task for receiving tensor
         )
 
-    def requires_handshake(self) -> bool:
+    def requires_handshake(self, request: "Request") -> bool:
         """Determine if a handshake is needed.
 
         Returns False if a cached connection already exists for this volume,

@@ -295,27 +295,26 @@ class TestSharedMemoryTransportBufferPUT:
 
     @pytest.mark.asyncio
     async def test_pre_put_hook_tensor(self):
-        """Test _pre_put_hook stores tensor locally and sets handshake flag."""
+        """Test _setup_put_hook stores tensor locally and sets handshake flag."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
 
         tensor = torch.randn(50, 50)
         request = MockRequest(tensor_val=tensor)
-
-        await buffer._pre_put_hook(request)
+        buffer._setup_put_hook("test_key", request)
 
         # Verify tensor is stored locally
         assert torch.equal(buffer._client_tensor, tensor)
         # Verify handshake is required
         assert buffer._needs_handshake is True
-        assert buffer.requires_handshake is True
+        assert buffer.requires_handshake(request) is True
         # Verify objects is NOT set
         assert buffer.objects is None
         assert buffer.is_object is False
 
     @pytest.mark.asyncio
     async def test_pre_put_hook_makes_contiguous(self):
-        """Test _pre_put_hook handles non-contiguous tensor."""
+        """Test _setup_put_hook handles non-contiguous tensor."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
 
@@ -324,7 +323,7 @@ class TestSharedMemoryTransportBufferPUT:
         assert not tensor.is_contiguous()
 
         request = MockRequest(tensor_val=tensor)
-        await buffer._pre_put_hook(request)
+        buffer._setup_put_hook("test_key", request)
 
         assert buffer._client_tensor is not None
         assert buffer._client_tensor.is_contiguous()
@@ -332,14 +331,13 @@ class TestSharedMemoryTransportBufferPUT:
 
     @pytest.mark.asyncio
     async def test_pre_put_hook_object(self):
-        """Test _pre_put_hook handles objects correctly."""
+        """Test _setup_put_hook handles objects correctly."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
 
         obj = {"key": "value", "list": [1, 2, 3]}
         request = MockRequest(objects=obj, is_object=True)
-
-        await buffer._pre_put_hook(request)
+        buffer._setup_put_hook("test_key", request)
 
         assert buffer.is_object is True
         assert buffer.objects == obj
@@ -636,14 +634,13 @@ class TestSharedMemoryTransportBufferGPU:
 
     @pytest.mark.asyncio
     async def test_pre_put_hook_gpu_tensor(self):
-        """Test _pre_put_hook keeps GPU tensor reference."""
+        """Test _setup_put_hook keeps GPU tensor reference."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
 
         tensor = torch.randn(50, 50, device="cuda")
         request = MockRequest(tensor_val=tensor)
-
-        await buffer._pre_put_hook(request)
+        buffer._setup_put_hook("test_key", request)
 
         assert buffer._client_tensor is not None
         assert buffer._client_tensor.device.type == "cuda"
