@@ -119,6 +119,7 @@ class Request:
         is_object (bool): Flag indicating whether this request contains a non-tensor object.
         is_tssd (bool): Flag indicating whether this request contains a TorchStoreStateDict object.
     """
+
     tensor_val: torch.Tensor | None = None
     tensor_slice: TensorSlice | None = None
     objects: Any | None = None

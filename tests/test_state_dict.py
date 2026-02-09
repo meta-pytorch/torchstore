@@ -190,9 +190,9 @@ class DCPParityTest(Actor):
         return dcp_state_dict, torchstore_state_dict
 
 
-@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.parametrize(*transport_params())
 @pytest.mark.asyncio
-async def test_state_dict(strategy_params, transport_type):
+async def test_dcp_sharding_parity(transport_type):
     class Trainer(Actor):
         # Monarch RDMA does not work outside of an actor, so we need
         # to wrap this test first

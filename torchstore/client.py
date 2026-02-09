@@ -13,11 +13,11 @@ from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
+from torchstore.state_dict_utils import TorchStoreStateDict
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.transport.buffers import TransportContext
 from torchstore.utils import assemble_tensor, get_slice_intersection
-from torchstore.state_dict_utils import TorchStoreStateDict
 
 logger = getLogger(__name__)
 
