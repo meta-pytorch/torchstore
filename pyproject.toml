@@ -22,6 +22,7 @@ classifiers = [
 dependencies = [
     "pygtrie",
     "torch==2.9.0",
+    "portpicker",
     "torchmonarch==0.2.0"
 ] #todo: add toml
 
