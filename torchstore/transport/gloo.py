@@ -131,13 +131,10 @@ class GlooTransportBuffer(TransportBuffer):
         )
 
     def requires_handshake(self) -> bool:
-        """Prepare for handshake. Create TCPStore and start PG creation on
-        client side (rank 0).
+        """Determine if a handshake is needed.
 
-        The TCPStore is created here so it's ready to accept connections
-        when the handshake RPC reaches the storage volume. The ProcessGroup
-        creation is started as a background task so it runs concurrently with
-        the handshake RPC, allowing both sides to rendezvous.
+        Returns False if a cached connection already exists for this volume,
+        True otherwise.
         """
         volume_id = self.storage_volume_ref.volume_id
 
@@ -148,6 +145,19 @@ class GlooTransportBuffer(TransportBuffer):
             self.master_port = cached_addr[1]
             self.store_key = cached_addr[2]
             return False
+
+        return True
+
+    async def _pre_handshake(self) -> None:
+        """Prepare for handshake. Create TCPStore and start PG creation on
+        client side (rank 0).
+
+        The TCPStore is created here so it's ready to accept connections
+        when the handshake RPC reaches the storage volume. The ProcessGroup
+        creation is started as a background task so it runs concurrently with
+        the handshake RPC, allowing both sides to rendezvous.
+        """
+        volume_id = self.storage_volume_ref.volume_id
 
         # Generate unique store key and find free port
         self.store_key = f"torchstore_gloo_{str(uuid.uuid4())[:8]}"
@@ -182,7 +192,6 @@ class GlooTransportBuffer(TransportBuffer):
             )
 
         self._pg_task = asyncio.create_task(asyncio.to_thread(create_pg))
-        return True
 
     def __getstate__(self) -> dict[str, Any]:
         """Serialize state, excluding non-serializable fields."""

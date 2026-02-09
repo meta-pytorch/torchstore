@@ -94,6 +94,7 @@ class TransportBuffer:
     - `__init__`: Initialize buffer with reference to target storage volume
     - `put_to_storage_volume`: Entry point for put operations
     - `get_from_storage_volume`: Entry point for get operations
+    - `_pre_handshake`: Prepare for handshake (if requires_handshake=True)
     - `_post_handshake`: Process handshake result (if requires_handshake=True)
     - `_pre_put_hook`: Prepare buffers before sending put request
     - `_pre_get_hook`: Prepare buffers before sending get request
@@ -150,6 +151,8 @@ class TransportBuffer:
         l = LatencyTracker("put")
         try:
             if self.requires_handshake():
+                await self._pre_handshake()
+                l.track_step("pre_handshake")
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(
                         self, key, request.meta_only()
@@ -174,6 +177,7 @@ class TransportBuffer:
     async def get_from_storage_volume(self, key, request: "Request"):
         try:
             if self.requires_handshake():
+                await self._pre_handshake()
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(
                         self, key, request.meta_only()
@@ -194,6 +198,15 @@ class TransportBuffer:
             await self.drop()
 
         return response
+
+    async def _pre_handshake(self) -> None:
+        """Prepare for handshake on the client side.
+
+        Called before the handshake request is sent to the storage volume.
+        Override this to perform any setup needed prior to handshake
+        (e.g., allocating resources, preparing connection info).
+        """
+        pass
 
     async def _post_handshake(self, handshake_result: Any) -> None:
         """Process the result of a handshake on the client side.
