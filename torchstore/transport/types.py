@@ -127,10 +127,35 @@ class Request:
     is_tssd: bool = False
 
     @classmethod
-    def from_any(cls, value: torch.Tensor | DTensor | None) -> "Request":
-        from torchstore.state_dict_utils import TorchStoreStateDict
+    def from_any(
+        cls,
+        value: torch.Tensor | DTensor | None,
+        tensor_slice: TensorSlice | None = None,
+    ) -> "Request":
+        """Create a Request from a tensor, DTensor, or None.
 
+        This method handles tensor-based requests. For arbitrary objects,
+        use from_objects() directly.
+
+        Args:
+            value: The value to create a request from. Can be a Tensor, DTensor, or None.
+            tensor_slice: Optional tensor slice specification. Cannot be provided when
+                value is a DTensor (DTensor has its own sharding info).
+
+        Returns:
+            A Request object representing the value.
+
+        Raises:
+            ValueError: If tensor_slice is provided when value is a DTensor.
+            ValueError: If tensor_slice.local_shape doesn't match value.shape for tensors.
+            TypeError: If value is not a Tensor, DTensor, or None.
+        """
         if isinstance(value, DTensor):
+            if tensor_slice is not None:
+                raise ValueError(
+                    "Cannot specify tensor_slice with a DTensor since "
+                    "DTensor already has its own sharding info."
+                )
             # Check if DTensor is fully local (not actually distributed)
             # If so, treat it as a regular tensor to avoid collective requirements
             # Note: this is due to behavior in torchtitan, where we have Replicate()
@@ -146,11 +171,25 @@ class Request:
             else:
                 request = cls.from_dtensor(value)
         elif isinstance(value, torch.Tensor):
+            # Validate shape match if both tensor and slice are provided
+            if tensor_slice is not None and tensor_slice.local_shape != value.shape:
+                raise ValueError(
+                    f"Requested tensor slice shape {tensor_slice.local_shape} "
+                    f"does not match tensor shape {value.shape}"
+                )
             request = cls.from_tensor(value)
         elif isinstance(value, TorchStoreStateDict):
             request = cls.from_tssd(value)
+            request.tensor_slice = tensor_slice
+        elif value is None:
+            # Mostly empty request - used for GET when we don't know the stored type
+            # (passing tensor_slice implies the user knows a tensor is stored)
+            request = cls(tensor_slice=tensor_slice)
         else:
-            request = cls.from_objects(value)
+            raise TypeError(
+                f"from_any accepts None, torch.Tensor, or DTensor, got {type(value)}. "
+                "For arbitrary objects, use Request.from_objects() instead."
+            )
 
         return request
 
