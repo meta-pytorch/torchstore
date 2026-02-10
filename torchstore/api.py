@@ -13,11 +13,7 @@ import torchstore.state_dict_utils
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
-from torchstore.strategy import (
-    ControllerStorageVolumes,
-    SingletonStrategy,
-    TorchStoreStrategy,
-)
+from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
 
 # I need to keep this somewhere, so here we go
@@ -40,7 +36,7 @@ async def initialize(
     Args:
         num_storage_volumes (int): Number of storage volumes to create. Defaults to 1.
         strategy (TorchStoreStrategy, optional): Strategy for distributing tensors across volumes.
-            Uses SingletonStrategy if None and num_storage_volumes=1.
+            Uses ControllerStorageVolumes if None and num_storage_volumes=1.
         store_name (str): Unique name for this store instance. Defaults to DEFAULT_TORCHSTORE_NAME.
         mesh (HostMesh, optional): Monarch HostMesh on which to spawn StorageVolumes
 
@@ -53,7 +49,7 @@ async def initialize(
         >>> >>> await ts.initialize("my_custom_store")
     """
     if num_storage_volumes == 1 and strategy is None:
-        strategy = SingletonStrategy()
+        strategy = ControllerStorageVolumes()
     elif strategy is None:
         raise RuntimeError(
             "Must specify controller strategy if num_storage_volumes > 1"

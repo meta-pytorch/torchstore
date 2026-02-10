@@ -13,7 +13,7 @@ import torch
 import torchstore as ts
 from monarch.actor import Actor, endpoint
 from torchstore.logging import init_logging
-from torchstore.strategy import SingletonStrategy
+from torchstore.strategy import HostStrategy
 from torchstore.transport import TransportType
 from torchstore.transport.monarch_rdma import monarch_rdma_transport_available
 from torchstore.utils import spawn_actors
@@ -105,13 +105,14 @@ async def test_large_tensors():
 
     # controller code
     await ts.initialize(
-        strategy=SingletonStrategy(
+        num_storage_volumes=1,
+        strategy=HostStrategy(
             default_transport_type=(
                 TransportType.MonarchRDMA
                 if monarch_rdma_transport_available()
                 else TransportType.Unset
             )
-        )
+        ),
     )
     actor = await spawn_actors(1, LargeTensorActor, "large_tensor")
     try:
