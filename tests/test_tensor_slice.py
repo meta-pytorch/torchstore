@@ -98,52 +98,52 @@ async def test_get_tensor_slice(strategy_params, transport_type):
         await ts.shutdown()
 
 
-# @pytest.mark.asyncio
-# async def test_tensor_slice_inplace():
-#     """Test tensor slice API with in-place operations"""
+@pytest.mark.asyncio
+async def test_tensor_slice_inplace():
+    """Test tensor slice API with in-place operations"""
 
-#     class TestActor(Actor):
-#         @endpoint
-#         async def test(self, test_tensor) -> Exception or None:
-#             try:
-#                 # Store a test tensor
-#                 await ts.put("inplace_test", test_tensor)
+    class TestActor(Actor):
+        @endpoint
+        async def test(self, test_tensor) -> Exception or None:
+            try:
+                # Store a test tensor
+                await ts.put("inplace_test", test_tensor)
 
-#                 # Test in-place retrieval with slice
-#                 slice_spec = TensorSlice(
-#                     offsets=(10, 20),
-#                     coordinates=(),
-#                     global_shape=(100, 200),
-#                     local_shape=(30, 40),
-#                     mesh_shape=(),
-#                 )
+                # Test in-place retrieval with slice
+                slice_spec = TensorSlice(
+                    offsets=(10, 20),
+                    coordinates=(),
+                    global_shape=(100, 200),
+                    local_shape=(30, 40),
+                    mesh_shape=(),
+                )
 
-#                 # Create pre-allocated buffer
-#                 slice_buffer = torch.empty(30, 40)
-#                 result = await ts.get(
-#                     "inplace_test",
-#                     inplace_tensor=slice_buffer,
-#                     tensor_slice_spec=slice_spec,
-#                 )
+                # Create pre-allocated buffer
+                slice_buffer = torch.empty(30, 40)
+                result = await ts.get(
+                    "inplace_test",
+                    inplace_tensor=slice_buffer,
+                    tensor_slice_spec=slice_spec,
+                )
 
-#                 # Verify in-place operation
-#                 assert result is slice_buffer
-#                 expected_slice = test_tensor[10:40, 20:60]
-#                 assert torch.equal(slice_buffer, expected_slice)
-#             except Exception as e:
-#                 return e
+                # Verify in-place operation
+                assert result is slice_buffer
+                expected_slice = test_tensor[10:40, 20:60]
+                assert torch.equal(slice_buffer, expected_slice)
+            except Exception as e:
+                return e
 
-#     await ts.initialize(num_storage_volumes=1)
+    await ts.initialize(num_storage_volumes=1)
 
-#     try:
-#         test_tensor = torch.randn(100, 200)
-#         actor = await spawn_actors(1, TestActor, "actor_0")
-#         err = await actor.test.call_one(test_tensor)
+    try:
+        test_tensor = torch.randn(100, 200)
+        actor = await spawn_actors(1, TestActor, "actor_0")
+        err = await actor.test.call_one(test_tensor)
 
-#         assert err is None
+        assert err is None
 
-#     finally:
-#         await ts.shutdown()
+    finally:
+        await ts.shutdown()
 
 
 @pytest.mark.asyncio
