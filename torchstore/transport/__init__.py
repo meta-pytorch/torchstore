@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.cuda_ipc import cuda_ipc_available, CudaIPCTransportBuffer
+from torchstore.transport.gloo import gloo_available, GlooTransportBuffer
 from torchstore.transport.monarch_rdma import (
     monarch_rdma_transport_available,
     MonarchRDMATransportBuffer,
@@ -20,6 +21,7 @@ from torchstore.transport.shared_memory import (
     SHM_ENABLED,
 )
 from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
+from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
 from torchstore.transport.types import Request, TensorSlice
 
 if TYPE_CHECKING:
@@ -32,6 +34,7 @@ class TransportType(Enum):
     MonarchRDMA = auto()
     TorchCommsRDMA = auto()
     CudaIPC = auto()  # CUDA IPC for intra-node GPU-direct transfers
+    Gloo = auto()
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
 
 
@@ -51,6 +54,10 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
     # Fall back to RDMA if available
     if monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
+    elif torchcomms_rdma_available():
+        return TransportType.TorchCommsRDMA
+    elif gloo_available():
+        return TransportType.Gloo
 
     # Check CUDA IPC for GPU-direct transfers
     if cuda_ipc_available():
@@ -70,6 +77,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
         TransportType.TorchCommsRDMA: TorchCommsRdmaTransportBuffer,
         TransportType.CudaIPC: CudaIPCTransportBuffer,
+        TransportType.Gloo: GlooTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
 
