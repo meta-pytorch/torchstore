@@ -5,32 +5,26 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Benchmark for torchstore weight synchronization (put_state_dict / get_state_dict).
+Benchmark for torchstore weight synchronization (put_state_dict_batch / get_state_dict_batch).
 
-Measures put_state_dict and get_state_dict performance using torchstore's public API.
-Works on both the feature/auto-batch-state-dict branch (batching) and main (sequential).
+Measures batched put/get state_dict performance using torchstore's public API.
 
 Usage:
-    # Default (synthetic-small / Qwen3-4B dimensions, 5 iterations):
-    pytest benchmarks/bench_weight_sync.py -v -s
+    # Default (Qwen3-4B, 5 iterations):
+    pytest tests/bench_weight_sync.py -v -s
 
     # Custom model and iterations via environment variables:
-    BENCH_MODEL=synthetic-large BENCH_ITER=3 pytest benchmarks/bench_weight_sync.py -v -s
-
-    # With real HuggingFace model (requires HF_TOKEN):
-    BENCH_MODEL=qwen3-4b BENCH_USE_HF=1 pytest benchmarks/bench_weight_sync.py -v -s
+    BENCH_MODEL=Qwen/Qwen3-30B-A3B BENCH_ITER=3 pytest tests/bench_weight_sync.py -v -s
 
 Environment variables:
-    BENCH_MODEL:   synthetic-small (default), synthetic-large, qwen3-4b, qwen3-30b
+    BENCH_MODEL:   HuggingFace model name (default: Qwen/Qwen3-4B)
     BENCH_ITER:    Number of timed iterations (default: 5)
     BENCH_WARMUP:  Number of warmup iterations (default: 1)
-    BENCH_USE_HF:  Set to 1 to load real HuggingFace model (requires HF_TOKEN)
 """
 
 import os
 import statistics
 import time
-from logging import getLogger
 
 import pytest
 import torch
@@ -40,73 +34,20 @@ from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torchstore.transport import TransportType
 from torchstore.utils import spawn_actors
 
-logger = getLogger(__name__)
-
-# Model configs: (hidden_size, intermediate_size, vocab_size, num_layers)
+# Model configs: HF model name -> (hidden_size, intermediate_size, vocab_size, num_layers)
 MODEL_CONFIGS = {
-    "synthetic-small": (2560, 8960, 151936, 36),
-    "qwen3-4b": (2560, 8960, 151936, 36),
-    "synthetic-large": (4096, 11008, 151936, 48),
-    "qwen3-30b": (4096, 11008, 151936, 48),
+    "Qwen/Qwen3-4B": (2560, 8960, 151936, 36),
+    "Qwen/Qwen3-30B-A3B": (4096, 11008, 151936, 48),
 }
-
-HF_MODEL_MAP = {
-    "qwen3-4b": "Qwen/Qwen3-4B",
-    "qwen3-30b": "Qwen/Qwen3-30B-A3B",
-}
-
-
-def create_synthetic_state_dict(model_type, dtype=torch.bfloat16):
-    """Create a synthetic state_dict matching real model structure."""
-    hidden, intermediate, vocab, num_layers = MODEL_CONFIGS[model_type]
-    state_dict = {}
-
-    state_dict["model.embed_tokens.weight"] = torch.randn(vocab, hidden, dtype=dtype)
-
-    for i in range(num_layers):
-        prefix = f"model.layers.{i}"
-        state_dict[f"{prefix}.self_attn.q_proj.weight"] = torch.randn(
-            hidden, hidden, dtype=dtype
-        )
-        state_dict[f"{prefix}.self_attn.k_proj.weight"] = torch.randn(
-            hidden, hidden, dtype=dtype
-        )
-        state_dict[f"{prefix}.self_attn.v_proj.weight"] = torch.randn(
-            hidden, hidden, dtype=dtype
-        )
-        state_dict[f"{prefix}.self_attn.o_proj.weight"] = torch.randn(
-            hidden, hidden, dtype=dtype
-        )
-        state_dict[f"{prefix}.mlp.gate_proj.weight"] = torch.randn(
-            intermediate, hidden, dtype=dtype
-        )
-        state_dict[f"{prefix}.mlp.up_proj.weight"] = torch.randn(
-            intermediate, hidden, dtype=dtype
-        )
-        state_dict[f"{prefix}.mlp.down_proj.weight"] = torch.randn(
-            hidden, intermediate, dtype=dtype
-        )
-        state_dict[f"{prefix}.input_layernorm.weight"] = torch.randn(
-            hidden, dtype=dtype
-        )
-        state_dict[f"{prefix}.post_attention_layernorm.weight"] = torch.randn(
-            hidden, dtype=dtype
-        )
-
-    state_dict["model.norm.weight"] = torch.randn(hidden, dtype=dtype)
-    state_dict["lm_head.weight"] = torch.randn(vocab, hidden, dtype=dtype)
-
-    return {"model": state_dict}
 
 
 class BenchmarkActor(Actor):
     """Actor that creates state dict internally and benchmarks put/get operations."""
 
-    def __init__(self, model_type, use_hf, iterations, warmup):
+    def __init__(self, model_name, iterations, warmup):
         self.rank = current_rank().rank
         os.environ["LOCAL_RANK"] = str(self.rank)
-        self.model_type = model_type
-        self.use_hf = use_hf
+        self.model_name = model_name
         self.iterations = iterations
         self.warmup = warmup
 
@@ -116,22 +57,17 @@ class BenchmarkActor(Actor):
         # Pre-cache the torchstore client before large allocations
         await ts.client()
 
-        # Create state dict inside the actor (avoids serializing large tensors)
-        if self.use_hf and self.model_type in HF_MODEL_MAP:
-            from transformers import AutoModelForCausalLM
+        # Load real HuggingFace model
+        from transformers import AutoModelForCausalLM
 
-            model_name = HF_MODEL_MAP[self.model_type]
-            print(f"[Actor] Loading HuggingFace model: {model_name}...")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                token=os.environ["HF_TOKEN"],
-                torch_dtype=torch.bfloat16,
-            )
-            state_dict = {"model": model.state_dict()}
-            del model
-        else:
-            print(f"[Actor] Creating synthetic state dict for: {self.model_type}...")
-            state_dict = create_synthetic_state_dict(self.model_type)
+        print(f"[Actor] Loading HuggingFace model: {self.model_name}...")
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            token=os.environ.get("HF_TOKEN"),
+            torch_dtype=torch.bfloat16,
+        )
+        state_dict = {"model": model.state_dict()}
+        del model
 
         # Calculate size info
         flat_sd, _ = flatten_state_dict(state_dict)
@@ -147,8 +83,8 @@ class BenchmarkActor(Actor):
         # Warmup
         print(f"[Actor] Running {self.warmup} warmup iteration(s)...")
         for i in range(self.warmup):
-            await ts.put_state_dict(state_dict, f"warmup_{i}")
-            await ts.get_state_dict(f"warmup_{i}", state_dict)
+            await ts.put_state_dict_batch(state_dict, "v0")
+            await ts.get_state_dict_batch("v0", state_dict)
         print("[Actor] Warmup complete.")
 
         # Timed iterations
@@ -157,15 +93,15 @@ class BenchmarkActor(Actor):
         get_times = []
 
         for i in range(self.iterations):
-            key = f"bench_{i}"
+            key = "v0"
 
             put_start = time.perf_counter()
-            await ts.put_state_dict(state_dict, key)
+            await ts.put_state_dict_batch(state_dict, key)
             put_elapsed = time.perf_counter() - put_start
             put_times.append(put_elapsed)
 
             get_start = time.perf_counter()
-            await ts.get_state_dict(key, state_dict)
+            await ts.get_state_dict_batch(key, state_dict)
             get_elapsed = time.perf_counter() - get_start
             get_times.append(get_elapsed)
 
@@ -222,8 +158,8 @@ def print_results(results):
     print(f"{'-'*70}")
 
     for name, s in [
-        ("put_state_dict", put_stats),
-        ("get_state_dict", get_stats),
+        ("put_state_dict_batch", put_stats),
+        ("get_state_dict_batch", get_stats),
         ("round_trip", rt_stats),
     ]:
         print(
@@ -250,22 +186,16 @@ def print_results(results):
 
 @pytest.mark.asyncio
 async def test_benchmark_weight_sync():
-    """Benchmark put_state_dict / get_state_dict performance."""
+    """Benchmark put_state_dict_batch / get_state_dict_batch performance."""
     ts.init_logging()
 
-    model_type = os.environ.get("BENCH_MODEL", "synthetic-small")
+    model_name = os.environ.get("BENCH_MODEL", "Qwen/Qwen3-4B")
     iterations = int(os.environ.get("BENCH_ITER", "5"))
     warmup = int(os.environ.get("BENCH_WARMUP", "1"))
-    use_hf = os.environ.get("BENCH_USE_HF", "0") == "1"
 
-    assert model_type in MODEL_CONFIGS, f"Unknown model: {model_type}"
+    assert model_name in MODEL_CONFIGS, f"Unknown model: {model_name}"
 
-    # Disable transports that may not be available
-    os.environ["TORCHSTORE_RDMA_ENABLED"] = "0"
-    os.environ["TORCHSTORE_GLOO_ENABLED"] = "0"
-    os.environ["TORCHSTORE_SHARED_MEMORY_ENABLED"] = "0"
-
-    hidden, intermediate, vocab, num_layers = MODEL_CONFIGS[model_type]
+    hidden, intermediate, vocab, num_layers = MODEL_CONFIGS[model_name]
     print(
         f"\nModel config: hidden={hidden}, intermediate={intermediate}, "
         f"vocab={vocab}, layers={num_layers}"
@@ -274,9 +204,7 @@ async def test_benchmark_weight_sync():
     print(f"\n{'='*70}")
     print("WEIGHT SYNC BENCHMARK")
     print(f"{'='*70}")
-    print(
-        f"Model:            {model_type} ({'HuggingFace' if use_hf else 'synthetic'})"
-    )
+    print(f"Model:            {model_name}")
     print("Transport:        MonarchRPC")
     print(f"Iterations:       {iterations} (+ {warmup} warmup)")
     print(f"{'='*70}\n")
@@ -291,8 +219,7 @@ async def test_benchmark_weight_sync():
             1,
             BenchmarkActor,
             "bench_actor",
-            model_type=model_type,
-            use_hf=use_hf,
+            model_name=model_name,
             iterations=iterations,
             warmup=warmup,
         )

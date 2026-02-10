@@ -177,24 +177,21 @@ class Controller(Actor):
 
         return volume_map
 
-    @endpoint
-    async def notify_put(
-        self, key: str, request: Request, storage_volume_id: str
-    ) -> None:
-        """Notify the controller that data has been stored in a storage volume.
+    def _register_put(self, key: str, request: Request, storage_volume_id: str) -> None:
+        """Register a single put operation in the storage index.
 
-        This should called after a successful put operation to
-        maintain the distributed storage index.
+        Shared implementation used by both notify_put and notify_put_batch.
 
         Args:
             key (str): The unique identifier for the stored data.
-            request (Request): The storage request containing metadata about the stored data.
+            request (Request): The storage request containing metadata (must not contain tensor data).
             storage_volume_id (str): ID of the storage volume where the data was stored.
         """
-        self.assert_initialized()
-        assert (
-            request.tensor_val is None
-        ), "request should not contain tensor data, as this will significantly increase e2e latency"
+        if request.tensor_val is not None:
+            raise ValueError(
+                "request should not contain tensor data, "
+                "as this will significantly increase e2e latency"
+            )
 
         if key not in self.keys_to_storage_volumes:
             self.keys_to_storage_volumes[key] = {}
@@ -210,6 +207,23 @@ class Controller(Actor):
             self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
 
     @endpoint
+    async def notify_put(
+        self, key: str, request: Request, storage_volume_id: str
+    ) -> None:
+        """Notify the controller that data has been stored in a storage volume.
+
+        This should called after a successful put operation to
+        maintain the distributed storage index.
+
+        Args:
+            key (str): The unique identifier for the stored data.
+            request (Request): The storage request containing metadata about the stored data.
+            storage_volume_id (str): ID of the storage volume where the data was stored.
+        """
+        self.assert_initialized()
+        self._register_put(key, request, storage_volume_id)
+
+    @endpoint
     async def notify_put_batch(
         self, notifications: list[tuple[str, Request, str]]
     ) -> None:
@@ -223,22 +237,7 @@ class Controller(Actor):
         """
         self.assert_initialized()
         for key, request, storage_volume_id in notifications:
-            assert request.tensor_val is None, "request should not contain tensor data"
-
-            if key not in self.keys_to_storage_volumes:
-                self.keys_to_storage_volumes[key] = {}
-
-            storage_info = StorageInfo(
-                object_type=ObjectType.from_request(request),
-                tensor_slices={request.tensor_slice},
-            )
-
-            if storage_volume_id not in self.keys_to_storage_volumes[key]:
-                self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
-            else:
-                self.keys_to_storage_volumes[key][storage_volume_id].update(
-                    storage_info
-                )
+            self._register_put(key, request, storage_volume_id)
 
     @endpoint
     async def teardown(self) -> None:

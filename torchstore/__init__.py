@@ -13,10 +13,12 @@ from torchstore.api import (
     exists,
     get,
     get_state_dict,
+    get_state_dict_batch,
     initialize,
     keys,
     put,
     put_state_dict,
+    put_state_dict_batch,
     reset_client,
     shutdown,
 )
@@ -56,5 +58,7 @@ __all__ = [
     "ControllerStorageVolumes",
     "put_state_dict",
     "get_state_dict",
+    "put_state_dict_batch",
+    "get_state_dict_batch",
     "reset_client",
 ]
