@@ -17,9 +17,11 @@ Usage:
     BENCH_MODEL=Qwen/Qwen3-30B-A3B BENCH_ITER=3 pytest tests/bench_weight_sync.py -v -s
 
 Environment variables:
-    BENCH_MODEL:   HuggingFace model name (default: Qwen/Qwen3-4B)
-    BENCH_ITER:    Number of timed iterations (default: 5)
-    BENCH_WARMUP:  Number of warmup iterations (default: 1)
+    BENCH_MODEL:       HuggingFace model name (default: Qwen/Qwen3-4B)
+    BENCH_ITER:        Number of timed iterations (default: 5)
+    BENCH_WARMUP:      Number of warmup iterations (default: 1)
+    BENCH_TRANSPORT:   Transport type (default: SharedMemory)
+    BENCH_CONCURRENCY: Max concurrent storage operations (default: 8)
 """
 
 import os
@@ -44,12 +46,13 @@ MODEL_CONFIGS = {
 class BenchmarkActor(Actor):
     """Actor that creates state dict internally and benchmarks put/get operations."""
 
-    def __init__(self, model_name, iterations, warmup):
+    def __init__(self, model_name, iterations, warmup, max_concurrent):
         self.rank = current_rank().rank
         os.environ["LOCAL_RANK"] = str(self.rank)
         self.model_name = model_name
         self.iterations = iterations
         self.warmup = warmup
+        self.max_concurrent = max_concurrent
 
     @endpoint
     async def run_benchmark(self):
@@ -83,8 +86,12 @@ class BenchmarkActor(Actor):
         # Warmup
         print(f"[Actor] Running {self.warmup} warmup iteration(s)...")
         for i in range(self.warmup):
-            await ts.put_state_dict_batch(state_dict, "v0")
-            await ts.get_state_dict_batch("v0", state_dict)
+            await ts.put_state_dict_batch(
+                state_dict, "v0", max_concurrent=self.max_concurrent
+            )
+            await ts.get_state_dict_batch(
+                "v0", state_dict, max_concurrent=self.max_concurrent
+            )
         print("[Actor] Warmup complete.")
 
         # Timed iterations
@@ -96,12 +103,16 @@ class BenchmarkActor(Actor):
             key = "v0"
 
             put_start = time.perf_counter()
-            await ts.put_state_dict_batch(state_dict, key)
+            await ts.put_state_dict_batch(
+                state_dict, key, max_concurrent=self.max_concurrent
+            )
             put_elapsed = time.perf_counter() - put_start
             put_times.append(put_elapsed)
 
             get_start = time.perf_counter()
-            await ts.get_state_dict_batch(key, state_dict)
+            await ts.get_state_dict_batch(
+                key, state_dict, max_concurrent=self.max_concurrent
+            )
             get_elapsed = time.perf_counter() - get_start
             get_times.append(get_elapsed)
 
@@ -112,6 +123,31 @@ class BenchmarkActor(Actor):
                 f"get={get_elapsed:.3f}s ({get_tp:.2f} GB/s), "
                 f"total={put_elapsed + get_elapsed:.3f}s"
             )
+
+        # Verification: assert the retrieved state dict matches the original
+        print("[Actor] Verifying correctness of last get...")
+        await ts.put_state_dict_batch(
+            state_dict, "v0", max_concurrent=self.max_concurrent
+        )
+        retrieved_sd = await ts.get_state_dict_batch(
+            "v0", max_concurrent=self.max_concurrent
+        )
+        flat_original, _ = flatten_state_dict(state_dict)
+        flat_retrieved, _ = flatten_state_dict(retrieved_sd)
+        assert len(flat_original) == len(
+            flat_retrieved
+        ), f"Key count mismatch: {len(flat_original)} vs {len(flat_retrieved)}"
+        for k in flat_original:
+            assert k in flat_retrieved, f"Missing key in retrieved state dict: {k}"
+            if isinstance(flat_original[k], torch.Tensor):
+                assert torch.equal(
+                    flat_original[k], flat_retrieved[k]
+                ), f"Tensor mismatch for key {k}"
+            else:
+                assert (
+                    flat_original[k] == flat_retrieved[k]
+                ), f"Value mismatch for key {k}"
+        print("[Actor] Verification passed.")
 
         return {
             "num_params": num_params,
@@ -192,6 +228,15 @@ async def test_benchmark_weight_sync():
     model_name = os.environ.get("BENCH_MODEL", "Qwen/Qwen3-4B")
     iterations = int(os.environ.get("BENCH_ITER", "5"))
     warmup = int(os.environ.get("BENCH_WARMUP", "1"))
+    transport_name = os.environ.get("BENCH_TRANSPORT", "SharedMemory")
+    max_concurrent = int(os.environ.get("BENCH_CONCURRENCY", "8"))
+
+    transport_map = {t.name: t for t in TransportType}
+    assert transport_name in transport_map, (
+        f"Unknown transport: {transport_name}. "
+        f"Available: {', '.join(t.name for t in TransportType if t.name != 'Unset')}"
+    )
+    transport_type = transport_map[transport_name]
 
     assert model_name in MODEL_CONFIGS, f"Unknown model: {model_name}"
 
@@ -205,13 +250,14 @@ async def test_benchmark_weight_sync():
     print("WEIGHT SYNC BENCHMARK")
     print(f"{'='*70}")
     print(f"Model:            {model_name}")
-    print("Transport:        MonarchRPC")
+    print(f"Transport:        {transport_name}")
+    print(f"Max concurrent:   {max_concurrent}")
     print(f"Iterations:       {iterations} (+ {warmup} warmup)")
     print(f"{'='*70}\n")
 
     await ts.initialize(
         num_storage_volumes=1,
-        strategy=ts.LocalRankStrategy(TransportType.MonarchRPC),
+        strategy=ts.LocalRankStrategy(transport_type),
     )
 
     try:
@@ -222,6 +268,7 @@ async def test_benchmark_weight_sync():
             model_name=model_name,
             iterations=iterations,
             warmup=warmup,
+            max_concurrent=max_concurrent,
         )
 
         results = await actor.run_benchmark.call_one()

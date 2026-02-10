@@ -90,12 +90,14 @@ class LocalClient:
             items: Dictionary mapping keys to values to store.
             max_concurrent: Maximum number of concurrent storage operations.
         """
-        if not items:
+        if items is None or len(items) == 0:
             return
 
         latency_tracker = LatencyTracker(f"put_batch:{len(items)}_keys")
 
-        # Select storage volume (all items go to same volume)
+        # All items in a single batch are routed to the same storage volume.
+        # This is correct because _put_batch is called per-client (one per rank),
+        # and each client's strategy returns a single volume for that rank.
         storage_volume_ref = self.strategy.select_storage_volume()
         if storage_volume_ref is None:
             raise RuntimeError("No storage volume available for batch put operation")
