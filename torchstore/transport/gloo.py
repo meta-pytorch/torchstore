@@ -28,9 +28,9 @@ import torch.distributed as dist
 logger = getLogger(__name__)
 
 # Global cache
-_store_addrs: dict[
-    str, tuple[str, int]
-] = {}  # volume_id -> (master_addr, master_port, store_key)
+_store_addrs: dict[str, tuple[str, int]] = (
+    {}
+)  # volume_id -> (master_addr, master_port, store_key)
 
 
 TORCHSTORE_GLOO_ENABLED = os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1"

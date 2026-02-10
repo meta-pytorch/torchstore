@@ -21,6 +21,56 @@ from torchstore.utils import assemble_tensor, get_slice_intersection
 logger = getLogger(__name__)
 
 
+def _get_destination_view(
+    dest_tensor: torch.Tensor,
+    dest_slice: TensorSlice,
+    fetch_slice: TensorSlice,
+) -> torch.Tensor | None:
+    """Get a view of the destination tensor where the fetched slice should be written.
+
+    Args:
+        dest_tensor: The destination tensor (must be contiguous)
+        dest_slice: TensorSlice describing the destination tensor's position in global space
+        fetch_slice: TensorSlice describing the slice being fetched
+
+    Returns:
+        A view of dest_tensor for the region where fetch_slice should be written,
+        or None if the fetch_slice doesn't map to a contiguous region in dest_tensor.
+    """
+    if not dest_tensor.is_contiguous():
+        return None
+
+    # Compute the local indices within dest_tensor where fetch_slice should be written
+    slices = []
+
+    for dim in range(len(fetch_slice.global_shape)):
+        # fetch_slice offset in global coordinates
+        fetch_start = fetch_slice.offsets[dim]
+        fetch_end = fetch_start + fetch_slice.local_shape[dim]
+
+        # dest_slice offset in global coordinates
+        dest_start = dest_slice.offsets[dim]
+
+        # Convert to local coordinates within dest_tensor
+        local_start = fetch_start - dest_start
+        local_end = fetch_end - dest_start
+
+        # Validate bounds
+        if local_start < 0 or local_end > dest_slice.local_shape[dim]:
+            return None
+
+        slices.append(slice(local_start, local_end))
+
+    # Create the view
+    view = dest_tensor[tuple(slices)]
+
+    # Check if the view is contiguous - required for RDMA transports
+    if not view.is_contiguous():
+        return None
+
+    return view
+
+
 class LocalClient:
     """Client-side interface for TorchStore operations.
 
@@ -137,6 +187,13 @@ class LocalClient:
         volume_map = await self._locate_volumes(key)
         partial_results = []
 
+        # Check if we can use inplace resharding by passing views of the destination tensor
+        use_inplace_views = (
+            request.tensor_val is not None
+            and request.tensor_val.is_contiguous()
+            and request.tensor_slice is not None
+        )
+
         for volume_id, storage_info in volume_map.items():
             volume_ref = self.strategy.get_storage_volume(volume_id)
             transport_buffer = create_transport_buffer(volume_ref)
@@ -161,13 +218,43 @@ class LocalClient:
                     if fetch_slice is None:
                         continue
 
-                # TODO: We should optimize this.
-                # this unfortunately creates a new allocation on every fetch. (and fetches each slice separately)
-                slice_request = Request.from_tensor_slice(fetch_slice)
-                local_tensor = await transport_buffer.get_from_storage_volume(
-                    key, slice_request
-                )
-                partial_results.append((local_tensor, fetch_slice))
+                # Try to get a view of the destination tensor for inplace writes
+                dest_view = None
+                if use_inplace_views:
+                    dest_view = _get_destination_view(
+                        request.tensor_val, request.tensor_slice, fetch_slice
+                    )
+
+                if dest_view is not None:
+                    # Pass the view as tensor_val - transport writes directly into it
+                    slice_request = Request.from_tensor_slice(fetch_slice)
+                    slice_request.tensor_val = dest_view
+                    await transport_buffer.get_from_storage_volume(key, slice_request)
+                    # Track that we wrote inplace (dest_view shares memory with request.tensor_val)
+                    partial_results.append((dest_view, fetch_slice))
+                else:
+                    # assert False
+                    # Standard path: allocate new tensor for each fetch
+                    # TODO: We should optimize this.
+                    # this unfortunately creates a new allocation on every fetch. (and fetches each slice separately)
+                    slice_request = Request.from_tensor_slice(fetch_slice)
+                    local_tensor = await transport_buffer.get_from_storage_volume(
+                        key, slice_request
+                    )
+                    partial_results.append((local_tensor, fetch_slice))
+
+        # Check if all results share memory with the destination tensor (inplace)
+        if (
+            use_inplace_views
+            and partial_results
+            and all(
+                t.data_ptr() >= request.tensor_val.data_ptr()
+                and t.data_ptr()
+                < request.tensor_val.data_ptr() + request.tensor_val.nbytes
+                for t, _ in partial_results
+            )
+        ):
+            return request.tensor_val
 
         # If we get here, we need to assemble from partial results
         if not partial_results:
