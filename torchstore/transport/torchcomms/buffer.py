@@ -66,19 +66,23 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             self.storage_volume_ref.volume_id, device
         )
 
-    def requires_handshake(self) -> bool:
-        """Only handshake if RDMA was set up and connection is not already cached."""
-        if self.address is None:
-            return False
-        return not self._connection_exists
+    def requires_handshake(self, request: "Request") -> bool:
+        """Setup transport from request if needed, then check if handshake is required."""
+        if not request.is_object:
+            self._setup_local_transport(request.tensor_val)
+
+            return not self._connection_exists
+        return False
 
     async def _post_handshake(self, handshake_result: Any) -> None:
         """Connect local transport to peer after handshake."""
         self._local_transport.connect(handshake_result)
 
-    async def recv_handshake(self, transport_context: "TransportContext") -> Any | None:
+    async def recv_handshake(
+        self, ctx: "TransportContext", current_object: Any = None
+    ) -> Any | None:
         """Confirm a handshake initiated by the local client (storage volume side)."""
-        transport_cache = transport_context.get_rdma_transport_cache()
+        transport_cache = ctx.get_rdma_transport_cache()
         transport, addr = transport_cache.put(self.address, device=0)
         transport.connect(self.address)
         return addr
@@ -93,28 +97,20 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         return state
 
     def _allocate(self, tensor: torch.Tensor) -> None:
+        self.shape = tensor.shape
+        self.dtype = tensor.dtype
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
         self.rdma_memory = RdmaMemory(tensor)
         self.rdma_remote_buffer = self.rdma_memory.to_remote_buffer()
 
     async def _pre_put_hook(self, request: "Request") -> None:
-        """Prepare buffers before sending put request (client-side)."""
+        """Allocate RDMA memory for put (transport already set up)."""
         if request.is_object:
             return
-
-        assert request.tensor_val is not None
-
-        tensor = request.tensor_val
-        self._setup_local_transport(tensor)
-
-        # allocate_source logic
-        self.shape = tensor.shape
-        self.dtype = tensor.dtype
-        self._allocate(tensor)
+        self._allocate(request.tensor_val)
 
     async def _pre_get_hook(self, key: str, request: "Request") -> None:
-        """Prepare buffers before sending get request (client-side)."""
-        # Fetch metadata if no tensor provided
+        """Fetch metadata if needed and allocate RDMA buffers."""
         tensor_like = request.tensor_val
         if tensor_like is None:
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
@@ -122,27 +118,17 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             )
             if isinstance(meta, str) or meta is None:
                 return  # Objects don't need RDMA setup
-            # if we are fetching a tensor slice, the local shape is already known
             if request.tensor_slice is not None:
                 meta = (request.tensor_slice.local_shape, *meta[1:])
+            tensor_like = meta
 
-            tensor_like = meta  # (shape, dtype) tuple
-
-        # Setup local transport - use tensor device if available, else use default
-        self._setup_local_transport(
-            tensor_like if isinstance(tensor_like, torch.Tensor) else None
-        )
-
-        # allocate_dest logic
         if isinstance(tensor_like, tuple):
             self.tensor_ref = torch.zeros(
                 tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
             )
-            self.shape, self.dtype = tensor_like
         else:
             assert isinstance(tensor_like, torch.Tensor)
             self.tensor_ref = tensor_like
-            self.shape, self.dtype = tensor_like.shape, tensor_like.dtype
 
         self._allocate(self.tensor_ref)
 
