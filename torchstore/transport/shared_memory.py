@@ -263,31 +263,27 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # Put needs a handshake, get does not
         self._needs_handshake: bool = False
 
-    def requires_handshake(self) -> bool:
-        """Handshake needed for tensor PUT to get segment allocation."""
+    def requires_handshake(self, request: "Request") -> bool:
+        if self._needs_handshake:
+            assert request.tensor_val is not None
+
+            self._client_tensor = request.tensor_val
+            if not self._client_tensor.is_contiguous():
+                self._client_tensor = self._client_tensor.contiguous()
+
         return self._needs_handshake
 
-    async def put_to_storage_volume(self, key, request: "Request"):
-        """Override to capture the key for shared memory segment naming."""
-        self._key = key
-        await super().put_to_storage_volume(key, request)
-
-    async def _pre_put_hook(self, request: "Request") -> None:
-        """Store tensor metadata; actual copy happens in _post_handshake."""
+    async def _pre_put_hook(self, request: "Request"):
         if request.is_object:
             self.is_object = True
-            self.objects = request.objects  # Objects use RPC
-            return
+            self.objects = request.objects
 
-        self._client_tensor = request.tensor_val
-        assert self._client_tensor is not None
-
-        # Handle non-contiguous tensors
-        if not self._client_tensor.is_contiguous():
-            self._client_tensor = self._client_tensor.contiguous()
-
-        # Need handshake for PUT (to get existing SHM handle from storage)
-        self._needs_handshake = True
+    async def put_to_storage_volume(self, key, request: "Request"):
+        """Override to capture key and prepare state before handshake check."""
+        if request.tensor_val is not None:
+            self._needs_handshake = True
+        self._key = key
+        await super().put_to_storage_volume(key, request)
 
     async def recv_handshake(
         self, ctx: "TransportContext", current_object: Any = None

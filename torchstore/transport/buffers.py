@@ -137,12 +137,16 @@ class TransportBuffer:
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
 
-    def requires_handshake(self) -> bool:
+    def requires_handshake(self, request: "Request") -> bool:
         """Determine if a handshake is needed before the operation.
 
         Override this method for custom handshake logic (e.g., cached connections).
         This method may have side effects (e.g., allocating resources for the handshake).
         Default implementation returns False.
+
+        Args:
+            request: The current request, provided so implementations can
+                     inspect it and perform setup before deciding.
         """
         return False
 
@@ -150,7 +154,7 @@ class TransportBuffer:
     async def put_to_storage_volume(self, key, request: "Request"):
         l = LatencyTracker("put")
         try:
-            if self.requires_handshake():
+            if self.requires_handshake(request):
                 await self._pre_handshake()
                 l.track_step("pre_handshake")
                 handshake_result = (
@@ -176,7 +180,7 @@ class TransportBuffer:
 
     async def get_from_storage_volume(self, key, request: "Request"):
         try:
-            if self.requires_handshake():
+            if self.requires_handshake(request):
                 await self._pre_handshake()
                 handshake_result = (
                     await self.storage_volume_ref.volume.handshake.call_one(
