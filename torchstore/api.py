@@ -223,6 +223,8 @@ async def delete(
 
 async def keys(
     prefix: str | None = None,
+    *,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> list[str]:
     """
     Get all keys that match the given prefix.
@@ -239,7 +241,7 @@ async def keys(
     Example:
         >>> keys = await keys("my_prefix")
     """
-    cl = await client()
+    cl = await client(store_name=store_name)
     return await cl.keys(prefix)
 
 
