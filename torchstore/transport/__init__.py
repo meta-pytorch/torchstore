@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from enum import auto, Enum
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,8 @@ from torchstore.transport.types import Request, TensorSlice
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
+
+logger = logging.getLogger(__name__)
 
 
 class TransportType(Enum):
@@ -62,6 +65,8 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
 
     if transport_type == TransportType.Unset:
         transport_type = get_available_transport(storage_volume_ref)
+
+    logger.info(f"Creating transport buffer: {transport_type.name}")
 
     transport_map = {
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
