@@ -36,12 +36,6 @@ from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torchstore.transport import TransportType
 from torchstore.utils import spawn_actors
 
-# Model configs: HF model name -> (hidden_size, intermediate_size, vocab_size, num_layers)
-MODEL_CONFIGS = {
-    "Qwen/Qwen3-4B": (2560, 8960, 151936, 36),
-    "Qwen/Qwen3-30B-A3B": (4096, 11008, 151936, 48),
-}
-
 
 class BenchmarkActor(Actor):
     """Actor that creates state dict internally and benchmarks put/get operations."""
@@ -237,14 +231,6 @@ async def test_benchmark_weight_sync():
         f"Available: {', '.join(t.name for t in TransportType if t.name != 'Unset')}"
     )
     transport_type = transport_map[transport_name]
-
-    assert model_name in MODEL_CONFIGS, f"Unknown model: {model_name}"
-
-    hidden, intermediate, vocab, num_layers = MODEL_CONFIGS[model_name]
-    print(
-        f"\nModel config: hidden={hidden}, intermediate={intermediate}, "
-        f"vocab={vocab}, layers={num_layers}"
-    )
 
     print(f"\n{'='*70}")
     print("WEIGHT SYNC BENCHMARK")
