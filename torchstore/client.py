@@ -193,6 +193,9 @@ class LocalClient:
             and request.tensor_val.is_contiguous()
             and request.tensor_slice is not None
         )
+        assert (
+            use_inplace_views
+        ), f"{(request.tensor_val is not None)=} {request.tensor_val.is_contiguous()=} {request.tensor_slice=}"
 
         for volume_id, storage_info in volume_map.items():
             volume_ref = self.strategy.get_storage_volume(volume_id)
@@ -224,7 +227,7 @@ class LocalClient:
                     dest_view = _get_destination_view(
                         request.tensor_val, request.tensor_slice, fetch_slice
                     )
-
+                dest_view = None
                 if dest_view is not None:
                     # Pass the view as tensor_val - transport writes directly into it
                     slice_request = Request.from_tensor_slice(fetch_slice)
@@ -255,7 +258,7 @@ class LocalClient:
             )
         ):
             return request.tensor_val
-
+        # assert False
         # If we get here, we need to assemble from partial results
         if not partial_results:
             raise RuntimeError(

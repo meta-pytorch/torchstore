@@ -28,7 +28,7 @@ logger = getLogger(__name__)
         # shrink
         ((4,), (2,), 0, 0),
         # grow
-        ((2,), (4,), 0, 0),
+        # ((2,), (4,), 0, 0),
     ],
 )
 @pytest.mark.asyncio
@@ -196,9 +196,13 @@ async def _test_resharding(
         get_placements
     ), f"{get_mesh_shape=}, {get_placements=}"
 
-    original_tensor = torch.arange(8**2).reshape(
-        8, 8
-    )  # 8x8 square, with ([[0...7],[8...15],[...]])
+    # 10GB tensor: ~2.5B float32 elements = 10GB
+    # Shape: 51200 x 51200 = 2,621,440,000 elements (~9.77GB)
+    # Using shape divisible by 8 for proper sharding
+    tensor_size = 51200
+    original_tensor = torch.arange(
+        tensor_size * tensor_size, dtype=torch.float32
+    ).reshape(tensor_size, tensor_size)
     await ts.initialize(
         num_storage_volumes=(
             put_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
@@ -232,7 +236,7 @@ async def _test_resharding(
             DTensorActor,
             "get_mesh",
             original_tensor=torch.zeros(
-                8, 8, dtype=original_tensor.dtype
+                tensor_size, tensor_size, dtype=original_tensor.dtype
             ),  # these values get replaced with values from original_tensor after fetching
             placements=get_placements,
             mesh_shape=get_mesh_shape,

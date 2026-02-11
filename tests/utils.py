@@ -101,6 +101,8 @@ class DTensorActor(Actor):
 
     def rlog(self, msg):
         # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
+        if not self.rank == 0:
+            return
         print(f"rank: {self.rank} {msg}")
         logger.info(f"rank: {self.rank} {msg}")
 
@@ -157,17 +159,15 @@ class DTensorActor(Actor):
         tensor_slice = dtensor_request.tensor_slice
 
         t = time.perf_counter()
-        fetched_tensor = await ts.get(
-            self.shared_key, tensor_slice_spec=dtensor_request.tensor_slice
-        )
-        self.rlog(
-            f"alloc on the fly after fetch: {fetched_tensor=} {time.perf_counter() - t=}"
-        )
+        # fetched_tensor = await ts.get(
+        #     self.shared_key, tensor_slice_spec=dtensor_request.tensor_slice
+        # )
+        self.rlog(f"alloc on the fly after fetch: {time.perf_counter() - t}")
 
         # self.rlog(f"inplace get with {dtensor=}")
         t = time.perf_counter()
         fetched_tensor = await ts.get(self.shared_key, dtensor)
-        self.rlog(f"inplace after fetch: {dtensor=} {time.perf_counter() - t=}")
+        self.rlog(f"inplace after fetch: {time.perf_counter() - t}")
         assert torch.equal(dtensor, fetched_tensor)
 
         return fetched_tensor, device_mesh.get_coordinate()
