@@ -7,7 +7,7 @@
 from typing import Any
 
 import torch
-from monarch.actor import get_or_spawn_controller, HostMesh
+from monarch.actor import get_or_spawn_controller, ProcMesh
 
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient
@@ -31,7 +31,7 @@ async def initialize(
     num_storage_volumes: int = 1,
     strategy: TorchStoreStrategy | None = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
-    mesh: HostMesh | None = None,
+    mesh: ProcMesh | None = None,
 ) -> None:
     """Initialize the TorchStore distributed storage system.
 
@@ -42,7 +42,7 @@ async def initialize(
         strategy (TorchStoreStrategy, optional): Strategy for distributing tensors across volumes.
             Uses SingletonStrategy if None and num_storage_volumes=1.
         store_name (str): Unique name for this store instance. Defaults to DEFAULT_TORCHSTORE_NAME.
-        mesh (HostMesh, optional): Monarch HostMesh on which to spawn StorageVolumes
+        mesh (ProcMesh, optional): Monarch ProcMesh on which to spawn StorageVolumes
 
     Raises:
         RuntimeError: If num_storage_volumes > 1 but no strategy is provided.
