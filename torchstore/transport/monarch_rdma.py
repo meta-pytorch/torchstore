@@ -195,13 +195,14 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         else:
             assert isinstance(tensor_like, torch.Tensor)
 
+            # note: .contiguous will return a copy if this tensor is not contiguous
+            # this usually shows up during resharding cases
+            tensor = tensor_like.contiguous()
+
             # monarch sometimes really doesn't like gpu tensors, so we convert to cpu
             # this makes things way slower, and hopefully will be fixed in the future
             if MONARCH_RDMA_EAGER_D2H:
                 tensor = tensor_like.cpu()
-            # note: .contiguous will return a copy if this tensor is not contiguous
-            # this usually shows up during resharding cases
-            tensor = tensor_like.contiguous()
 
         self.tensor = tensor
 
