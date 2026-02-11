@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 # For some reason, monarch sometimes doesn't like gpu tensors, so we convert to cpu. We noticed this in larger
 # models, like qwen3-30BA3B
-MONARCH_RDMA_EAGER_D2H = os.environ.get("TORCHSTORE_MONARCH_RDMA_EAGER_D2H", "0") == "1"
+MONARCH_RDMA_EAGER_D2H = os.environ.get("TORCHSTORE_MONARCH_RDMA_EAGER_D2H", "1") == "1"
 
 
 def monarch_rdma_transport_available() -> bool:
