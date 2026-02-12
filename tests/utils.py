@@ -100,10 +100,6 @@ class DTensorActor(Actor):
         os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
 
     def rlog(self, msg):
-        # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
-        if not self.rank == 0:
-            return
-        print(f"rank: {self.rank} {msg}")
         logger.info(f"rank: {self.rank} {msg}")
 
     def initialize_distributed(self):
