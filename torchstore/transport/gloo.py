@@ -103,6 +103,8 @@ class GlooTransportBuffer(TransportBuffer):
     - Network connectivity between client and storage (for TCPStore)
     """
 
+    supports_inplace_resharding = False
+
     def __init__(self, storage_volume_ref: "StorageVolumeRef") -> None:
         super().__init__(storage_volume_ref)
 

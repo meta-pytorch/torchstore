@@ -3,9 +3,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
 import math
 import os
+import time
 from itertools import product
 from logging import getLogger
 
@@ -16,6 +16,7 @@ from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
 from torchstore.transport import TransportType
+from torchstore.transport.types import Request
 
 logger = getLogger(__name__)
 
@@ -33,26 +34,25 @@ def strategy_params(with_host_strategy: bool = False):
     ]
 
     if with_host_strategy:
-        pass
-        # strategies.append((1, ts.HostStrategy))
+        strategies.append((1, ts.HostStrategy))
 
     return "strategy_params", strategies
 
 
 def transport_params():
     """Return transport types for parameterization without strategy."""
-    # enabled_transport_types = [TransportType.MonarchRPC]
-    enabled_transport_types = []
-    if os.environ.get("TORCHSTORE_RDMA_ENABLED", "0") == "1":
+    enabled_transport_types = [TransportType.MonarchRPC]
+
+    if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.MonarchRDMA)
 
-    if os.environ.get("USE_TORCHCOMMS_RDMA", "1") == "1":
+    if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
         enabled_transport_types.append(TransportType.TorchCommsRDMA)
 
-    if os.environ.get("TORCHSTORE_GLOO_ENABLED", "0") == "1":
+    if os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.Gloo)
 
-    if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "0") == "1":
+    if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.SharedMemory)
 
     return "transport_type", enabled_transport_types
@@ -149,28 +149,24 @@ class DTensorActor(Actor):
         self.rlog("distributing dtensor")
         tensor = self.original_tensor.to("cpu")
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
-        import time
-
-        # self.rlog(f"calling get with {dtensor=}")
-
-        from torchstore.transport.types import Request
 
         dtensor_request = Request.from_any(dtensor)
         tensor_slice = dtensor_request.tensor_slice
 
         t = time.perf_counter()
-        # fetched_tensor = await ts.get(
-        #     self.shared_key, tensor_slice_spec=dtensor_request.tensor_slice
-        # )
-        self.rlog(f"alloc on the fly after fetch: {time.perf_counter() - t}")
+        fetched_tensor = await ts.get(
+            self.shared_key, tensor_slice_spec=dtensor_request.tensor_slice
+        )
+        self.rlog(f"alloc on the fly: {time.perf_counter() - t}")
 
-        # self.rlog(f"inplace get with {dtensor=}")
         t = time.perf_counter()
-        fetched_tensor = await ts.get(self.shared_key, dtensor)
-        self.rlog(f"inplace after fetch: {time.perf_counter() - t}")
-        assert torch.equal(dtensor, fetched_tensor)
+        inplace_fetched_tensor = await ts.get(self.shared_key, dtensor)
+        self.rlog(f"inplace: {time.perf_counter() - t}")
 
-        return fetched_tensor, device_mesh.get_coordinate()
+        assert torch.equal(dtensor._local_tensor, fetched_tensor)
+        assert torch.equal(dtensor, inplace_fetched_tensor)
+
+        return inplace_fetched_tensor, device_mesh.get_coordinate()
 
     @endpoint
     async def destroy_process_group(self):

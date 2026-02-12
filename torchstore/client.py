@@ -187,19 +187,24 @@ class LocalClient:
         volume_map = await self._locate_volumes(key)
         partial_results = []
 
-        # Check if we can use inplace resharding by passing views of the destination tensor
+        # Eagerly create transport buffers for all volumes
+        transport_buffer_map = {
+            volume_id: create_transport_buffer(
+                self.strategy.get_storage_volume(volume_id)
+            )
+            for volume_id in volume_map.keys()
+        }
+
+        # only attempt inplace if buffer has support, tensor is contiguous, and tensor_slice is provided
         use_inplace_views = (
-            request.tensor_val is not None
+            all(tb.supports_inplace_resharding for tb in transport_buffer_map.values())
+            and request.tensor_val is not None
             and request.tensor_val.is_contiguous()
             and request.tensor_slice is not None
         )
-        assert (
-            use_inplace_views
-        ), f"{(request.tensor_val is not None)=} {request.tensor_val.is_contiguous()=} {request.tensor_slice=}"
 
         for volume_id, storage_info in volume_map.items():
-            volume_ref = self.strategy.get_storage_volume(volume_id)
-            transport_buffer = create_transport_buffer(volume_ref)
+            transport_buffer = transport_buffer_map[volume_id]
 
             # no sharding for objects or regular tensors.
             if storage_info.object_type == ObjectType.OBJECT:
@@ -222,24 +227,24 @@ class LocalClient:
                         continue
 
                 # Try to get a view of the destination tensor for inplace writes
-                dest_view = None
-                if use_inplace_views:
-                    dest_view = _get_destination_view(
+                dest_view = (
+                    _get_destination_view(
                         request.tensor_val, request.tensor_slice, fetch_slice
                     )
-                dest_view = None
+                    if use_inplace_views
+                    else None
+                )
+
                 if dest_view is not None:
-                    # Pass the view as tensor_val - transport writes directly into it
+                    # Pass the view as tensor_val - transport writes directly inplace
                     slice_request = Request.from_tensor_slice(fetch_slice)
                     slice_request.tensor_val = dest_view
                     await transport_buffer.get_from_storage_volume(key, slice_request)
-                    # Track that we wrote inplace (dest_view shares memory with request.tensor_val)
                     partial_results.append((dest_view, fetch_slice))
                 else:
-                    # assert False
-                    # Standard path: allocate new tensor for each fetch
-                    # TODO: We should optimize this.
-                    # this unfortunately creates a new allocation on every fetch. (and fetches each slice separately)
+                    # TODO: ensure this is not in the common path, or that we have a solution for
+                    # this pattern since it creates a new allocation on every fetch, and should be
+                    # is generally avoidable.
                     slice_request = Request.from_tensor_slice(fetch_slice)
                     local_tensor = await transport_buffer.get_from_storage_volume(
                         key, slice_request
@@ -258,8 +263,8 @@ class LocalClient:
             )
         ):
             return request.tensor_val
-        # assert False
-        # If we get here, we need to assemble from partial results
+
+        # Tensor was not resharded inplace, requires us to rebuild the slice 'manually'
         if not partial_results:
             raise RuntimeError(
                 f"No tensor slices found for key '{key}' that intersect with the requested slice"

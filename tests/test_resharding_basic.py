@@ -28,7 +28,7 @@ logger = getLogger(__name__)
         # shrink
         ((4,), (2,), 0, 0),
         # grow
-        # ((2,), (4,), 0, 0),
+        ((2,), (4,), 0, 0),
     ],
 )
 @pytest.mark.asyncio
@@ -196,10 +196,10 @@ async def _test_resharding(
         get_placements
     ), f"{get_mesh_shape=}, {get_placements=}"
 
-    # 10GB tensor: ~2.5B float32 elements = 10GB
-    # Shape: 51200 x 51200 = 2,621,440,000 elements (~9.77GB)
+    # 1GB tensor: 256M float32 elements = 1GB
+    # Shape: 16384 x 16384 = 268,435,456 elements (~1.07GB)
     # Using shape divisible by 8 for proper sharding
-    tensor_size = 51200
+    tensor_size = 16384
     original_tensor = torch.arange(
         tensor_size * tensor_size, dtype=torch.float32
     ).reshape(tensor_size, tensor_size)

@@ -134,6 +134,8 @@ class TransportBuffer:
 
     """
 
+    supports_inplace_resharding: bool = True
+
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
 
