@@ -75,8 +75,8 @@ class DTensorActor(Actor):
             init_method=f"file://{self.file_store_name}",
         )
 
-        # this barrier is more to make sure torch.distibuted is working
-        self.rlog("barrrer")
+        # this barrier is more to make sure torch.distributed is working
+        self.rlog("barrier")
         torch.distributed.barrier()
 
     @endpoint
