@@ -13,6 +13,7 @@ from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
+from torchstore.state_dict_utils import TorchStoreStateDict
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.transport.buffers import TransportContext
@@ -50,7 +51,7 @@ class LocalClient:
         latency_tracker = LatencyTracker(f"put:{key}")
 
         # Create request based on value type
-        if isinstance(value, (torch.Tensor, DTensor)):
+        if isinstance(value, (torch.Tensor, DTensor, TorchStoreStateDict)):
             request = Request.from_any(value)
         else:
             request = Request.from_objects(value)
