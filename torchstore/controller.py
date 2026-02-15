@@ -187,6 +187,35 @@ class Controller(Actor):
 
         return volume_map
 
+    def _register_put(self, key: str, request: Request, storage_volume_id: str) -> None:
+        """Register a single put operation in the storage index.
+
+        Shared implementation used by both notify_put and notify_put_batch.
+
+        Args:
+            key (str): The unique identifier for the stored data.
+            request (Request): The storage request containing metadata (must not contain tensor data).
+            storage_volume_id (str): ID of the storage volume where the data was stored.
+        """
+        if request.tensor_val is not None:
+            raise ValueError(
+                "request should not contain tensor data, "
+                "as this will significantly increase e2e latency"
+            )
+
+        if key not in self.keys_to_storage_volumes:
+            self.keys_to_storage_volumes[key] = {}
+
+        storage_info = StorageInfo(
+            object_type=ObjectType.from_request(request),
+            tensor_slices={request.tensor_slice},
+        )
+
+        if storage_volume_id not in self.keys_to_storage_volumes[key]:
+            self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
+        else:
+            self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
+
     @endpoint
     async def notify_put(
         self, key: str, request: Request, storage_volume_id: str
@@ -202,22 +231,23 @@ class Controller(Actor):
             storage_volume_id (str): ID of the storage volume where the data was stored.
         """
         self.assert_initialized()
-        assert (
-            request.tensor_val is None
-        ), "request should not contain tensor data, as this will significantly increase e2e latency"
+        self._register_put(key, request, storage_volume_id)
 
-        if key not in self.keys_to_storage_volumes:
-            self.keys_to_storage_volumes[key] = {}
+    @endpoint
+    async def notify_put_batch(
+        self, notifications: list[tuple[str, Request, str]]
+    ) -> None:
+        """Notify the controller about multiple stored items in a single RPC call.
 
-        storage_info = StorageInfo(
-            object_type=ObjectType.from_request(request),
-            tensor_slices={request.tensor_slice},
-        )
+        This is used internally by put_state_dict to efficiently batch notifications
+        when storing multiple tensors, reducing RPC overhead.
 
-        if storage_volume_id not in self.keys_to_storage_volumes[key]:
-            self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
-        else:
-            self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
+        Args:
+            notifications: List of (key, request, storage_volume_id) tuples.
+        """
+        self.assert_initialized()
+        for key, request, storage_volume_id in notifications:
+            self._register_put(key, request, storage_volume_id)
 
     @endpoint
     async def teardown(self) -> None:

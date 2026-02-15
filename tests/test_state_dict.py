@@ -265,6 +265,146 @@ async def test_dcp_sharding_parity(transport_type):
             await ts.shutdown()
 
 
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_state_dict_batch(strategy_params, transport_type):
+    """Test put_state_dict_batch / get_state_dict_batch round-trip correctness."""
+
+    class BatchTrainer(Actor):
+        def __init__(self) -> None:
+            self.rank = current_rank().rank
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def do_test(self):
+            model = CompositeParamModel()
+            optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+
+            for _ in range(5):
+                optimizer.zero_grad()
+                loss = model(torch.randn(8, MODEL_LINER_LENGTH)).sum()
+                loss.backward()
+                optimizer.step()
+
+            state_dict = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+            await ts.put_state_dict_batch(state_dict, "v0")
+
+            fetched_state_dict = await ts.get_state_dict_batch("v0")
+            return state_dict, fetched_state_dict
+
+    _, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=1, strategy=strategy(transport_type))
+    trainer = await spawn_actors(1, BatchTrainer, "batch_trainer")
+    try:
+        state_dict, fetched_state_dict = await trainer.do_test.call_one()
+    finally:
+        await ts.shutdown()
+    _assert_equal_state_dict(state_dict, fetched_state_dict)
+
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_state_dict_batch_inplace(strategy_params, transport_type):
+    """Test get_state_dict_batch with a pre-allocated user_state_dict for in-place retrieval."""
+
+    class InplaceTrainer(Actor):
+        def __init__(self) -> None:
+            self.rank = current_rank().rank
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def do_test(self):
+            model = CompositeParamModel()
+            optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+
+            for _ in range(5):
+                optimizer.zero_grad()
+                loss = model(torch.randn(8, MODEL_LINER_LENGTH)).sum()
+                loss.backward()
+                optimizer.step()
+
+            state_dict = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+            await ts.put_state_dict_batch(state_dict, "v0")
+
+            # Create a fresh model as the target for in-place get
+            target_model = CompositeParamModel()
+            target_optimizer = torch.optim.SGD(target_model.parameters(), lr=1e-4)
+            target_state_dict = {
+                "model": target_model.state_dict(),
+                "optimizer": target_optimizer.state_dict(),
+            }
+            fetched_state_dict = await ts.get_state_dict_batch("v0", target_state_dict)
+            return state_dict, fetched_state_dict
+
+    _, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=1, strategy=strategy(transport_type))
+    trainer = await spawn_actors(1, InplaceTrainer, "inplace_trainer")
+    try:
+        state_dict, fetched_state_dict = await trainer.do_test.call_one()
+    finally:
+        await ts.shutdown()
+    _assert_equal_state_dict(state_dict, fetched_state_dict)
+
+
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_state_dict_batch_sequential_cross_compat(
+    strategy_params, transport_type
+):
+    """Test that batch-written state dicts can be read by sequential get, and vice versa."""
+
+    class CrossCompatTrainer(Actor):
+        def __init__(self) -> None:
+            self.rank = current_rank().rank
+            os.environ["LOCAL_RANK"] = str(self.rank)
+
+        @endpoint
+        async def do_test(self):
+            model = CompositeParamModel()
+            optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+
+            for _ in range(5):
+                optimizer.zero_grad()
+                loss = model(torch.randn(8, MODEL_LINER_LENGTH)).sum()
+                loss.backward()
+                optimizer.step()
+
+            state_dict = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+            }
+
+            # Write with batch, read with sequential
+            await ts.put_state_dict_batch(state_dict, "batch_written")
+            fetched_by_sequential = await ts.get_state_dict("batch_written")
+
+            # Write with sequential, read with batch
+            await ts.put_state_dict(state_dict, "seq_written")
+            fetched_by_batch = await ts.get_state_dict_batch("seq_written")
+
+            return state_dict, fetched_by_sequential, fetched_by_batch
+
+    _, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=1, strategy=strategy(transport_type))
+    trainer = await spawn_actors(1, CrossCompatTrainer, "cross_compat_trainer")
+    try:
+        (
+            state_dict,
+            fetched_by_sequential,
+            fetched_by_batch,
+        ) = await trainer.do_test.call_one()
+    finally:
+        await ts.shutdown()
+    _assert_equal_state_dict(state_dict, fetched_by_sequential)
+    _assert_equal_state_dict(state_dict, fetched_by_batch)
+
+
 def _assert_equal_state_dict(state_dict1, state_dict2):
     flattened_state_dict_1, _ = flatten_state_dict(state_dict1)
     flattened_state_dict_2, _ = flatten_state_dict(state_dict2)

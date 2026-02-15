@@ -20,6 +20,10 @@ from torchstore.utils import assemble_tensor, get_slice_intersection
 
 logger = getLogger(__name__)
 
+# Default maximum number of concurrent storage operations for batched puts/gets.
+# Prevents unbounded resource usage (transport buffers, connections) for large models.
+_DEFAULT_MAX_CONCURRENT = 64
+
 
 class LocalClient:
     """Client-side interface for TorchStore operations.
@@ -66,6 +70,82 @@ class LocalClient:
             key, request.meta_only(), storage_volume_ref.volume_id
         )
         latency_tracker.track_step("notify_put")
+        latency_tracker.track_e2e()
+
+    @torch.no_grad
+    async def _put_batch(
+        self,
+        items: dict[str, torch.Tensor | Any],
+        max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+    ) -> None:
+        """Internal method to store multiple tensors or objects in a single batched call.
+
+        This is significantly more efficient than calling put() multiple times as it
+        parallelizes storage operations and batches controller notifications.
+
+        Uses all-or-nothing semantics: if any individual put fails, the controller
+        is not notified about any items, making retries safe and idempotent.
+
+        Args:
+            items: Dictionary mapping keys to values to store.
+            max_concurrent: Maximum number of concurrent storage operations.
+        """
+        if items is None or len(items) == 0:
+            return
+
+        latency_tracker = LatencyTracker(f"put_batch:{len(items)}_keys")
+
+        # All items in a single batch are routed to the same storage volume.
+        # This is correct because _put_batch is called per-client (one per rank),
+        # and each client's strategy returns a single volume for that rank.
+        storage_volume_ref = self.strategy.select_storage_volume()
+        if storage_volume_ref is None:
+            raise RuntimeError("No storage volume available for batch put operation")
+        latency_tracker.track_step("strategy.select_storage_volume")
+
+        # Put all items in parallel using asyncio.gather with a semaphore to
+        # limit concurrency. Without throttling, large models (hundreds of tensors)
+        # would create an unbounded number of concurrent transport buffers.
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        # NOTE: Each operation needs its own transport buffer to avoid race conditions.
+        # Transport buffers maintain internal state (ipc_handle, tensor_ref, shape, dtype, etc.)
+        # that gets corrupted when multiple concurrent operations share the same instance.
+        async def put_single(key: str, value: torch.Tensor | Any):
+            async with semaphore:
+                transport_buffer = create_transport_buffer(storage_volume_ref)
+                # Create request based on value type (same logic as put method)
+                if isinstance(value, (torch.Tensor, DTensor)):
+                    request = Request.from_any(value)
+                else:
+                    request = Request.from_objects(value)
+                await transport_buffer.put_to_storage_volume(key, request)
+                return key, request
+
+        put_results = await asyncio.gather(
+            *[put_single(key, value) for key, value in items.items()],
+            return_exceptions=True,
+        )
+        latency_tracker.track_step("put_to_storage_volume_batch")
+
+        # All-or-nothing: if any operation failed, don't notify the controller.
+        # Orphaned data in storage volumes is harmless and will be overwritten
+        # on retry.
+        failures = [r for r in put_results if isinstance(r, BaseException)]
+        if failures:
+            latency_tracker.track_e2e()
+            raise RuntimeError(
+                f"{len(failures)}/{len(put_results)} put operations failed in batch. "
+                f"First error: {failures[0]}"
+            ) from failures[0]
+
+        # All succeeded — notify controller in a single batched RPC call
+        notifications = [
+            (key, request.meta_only(), storage_volume_ref.volume_id)
+            for key, request in put_results
+        ]
+        await self._controller.notify_put_batch.call(notifications)
+        latency_tracker.track_step("notify_put_batch")
         latency_tracker.track_e2e()
 
     @torch.no_grad

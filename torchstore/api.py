@@ -10,7 +10,7 @@ import torch
 from monarch.actor import get_or_spawn_controller, ProcMesh
 
 import torchstore.state_dict_utils
-from torchstore.client import LocalClient
+from torchstore.client import _DEFAULT_MAX_CONCURRENT, LocalClient
 from torchstore.controller import Controller
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
@@ -307,4 +307,63 @@ async def get_state_dict(
     cl = await client(store_name)
     return await torchstore.state_dict_utils.get_state_dict(
         cl, key, user_state_dict, strict
+    )
+
+
+async def put_state_dict_batch(
+    state_dict: dict[str, Any],
+    key: str,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+    max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+) -> None:
+    """Store a PyTorch model state_dict using batched operations for efficiency.
+
+    This is significantly faster than put_state_dict as it parallelizes storage
+    operations and batches controller notifications into a single RPC call.
+
+    Args:
+        state_dict (dict): Model state_dict to store.
+        key (str): Unique identifier for the state_dict.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+        max_concurrent (int): Maximum number of concurrent storage operations.
+
+    Example:
+        >>> model = torch.nn.Linear(10, 5)
+        >>> await put_state_dict_batch(model.state_dict(), "model_checkpoint")
+    """
+    cl = await client(store_name)
+    await torchstore.state_dict_utils.put_state_dict_batch(
+        store=cl, state_dict=state_dict, key=key, max_concurrent=max_concurrent
+    )
+
+
+async def get_state_dict_batch(
+    key: str,
+    user_state_dict: dict[str, Any] | None = None,
+    strict: bool = True,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+    max_concurrent: int = _DEFAULT_MAX_CONCURRENT,
+) -> dict[str, Any]:
+    """Retrieve a PyTorch model state_dict using parallel fetches for efficiency.
+
+    This is significantly faster than get_state_dict as it fetches all tensors
+    concurrently rather than sequentially.
+
+    Args:
+        key (str): Unique identifier of the state_dict to retrieve.
+        user_state_dict (dict, optional): Pre-existing state_dict to merge with.
+        strict (bool): Whether to enforce strict loading. Defaults to True.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+        max_concurrent (int): Maximum number of concurrent fetch operations.
+
+    Returns:
+        dict: The retrieved state_dict.
+
+    Example:
+        >>> state_dict = await get_state_dict_batch("model_checkpoint")
+        >>> model.load_state_dict(state_dict)
+    """
+    cl = await client(store_name)
+    return await torchstore.state_dict_utils.get_state_dict_batch(
+        cl, key, user_state_dict, strict, max_concurrent=max_concurrent
     )
