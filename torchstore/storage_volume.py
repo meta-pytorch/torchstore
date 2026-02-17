@@ -84,6 +84,22 @@ class StorageVolume(Actor):
         await self.store.delete(key)
 
     @endpoint
+    async def handshake_batch(
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[tuple[str, Request]],
+    ) -> list[Any]:
+        return await self.store.handshake_batch(transport_buffer, entries)
+
+    @endpoint
+    async def put_batch(
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[tuple[str, Request]],
+    ) -> None:
+        await self.store.put_batch(transport_buffer, entries)
+
+    @endpoint
     async def reset(self) -> None:
         self.store.reset()
 
@@ -121,6 +137,20 @@ class StorageImpl:
     ) -> Any | None:
         raise NotImplementedError()
 
+    async def handshake_batch(
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[tuple[str, "Request"]],
+    ) -> list[Any]:
+        raise NotImplementedError()
+
+    async def put_batch(
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[tuple[str, "Request"]],
+    ) -> None:
+        raise NotImplementedError()
+
 
 class InMemoryStore(StorageImpl):
     """Local in memory storage."""
@@ -136,6 +166,42 @@ class InMemoryStore(StorageImpl):
         return await transport_buffer.recv_handshake(
             self.transport_context, current_object
         )
+
+    async def handshake_batch(
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[tuple[str, "Request"]],
+    ) -> list[Any]:
+        keys_and_current_objects = [
+            (key, self._extract_existing(key, request)) for key, request in entries
+        ]
+        return await transport_buffer.recv_handshake_batch(
+            self.transport_context, keys_and_current_objects
+        )
+
+    async def put_batch(
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[tuple[str, "Request"]],
+    ) -> None:
+        put_entries = [
+            (key, request, self._extract_existing(key, request))
+            for key, request in entries
+        ]
+        results = await transport_buffer.handle_put_batch_request(
+            self.transport_context, put_entries
+        )
+        for key, request in entries:
+            self._store(key, request, results[key])
+
+    def _store(self, key: str, request: "Request", data: Any) -> None:
+        """Store data in kv, wrapping objects and handling DTensor shards."""
+        if request.is_object:
+            self.kv[key] = {"obj": data}
+        elif request.tensor_slice is not None:
+            self._handle_dtensor(key, request.tensor_slice, data)
+        else:
+            self.kv[key] = data
 
     def _extract_existing(self, key: str, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
@@ -274,16 +340,7 @@ class InMemoryStore(StorageImpl):
         )
 
         # store locally
-        if request.is_object:
-            self.kv[key] = {"obj": data}
-            return
-
-        if request.tensor_slice is not None:
-            # tensor is actually part of a DTensor
-            self._handle_dtensor(key, request.tensor_slice, data)
-            return
-
-        self.kv[key] = data
+        self._store(key, request, data)
 
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request

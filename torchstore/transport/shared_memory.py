@@ -20,6 +20,7 @@ from typing import Any, TYPE_CHECKING
 
 import torch
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.utils import get_local_hostname
 
@@ -46,9 +47,9 @@ def allocate_shared_tensor(shape: torch.Size, dtype: torch.dtype) -> torch.Tenso
 
 
 SHOULD_PIN_SHM = os.environ.get("TORCHSTORE_PIN_SHM", "1") == "1"
-MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "0") == "1"
+MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "1") == "1"
 # Disabling by default on initial release
-SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "0") == "1"
+SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1"
 
 
 def pin_memory(tensor: torch.Tensor) -> None:
@@ -263,6 +264,11 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # Put needs a handshake, get does not
         self._needs_handshake: bool = False
 
+        # Batch state
+        self._batch_shm_descriptors: dict[str, SharedMemoryDescriptor | None] = {}
+        # Objects travel via RPC serialization (not excluded from __getstate__)
+        self._batch_objects: dict[str, Any] = {}
+
     def requires_handshake(self, request: "Request") -> bool:
         if self._needs_handshake:
             assert request.tensor_val is not None
@@ -285,6 +291,90 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         self._key = key
         await super().put_to_storage_volume(key, request)
 
+    async def put_batch_to_storage_volume(
+        self, entries: list[tuple[str, "Request"]]
+    ) -> None:
+        """Optimized batch put: 1 handshake RPC, parallel copy, 1 put RPC.
+
+        Tensors go through the SHM path (handshake + copy). Objects are
+        carried via RPC serialization. Both are sent in a single put RPC.
+        """
+        latency_tracker = LatencyTracker("put_batch_shm")
+
+        # split objects and tensors for handshakes / batch put
+        tensor_entries = []
+        all_meta_entries = []
+        tensor_meta_entries = []
+        for key, request in entries:
+            req_meta = request.meta_only()
+            all_meta_entries.append((key, req_meta))
+            if request.is_object:
+                self._batch_objects[key] = request.objects
+            else:
+                assert request.tensor_val is not None
+                if not request.tensor_val.is_contiguous():
+                    request.tensor_val = request.tensor_val.cpu().contiguous()
+                tensor_entries.append((key, request))
+                tensor_meta_entries.append((key, req_meta))
+        latency_tracker.track_step("prepare")
+
+        # one handshake + SHM copy only for tensor entries
+        if tensor_entries:
+            descriptors = await self.storage_volume_ref.volume.handshake_batch.call_one(
+                self, tensor_meta_entries
+            )
+            latency_tracker.track_step("handshake_rpc")
+
+            # Step 2: Post-handshake — allocate/attach SHM and copy data
+            self._post_handshake_batch(tensor_entries, descriptors)
+            latency_tracker.track_step("_post_handshake_batch")
+
+        # one put RPC for all entries (tensors + objects)
+        try:
+            await self.storage_volume_ref.volume.put_batch.call(self, all_meta_entries)
+            latency_tracker.track_step("put_rpc")
+        finally:
+            await self.drop()
+            latency_tracker.track_step("drop")
+            latency_tracker.track_e2e()
+
+    def _post_handshake_batch(
+        self,
+        entries: list[tuple[str, "Request"]],
+        descriptors: list["SharedMemoryDescriptor | None"],
+    ) -> None:
+        """Allocate/attach SHM segments and copy tensor data for a batch.
+
+        For each entry, either attaches to an existing SHM segment (if the SV
+        returned a descriptor) or allocates a new one. Then copies the client
+        tensor into the SHM region with non_blocking=True, and synchronizes
+        to ensure all copies complete before returning.
+        """
+        latency_tracker = LatencyTracker("post_handshake_batch")
+
+        shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
+        for (key, request), descriptor in zip(entries, descriptors):
+            tensor = request.tensor_val
+            assert tensor is not None
+
+            if descriptor is not None:
+                client_entry = shm_cache.attach(key, descriptor)
+            else:
+                client_entry, descriptor = shm_cache.allocate(
+                    key, tensor.shape, tensor.dtype
+                )
+
+            self._batch_shm_descriptors[key] = descriptor
+
+            shm_tensor = client_entry.get_tensor()
+            shm_tensor.copy_(tensor, non_blocking=True)
+        latency_tracker.track_step("alloc_and_copy")
+
+        # Wait for all async copies (GPU->CPU DMA) to complete
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        latency_tracker.track_step("cuda_synchronize")
+
     async def recv_handshake(
         self, ctx: "TransportContext", current_object: Any = None
     ) -> "SharedMemoryDescriptor | None":
@@ -297,6 +387,34 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         descriptor = SharedMemoryDescriptor.from_tensor(current_object)
         assert descriptor is not None, "Stored tensor is not in shared memory."
         return descriptor
+
+    async def recv_handshake_batch(
+        self,
+        ctx: "TransportContext",
+        keys_and_current_objects: list[tuple[str, Any]],
+    ) -> list["SharedMemoryDescriptor | None"]:
+        """SV side: return descriptors for existing tensors, None for new."""
+        return [
+            await self.recv_handshake(ctx, current_object)
+            for _key, current_object in keys_and_current_objects
+        ]
+
+    async def handle_put_batch_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[str, "Request", Any]],
+    ) -> dict[str, Any]:
+        """SV side: handle batch of put requests for tensors and objects."""
+        results = {}
+        for key, request, current_object in entries:
+            if key in self._batch_objects:
+                results[key] = self._batch_objects[key]
+            else:
+                self.shm_descriptor = self._batch_shm_descriptors.get(key)
+                results[key] = await self.handle_put_request(
+                    ctx, request, current_object
+                )
+        return results
 
     async def _post_handshake(self, handshake_result: Any) -> None:
         """Client: grab existing tensor OR allocate new one, then copy data."""
@@ -415,3 +533,5 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         """
         self._client_tensor = None
         self.objects = None
+        self._batch_shm_descriptors = {}
+        self._batch_objects = {}

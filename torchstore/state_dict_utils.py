@@ -29,9 +29,11 @@ async def put_state_dict(store, state_dict, key):
 
     """
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
-    for flattened_key, value in flattened_state_dict.items():
-        await store.put(f"{key}{DELIM}{flattened_key}", value)
 
+    # Batch all tensor entries, then put the mapping object separately
+    # (batch only supports tensors)
+    entries = [(f"{key}{DELIM}{k}", v) for k, v in flattened_state_dict.items()]
+    await store.put_batch(entries)
     await store.put(f"{key}{DELIM}{MAPPING}", mapping)
 
 

@@ -254,6 +254,42 @@ class TransportBuffer:
         # called on the storage volume side
         raise NotImplementedError()
 
+    async def put_batch_to_storage_volume(
+        self, entries: list[tuple[str, "Request"]]
+    ) -> None:
+        """Client-side entry point for batch put.
+
+        Default implementation: sequential loop calling put_to_storage_volume
+        for each entry. This ensures all non-SharedMemory transports work
+        without changes.
+        """
+        for key, request in entries:
+            await self.put_to_storage_volume(key, request)
+
+    async def recv_handshake_batch(
+        self,
+        ctx: "TransportContext",
+        keys_and_current_objects: list[tuple[str, Any]],
+    ) -> list[Any]:
+        """SV-side batch handshake.
+
+        Only called via batch SV endpoints. Subclasses that override
+        put_batch_to_storage_volume must implement this.
+        """
+        raise NotImplementedError()
+
+    async def handle_put_batch_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[str, "Request", Any]],
+    ) -> dict[str, Any]:
+        """SV-side batch put handler.
+
+        Only called via batch SV endpoints. Subclasses that override
+        put_batch_to_storage_volume must implement this.
+        """
+        raise NotImplementedError()
+
     # Helper methods
     def _assert_valid_tensor(
         self,

@@ -388,5 +388,90 @@ async def test_shm_cache_reuse_on_same_key_puts(strategy_params):
         await ts.shutdown()
 
 
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_put_batch_basic(strategy_params, transport_type):
+    """Test batch put/get functionality for multiple key-value pairs.
+
+    Runs two put/get cycles, mutating tensor data between them.
+    Tests both CPU and CUDA (if available) source tensors.
+    """
+
+    class BatchPutGetActor(Actor):
+        """Each instance of this actor represents a single process."""
+
+        def __init__(
+            self,
+            world_size,
+        ):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            os.environ["LOCAL_RANK"] = str(self.rank)
+            os.environ["HOSTNAME"] = socket.gethostname()
+
+        def _make_tensors(
+            self, offset: int, device: str
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            t1 = torch.tensor([self.rank + 1 + offset] * 10, device=device)
+            t2 = torch.tensor([self.rank + 100 + offset] * 5, device=device)
+            return t1, t2
+
+        @endpoint
+        async def put_batch(self, prefix: str, offset: int, device: str):
+            t1, t2 = self._make_tensors(offset, device)
+            await ts.put_batch(
+                [
+                    (f"{prefix}_tensor1_{self.rank}", t1),
+                    (f"{prefix}_tensor2_{self.rank}", t2),
+                ]
+            )
+
+        @endpoint
+        async def get_and_verify(self, prefix: str, offset: int):
+            t1 = await ts.get(f"{prefix}_tensor1_{self.rank}")
+            t2 = await ts.get(f"{prefix}_tensor2_{self.rank}")
+
+            expected_t1 = torch.tensor([self.rank + 1 + offset] * 10)
+            expected_t2 = torch.tensor([self.rank + 100 + offset] * 5)
+
+            assert torch.equal(t1, expected_t1), f"t1: {t1} != {expected_t1}"
+            assert torch.equal(t2, expected_t2), f"t2: {t2} != {expected_t2}"
+            return True
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(
+        num_storage_volumes=volume_world_size, strategy=strategy(transport_type)
+    )
+    actor_mesh = await spawn_actors(
+        volume_world_size,
+        BatchPutGetActor,
+        "batch_actor_mesh",
+        world_size=volume_world_size,
+    )
+
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+
+    try:
+        for device in devices:
+            prefix = f"batch_{device}"
+
+            # Cycle 1: initial put/get
+            await actor_mesh.put_batch.call(prefix, 0, device)
+            results = await actor_mesh.get_and_verify.call(prefix, 0)
+            for pt, ok in results:
+                assert ok
+
+            # Cycle 2: mutate data (same shape, different values) and overwrite
+            await actor_mesh.put_batch.call(prefix, 1000, device)
+            results = await actor_mesh.get_and_verify.call(prefix, 1000)
+            for pt, ok in results:
+                assert ok
+    finally:
+        await ts.shutdown()
+
+
 if __name__ == "__main__":
     main(__file__)
