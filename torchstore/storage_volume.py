@@ -55,15 +55,19 @@ class StorageVolume(Actor):
 
     @endpoint
     async def handshake(
-        self, transport_buffer: TransportBuffer, key: str, request: Request
-    ) -> Any | None:
-        return await self.store.handshake(transport_buffer, key, request)
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[tuple[str, Request]],
+    ) -> list[Any]:
+        return await self.store.handshake(transport_buffer, entries)
 
     @endpoint
     async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[tuple[str, Request]],
     ) -> None:
-        await self.store.put(key, transport_buffer, request)
+        await self.store.put(transport_buffer, entries)
 
     @endpoint
     async def get(
@@ -84,22 +88,6 @@ class StorageVolume(Actor):
         await self.store.delete(key)
 
     @endpoint
-    async def handshake_batch(
-        self,
-        transport_buffer: TransportBuffer,
-        entries: list[tuple[str, Request]],
-    ) -> list[Any]:
-        return await self.store.handshake_batch(transport_buffer, entries)
-
-    @endpoint
-    async def put_batch(
-        self,
-        transport_buffer: TransportBuffer,
-        entries: list[tuple[str, Request]],
-    ) -> None:
-        await self.store.put_batch(transport_buffer, entries)
-
-    @endpoint
     async def reset(self) -> None:
         self.store.reset()
 
@@ -111,8 +99,10 @@ class StorageImpl:
         self.transport_context = TransportContext()
 
     async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
-    ) -> TransportBuffer | None:
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[tuple[str, "Request"]],
+    ) -> None:
         """Store data in the storage backend."""
         raise NotImplementedError()
 
@@ -133,22 +123,10 @@ class StorageImpl:
         raise NotImplementedError()
 
     async def handshake(
-        self, transport_buffer: TransportBuffer, key: str, request: "Request"
-    ) -> Any | None:
-        raise NotImplementedError()
-
-    async def handshake_batch(
         self,
         transport_buffer: TransportBuffer,
         entries: list[tuple[str, "Request"]],
     ) -> list[Any]:
-        raise NotImplementedError()
-
-    async def put_batch(
-        self,
-        transport_buffer: TransportBuffer,
-        entries: list[tuple[str, "Request"]],
-    ) -> None:
         raise NotImplementedError()
 
 
@@ -160,14 +138,6 @@ class InMemoryStore(StorageImpl):
         super().__init__()
 
     async def handshake(
-        self, transport_buffer: TransportBuffer, key: str, request: "Request"
-    ) -> Any | None:
-        current_object = self._extract_existing(key, request)
-        return await transport_buffer.recv_handshake(
-            self.transport_context, current_object
-        )
-
-    async def handshake_batch(
         self,
         transport_buffer: TransportBuffer,
         entries: list[tuple[str, "Request"]],
@@ -175,11 +145,11 @@ class InMemoryStore(StorageImpl):
         keys_and_current_objects = [
             (key, self._extract_existing(key, request)) for key, request in entries
         ]
-        return await transport_buffer.recv_handshake_batch(
+        return await transport_buffer.recv_handshake(
             self.transport_context, keys_and_current_objects
         )
 
-    async def put_batch(
+    async def put(
         self,
         transport_buffer: TransportBuffer,
         entries: list[tuple[str, "Request"]],
@@ -188,7 +158,7 @@ class InMemoryStore(StorageImpl):
             (key, request, self._extract_existing(key, request))
             for key, request in entries
         ]
-        results = await transport_buffer.handle_put_batch_request(
+        results = await transport_buffer.handle_put_request(
             self.transport_context, put_entries
         )
         for key, request in entries:
@@ -325,22 +295,6 @@ class InMemoryStore(StorageImpl):
 
             if extracted_tensor is not None:
                 return extracted_tensor
-
-    async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
-    ) -> None:
-        # Extract existing tensor for potential in-place update
-        current_obj = self._extract_existing(key, request)
-
-        # fetch from remote
-        data = await transport_buffer.handle_put_request(
-            self.transport_context,
-            request,
-            current_obj,
-        )
-
-        # store locally
-        self._store(key, request, data)
 
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request
