@@ -41,8 +41,9 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         state["inplace_tensor"] = None
         return state
 
-    async def _pre_put_hook(self, request: Request) -> None:
+    async def _pre_put_hook(self, entries: list[tuple[str, "Request"]]) -> None:
         """Store data from request to be serialized with this buffer."""
+        _key, request = entries[0]
         self.data = request.objects if request.is_object else request.tensor_val
 
     async def _pre_get_hook(self, key: str, request: Request) -> None:
@@ -51,10 +52,11 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         self.inplace_tensor = request.tensor_val
 
     async def handle_put_request(
-        self, ctx: "TransportContext", request: Request, current_object
-    ) -> Any:
+        self, ctx: "TransportContext", entries: list[tuple[str, "Request", Any]]
+    ) -> dict[str, Any]:
         """Return the data from the buffer to be stored."""
-        return self.data
+        key, _request, _current_object = entries[0]
+        return {key: self.data}
 
     async def handle_get_request(self, ctx: "TransportContext", data) -> None:
         """Store the data to be sent back to the client."""

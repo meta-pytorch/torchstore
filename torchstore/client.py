@@ -77,8 +77,8 @@ class LocalClient:
         transport_buffer = create_transport_buffer(storage_volume_ref)
         latency_tracker.track_step("create transport buffer")
 
-        await transport_buffer.put_batch_to_storage_volume(requests)
-        latency_tracker.track_step("put_batch_to_storage_volume")
+        await transport_buffer.put_to_storage_volume(requests)
+        latency_tracker.track_step("put_to_storage_volume")
 
         await self._controller.notify_put_batch.call(
             [(key, req.meta_only()) for key, req in requests],
