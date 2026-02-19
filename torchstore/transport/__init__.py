@@ -21,7 +21,7 @@ from torchstore.transport.shared_memory import (
 )
 from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
-from torchstore.transport.types import Request, TensorSlice
+from torchstore.transport.types import KeyedRequest, Request, TensorSlice
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -74,4 +74,4 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
     return transport_map[transport_type](storage_volume_ref)
 
 
-__all__ = ["Request", "TensorSlice", "TransportType"]
+__all__ = ["KeyedRequest", "Request", "TensorSlice", "TransportType"]

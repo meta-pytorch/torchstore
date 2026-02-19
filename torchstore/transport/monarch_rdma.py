@@ -22,7 +22,7 @@ except ImportError:
 
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.types import Request
+from torchstore.transport.types import KeyedRequest, Request
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -65,9 +65,9 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             tensor = tensor.unsqueeze(0)
         return tensor.view(torch.uint8).flatten()
 
-    async def _pre_put_hook(self, entries: list[tuple[str, "Request"]]) -> None:
+    async def _pre_put_hook(self, entries: list[KeyedRequest]) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        _key, request = entries[0]
+        request = entries[0].request
 
         if request.is_object:
             return
@@ -99,9 +99,9 @@ class MonarchRDMATransportBuffer(TransportBuffer):
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[str, "Request", Any]],
+        entries: list[tuple[KeyedRequest, Any]],
     ) -> dict[str, Any]:
-        key, request, current_object = entries[0]
+        (key, request), current_object = entries[0]
 
         if request.is_object:
             self.is_object = True

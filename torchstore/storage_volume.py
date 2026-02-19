@@ -13,7 +13,7 @@ import torch
 from monarch.actor import Actor, endpoint
 
 from torchstore.transport.buffers import TransportBuffer, TransportContext
-from torchstore.transport.types import Request, TensorSlice
+from torchstore.transport.types import KeyedRequest, Request, TensorSlice
 from torchstore.utils import get_slice_intersection, spawn_actors
 
 logger = getLogger(__name__)
@@ -57,7 +57,7 @@ class StorageVolume(Actor):
     async def handshake(
         self,
         transport_buffer: TransportBuffer,
-        entries: list[tuple[str, Request]],
+        entries: list[KeyedRequest],
     ) -> list[Any]:
         return await self.store.handshake(transport_buffer, entries)
 
@@ -65,7 +65,7 @@ class StorageVolume(Actor):
     async def put(
         self,
         transport_buffer: TransportBuffer,
-        entries: list[tuple[str, Request]],
+        entries: list[KeyedRequest],
     ) -> None:
         await self.store.put(transport_buffer, entries)
 
@@ -101,7 +101,7 @@ class StorageImpl:
     async def put(
         self,
         transport_buffer: TransportBuffer,
-        entries: list[tuple[str, "Request"]],
+        entries: list[KeyedRequest],
     ) -> None:
         """Store data in the storage backend."""
         raise NotImplementedError()
@@ -125,7 +125,7 @@ class StorageImpl:
     async def handshake(
         self,
         transport_buffer: TransportBuffer,
-        entries: list[tuple[str, "Request"]],
+        entries: list[KeyedRequest],
     ) -> list[Any]:
         raise NotImplementedError()
 
@@ -140,29 +140,28 @@ class InMemoryStore(StorageImpl):
     async def handshake(
         self,
         transport_buffer: TransportBuffer,
-        entries: list[tuple[str, "Request"]],
+        entries: list[KeyedRequest],
     ) -> list[Any]:
-        keys_and_current_objects = [
-            (key, self._extract_existing(key, request)) for key, request in entries
+        pairs = [
+            (entry, self._extract_existing(entry.key, entry.request))
+            for entry in entries
         ]
-        return await transport_buffer.recv_handshake(
-            self.transport_context, keys_and_current_objects
-        )
+        return await transport_buffer.recv_handshake(self.transport_context, pairs)
 
     async def put(
         self,
         transport_buffer: TransportBuffer,
-        entries: list[tuple[str, "Request"]],
+        entries: list[KeyedRequest],
     ) -> None:
-        put_entries = [
-            (key, request, self._extract_existing(key, request))
-            for key, request in entries
+        entries_with_current_obj = [
+            (entry, self._extract_existing(entry.key, entry.request))
+            for entry in entries
         ]
         results = await transport_buffer.handle_put_request(
-            self.transport_context, put_entries
+            self.transport_context, entries_with_current_obj
         )
-        for key, request in entries:
-            self._store(key, request, results[key])
+        for entry in entries:
+            self._store(entry.key, entry.request, results[entry.key])
 
     def _store(self, key: str, request: "Request", data: Any) -> None:
         """Store data in kv, wrapping objects and handling DTensor shards."""
