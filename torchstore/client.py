@@ -16,59 +16,14 @@ from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.transport.buffers import TransportContext
-from torchstore.utils import assemble_tensor, get_slice_intersection
+from torchstore.utils import (
+    assemble_tensor,
+    get_destination_view,
+    get_slice_intersection,
+    tensors_overlap_in_memory,
+)
 
 logger = getLogger(__name__)
-
-
-def _get_destination_view(
-    dest_tensor: torch.Tensor,
-    dest_slice: TensorSlice,
-    fetch_slice: TensorSlice,
-) -> torch.Tensor | None:
-    """Get a view of the destination tensor where the fetched slice should be written.
-
-    Args:
-        dest_tensor: The destination tensor (must be contiguous)
-        dest_slice: TensorSlice describing the destination tensor's position in global space
-        fetch_slice: TensorSlice describing the slice being fetched
-
-    Returns:
-        A view of dest_tensor for the region where fetch_slice should be written,
-        or None if the fetch_slice doesn't map to a contiguous region in dest_tensor.
-    """
-    if not dest_tensor.is_contiguous():
-        return None
-
-    # Compute the local indices within dest_tensor where fetch_slice should be written
-    slices = []
-
-    for dim in range(len(fetch_slice.global_shape)):
-        # fetch_slice offset in global coordinates
-        fetch_start = fetch_slice.offsets[dim]
-        fetch_end = fetch_start + fetch_slice.local_shape[dim]
-
-        # dest_slice offset in global coordinates
-        dest_start = dest_slice.offsets[dim]
-
-        # Convert to local coordinates within dest_tensor
-        local_start = fetch_start - dest_start
-        local_end = fetch_end - dest_start
-
-        # Validate bounds
-        if local_start < 0 or local_end > dest_slice.local_shape[dim]:
-            return None
-
-        slices.append(slice(local_start, local_end))
-
-    # Create the view
-    view = dest_tensor[tuple(slices)]
-
-    # Check if the view is contiguous - required for RDMA transports
-    if not view.is_contiguous():
-        return None
-
-    return view
 
 
 class LocalClient:
@@ -228,7 +183,7 @@ class LocalClient:
 
                 # Try to get a view of the destination tensor for inplace writes
                 dest_view = (
-                    _get_destination_view(
+                    get_destination_view(
                         request.tensor_val, request.tensor_slice, fetch_slice
                     )
                     if use_inplace_views
@@ -252,15 +207,8 @@ class LocalClient:
                     partial_results.append((local_tensor, fetch_slice))
 
         # Check if all results share memory with the destination tensor (inplace)
-        if (
-            use_inplace_views
-            and partial_results
-            and all(
-                t.data_ptr() >= request.tensor_val.data_ptr()
-                and t.data_ptr()
-                < request.tensor_val.data_ptr() + request.tensor_val.nbytes
-                for t, _ in partial_results
-            )
+        if use_inplace_views and tensors_overlap_in_memory(
+            partial_results, request.tensor_val
         ):
             return request.tensor_val
 
