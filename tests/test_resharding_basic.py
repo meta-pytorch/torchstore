@@ -196,10 +196,10 @@ async def _test_resharding(
         get_placements
     ), f"{get_mesh_shape=}, {get_placements=}"
 
-    # 1GB tensor: 256M float32 elements = 1GB
-    # Shape: 16384 x 16384 = 268,435,456 elements (~1.07GB)
+    # 1MB tensor: 256K float32 elements = 1MB
+    # Shape: 512 x 512 = 262,144 elements (~1MB)
     # Using shape divisible by 8 for proper sharding
-    tensor_size = 16384
+    tensor_size = 512
     original_tensor = torch.arange(
         tensor_size * tensor_size, dtype=torch.float32
     ).reshape(tensor_size, tensor_size)
