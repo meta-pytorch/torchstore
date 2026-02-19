@@ -120,13 +120,13 @@ class TransportBuffer:
     - `recv_handshake`: If `requires_handshake=True`
     - `drop`: Resource cleanup (especially important for RDMA buffers)
 
-    Properties
+    Attributes
     ----------
     supports_inplace_resharding : bool
         Whether this transport supports inplace resharding.
 
-    Args
-    ----
+    Parameters
+    ----------
     storage_volume_ref : StorageVolumeRef
         Reference to the target storage volume, including actor handle and transport context.
 
