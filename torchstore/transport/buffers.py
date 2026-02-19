@@ -122,10 +122,8 @@ class TransportBuffer:
 
     Properties
     ----------
-    requires_handshake : bool
-        Property that returns True if a handshake is needed before put/get.
-        Override this in subclasses to implement custom handshake logic.
-        Default is False.
+    supports_inplace_resharding : bool
+        Whether this transport supports inplace resharding.
 
     Args
     ----
