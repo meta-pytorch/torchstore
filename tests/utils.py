@@ -29,8 +29,6 @@ def main(file):
 def strategy_params(with_host_strategy: bool = False):
     strategies = [
         (2, ts.LocalRankStrategy),
-        # (1, ts.SingletonStrategy), essentially same as ControllerStorageVolumes
-        # (1, ts.ControllerStorageVolumes),
     ]
 
     if with_host_strategy:
@@ -111,8 +109,8 @@ class DTensorActor(Actor):
             init_method=f"file://{self.file_store_name}",
         )
 
-        # this barrier is more to make sure torch.distibuted is working
-        self.rlog("barrrer")
+        # this barrier is more to make sure torch.distributed is working
+        self.rlog("barrier")
         torch.distributed.barrier()
 
     @endpoint

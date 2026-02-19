@@ -59,8 +59,8 @@ class ModelTest(Actor):
             init_method=f"file://{self.file_store_name}",
         )
 
-        # this barrier is more to make sure torch.distibuted is working
-        self.rlog("barrrer")
+        # this barrier is more to make sure torch.distributed is working
+        self.rlog("barrier")
         torch.distributed.barrier()
 
     def build_model(self):
@@ -142,9 +142,7 @@ async def _do_test(put_mesh_shape, get_mesh_shape, strategy, transport_type):
 
     put_world_size = math.prod(put_mesh_shape)
     await ts.initialize(
-        num_storage_volumes=(
-            put_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
-        ),
+        num_storage_volumes=put_world_size,
         strategy=strategy(transport_type),
     )
     try:

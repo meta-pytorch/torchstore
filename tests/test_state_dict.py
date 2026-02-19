@@ -118,8 +118,8 @@ class DCPParityTest(Actor):
             init_method=f"file://{self.file_store_name}",
         )
 
-        # this barrier is more to make sure torch.distibuted is working
-        self.rlog("barrrer")
+        # this barrier is more to make sure torch.distributed is working
+        self.rlog("barrier")
         torch.distributed.barrier()
 
     @endpoint
@@ -224,9 +224,7 @@ async def test_dcp_sharding_parity(transport_type):
         # race conditions (contains non sharded elements)
         strategy = ts.LocalRankStrategy
         await ts.initialize(
-            num_storage_volumes=(
-                save_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
-            ),
+            num_storage_volumes=save_world_size,
             strategy=strategy(transport_type),
         )
         try:

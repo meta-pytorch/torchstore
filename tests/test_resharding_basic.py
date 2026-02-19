@@ -204,9 +204,7 @@ async def _test_resharding(
         tensor_size * tensor_size, dtype=torch.float32
     ).reshape(tensor_size, tensor_size)
     await ts.initialize(
-        num_storage_volumes=(
-            put_world_size if not issubclass(strategy, ts.SingletonStrategy) else 1
-        ),
+        num_storage_volumes=put_world_size,
         strategy=strategy(transport_type),
     )
     with tempfile.TemporaryDirectory() as filesystem_store_dir:
