@@ -3,9 +3,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
 import math
 import os
+import time
 from itertools import product
 from logging import getLogger
 
@@ -16,6 +16,7 @@ from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
 from torchstore.transport import TransportType
+from torchstore.transport.types import Request
 
 logger = getLogger(__name__)
 
@@ -97,7 +98,6 @@ class DTensorActor(Actor):
         os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
 
     def rlog(self, msg):
-        # TODO: set to 'info' once this is fixed in monarch (which currently is hiding logs :/)
         logger.info(f"rank: {self.rank} {msg}")
 
     def initialize_distributed(self):
@@ -144,12 +144,23 @@ class DTensorActor(Actor):
         tensor = self.original_tensor.to("cpu")
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 
-        self.rlog(f"calling get with {dtensor=}")
-        fetched_tensor = await ts.get(self.shared_key, dtensor)
-        self.rlog(f"after fetch: {dtensor=}")
-        assert torch.equal(dtensor, fetched_tensor)
+        dtensor_request = Request.from_any(dtensor)
+        tensor_slice = dtensor_request.tensor_slice
 
-        return fetched_tensor, device_mesh.get_coordinate()
+        t = time.perf_counter()
+        fetched_tensor = await ts.get(
+            self.shared_key, tensor_slice_spec=dtensor_request.tensor_slice
+        )
+        self.rlog(f"alloc on the fly: {time.perf_counter() - t}")
+
+        t = time.perf_counter()
+        inplace_fetched_tensor = await ts.get(self.shared_key, dtensor)
+        self.rlog(f"inplace: {time.perf_counter() - t}")
+
+        assert torch.equal(dtensor._local_tensor, fetched_tensor)
+        assert torch.equal(dtensor, inplace_fetched_tensor)
+
+        return inplace_fetched_tensor, device_mesh.get_coordinate()
 
     @endpoint
     async def destroy_process_group(self):

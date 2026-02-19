@@ -22,6 +22,78 @@ if TYPE_CHECKING:
 logger = getLogger(__name__)
 
 
+def get_destination_view(
+    dest_tensor: torch.Tensor,
+    dest_slice: "TensorSlice",
+    fetch_slice: "TensorSlice",
+) -> torch.Tensor | None:
+    """Get a view of the destination tensor where the fetched slice should be written.
+
+    Args:
+        dest_tensor: The destination tensor (must be contiguous)
+        dest_slice: TensorSlice describing the destination tensor's position in global space
+        fetch_slice: TensorSlice describing the slice being fetched
+
+    Returns:
+        A view of dest_tensor for the region where fetch_slice should be written,
+        or None if the fetch_slice doesn't map to a contiguous region in dest_tensor.
+    """
+    if not dest_tensor.is_contiguous():
+        return None
+
+    # Compute the local indices within dest_tensor where fetch_slice should be written
+    slices = []
+
+    for dim in range(len(fetch_slice.global_shape)):
+        # fetch_slice offset in global coordinates
+        fetch_start = fetch_slice.offsets[dim]
+        fetch_end = fetch_start + fetch_slice.local_shape[dim]
+
+        # dest_slice offset in global coordinates
+        dest_start = dest_slice.offsets[dim]
+
+        # Convert to local coordinates within dest_tensor
+        local_start = fetch_start - dest_start
+        local_end = fetch_end - dest_start
+
+        # Validate bounds
+        if local_start < 0 or local_end > dest_slice.local_shape[dim]:
+            return None
+
+        slices.append(slice(local_start, local_end))
+
+    # Create the view
+    view = dest_tensor[tuple(slices)]
+
+    # Check if the view is contiguous - required for RDMA transports
+    if not view.is_contiguous():
+        return None
+
+    return view
+
+
+def tensors_overlap_in_memory(
+    tensors: list[tuple[torch.Tensor, object]],
+    base_tensor: torch.Tensor,
+) -> bool:
+    """Check if all tensors share memory with the base tensor.
+
+    Args:
+        tensors: List of (tensor, metadata) tuples to check
+        base_tensor: The base tensor to check overlap against
+
+    Returns:
+        True if all tensors' data pointers fall within the base tensor's memory range.
+    """
+    if not tensors:
+        return False
+
+    base_start = base_tensor.data_ptr()
+    base_end = base_start + base_tensor.nbytes
+
+    return all(base_start <= t.data_ptr() < base_end for t, _ in tensors)
+
+
 def get_local_hostname() -> str:
     """Get the current machine's hostname."""
     return os.environ.get("HOSTNAME", socket.gethostname())

@@ -120,19 +120,19 @@ class TransportBuffer:
     - `recv_handshake`: If `requires_handshake=True`
     - `drop`: Resource cleanup (especially important for RDMA buffers)
 
-    Properties
+    Attributes
     ----------
-    requires_handshake : bool
-        Property that returns True if a handshake is needed before put/get.
-        Override this in subclasses to implement custom handshake logic.
-        Default is False.
+    supports_inplace_resharding : bool
+        Whether this transport supports inplace resharding.
 
-    Args
-    ----
+    Parameters
+    ----------
     storage_volume_ref : StorageVolumeRef
         Reference to the target storage volume, including actor handle and transport context.
 
     """
+
+    supports_inplace_resharding: bool = True
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref

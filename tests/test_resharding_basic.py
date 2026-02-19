@@ -196,9 +196,13 @@ async def _test_resharding(
         get_placements
     ), f"{get_mesh_shape=}, {get_placements=}"
 
-    original_tensor = torch.arange(8**2).reshape(
-        8, 8
-    )  # 8x8 square, with ([[0...7],[8...15],[...]])
+    # 1GB tensor: 256M float32 elements = 1GB
+    # Shape: 16384 x 16384 = 268,435,456 elements (~1.07GB)
+    # Using shape divisible by 8 for proper sharding
+    tensor_size = 16384
+    original_tensor = torch.arange(
+        tensor_size * tensor_size, dtype=torch.float32
+    ).reshape(tensor_size, tensor_size)
     await ts.initialize(
         num_storage_volumes=put_world_size,
         strategy=strategy(transport_type),
@@ -230,7 +234,7 @@ async def _test_resharding(
             DTensorActor,
             "get_mesh",
             original_tensor=torch.zeros(
-                8, 8, dtype=original_tensor.dtype
+                tensor_size, tensor_size, dtype=original_tensor.dtype
             ),  # these values get replaced with values from original_tensor after fetching
             placements=get_placements,
             mesh_shape=get_mesh_shape,
