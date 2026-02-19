@@ -7,7 +7,7 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, TYPE_CHECKING
+from typing import Any, NamedTuple, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -213,3 +213,12 @@ class Request:
             objects=self.objects,
             is_object=self.is_object,
         )
+
+
+class KeyedRequest(NamedTuple):
+    key: str
+    request: Request
+
+    def meta_only(self) -> "KeyedRequest":
+        """Return a copy with request.tensor_val stripped."""
+        return KeyedRequest(key=self.key, request=self.request.meta_only())

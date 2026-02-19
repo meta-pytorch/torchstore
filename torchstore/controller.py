@@ -15,7 +15,7 @@ from monarch.actor import Actor, endpoint
 from torchstore.storage_utils.trie import Trie
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
-from torchstore.transport.types import Request, TensorSlice
+from torchstore.transport.types import KeyedRequest, Request, TensorSlice
 
 
 # TODO: move this into request as a field
@@ -190,13 +190,13 @@ class Controller(Actor):
     @endpoint
     async def notify_put_batch(
         self,
-        entries: list[tuple[str, Request]],
+        entries: list[KeyedRequest],
         storage_volume_id: str,
     ) -> None:
         """Notify the controller that one or more keys have been stored.
 
         Args:
-            entries: List of (key, meta_request) tuples.
+            entries: List of KeyedRequests
             storage_volume_id: ID of the storage volume where the data was stored.
         """
         self.assert_initialized()

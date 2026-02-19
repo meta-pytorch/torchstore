@@ -14,7 +14,12 @@ from torch.distributed.tensor import DTensor
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
-from torchstore.transport import create_transport_buffer, Request, TensorSlice
+from torchstore.transport import (
+    create_transport_buffer,
+    KeyedRequest,
+    Request,
+    TensorSlice,
+)
 from torchstore.transport.buffers import TransportContext
 from torchstore.utils import (
     assemble_tensor,
@@ -71,7 +76,7 @@ class LocalClient:
                 request = Request.from_any(value)
             else:
                 request = Request.from_objects(value)
-            requests.append((key, request))
+            requests.append(KeyedRequest(key, request))
 
         storage_volume_ref = self.strategy.select_storage_volume()
         transport_buffer = create_transport_buffer(storage_volume_ref)
@@ -81,7 +86,7 @@ class LocalClient:
         latency_tracker.track_step("put_to_storage_volume")
 
         await self._controller.notify_put_batch.call(
-            [(key, req.meta_only()) for key, req in requests],
+            [r.meta_only() for r in requests],
             storage_volume_ref.volume_id,
         )
         latency_tracker.track_step("notify_put_batch")
