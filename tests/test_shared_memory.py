@@ -15,6 +15,7 @@ from torchstore.transport.shared_memory import (
     SharedMemoryDescriptor,
     SharedMemoryTransportBuffer,
 )
+from torchstore.transport.types import KeyedRequest
 from torchstore.utils import get_local_hostname
 
 
@@ -244,29 +245,30 @@ class TestSharedMemoryCache:
 
         # First PUT: allocate new shared memory
         buffer1 = SharedMemoryTransportBuffer(ref)
-        buffer1._key = "test_key"
         tensor1 = torch.randn(50, 50)
-        buffer1._client_tensor = tensor1
+        entries1 = [KeyedRequest("test_key", MockRequest(tensor_val=tensor1))]
 
-        await buffer1._post_handshake(None)  # No existing descriptor, allocates new
+        await buffer1._post_handshake([None], entries1)  # No existing descriptor
 
         # Verify cache has 1 entry after first PUT
         assert len(shm_cache._entries) == 1
-        first_descriptor = buffer1.shm_descriptor
+        first_descriptor = buffer1._batch_shm_descriptors["test_key"]
 
         # Second PUT: reuse existing shared memory
         buffer2 = SharedMemoryTransportBuffer(ref)
-        buffer2._key = "test_key"
         tensor2 = torch.randn(50, 50)
-        buffer2._client_tensor = tensor2
+        entries2 = [KeyedRequest("test_key", MockRequest(tensor_val=tensor2))]
 
         await buffer2._post_handshake(
-            first_descriptor
+            [first_descriptor], entries2
         )  # Existing descriptor from handshake
 
         # Verify cache still has only 1 entry (same SHM reused)
         assert len(shm_cache._entries) == 1
-        assert buffer2.shm_descriptor.storage_handle == first_descriptor.storage_handle
+        assert (
+            buffer2._batch_shm_descriptors["test_key"].storage_handle
+            == first_descriptor.storage_handle
+        )
 
         # Verify the data was updated
         entry = shm_cache._entries[("test_key", first_descriptor.storage_handle)]
@@ -294,60 +296,43 @@ class TestSharedMemoryTransportBufferPUT:
     """Tests for SharedMemoryTransportBuffer PUT flow."""
 
     @pytest.mark.asyncio
-    async def test_requires_handshake_tensor(self):
-        """Test requires_handshake stores tensor locally when handshake is needed."""
+    async def test_requires_handshake_true_in_put_context(self):
+        """Test requires_handshake returns True in PUT context."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
+        buffer._needs_handshake = True
 
         tensor = torch.randn(50, 50)
-        request = MockRequest(tensor_val=tensor)
-        # Simulate what put_to_storage_volume does before calling requires_handshake
-        buffer._needs_handshake = True
+        entries = [KeyedRequest("key1", MockRequest(tensor_val=tensor))]
 
-        # Call requires_handshake which prepares the tensor
-        result = buffer.requires_handshake(request)
-
-        # Verify handshake is required
-        assert result is True
-        # Verify tensor is stored locally
-        assert torch.equal(buffer._client_tensor, tensor)
-        # Verify objects is NOT set
-        assert buffer.objects is None
-        assert buffer.is_object is False
+        assert buffer.requires_handshake(entries) is True
 
     @pytest.mark.asyncio
-    async def test_requires_handshake_makes_contiguous(self):
-        """Test requires_handshake handles non-contiguous tensor."""
+    async def test_requires_handshake_false_outside_put_context(self):
+        """Test requires_handshake returns False when not in PUT context (e.g., GET)."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
+        # _needs_handshake defaults to False
 
-        # Create non-contiguous tensor (transpose creates a view)
-        tensor = torch.randn(50, 100).t()
-        assert not tensor.is_contiguous()
+        tensor = torch.randn(50, 50)
+        entries = [KeyedRequest("key1", MockRequest(tensor_val=tensor))]
 
-        request = MockRequest(tensor_val=tensor)
-        # Simulate what put_to_storage_volume does before calling requires_handshake
-        buffer._needs_handshake = True
+        result = buffer.requires_handshake(entries)
 
-        buffer.requires_handshake(request)
-
-        assert buffer._client_tensor is not None
-        assert buffer._client_tensor.is_contiguous()
-        assert torch.equal(buffer._client_tensor, tensor)
+        assert result is False
 
     @pytest.mark.asyncio
-    async def test_pre_put_hook_object(self):
-        """Test _pre_put_hook handles objects correctly."""
+    async def test_pre_put_hook_stores_objects(self):
+        """Test _pre_put_hook stores objects in _batch_objects."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
 
         obj = {"key": "value", "list": [1, 2, 3]}
-        request = MockRequest(objects=obj, is_object=True)
-        await buffer._pre_put_hook(request)
+        entries = [KeyedRequest("obj_key", MockRequest(objects=obj, is_object=True))]
 
-        assert buffer.is_object is True
-        assert buffer.objects == obj
-        assert buffer._client_tensor is None
+        await buffer._pre_put_hook(entries)
+
+        assert buffer._batch_objects["obj_key"] == obj
 
     @pytest.mark.asyncio
     async def test_recv_handshake_returns_none_for_new(self):
@@ -357,9 +342,12 @@ class TestSharedMemoryTransportBufferPUT:
         ctx = MockTransportContext()
 
         # No current_object means new allocation on client
-        descriptor = await buffer.recv_handshake(ctx, current_object=None)
+        results = await buffer.recv_handshake(
+            ctx, [(KeyedRequest("key1", MockRequest()), None)]
+        )
 
-        assert descriptor is None
+        assert len(results) == 1
+        assert results[0] is None
 
     @pytest.mark.asyncio
     async def test_recv_handshake_returns_descriptor_for_existing(self):
@@ -372,10 +360,13 @@ class TestSharedMemoryTransportBufferPUT:
         existing_tensor = allocate_shared_tensor(torch.Size([50, 50]), torch.float32)
         expected_descriptor = SharedMemoryDescriptor.from_tensor(existing_tensor)
 
-        descriptor = await buffer.recv_handshake(ctx, current_object=existing_tensor)
+        results = await buffer.recv_handshake(
+            ctx, [(KeyedRequest("key1", MockRequest()), existing_tensor)]
+        )
 
-        assert descriptor is not None
-        assert descriptor.storage_handle == expected_descriptor.storage_handle
+        assert len(results) == 1
+        assert results[0] is not None
+        assert results[0].storage_handle == expected_descriptor.storage_handle
 
     @pytest.mark.asyncio
     async def test_post_handshake_allocates_and_copies(self):
@@ -385,28 +376,27 @@ class TestSharedMemoryTransportBufferPUT:
         # Case 1: No descriptor - allocate new
         buffer1 = SharedMemoryTransportBuffer(ref)
         tensor1 = torch.randn(50, 50)
-        buffer1._key = "test_key_1"
-        buffer1._client_tensor = tensor1
+        entries1 = [KeyedRequest("test_key_1", MockRequest(tensor_val=tensor1))]
 
-        await buffer1._post_handshake(None)
+        await buffer1._post_handshake([None], entries1)
 
-        assert buffer1.shm_descriptor is not None
-        assert buffer1.shm_descriptor.shape == tensor1.shape
-        entry1 = buffer1.shm_descriptor.attach()
+        descriptor1 = buffer1._batch_shm_descriptors["test_key_1"]
+        assert descriptor1 is not None
+        assert descriptor1.shape == tensor1.shape
+        entry1 = descriptor1.attach()
         assert torch.allclose(entry1.get_tensor(), tensor1)
 
         # Case 2: With descriptor - reuse existing
         buffer2 = SharedMemoryTransportBuffer(ref)
         tensor2 = torch.randn(50, 50)
-        buffer2._key = "test_key_2"
-        buffer2._client_tensor = tensor2
 
         shm_tensor = allocate_shared_tensor(tensor2.shape, tensor2.dtype)
         descriptor = SharedMemoryDescriptor.from_tensor(shm_tensor)
+        entries2 = [KeyedRequest("test_key_2", MockRequest(tensor_val=tensor2))]
 
-        await buffer2._post_handshake(descriptor)
+        await buffer2._post_handshake([descriptor], entries2)
 
-        assert buffer2.shm_descriptor is descriptor
+        assert buffer2._batch_shm_descriptors["test_key_2"] is descriptor
         assert torch.allclose(shm_tensor, tensor2)
 
         ref.transport_context.reset()
@@ -424,20 +414,86 @@ class TestSharedMemoryTransportBufferPUT:
         shm_tensor.copy_(tensor)
         descriptor = SharedMemoryDescriptor.from_tensor(shm_tensor)
 
-        buffer._key = "test_key"
-        buffer.shm_descriptor = descriptor
+        buffer._batch_shm_descriptors = {"test_key": descriptor}
 
         # Handle put with no current_object (new key)
         request = MockRequest()
-        result = await buffer.handle_put_request(ctx, request, current_object=None)
+        results = await buffer.handle_put_request(
+            ctx, [(KeyedRequest("test_key", request), None)]
+        )
 
-        assert torch.allclose(result, tensor)
+        assert "test_key" in results
+        assert torch.allclose(results["test_key"], tensor)
 
         # Handle put with matching existing tensor returns existing
-        result2 = await buffer.handle_put_request(
-            ctx, request, current_object=shm_tensor
+        results2 = await buffer.handle_put_request(
+            ctx, [(KeyedRequest("test_key", request), shm_tensor)]
         )
-        assert result2 is shm_tensor
+        assert results2["test_key"] is shm_tensor
+
+    @pytest.mark.asyncio
+    async def test_handle_put_batch_request_tensors(self):
+        """Verify SV handles batch of tensor put requests."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        buffer = SharedMemoryTransportBuffer(ref)
+        ctx = MockTransportContext()
+
+        # Setup two tensor entries
+        t1 = torch.randn(10, 10)
+        shm_tensor1 = allocate_shared_tensor(t1.shape, t1.dtype)
+        shm_tensor1.copy_(t1)
+        descriptor1 = SharedMemoryDescriptor.from_tensor(shm_tensor1)
+
+        t2 = torch.randn(5, 5)
+        shm_tensor2 = allocate_shared_tensor(t2.shape, t2.dtype)
+        shm_tensor2.copy_(t2)
+        descriptor2 = SharedMemoryDescriptor.from_tensor(shm_tensor2)
+
+        buffer._batch_shm_descriptors = {"k1": descriptor1, "k2": descriptor2}
+
+        req1 = MockRequest()
+        req2 = MockRequest()
+
+        results = await buffer.handle_put_request(
+            ctx,
+            [
+                (KeyedRequest("k1", req1), None),  # new tensor
+                (KeyedRequest("k2", req2), None),  # new tensor
+            ],
+        )
+
+        assert "k1" in results
+        assert "k2" in results
+        assert torch.allclose(results["k1"], t1)
+        assert torch.allclose(results["k2"], t2)
+
+    @pytest.mark.asyncio
+    async def test_handle_put_batch_request_mixed(self):
+        """Verify SV handles batch with both tensor and object entries."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        buffer = SharedMemoryTransportBuffer(ref)
+        ctx = MockTransportContext()
+
+        # Tensor entry via SHM
+        t1 = torch.randn(10, 10)
+        shm_tensor1 = allocate_shared_tensor(t1.shape, t1.dtype)
+        shm_tensor1.copy_(t1)
+        descriptor1 = SharedMemoryDescriptor.from_tensor(shm_tensor1)
+        buffer._batch_shm_descriptors = {"tensor_key": descriptor1}
+
+        # Object entry via _batch_objects
+        buffer._batch_objects = {"obj_key": {"value": 99}}
+
+        results = await buffer.handle_put_request(
+            ctx,
+            [
+                (KeyedRequest("tensor_key", MockRequest()), None),
+                (KeyedRequest("obj_key", MockRequest(is_object=True)), None),
+            ],
+        )
+
+        assert torch.allclose(results["tensor_key"], t1)
+        assert results["obj_key"] == {"value": 99}
 
 
 class TestSharedMemoryTransportBufferGET:
@@ -639,39 +695,99 @@ class TestSharedMemoryTransportBufferGPU:
     """GPU-specific tests for SharedMemoryTransportBuffer."""
 
     @pytest.mark.asyncio
-    async def test_requires_handshake_gpu_tensor(self):
-        """Test requires_handshake keeps GPU tensor reference."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-
-        tensor = torch.randn(50, 50, device="cuda")
-        request = MockRequest(tensor_val=tensor)
-        # Simulate what put_to_storage_volume does before calling requires_handshake
-        buffer._needs_handshake = True
-
-        buffer.requires_handshake(request)
-
-        assert buffer._client_tensor is not None
-        assert buffer._client_tensor.device.type == "cuda"
-
-    @pytest.mark.asyncio
     async def test_gpu_tensor_copied_in_post_handshake(self):
         """Test GPU tensor is copied to shared memory in _post_handshake."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
 
         tensor = torch.randn(50, 50, device="cuda")
-        buffer._key = "test_key"
-        buffer._client_tensor = tensor
+        entries = [KeyedRequest("test_key", MockRequest(tensor_val=tensor))]
 
         shm_tensor = allocate_shared_tensor(tensor.shape, tensor.dtype)
         descriptor = SharedMemoryDescriptor.from_tensor(shm_tensor)
 
-        await buffer._post_handshake(descriptor)
+        await buffer._post_handshake([descriptor], entries)
 
         assert torch.allclose(shm_tensor, tensor.cpu())
 
         ref.transport_context.reset()
+
+
+class TestSharedMemoryTransportBufferBatch:
+    """Tests for SharedMemoryTransportBuffer batch operations."""
+
+    @pytest.mark.asyncio
+    async def test_post_handshake_allocates_and_copies_batch(self):
+        """Verify _post_handshake allocates/attaches correctly for multiple tensors and copies data."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        buffer = SharedMemoryTransportBuffer(ref)
+
+        t1 = torch.randn(10, 10)
+        t2 = torch.randn(20, 5)
+
+        # Simulate post-handshake: no existing descriptors (all None)
+        entries = [
+            KeyedRequest("k1", MockRequest(tensor_val=t1)),
+            KeyedRequest("k2", MockRequest(tensor_val=t2)),
+        ]
+        descriptors = [None, None]
+        await buffer._post_handshake(descriptors, entries)
+
+        # Verify both descriptors were allocated
+        assert buffer._batch_shm_descriptors["k1"] is not None
+        assert buffer._batch_shm_descriptors["k2"] is not None
+
+        # Verify data was copied
+        entry1 = buffer._batch_shm_descriptors["k1"].attach()
+        assert torch.allclose(entry1.get_tensor(), t1)
+
+        entry2 = buffer._batch_shm_descriptors["k2"].attach()
+        assert torch.allclose(entry2.get_tensor(), t2)
+
+        ref.transport_context.reset()
+
+    @pytest.mark.asyncio
+    async def test_recv_handshake(self):
+        """Verify SV returns descriptors for existing tensors, None for new."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        buffer = SharedMemoryTransportBuffer(ref)
+        ctx = MockTransportContext()
+
+        existing_tensor = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
+        expected_descriptor = SharedMemoryDescriptor.from_tensor(existing_tensor)
+
+        results = await buffer.recv_handshake(
+            ctx,
+            [
+                (KeyedRequest("k1", MockRequest()), existing_tensor),
+                (KeyedRequest("k2", MockRequest()), None),
+                (KeyedRequest("k3", MockRequest()), "not_a_tensor"),
+            ],
+        )
+
+        assert len(results) == 3
+        assert results[0] is not None
+        assert results[0].storage_handle == expected_descriptor.storage_handle
+        assert results[1] is None
+        assert results[2] is None
+
+    @pytest.mark.asyncio
+    async def test_batch_drop_clears_all_state(self):
+        """Verify drop clears all batch fields."""
+        ref = MockStorageVolumeRef(volume_hostname="localhost")
+        buffer = SharedMemoryTransportBuffer(ref)
+
+        buffer._client_tensor = torch.randn(5, 5)
+        buffer.objects = {"data": 1}
+        buffer._batch_shm_descriptors = {"k1": None}
+        buffer._batch_objects = {"k2": "some_object"}
+
+        await buffer.drop()
+
+        assert buffer._client_tensor is None
+        assert buffer.objects is None
+        assert buffer._batch_shm_descriptors == {}
+        assert buffer._batch_objects == {}
 
 
 if __name__ == "__main__":

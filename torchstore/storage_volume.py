@@ -13,7 +13,7 @@ import torch
 from monarch.actor import Actor, endpoint
 
 from torchstore.transport.buffers import TransportBuffer, TransportContext
-from torchstore.transport.types import Request, TensorSlice
+from torchstore.transport.types import KeyedRequest, Request, TensorSlice
 from torchstore.utils import get_slice_intersection, spawn_actors
 
 logger = getLogger(__name__)
@@ -55,15 +55,19 @@ class StorageVolume(Actor):
 
     @endpoint
     async def handshake(
-        self, transport_buffer: TransportBuffer, key: str, request: Request
-    ) -> Any | None:
-        return await self.store.handshake(transport_buffer, key, request)
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[KeyedRequest],
+    ) -> list[Any]:
+        return await self.store.handshake(transport_buffer, entries)
 
     @endpoint
     async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[KeyedRequest],
     ) -> None:
-        await self.store.put(key, transport_buffer, request)
+        await self.store.put(transport_buffer, entries)
 
     @endpoint
     async def get(
@@ -95,8 +99,10 @@ class StorageImpl:
         self.transport_context = TransportContext()
 
     async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
-    ) -> TransportBuffer | None:
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[KeyedRequest],
+    ) -> None:
         """Store data in the storage backend."""
         raise NotImplementedError()
 
@@ -117,8 +123,10 @@ class StorageImpl:
         raise NotImplementedError()
 
     async def handshake(
-        self, transport_buffer: TransportBuffer, key: str, request: "Request"
-    ) -> Any | None:
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[KeyedRequest],
+    ) -> list[Any]:
         raise NotImplementedError()
 
 
@@ -130,12 +138,39 @@ class InMemoryStore(StorageImpl):
         super().__init__()
 
     async def handshake(
-        self, transport_buffer: TransportBuffer, key: str, request: "Request"
-    ) -> Any | None:
-        current_object = self._extract_existing(key, request)
-        return await transport_buffer.recv_handshake(
-            self.transport_context, current_object
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[KeyedRequest],
+    ) -> list[Any]:
+        pairs = [
+            (entry, self._extract_existing(entry.key, entry.request))
+            for entry in entries
+        ]
+        return await transport_buffer.recv_handshake(self.transport_context, pairs)
+
+    async def put(
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[KeyedRequest],
+    ) -> None:
+        entries_with_current_obj = [
+            (entry, self._extract_existing(entry.key, entry.request))
+            for entry in entries
+        ]
+        results = await transport_buffer.handle_put_request(
+            self.transport_context, entries_with_current_obj
         )
+        for entry in entries:
+            self._store(entry.key, entry.request, results[entry.key])
+
+    def _store(self, key: str, request: "Request", data: Any) -> None:
+        """Store data in kv, wrapping objects and handling DTensor shards."""
+        if request.is_object:
+            self.kv[key] = {"obj": data}
+        elif request.tensor_slice is not None:
+            self._handle_dtensor(key, request.tensor_slice, data)
+        else:
+            self.kv[key] = data
 
     def _extract_existing(self, key: str, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
@@ -259,31 +294,6 @@ class InMemoryStore(StorageImpl):
 
             if extracted_tensor is not None:
                 return extracted_tensor
-
-    async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
-    ) -> None:
-        # Extract existing tensor for potential in-place update
-        current_obj = self._extract_existing(key, request)
-
-        # fetch from remote
-        data = await transport_buffer.handle_put_request(
-            self.transport_context,
-            request,
-            current_obj,
-        )
-
-        # store locally
-        if request.is_object:
-            self.kv[key] = {"obj": data}
-            return
-
-        if request.tensor_slice is not None:
-            # tensor is actually part of a DTensor
-            self._handle_dtensor(key, request.tensor_slice, data)
-            return
-
-        self.kv[key] = data
 
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request

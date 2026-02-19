@@ -15,7 +15,7 @@ from monarch.actor import Actor, endpoint
 from torchstore.storage_utils.trie import Trie
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
-from torchstore.transport.types import Request, TensorSlice
+from torchstore.transport.types import KeyedRequest, Request, TensorSlice
 
 
 # TODO: move this into request as a field
@@ -188,36 +188,38 @@ class Controller(Actor):
         return volume_map
 
     @endpoint
-    async def notify_put(
-        self, key: str, request: Request, storage_volume_id: str
+    async def notify_put_batch(
+        self,
+        entries: list[KeyedRequest],
+        storage_volume_id: str,
     ) -> None:
-        """Notify the controller that data has been stored in a storage volume.
-
-        This should called after a successful put operation to
-        maintain the distributed storage index.
+        """Notify the controller that one or more keys have been stored.
 
         Args:
-            key (str): The unique identifier for the stored data.
-            request (Request): The storage request containing metadata about the stored data.
-            storage_volume_id (str): ID of the storage volume where the data was stored.
+            entries: List of KeyedRequests
+            storage_volume_id: ID of the storage volume where the data was stored.
         """
         self.assert_initialized()
-        assert (
-            request.tensor_val is None
-        ), "request should not contain tensor data, as this will significantly increase e2e latency"
 
-        if key not in self.keys_to_storage_volumes:
-            self.keys_to_storage_volumes[key] = {}
+        for key, request in entries:
+            assert (
+                request.tensor_val is None
+            ), "request should not contain tensor data, as this will significantly increase e2e latency"
 
-        storage_info = StorageInfo(
-            object_type=ObjectType.from_request(request),
-            tensor_slices={request.tensor_slice},
-        )
+            if key not in self.keys_to_storage_volumes:
+                self.keys_to_storage_volumes[key] = {}
 
-        if storage_volume_id not in self.keys_to_storage_volumes[key]:
-            self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
-        else:
-            self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
+            storage_info = StorageInfo(
+                object_type=ObjectType.from_request(request),
+                tensor_slices={request.tensor_slice},
+            )
+
+            if storage_volume_id not in self.keys_to_storage_volumes[key]:
+                self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
+            else:
+                self.keys_to_storage_volumes[key][storage_volume_id].update(
+                    storage_info
+                )
 
     @endpoint
     async def teardown(self) -> None:

@@ -16,11 +16,11 @@ import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
 
 from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.types import KeyedRequest, Request
 
 if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
     from torchstore.transport.pipe import StorageVolumeRef
-    from torchstore.transport.types import Request
 import os
 
 import torch.distributed as dist
@@ -131,7 +131,7 @@ class GlooTransportBuffer(TransportBuffer):
             None  # Background task for receiving tensor
         )
 
-    def requires_handshake(self, request: "Request") -> bool:
+    def requires_handshake(self, entries: list[KeyedRequest]) -> bool:
         """Determine if a handshake is needed.
 
         Returns False if a cached connection already exists for this volume,
@@ -205,8 +205,10 @@ class GlooTransportBuffer(TransportBuffer):
         return state
 
     async def recv_handshake(
-        self, ctx: "TransportContext", current_object: Any = None
-    ) -> None:
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[KeyedRequest, Any]],
+    ) -> list[None]:
         """Called on storage volume side to set up the process group.
 
         Creates TCPStore and ProcessGroup on storage side (rank 1).
@@ -251,9 +253,13 @@ class GlooTransportBuffer(TransportBuffer):
             f"Storage volume finished gloo process group setup for store_key={self.store_key}"
         )
 
-        return None
+        return [None]
 
-    async def _post_handshake(self, handshake_result: Any) -> None:
+    async def _post_handshake(
+        self,
+        handshake_results: list[Any],
+        entries: list[KeyedRequest],
+    ) -> None:
         """Await ProcessGroup creation that was started in _pre_handshake.
 
         The PG creation was started concurrently with the handshake RPC,
@@ -276,13 +282,15 @@ class GlooTransportBuffer(TransportBuffer):
 
         logger.info(f"Finished gloo handshake with StorageVolume:[{volume_id}]")
 
-    async def _pre_put_hook(self, request: "Request") -> None:
+    async def _pre_put_hook(self, entries: list[KeyedRequest]) -> None:
         """Start sending tensor before put RPC.
 
         Called after handshake completes, before put.call().
         Starts the send as a background task so it runs concurrently
         with the storage volume's recv in handle_put_request.
         """
+        request = entries[0].request
+
         # Check if this is an object (non-tensor) PUT
         if request.is_object:
             self.is_object = True
@@ -307,13 +315,14 @@ class GlooTransportBuffer(TransportBuffer):
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        request: "Request",
-        maybe_tensor: torch.Tensor | None,
-    ) -> Any:
+        entries: list[tuple[KeyedRequest, Any]],
+    ) -> dict[str, Any]:
         """Called by storage volume. Receive tensor from client via gloo process group."""
+        (key, request), maybe_tensor = entries[0]
+
         if request.is_object:
             self.is_object = True
-            return request.objects
+            return {key: request.objects}
 
         # Allocate destination tensor if needed
         tensor = maybe_tensor
@@ -325,9 +334,9 @@ class GlooTransportBuffer(TransportBuffer):
         # Receive tensor from client via gloo
         tensor = await self._receive_tensor(tensor, ctx)
 
-        return tensor
+        return {key: tensor}
 
-    async def _pre_get_hook(self, key: str, request: "Request") -> None:
+    async def _pre_get_hook(self, key: str, request: Request) -> None:
         """Start receiving tensor before get RPC.
 
         Called after handshake completes, before get.call().
