@@ -284,13 +284,13 @@ class TestSharedMemoryTransportBuffer:
         """Test serialization excludes client-side handles."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        buffer._batch_client_tensors = [torch.randn(10, 10)]
-        buffer._batch_keys = ["test_key"]
+        buffer._batch_entries = [
+            KeyedRequest("test_key", MockRequest(tensor_val=torch.randn(10, 10)))
+        ]
 
         state = buffer.__getstate__()
 
-        assert state["_batch_client_tensors"] == []
-        assert state["_batch_keys"] == []
+        assert state["_batch_entries"] is None
         assert state["storage_volume_ref"] is None
 
 
@@ -579,9 +579,10 @@ class TestSharedMemoryTransportBufferGET:
         """Test _handle_storage_volume_response with shared memory path."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        buffer._batch_keys = ["test_key"]
         dest_tensor = torch.zeros(10, 10)
-        buffer._batch_client_tensors = [dest_tensor]
+        buffer._batch_entries = [
+            KeyedRequest("test_key", MockRequest(tensor_val=dest_tensor))
+        ]
 
         # Create segment and response
         shm_tensor = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
@@ -613,8 +614,9 @@ class TestSharedMemoryTransportBufferGET:
         # Case 1: With client tensor - copies to it
         buffer1 = SharedMemoryTransportBuffer(ref)
         dest_tensor = torch.zeros(10, 10)
-        buffer1._batch_client_tensors = [dest_tensor]
-        buffer1._batch_keys = ["test_key"]
+        buffer1._batch_entries = [
+            KeyedRequest("test_key", MockRequest(tensor_val=dest_tensor))
+        ]
 
         response1 = SharedMemoryTransportBuffer(ref)
         rpc_data = torch.randn(10, 10)
@@ -627,8 +629,9 @@ class TestSharedMemoryTransportBufferGET:
 
         # Case 2: No client tensor - returns objects directly
         buffer2 = SharedMemoryTransportBuffer(ref)
-        buffer2._batch_client_tensors = [None]
-        buffer2._batch_keys = ["test_key"]
+        buffer2._batch_entries = [
+            KeyedRequest("test_key", MockRequest(tensor_val=None))
+        ]
 
         response2 = SharedMemoryTransportBuffer(ref)
         rpc_data2 = torch.randn(10, 10)
@@ -654,8 +657,9 @@ class TestSharedMemoryTransportBufferGET:
         # Test with MUTABLE_SHM=False (default) - should return cloned tensor
         monkeypatch.setattr(shm_module, "MUTABLE_SHM", False)
         buffer1 = SharedMemoryTransportBuffer(ref)
-        buffer1._batch_keys = ["test_key"]
-        buffer1._batch_client_tensors = [None]
+        buffer1._batch_entries = [
+            KeyedRequest("test_key", MockRequest(tensor_val=None))
+        ]
 
         response1 = SharedMemoryTransportBuffer(ref)
         response1._batch_shm_descriptors = {0: descriptor}
@@ -675,8 +679,9 @@ class TestSharedMemoryTransportBufferGET:
         monkeypatch.setattr(shm_module, "MUTABLE_SHM", True)
         ref.transport_context.reset()  # Clear cache to force re-attach
         buffer2 = SharedMemoryTransportBuffer(ref)
-        buffer2._batch_keys = ["test_key"]
-        buffer2._batch_client_tensors = [None]
+        buffer2._batch_entries = [
+            KeyedRequest("test_key", MockRequest(tensor_val=None))
+        ]
 
         response2 = SharedMemoryTransportBuffer(ref)
         response2._batch_shm_descriptors = {0: descriptor}
@@ -784,15 +789,15 @@ class TestSharedMemoryTransportBufferBatch:
 
         buffer._batch_shm_descriptors = {"k1": None}
         buffer._batch_objects = {"k2": "some_object"}
-        buffer._batch_client_tensors = [torch.randn(5, 5)]
-        buffer._batch_keys = ["k1"]
+        buffer._batch_entries = [
+            KeyedRequest("k1", MockRequest(tensor_val=torch.randn(5, 5)))
+        ]
 
         await buffer.drop()
 
         assert buffer._batch_shm_descriptors == {}
         assert buffer._batch_objects == {}
-        assert buffer._batch_client_tensors == []
-        assert buffer._batch_keys == []
+        assert buffer._batch_entries == []
 
     @pytest.mark.asyncio
     async def test_handle_get_request_shm_tensors(self):
@@ -867,52 +872,6 @@ class TestSharedMemoryTransportBufferBatch:
         # RPC fallback path (non-shared tensor)
         assert 2 in buffer._batch_objects
         assert buffer._batch_objects[2] is rpc_tensor
-
-    @pytest.mark.asyncio
-    async def test_handle_get_response_shm(self):
-        """Client-side SHM attach + copy to inplace."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-
-        dest = torch.zeros(10, 10)
-        buffer._batch_keys = ["test_key"]
-        buffer._batch_client_tensors = [dest]
-
-        shm_tensor = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
-        original = torch.randn(10, 10)
-        shm_tensor.copy_(original)
-        descriptor = SharedMemoryDescriptor.from_tensor(shm_tensor)
-
-        response = SharedMemoryTransportBuffer(ref)
-        response._batch_shm_descriptors = {0: descriptor}
-
-        results = await buffer._handle_storage_volume_response(response)
-
-        assert len(results) == 1
-        assert results[0] is dest
-        assert torch.allclose(dest, original)
-
-        ref.transport_context.reset()
-
-    @pytest.mark.asyncio
-    async def test_handle_get_response_rpc_fallback(self):
-        """Client-side fallback path."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-
-        dest = torch.zeros(10, 10)
-        buffer._batch_keys = ["test_key"]
-        buffer._batch_client_tensors = [dest]
-
-        rpc_data = torch.randn(10, 10)
-        response = SharedMemoryTransportBuffer(ref)
-        response._batch_objects = {0: rpc_data}
-
-        results = await buffer._handle_storage_volume_response(response)
-
-        assert len(results) == 1
-        assert results[0] is dest
-        assert torch.allclose(dest, rpc_data)
 
 
 if __name__ == "__main__":
