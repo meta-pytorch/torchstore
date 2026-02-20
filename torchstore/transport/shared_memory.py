@@ -251,7 +251,6 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
-
         # SHM only needs handshake during PUT, not GET
         self._needs_handshake: bool = False
 
@@ -261,8 +260,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         self._batch_objects: dict[str | int, Any] = {}
 
         # Batch GET client-only state (excluded from serialization)
-        self._batch_client_tensors: list[torch.Tensor | None] = []
-        self._batch_keys: list[str] = []
+        self._batch_entries: list[KeyedRequest] = []
 
     async def put_to_storage_volume(self, entries: list[KeyedRequest]) -> None:
         self._needs_handshake = True
@@ -364,26 +362,24 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     def __getstate__(self) -> dict[str, Any]:
         """Exclude non-serializable objects when sending buffer to storage volume."""
         state = self.__dict__.copy()
-        state["_batch_client_tensors"] = []
-        state["_batch_keys"] = []
+        state["_batch_entries"] = None
         state["storage_volume_ref"] = None
         return state
 
     async def _pre_get_hook(self, entries: list[KeyedRequest]) -> None:
-        self._batch_keys = [e.key for e in entries]
-        self._batch_client_tensors = [e.request.tensor_val for e in entries]
+        self._batch_entries = entries
 
     async def handle_get_request(
         self,
         ctx: "TransportContext",
         entries: list[tuple[KeyedRequest, Any]],
     ) -> None:
-        for i, (entry, data) in enumerate(entries):
-            if not isinstance(data, torch.Tensor):
-                self._batch_objects[i] = data
+        for i, (entry, current_object) in enumerate(entries):
+            if not isinstance(current_object, torch.Tensor):
+                self._batch_objects[i] = current_object
                 continue
 
-            descriptor = SharedMemoryDescriptor.from_tensor(data)
+            descriptor = SharedMemoryDescriptor.from_tensor(current_object)
             if descriptor is not None:
                 self._batch_shm_descriptors[i] = descriptor
             else:
@@ -392,7 +388,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                     f"Key {entry.key} is a view or not in shared memory, "
                     "using RPC fallback"
                 )
-                self._batch_objects[i] = data
+                self._batch_objects[i] = current_object
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
@@ -400,8 +396,8 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         results = []
         shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
 
-        for i, key in enumerate(self._batch_keys):
-            client_tensor = self._batch_client_tensors[i]
+        for i, entry in enumerate(self._batch_entries):
+            client_tensor = entry.request.tensor_val
 
             # Path 1: Object or RPC fallback (non-SHM data, stored by another transport)
             if i in transport_buffer._batch_objects:
@@ -420,7 +416,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             ), f"No descriptor or data for position {i}, key {key}"
 
             try:
-                client_entry = shm_cache.attach(key, descriptor)
+                client_entry = shm_cache.attach(entry.key, descriptor)
             except RuntimeError as e:
                 if "No such file" in str(e):
                     raise RuntimeError(
@@ -441,5 +437,4 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     async def drop(self) -> None:
         self._batch_shm_descriptors = {}
         self._batch_objects = {}
-        self._batch_client_tensors = []
-        self._batch_keys = []
+        self._batch_entries = []

@@ -384,7 +384,7 @@ class GlooTransportBuffer(TransportBuffer):
         entries: list[tuple[KeyedRequest, Any]],
     ) -> None:
         """Called by storage volume. Send tensor to client via gloo process group."""
-        _entry, data = entries[0]
+        _, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True
             self.objects = data

@@ -129,7 +129,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         ctx: "TransportContext",
         entries: list[tuple[KeyedRequest, Any]],
     ) -> None:
-        _entry, data = entries[0]
+        _, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True
             self.objects = data

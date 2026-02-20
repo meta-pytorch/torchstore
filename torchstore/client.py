@@ -120,6 +120,8 @@ class LocalClient:
         latency_tracker = LatencyTracker(f"get:{key}")
 
         request = Request.from_any(inplace_tensor, tensor_slice_spec)
+
+        # Fetch the data
         results = await self._fetch({key: request})
         latency_tracker.track_step("fetch")
 
@@ -168,7 +170,7 @@ class LocalClient:
     def _apply_inplace(
         self,
         fetched: Any,
-        inplace: torch.Tensor | DTensor | None,
+        inplace_tensor: torch.Tensor | DTensor | None,
         request: Request,
     ) -> Any:
         """Handle inplace copy-back for DTensor resharding cases.
@@ -176,15 +178,20 @@ class LocalClient:
         Always returns inplace if provided. Copies fetched data into
         request.tensor_val when data_ptr differs (resharding produced a new tensor).
         """
-        if inplace is not None:
-            if (
-                isinstance(fetched, torch.Tensor)
-                and fetched.data_ptr() != request.tensor_val.data_ptr()
-            ):
-                # request.tensor_val is a ref to _local_tensor if inplace is DTensor
-                request.tensor_val.copy_(fetched)
-            return inplace
-        return fetched
+        # TODO: remove this copy and instead assert.
+        # unfortunately, during resharding cases, we don't yet support writing inplace
+        # from multiple regions into the inplace tensor, which leads to _fetch returning
+        # a new tensor.
+        if (
+            inplace_tensor is not None
+            and fetched.data_ptr() != request.tensor_val.data_ptr()
+        ):
+            # request tensor_val is a ref to _local_tensor if inplace is dtensor.
+            request.tensor_val.copy_(fetched)
+            return inplace_tensor
+        # returning inplace_tensor since fetched will point to _local_tensor in
+        # the case of DTensor.
+        return inplace_tensor if inplace_tensor is not None else fetched
 
     async def _fetch(
         self,

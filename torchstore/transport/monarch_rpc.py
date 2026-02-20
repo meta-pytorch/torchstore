@@ -67,7 +67,7 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         entries: list[tuple[KeyedRequest, Any]],
     ) -> None:
         """Store the data to be sent back to the client."""
-        _entry, data = entries[0]
+        _, data = entries[0]
         self.data = data
 
     async def _handle_storage_volume_response(

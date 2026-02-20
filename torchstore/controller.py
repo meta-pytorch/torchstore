@@ -147,7 +147,7 @@ class Controller(Actor):
 
         For example, if a key holds a DTensor with 3 shards, the returned map will look like:
         {
-            "<key>": {
+            "<dtensor_fqn>": {
                 "<storage_volume_id>": StorageInfo.tensor_slice=set([
                     "<tensor_slice>",
                     "<tensor_slice>",
