@@ -22,7 +22,7 @@ import torch
 
 from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.types import KeyedRequest, Request
+from torchstore.transport.types import KeyedRequest
 from torchstore.utils import get_local_hostname
 
 if TYPE_CHECKING:
@@ -247,25 +247,22 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     """
 
     supports_batch_puts = True
+    supports_batch_gets = True
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
-        self.shm_descriptor: SharedMemoryDescriptor | None = None
-        self.is_object: bool = False
-        self.objects: Any = None  # Python objects use RPC, not shared memory
 
-        # Request metadata (serialized)
-        self._key: str | None = None
-
-        # Client-side only (excluded from serialization)
-        self._client_tensor: torch.Tensor | None = None
         # SHM only needs handshake during PUT, not GET
         self._needs_handshake: bool = False
 
         # Batch state
-        self._batch_shm_descriptors: dict[str, SharedMemoryDescriptor | None] = {}
+        self._batch_shm_descriptors: dict[str | int, SharedMemoryDescriptor | None] = {}
         # Objects travel via RPC serialization (not excluded from __getstate__)
-        self._batch_objects: dict[str, Any] = {}
+        self._batch_objects: dict[str | int, Any] = {}
+
+        # Batch GET client-only state (excluded from serialization)
+        self._batch_client_tensors: list[torch.Tensor | None] = []
+        self._batch_keys: list[str] = []
 
     async def put_to_storage_volume(self, entries: list[KeyedRequest]) -> None:
         self._needs_handshake = True
@@ -367,74 +364,82 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     def __getstate__(self) -> dict[str, Any]:
         """Exclude non-serializable objects when sending buffer to storage volume."""
         state = self.__dict__.copy()
-        # Exclude client-side handles
-        state["_client_tensor"] = None
+        state["_batch_client_tensors"] = []
+        state["_batch_keys"] = []
         state["storage_volume_ref"] = None
         return state
 
-    async def _pre_get_hook(self, key: str, request: Request) -> None:
-        """Prepare for receiving - may fetch metadata if not provided."""
-        self._key = key
-        self._client_tensor = request.tensor_val
+    async def _pre_get_hook(self, entries: list[KeyedRequest]) -> None:
+        self._batch_keys = [e.key for e in entries]
+        self._batch_client_tensors = [e.request.tensor_val for e in entries]
 
-    async def handle_get_request(self, ctx: "TransportContext", data: Any) -> None:
-        """Derive descriptor from stored tensor if backed by shared memory."""
-        if not isinstance(data, torch.Tensor):
-            self.is_object = True
-            self.objects = data
-            return
+    async def handle_get_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[KeyedRequest, Any]],
+    ) -> None:
+        for i, (entry, data) in enumerate(entries):
+            if not isinstance(data, torch.Tensor):
+                self._batch_objects[i] = data
+                continue
 
-        descriptor = SharedMemoryDescriptor.from_tensor(data)
-        if descriptor is not None:
-            self.shm_descriptor = descriptor
-            return
-
-        logger.debug(
-            f"Key {self._key} is a view or not in shared memory, using RPC fallback"
-        )
-
-        self.shm_descriptor = None
-        self.objects = data
+            descriptor = SharedMemoryDescriptor.from_tensor(data)
+            if descriptor is not None:
+                self._batch_shm_descriptors[i] = descriptor
+            else:
+                # View or not in shared memory — RPC fallback
+                logger.debug(
+                    f"Key {entry.key} is a view or not in shared memory, "
+                    "using RPC fallback"
+                )
+                self._batch_objects[i] = data
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
-    ) -> Any:
-        """Client-side: extract tensor from shared memory or handle RPC fallback."""
-        if transport_buffer.is_object:
-            return transport_buffer.objects
+    ) -> list[Any]:
+        results = []
+        shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
 
-        # RPC fallback path (no shared memory descriptor, stored by another transport)
-        if transport_buffer.shm_descriptor is None:
-            if self._client_tensor is not None:
-                self._client_tensor.copy_(transport_buffer.objects)
-                return self._client_tensor
-            return transport_buffer.objects
+        for i, key in enumerate(self._batch_keys):
+            client_tensor = self._batch_client_tensors[i]
 
-        try:
-            shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
-            client_entry = shm_cache.attach(self._key, transport_buffer.shm_descriptor)
-        except RuntimeError as e:
-            if "No such file" in str(e):
-                raise RuntimeError(
-                    "Shared memory storage not found. "
-                    "This may indicate the storage volume is on a different host."
-                ) from e
-            raise
+            # Path 1: Object or RPC fallback (non-SHM data, stored by another transport)
+            if i in transport_buffer._batch_objects:
+                data = transport_buffer._batch_objects[i]
+                if isinstance(data, torch.Tensor) and client_tensor is not None:
+                    client_tensor.copy_(data)
+                    results.append(client_tensor)
+                else:
+                    results.append(data)
+                continue
 
-        shm_tensor = client_entry.get_tensor()
+            # Path 2: SHM
+            descriptor = transport_buffer._batch_shm_descriptors.get(i)
+            assert (
+                descriptor is not None
+            ), f"No descriptor or data for position {i}, key {key}"
 
-        # Copy to client's tensor if provided (inplace), otherwise clone
-        if self._client_tensor is not None:
-            self._client_tensor.copy_(shm_tensor)
-            return self._client_tensor
-        else:
-            return shm_tensor if MUTABLE_SHM else shm_tensor.clone()
+            try:
+                client_entry = shm_cache.attach(key, descriptor)
+            except RuntimeError as e:
+                if "No such file" in str(e):
+                    raise RuntimeError(
+                        "Shared memory storage not found. "
+                        "This may indicate the storage volume is on a different host."
+                    ) from e
+                raise
+
+            shm_tensor = client_entry.get_tensor()
+            if client_tensor is not None:
+                client_tensor.copy_(shm_tensor)
+                results.append(client_tensor)
+            else:
+                results.append(shm_tensor if MUTABLE_SHM else shm_tensor.clone())
+
+        return results
 
     async def drop(self) -> None:
-        """
-        Drop some references, but even this is not necessary if the transport object as a whole is dropped
-        """
-        self._client_tensor = None
-        self.objects = None
         self._batch_shm_descriptors = {}
         self._batch_objects = {}
+        self._batch_client_tensors = []
+        self._batch_keys = []

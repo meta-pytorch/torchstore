@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 from monarch.actor import get_or_spawn_controller, ProcMesh
+from torch.distributed.tensor import DTensor
 
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient
@@ -214,6 +215,25 @@ async def get(
     """
     cl = await client(store_name)
     return await cl.get(key, inplace_tensor, tensor_slice_spec)
+
+
+async def get_batch(
+    keys: list[str],
+    inplace_tensors: dict[str, torch.Tensor | DTensor] | None = None,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> dict[str, Any]:
+    """Retrieve multiple keys from the distributed store in a single batched operation.
+
+    Args:
+        keys: List of keys to retrieve.
+        inplace_tensors: Optional mapping of key -> pre-allocated tensor for in-place retrieval.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Returns:
+        dict mapping each key to its fetched data.
+    """
+    cl = await client(store_name)
+    return await cl.get_batch(keys, inplace_tensors)
 
 
 async def delete(

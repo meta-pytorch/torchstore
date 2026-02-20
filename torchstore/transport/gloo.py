@@ -16,7 +16,7 @@ import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.types import KeyedRequest, Request
+from torchstore.transport.types import KeyedRequest
 
 if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
@@ -336,13 +336,14 @@ class GlooTransportBuffer(TransportBuffer):
 
         return {key: tensor}
 
-    async def _pre_get_hook(self, key: str, request: Request) -> None:
+    async def _pre_get_hook(self, entries: list[KeyedRequest]) -> None:
         """Start receiving tensor before get RPC.
 
         Called after handshake completes, before get.call().
         Starts the recv as a background task so it runs concurrently
         with the storage volume's send in handle_get_request.
         """
+        key, request = entries[0]
         # TODO: support in place get with receiving directly to request.tensor_val
 
         # If request specifies a tensor slice, use its shape
@@ -377,8 +378,13 @@ class GlooTransportBuffer(TransportBuffer):
             )
         )
 
-    async def handle_get_request(self, ctx: "TransportContext", data: Any) -> None:
+    async def handle_get_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[KeyedRequest, Any]],
+    ) -> None:
         """Called by storage volume. Send tensor to client via gloo process group."""
+        _entry, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True
             self.objects = data
@@ -389,13 +395,13 @@ class GlooTransportBuffer(TransportBuffer):
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
-    ) -> Any:
+    ) -> list[Any]:
         """Process the response from storage volume after get.
 
         The tensor data was received via gloo in the background recv task.
         """
         if transport_buffer.is_object:
-            return transport_buffer.objects
+            return [transport_buffer.objects]
 
         # Wait for the recv to complete
         if self._recv_task is not None:
@@ -406,7 +412,7 @@ class GlooTransportBuffer(TransportBuffer):
                     f"receive_tensor returned None (is_object={self.is_object}, "
                     f"shape={self.shape}, dtype={self.dtype})"
                 )
-            return tensor
+            return [tensor]
 
         raise RuntimeError(f"No recv task available (is_object={self.is_object})")
 
