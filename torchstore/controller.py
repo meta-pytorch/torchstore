@@ -138,15 +138,15 @@ class Controller(Actor):
     @endpoint
     async def locate_volumes(
         self,
-        key: str,
-    ) -> dict[str, StorageInfo]:
-        """Locate storage volumes containing shards of the specified key.
+        keys: list[str],
+    ) -> dict[str, dict[str, StorageInfo]]:
+        """Locate storage volumes containing shards of the specified keys.
 
-        Returns {<storage_volume_id> -> StorageInfo} where <storage_volume_id>
-        are IDs of storage volumes holding shards of the data.
+        Returns {<key> -> {<storage_volume_id> -> StorageInfo}} where each key maps to
+        the storage volumes holding shards of its data.
 
-        For example, if the data is a DTensor with 3 shards, the returned map will look like:
-        storage_volume_map = {
+        For example, if a key holds a DTensor with 3 shards, the returned map will look like:
+        {
             "<dtensor_fqn>": {
                 "<storage_volume_id>": StorageInfo.tensor_slice=set([
                     "<tensor_slice>",
@@ -154,38 +154,32 @@ class Controller(Actor):
                     "<tensor_slice>",
                 ]),
                 ...
-            }
-            ,
+            },
             ...
         }
 
         Args:
-            key (str): The key to locate in storage volumes.
+            keys (list[str]): The keys to locate in storage volumes.
 
         Returns:
-            Dict[str, StorageInfo]: Mapping from storage volume IDs to StorageInfo
-                objects containing metadata about the stored data shards.
+            Dict[str, Dict[str, StorageInfo]]: Mapping from each key to a mapping from
+                storage volume IDs to StorageInfo objects containing metadata about
+                the stored data shards.
 
         Raises:
-            KeyError: If the key is not found in any storage volumes, or if the key
+            KeyError: If any key is not found in any storage volumes, or if a key
                 is a DTensor that is only partially committed.
         """
         self.assert_initialized()
-
-        if key not in self.keys_to_storage_volumes:
-            raise KeyError(f"Unable to locate {key} in any storage volumes.")
-
-        volume_map = self.keys_to_storage_volumes[key]
-
-        # Check if this is a DTensor and if it's fully committed
-        if not self._is_dtensor_fully_committed(key, volume_map):
-            raise KeyError(
-                f"DTensor '{key}' is only partially committed. "
-                f"Not all shards have been stored yet. "
-                f"Please ensure all ranks complete their put() operations."
-            )
-
-        return volume_map
+        result = {}
+        for key in keys:
+            if key not in self.keys_to_storage_volumes:
+                raise KeyError(f"Unable to locate {key} in any storage volumes.")
+            volume_map = self.keys_to_storage_volumes[key]
+            if not self._is_dtensor_fully_committed(key, volume_map):
+                raise KeyError(f"DTensor '{key}' is only partially committed.")
+            result[key] = volume_map
+        return result
 
     @endpoint
     async def notify_put_batch(

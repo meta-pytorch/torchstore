@@ -9,7 +9,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.types import KeyedRequest, Request
+from torchstore.transport.types import KeyedRequest
 
 try:
     from torchcomms._transport import RdmaMemory, RdmaRemoteBuffer
@@ -117,8 +117,9 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             return
         self._allocate(request.tensor_val)
 
-    async def _pre_get_hook(self, key: str, request: Request) -> None:
+    async def _pre_get_hook(self, entries: list[KeyedRequest]) -> None:
         """Fetch metadata if needed and allocate RDMA buffers."""
+        key, request = entries[0]
         tensor_like = request.tensor_val
         if tensor_like is None:
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
@@ -170,8 +171,13 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
         return {key: maybe_tensor}
 
-    async def handle_get_request(self, ctx: "TransportContext", data) -> None:
+    async def handle_get_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[KeyedRequest, Any]],
+    ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
+        _, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True
             self.objects = data
@@ -199,13 +205,13 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
-    ) -> Any:
+    ) -> list[Any]:
         """Extract data from response buffer on client side."""
         if transport_buffer.is_object:
-            return transport_buffer.objects
+            return [transport_buffer.objects]
 
         # Data was written directly into self.tensor_ref via RDMA
-        return self.tensor_ref
+        return [self.tensor_ref]
 
     async def drop(self) -> None:
         """Clean up any resources held by this buffer."""
