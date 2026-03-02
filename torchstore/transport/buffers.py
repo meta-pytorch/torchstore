@@ -72,10 +72,10 @@ class TransportBuffer:
     - Otherwise, `_put_entries` is called once per entry with a single-element list.
 
     `_put_entries(entries)`:
-      1. Optionally performs handshake if `requires_handshake(entries)` returns True
-      2. Calls `_pre_put_hook(entries)` [CLIENT] - allocate local buffers, prepare data
-      3. Sends to StorageVolume via `volume.put.call()`
-      4. Calls `drop()` [CLIENT] - cleanup resources
+    1. Optionally performs handshake if `requires_handshake(entries)` returns True
+    2. Calls `_pre_put_hook(entries)` [CLIENT] - allocate local buffers, prepare data
+    3. Sends to StorageVolume via `volume.put.call()`
+    4. Client calls `drop()` [CLIENT] - cleanup resources (e.g., deregister RDMA memory)
 
     Lifecycle: GET Operation
     ------------------------
@@ -85,7 +85,11 @@ class TransportBuffer:
        b. Invokes `_pre_get_hook(key, request)` [CLIENT] - allocate receive buffers
        c. Serializes self and sends to StorageVolume
     3. StorageVolume receives buffer and calls `handle_get_request(...)` [STORAGE VOLUME]
+       - Writes stored tensor data into the transport buffer (e.g., RDMA write)
+       - Returns the buffer with data ready to be read
     4. Client calls `_handle_storage_volume_response(response)` [CLIENT]
+       - Extracts tensor data from the response buffer
+       - Copies into user's tensor if inplace, or returns new tensor
     5. Client calls `drop()` [CLIENT] - cleanup resources
 
     Methods Called on CLIENT (Local Process)
@@ -229,14 +233,10 @@ class TransportBuffer:
         handshake_results: list[Any],
         entries: list[KeyedRequest],
     ) -> None:
-        """Process the results of a handshake on the client side.
+        """Process the result of a handshake on the client side.
 
         Called after the storage volume responds to a handshake request.
         Override this to handle handshake results (e.g., connecting to peer).
-
-        Args:
-            handshake_results: List of results from recv_handshake, one per entry.
-            entries: The original KeyedRequest entries that were handshaked.
         """
         pass
 

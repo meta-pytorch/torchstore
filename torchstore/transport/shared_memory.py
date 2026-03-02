@@ -267,12 +267,35 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # Objects travel via RPC serialization (not excluded from __getstate__)
         self._batch_objects: dict[str, Any] = {}
 
+    def requires_handshake(self, entries: list[KeyedRequest]) -> bool:
+        return self._needs_handshake
+
+    async def _pre_put_hook(self, entries: list[KeyedRequest]):
+        for key, request in entries:
+            if request.is_object:
+                self._batch_objects[key] = request.objects
+
     async def put_to_storage_volume(self, entries: list[KeyedRequest]) -> None:
         self._needs_handshake = True
         await super().put_to_storage_volume(entries)
 
-    def requires_handshake(self, entries: list[KeyedRequest]) -> bool:
-        return self._needs_handshake
+    async def recv_handshake(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[KeyedRequest, Any]],
+    ) -> list["SharedMemoryDescriptor | None"]:
+        """Storage volume: return existing descriptors if available, else None."""
+        results = []
+        for entry, current_object in entries:
+            if not isinstance(current_object, torch.Tensor):
+                # No existing tensor - client will allocate shared memory
+                results.append(None)
+            else:
+                # return existing descriptor for re-use
+                descriptor = SharedMemoryDescriptor.from_tensor(current_object)
+                assert descriptor is not None, "Stored tensor is not in shared memory."
+                results.append(descriptor)
+        return results
 
     async def _post_handshake(
         self,
@@ -302,14 +325,17 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                 tensor = tensor.cpu().contiguous()
 
             if descriptor is not None:
+                # Reuse existing segment
                 client_entry = shm_cache.attach(key, descriptor)
             else:
+                # Allocate new shared memory on client side
                 client_entry, descriptor = shm_cache.allocate(
                     key, tensor.shape, tensor.dtype
                 )
 
             self._batch_shm_descriptors[key] = descriptor
 
+            # Copy tensor data to shared memory
             shm_tensor = client_entry.get_tensor()
             shm_tensor.copy_(tensor, non_blocking=True)
         latency_tracker.track_step("alloc_and_copy")
@@ -318,27 +344,6 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         latency_tracker.track_step("cuda_synchronize")
-
-    async def _pre_put_hook(self, entries: list[KeyedRequest]):
-        for key, request in entries:
-            if request.is_object:
-                self._batch_objects[key] = request.objects
-
-    async def recv_handshake(
-        self,
-        ctx: "TransportContext",
-        entries: list[tuple[KeyedRequest, Any]],
-    ) -> list["SharedMemoryDescriptor | None"]:
-        """Storage volume: return existing descriptors if available, else None."""
-        results = []
-        for entry, current_object in entries:
-            if not isinstance(current_object, torch.Tensor):
-                results.append(None)
-            else:
-                descriptor = SharedMemoryDescriptor.from_tensor(current_object)
-                assert descriptor is not None, "Stored tensor is not in shared memory."
-                results.append(descriptor)
-        return results
 
     async def handle_put_request(
         self,
@@ -354,12 +359,14 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                 descriptor = self._batch_shm_descriptors.get(entry.key)
                 assert descriptor is not None, f"No descriptor for {entry.key}"
 
+                # Ensure server-side storage hasn't changed since handshake
                 if isinstance(current_object, torch.Tensor):
                     existing = SharedMemoryDescriptor.from_tensor(current_object)
                     assert existing is not None
                     assert existing.storage_handle == descriptor.storage_handle
                     results[entry.key] = current_object
                 else:
+                    # New segment - attach and return
                     shm_entry = descriptor.attach()
                     results[entry.key] = shm_entry.get_tensor()
         return results

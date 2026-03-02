@@ -193,7 +193,10 @@ class Controller(Actor):
         entries: list[KeyedRequest],
         storage_volume_id: str,
     ) -> None:
-        """Notify the controller that one or more keys have been stored.
+        """Notify the controller that data has been stored in a storage volume.
+
+        This should called after a successful put operation to
+        maintain the distributed storage index.
 
         Args:
             entries: List of KeyedRequests
@@ -202,24 +205,25 @@ class Controller(Actor):
         self.assert_initialized()
 
         for key, request in entries:
-            assert (
-                request.tensor_val is None
-            ), "request should not contain tensor data, as this will significantly increase e2e latency"
+            self._notify_put(key, request, storage_volume_id)
 
-            if key not in self.keys_to_storage_volumes:
-                self.keys_to_storage_volumes[key] = {}
+    def _notify_put(self, key: str, request: Request, storage_volume_id: str) -> None:
+        assert (
+            request.tensor_val is None
+        ), "request should not contain tensor data, as this will significantly increase e2e latency"
 
-            storage_info = StorageInfo(
-                object_type=ObjectType.from_request(request),
-                tensor_slices={request.tensor_slice},
-            )
+        if key not in self.keys_to_storage_volumes:
+            self.keys_to_storage_volumes[key] = {}
 
-            if storage_volume_id not in self.keys_to_storage_volumes[key]:
-                self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
-            else:
-                self.keys_to_storage_volumes[key][storage_volume_id].update(
-                    storage_info
-                )
+        storage_info = StorageInfo(
+            object_type=ObjectType.from_request(request),
+            tensor_slices={request.tensor_slice},
+        )
+
+        if storage_volume_id not in self.keys_to_storage_volumes[key]:
+            self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
+        else:
+            self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
 
     @endpoint
     async def teardown(self) -> None:

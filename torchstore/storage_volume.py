@@ -148,30 +148,6 @@ class InMemoryStore(StorageImpl):
         ]
         return await transport_buffer.recv_handshake(self.transport_context, pairs)
 
-    async def put(
-        self,
-        transport_buffer: TransportBuffer,
-        entries: list[KeyedRequest],
-    ) -> None:
-        entries_with_current_obj = [
-            (entry, self._extract_existing(entry.key, entry.request))
-            for entry in entries
-        ]
-        results = await transport_buffer.handle_put_request(
-            self.transport_context, entries_with_current_obj
-        )
-        for entry in entries:
-            self._store(entry.key, entry.request, results[entry.key])
-
-    def _store(self, key: str, request: "Request", data: Any) -> None:
-        """Store data in kv, wrapping objects and handling DTensor shards."""
-        if request.is_object:
-            self.kv[key] = {"obj": data}
-        elif request.tensor_slice is not None:
-            self._handle_dtensor(key, request.tensor_slice, data)
-        else:
-            self.kv[key] = data
-
     def _extract_existing(self, key: str, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
 
@@ -294,6 +270,39 @@ class InMemoryStore(StorageImpl):
 
             if extracted_tensor is not None:
                 return extracted_tensor
+
+    async def put(
+        self,
+        transport_buffer: TransportBuffer,
+        entries: list[KeyedRequest],
+    ) -> None:
+        # Extract existing tensor for potential in-place update
+        entries_with_current_obj = [
+            (entry, self._extract_existing(entry.key, entry.request))
+            for entry in entries
+        ]
+
+        # fetch from remote
+        results = await transport_buffer.handle_put_request(
+            self.transport_context, entries_with_current_obj
+        )
+
+        # store locally
+        for entry in entries:
+            self._store(entry.key, entry.request, results[entry.key])
+
+    def _store(self, key: str, request: "Request", data: Any) -> None:
+        """Store data in kv, wrapping objects and handling DTensor shards."""
+        if request.is_object:
+            self.kv[key] = {"obj": data}
+            return
+
+        if request.tensor_slice is not None:
+            # tensor is actually part of a DTensor
+            self._handle_dtensor(key, request.tensor_slice, data)
+            return
+
+        self.kv[key] = data
 
     async def get(
         self, key: str, transport_buffer: TransportBuffer, request: Request
