@@ -435,7 +435,7 @@ class TestSharedMemoryTransportBufferPUT:
         descriptor1 = SharedMemoryDescriptor.from_tensor(shm_tensor1)
         buffer._contexts = [
             ShmContext(descriptor=descriptor1),
-            ShmContext(object={"value": 99}),
+            ShmContext(object={"value": 99}, is_object=True),
         ]
 
         results = await buffer.handle_put_request(
