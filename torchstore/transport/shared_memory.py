@@ -151,6 +151,7 @@ class ShmContext:
 
     descriptor: SharedMemoryDescriptor | None = None
     object: Any = None
+    is_object: bool = False
 
 
 @dataclass
@@ -317,7 +318,9 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         devices_to_sync: set[torch.device] = set()
         for (key, request), descriptor in zip(entries, handshake_results, strict=True):
             if request.is_object:
-                self._contexts.append(ShmContext(object=request.objects))
+                self._contexts.append(
+                    ShmContext(object=request.objects, is_object=True)
+                )
                 continue
 
             tensor = request.tensor_val
@@ -358,7 +361,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         """SV side: handle batch of put requests for tensors and objects."""
         results = []
         for (entry, current_object), ctx in zip(entries, self._contexts, strict=True):
-            if ctx.object is not None:
+            if ctx.is_object:
                 results.append(ctx.object)
             else:
                 descriptor = ctx.descriptor
