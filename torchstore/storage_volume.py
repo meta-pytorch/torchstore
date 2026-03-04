@@ -288,8 +288,8 @@ class InMemoryStore(StorageImpl):
         )
 
         # store locally
-        for entry in entries:
-            self._store(entry.key, entry.request, results[entry.key])
+        for entry, result in zip(entries, results, strict=True):
+            self._store(entry.key, entry.request, result)
 
     def _store(self, key: str, request: "Request", data: Any) -> None:
         """Store data in kv, wrapping objects and handling DTensor shards."""

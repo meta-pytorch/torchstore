@@ -146,6 +146,14 @@ class SharedMemoryDescriptor:
 
 
 @dataclass
+class ShmContext:
+    """Per-entry state for SHM batch operations."""
+
+    descriptor: SharedMemoryDescriptor | None = None
+    object: Any = None
+
+
+@dataclass
 class SharedMemoryEntry:
     """Entry wrapping PyTorch shared storage."""
 
@@ -234,9 +242,8 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     1. Client: requires_handshake checks if any entry has a tensor (needs SHM handshake)
     2. SV: recv_handshake: Return descriptors for existing tensors, None for new
-    3. Client: _post_handshake: Allocate/attach SHM segments and copy tensor data
-    4. Client: _pre_put_hook: Store objects in _batch_objects for RPC transport
-    5. SV: handle_put_request: Route objects from _batch_objects, tensors via SHM attachment
+    3. Client: _post_handshake: Build _contexts — allocate/attach SHM for tensors, capture objects
+    4. SV: handle_put_request: Route objects/tensors from _contexts
 
     GET
     1. _pre_get_hook: Save some metadata
@@ -262,18 +269,11 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # SHM only needs handshake during PUT, not GET
         self._needs_handshake: bool = False
 
-        # Batch state
-        self._batch_shm_descriptors: dict[str, SharedMemoryDescriptor | None] = {}
-        # Objects travel via RPC serialization (not excluded from __getstate__)
-        self._batch_objects: dict[str, Any] = {}
+        # Batch state – one context per processed entry
+        self._contexts: list[ShmContext] = []
 
     def requires_handshake(self, entries: list[KeyedRequest]) -> bool:
         return self._needs_handshake
-
-    async def _pre_put_hook(self, entries: list[KeyedRequest]):
-        for key, request in entries:
-            if request.is_object:
-                self._batch_objects[key] = request.objects
 
     async def put_to_storage_volume(self, entries: list[KeyedRequest]) -> None:
         self._needs_handshake = True
@@ -302,20 +302,22 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         handshake_results: list[Any],
         entries: list[KeyedRequest],
     ) -> None:
-        """Allocate/attach SHM segments and copy tensor data for entries.
+        """Build _contexts and prepare data for each entry.
 
-        Iterates entries and handshake_results in lockstep. For each tensor entry, either
-        attaches to an existing SHM segment (if the SV returned a descriptor)
-        or allocates a new one. Then copies the client tensor into the SHM
-        region with non_blocking=True, and synchronizes to ensure all copies
-        complete before returning.
+        For tensor entries: attaches to an existing SHM segment (if the SV
+        returned a descriptor) or allocates a new one, then copies data with
+        non_blocking=True. For object entries: captures the object directly.
+        Synchronizes after all copies to ensure GPU->CPU DMA completes.
         """
         latency_tracker = LatencyTracker("post_handshake")
 
         shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
 
-        for (key, request), descriptor in zip(entries, handshake_results):
+        self._contexts = []
+        devices_to_sync: set[torch.device] = set()
+        for (key, request), descriptor in zip(entries, handshake_results, strict=True):
             if request.is_object:
+                self._contexts.append(ShmContext(object=request.objects))
                 continue
 
             tensor = request.tensor_val
@@ -323,6 +325,9 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
             if not tensor.is_contiguous():
                 tensor = tensor.cpu().contiguous()
+
+            if tensor.is_cuda:
+                devices_to_sync.add(tensor.device)
 
             if descriptor is not None:
                 # Reuse existing segment
@@ -333,30 +338,30 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                     key, tensor.shape, tensor.dtype
                 )
 
-            self._batch_shm_descriptors[key] = descriptor
+            self._contexts.append(ShmContext(descriptor=descriptor))
 
             # Copy tensor data to shared memory
             shm_tensor = client_entry.get_tensor()
             shm_tensor.copy_(tensor, non_blocking=True)
         latency_tracker.track_step("alloc_and_copy")
 
-        # Wait for all async copies (GPU->CPU DMA) to complete
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # Wait for async copies (GPU->CPU DMA) on involved devices only
+        for device in devices_to_sync:
+            torch.cuda.synchronize(device)
         latency_tracker.track_step("cuda_synchronize")
 
     async def handle_put_request(
         self,
         ctx: "TransportContext",
         entries: list[tuple[KeyedRequest, Any]],
-    ) -> dict[str, Any]:
+    ) -> list[Any]:
         """SV side: handle batch of put requests for tensors and objects."""
-        results = {}
-        for entry, current_object in entries:
-            if entry.key in self._batch_objects:
-                results[entry.key] = self._batch_objects[entry.key]
+        results = []
+        for (entry, current_object), ctx in zip(entries, self._contexts, strict=True):
+            if ctx.object is not None:
+                results.append(ctx.object)
             else:
-                descriptor = self._batch_shm_descriptors.get(entry.key)
+                descriptor = ctx.descriptor
                 assert descriptor is not None, f"No descriptor for {entry.key}"
 
                 # Ensure server-side storage hasn't changed since handshake
@@ -364,11 +369,11 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                     existing = SharedMemoryDescriptor.from_tensor(current_object)
                     assert existing is not None
                     assert existing.storage_handle == descriptor.storage_handle
-                    results[entry.key] = current_object
+                    results.append(current_object)
                 else:
                     # New segment - attach and return
                     shm_entry = descriptor.attach()
-                    results[entry.key] = shm_entry.get_tensor()
+                    results.append(shm_entry.get_tensor())
         return results
 
     def __getstate__(self) -> dict[str, Any]:
@@ -443,5 +448,4 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         """
         self._client_tensor = None
         self.objects = None
-        self._batch_shm_descriptors = {}
-        self._batch_objects = {}
+        self._contexts = []

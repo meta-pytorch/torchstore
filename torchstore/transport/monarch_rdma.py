@@ -67,6 +67,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _pre_put_hook(self, entries: list[KeyedRequest]) -> None:
         """Hook to perform any pre-put operations on the buffer."""
+        assert len(entries) == 1
         request = entries[0].request
 
         if request.is_object:
@@ -100,12 +101,13 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         self,
         ctx: "TransportContext",
         entries: list[tuple[KeyedRequest, Any]],
-    ) -> dict[str, Any]:
+    ) -> list[Any]:
+        assert len(entries) == 1
         (key, request), current_object = entries[0]
 
         if request.is_object:
             self.is_object = True
-            return {key: request.objects}
+            return [request.objects]
 
         # current_object is now the extracted tensor (or None)
         tensor = current_object
@@ -121,7 +123,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         byte_view = self._to_byte_view(tensor)
         await self.rdma_buffer.read_into(byte_view)
 
-        return {key: tensor}
+        return [tensor]
 
     async def handle_get_request(self, ctx: "TransportContext", data: Any):
         if not isinstance(data, torch.Tensor):

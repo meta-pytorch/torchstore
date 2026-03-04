@@ -107,13 +107,13 @@ class TransportBuffer:
     Methods Called on STORAGE VOLUME (Remote Process)
     -------------------------------------------------
     - `recv_handshake`: Exchange connection info (if requires_handshake returns True)
-    - `handle_put_request`: Receive tensor data and return it for storage
+    - `handle_put_request`: Receive tensor data and return list aligned with entries
     - `handle_get_request`: Send stored tensor data back to client
 
     Implementing a Custom TransportBuffer
     -------------------------------------
     Subclasses must implement:
-    - `handle_put_request`: How to receive data on the storage volume
+    - `handle_put_request`: How to receive data on the storage volume (returns list aligned with entries)
     - `handle_get_request`: How to send data from the storage volume
     - `_handle_storage_volume_response`: How to extract data from response on client
 
@@ -267,7 +267,7 @@ class TransportBuffer:
         self,
         ctx: "TransportContext",
         entries: list[tuple[KeyedRequest, Any]],
-    ) -> dict[str, Any]:
+    ) -> list[Any]:
         # called on the storage volume side
         raise NotImplementedError()
 

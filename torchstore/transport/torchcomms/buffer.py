@@ -112,6 +112,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     async def _pre_put_hook(self, entries: list[KeyedRequest]) -> None:
         """Allocate RDMA memory for put (transport already set up)."""
+        assert len(entries) == 1
         request = entries[0].request
         if request.is_object:
             return
@@ -144,12 +145,13 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self,
         ctx: "TransportContext",
         entries: list[tuple[KeyedRequest, Any]],
-    ) -> dict[str, Any]:
+    ) -> list[Any]:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
+        assert len(entries) == 1
         (key, request), maybe_tensor = entries[0]
 
         if request.is_object:
-            return {key: request.objects}
+            return [request.objects]
 
         if maybe_tensor is None:
             maybe_tensor = torch.zeros(
@@ -168,7 +170,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         )
         assert res == 0, f"RDMA read failed: conn code {res}"
 
-        return {key: maybe_tensor}
+        return [maybe_tensor]
 
     async def handle_get_request(self, ctx: "TransportContext", data) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""

@@ -289,6 +289,7 @@ class GlooTransportBuffer(TransportBuffer):
         Starts the send as a background task so it runs concurrently
         with the storage volume's recv in handle_put_request.
         """
+        assert len(entries) == 1
         request = entries[0].request
 
         # Check if this is an object (non-tensor) PUT
@@ -316,13 +317,14 @@ class GlooTransportBuffer(TransportBuffer):
         self,
         ctx: "TransportContext",
         entries: list[tuple[KeyedRequest, Any]],
-    ) -> dict[str, Any]:
+    ) -> list[Any]:
         """Called by storage volume. Receive tensor from client via gloo process group."""
+        assert len(entries) == 1
         (key, request), maybe_tensor = entries[0]
 
         if request.is_object:
             self.is_object = True
-            return {key: request.objects}
+            return [request.objects]
 
         # Allocate destination tensor if needed
         tensor = maybe_tensor
@@ -334,7 +336,7 @@ class GlooTransportBuffer(TransportBuffer):
         # Receive tensor from client via gloo
         tensor = await self._receive_tensor(tensor, ctx)
 
-        return {key: tensor}
+        return [tensor]
 
     async def _pre_get_hook(self, key: str, request: Request) -> None:
         """Start receiving tensor before get RPC.
