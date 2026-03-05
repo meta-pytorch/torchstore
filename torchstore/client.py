@@ -157,22 +157,6 @@ class LocalClient:
             and request.tensor_val.is_contiguous()
         )
 
-        # When no tensor_slice is provided but we have an inplace tensor,
-        # synthesize a full-tensor slice so get_destination_view can compute
-        # views for each shard. This enables inplace writes for the
-        # "sharded store → full tensor get" case.
-        if use_inplace_views and request.tensor_slice is None:
-            shape = tuple(request.tensor_val.shape)
-            dest_tensor_slice = TensorSlice(
-                offsets=tuple(0 for _ in shape),
-                coordinates=None,
-                global_shape=shape,
-                local_shape=shape,
-                mesh_shape=None,
-            )
-        else:
-            dest_tensor_slice = request.tensor_slice
-
         for volume_id, storage_info in volume_map.items():
             transport_buffer = transport_buffer_map[volume_id]
 
@@ -196,10 +180,10 @@ class LocalClient:
                     if fetch_slice is None:
                         continue
 
-                # Try to get a view of the destination tensor for inplace writes
+                # Try to get a view of the destination tensor for inplace writes.
                 dest_view = (
                     get_destination_view(
-                        request.tensor_val, dest_tensor_slice, fetch_slice
+                        request.tensor_val, request.tensor_slice, fetch_slice
                     )
                     if use_inplace_views
                     else None
