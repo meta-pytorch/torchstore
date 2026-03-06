@@ -22,7 +22,7 @@ import torch
 
 from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.types import KeyedRequest, Request
+from torchstore.transport.types import Request
 from torchstore.utils import get_local_hostname
 
 if TYPE_CHECKING:
@@ -273,17 +273,17 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # Batch state – one context per processed entry
         self._contexts: list[ShmContext] = []
 
-    def requires_handshake(self, entries: list[KeyedRequest]) -> bool:
+    def requires_handshake(self, requests: list[Request]) -> bool:
         return self._needs_handshake
 
-    async def put_to_storage_volume(self, entries: list[KeyedRequest]) -> None:
+    async def put_to_storage_volume(self, requests: list[Request]) -> None:
         self._needs_handshake = True
-        await super().put_to_storage_volume(entries)
+        await super().put_to_storage_volume(requests)
 
     async def recv_handshake(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[KeyedRequest, Any]],
+        entries: list[tuple[Request, Any]],
     ) -> list["SharedMemoryDescriptor | None"]:
         """Storage volume: return existing descriptors if available, else None."""
         results = []
@@ -301,13 +301,13 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     async def _post_handshake(
         self,
         handshake_results: list[Any],
-        entries: list[KeyedRequest],
+        requests: list[Request],
     ) -> None:
-        """Build _contexts and prepare data for each entry.
+        """Build _contexts and prepare data for each request.
 
-        For tensor entries: attaches to an existing SHM segment (if the SV
+        For tensor requests: attaches to an existing SHM segment (if the SV
         returned a descriptor) or allocates a new one, then copies data with
-        non_blocking=True. For object entries: captures the object directly.
+        non_blocking=True. For object requests: captures the object directly.
         Synchronizes after all copies to ensure GPU->CPU DMA completes.
         """
         latency_tracker = LatencyTracker("post_handshake")
@@ -316,7 +316,8 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         self._contexts = []
         devices_to_sync: set[torch.device] = set()
-        for (key, request), descriptor in zip(entries, handshake_results, strict=True):
+        for request, descriptor in zip(requests, handshake_results, strict=True):
+            key = request.key
             if request.is_object:
                 self._contexts.append(
                     ShmContext(object=request.objects, is_object=True)
@@ -356,16 +357,16 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[KeyedRequest, Any]],
+        entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """SV side: handle batch of put requests for tensors and objects."""
         results = []
-        for (entry, current_object), ctx in zip(entries, self._contexts, strict=True):
+        for (request, current_object), ctx in zip(entries, self._contexts, strict=True):
             if ctx.is_object:
                 results.append(ctx.object)
             else:
                 descriptor = ctx.descriptor
-                assert descriptor is not None, f"No descriptor for {entry.key}"
+                assert descriptor is not None, f"No descriptor for {request.key}"
 
                 # Ensure server-side storage hasn't changed since handshake
                 if isinstance(current_object, torch.Tensor):
@@ -387,9 +388,9 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         state["storage_volume_ref"] = None
         return state
 
-    async def _pre_get_hook(self, key: str, request: Request) -> None:
+    async def _pre_get_hook(self, request: Request) -> None:
         """Prepare for receiving - may fetch metadata if not provided."""
-        self._key = key
+        self._key = request.key
         self._client_tensor = request.tensor_val
 
     async def handle_get_request(self, ctx: "TransportContext", data: Any) -> None:

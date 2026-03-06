@@ -15,7 +15,7 @@ from monarch.actor import Actor, endpoint
 from torchstore.storage_utils.trie import Trie
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
-from torchstore.transport.types import KeyedRequest, Request, TensorSlice
+from torchstore.transport.types import Request, TensorSlice
 
 
 # TODO: move this into request as a field
@@ -190,7 +190,7 @@ class Controller(Actor):
     @endpoint
     async def notify_put_batch(
         self,
-        entries: list[KeyedRequest],
+        requests: list[Request],
         storage_volume_id: str,
     ) -> None:
         """Notify the controller that data has been stored in a storage volume.
@@ -199,19 +199,20 @@ class Controller(Actor):
         maintain the distributed storage index.
 
         Args:
-            entries: List of KeyedRequests
+            requests: List of Requests (meta-only, no tensor data).
             storage_volume_id: ID of the storage volume where the data was stored.
         """
         self.assert_initialized()
 
-        for key, request in entries:
-            self._notify_put(key, request, storage_volume_id)
+        for request in requests:
+            self._notify_put(request, storage_volume_id)
 
-    def _notify_put(self, key: str, request: Request, storage_volume_id: str) -> None:
+    def _notify_put(self, request: Request, storage_volume_id: str) -> None:
         assert (
             request.tensor_val is None
         ), "request should not contain tensor data, as this will significantly increase e2e latency"
 
+        key = request.key
         if key not in self.keys_to_storage_volumes:
             self.keys_to_storage_volumes[key] = {}
 

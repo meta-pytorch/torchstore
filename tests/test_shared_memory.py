@@ -16,7 +16,7 @@ from torchstore.transport.shared_memory import (
     SharedMemoryTransportBuffer,
     ShmContext,
 )
-from torchstore.transport.types import KeyedRequest
+from torchstore.transport.types import Request
 from torchstore.utils import get_local_hostname
 
 
@@ -40,17 +40,6 @@ class MockStorageVolumeRef:
         self.volume_hostname = volume_hostname
         self.volume_id = volume_id
         self.transport_context = MockTransportContext()
-
-
-class MockRequest:
-    """Mock Request for testing."""
-
-    __slots__ = ("tensor_val", "objects", "is_object")
-
-    def __init__(self, tensor_val=None, objects=None, is_object=False):
-        self.tensor_val = tensor_val
-        self.objects = objects
-        self.is_object = is_object
 
 
 class TestHelperFunctions:
@@ -247,7 +236,7 @@ class TestSharedMemoryCache:
         # First PUT: allocate new shared memory
         buffer1 = SharedMemoryTransportBuffer(ref)
         tensor1 = torch.randn(50, 50)
-        entries1 = [KeyedRequest("test_key", MockRequest(tensor_val=tensor1))]
+        entries1 = [Request(key="test_key", tensor_val=tensor1)]
 
         await buffer1._post_handshake([None], entries1)  # No existing descriptor
 
@@ -258,7 +247,7 @@ class TestSharedMemoryCache:
         # Second PUT: reuse existing shared memory
         buffer2 = SharedMemoryTransportBuffer(ref)
         tensor2 = torch.randn(50, 50)
-        entries2 = [KeyedRequest("test_key", MockRequest(tensor_val=tensor2))]
+        entries2 = [Request(key="test_key", tensor_val=tensor2)]
 
         await buffer2._post_handshake(
             [first_descriptor], entries2
@@ -300,7 +289,7 @@ class TestSharedMemoryTransportBufferPUT:
         """Test requires_handshake mirrors _needs_handshake (True in PUT, False in GET)."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        entries = [KeyedRequest("key1", MockRequest(tensor_val=torch.randn(5, 5)))]
+        entries = [Request(key="key1", tensor_val=torch.randn(5, 5))]
 
         assert buffer.requires_handshake(entries) is False
         buffer._needs_handshake = True
@@ -313,7 +302,7 @@ class TestSharedMemoryTransportBufferPUT:
         buffer = SharedMemoryTransportBuffer(ref)
 
         obj = {"key": "value", "list": [1, 2, 3]}
-        entries = [KeyedRequest("obj_key", MockRequest(objects=obj, is_object=True))]
+        entries = [Request(key="obj_key", objects=obj, is_object=True)]
 
         await buffer._post_handshake([None], entries)
 
@@ -327,7 +316,7 @@ class TestSharedMemoryTransportBufferPUT:
         # Case 1: No descriptor - allocate new
         buffer1 = SharedMemoryTransportBuffer(ref)
         tensor1 = torch.randn(50, 50)
-        entries1 = [KeyedRequest("test_key_1", MockRequest(tensor_val=tensor1))]
+        entries1 = [Request(key="test_key_1", tensor_val=tensor1)]
 
         await buffer1._post_handshake([None], entries1)
 
@@ -343,7 +332,7 @@ class TestSharedMemoryTransportBufferPUT:
 
         shm_tensor = allocate_shared_tensor(tensor2.shape, tensor2.dtype)
         descriptor = SharedMemoryDescriptor.from_tensor(shm_tensor)
-        entries2 = [KeyedRequest("test_key_2", MockRequest(tensor_val=tensor2))]
+        entries2 = [Request(key="test_key_2", tensor_val=tensor2)]
 
         await buffer2._post_handshake([descriptor], entries2)
 
@@ -368,9 +357,8 @@ class TestSharedMemoryTransportBufferPUT:
         buffer._contexts = [ShmContext(descriptor=descriptor)]
 
         # Handle put with no current_object (new key)
-        request = MockRequest()
         results = await buffer.handle_put_request(
-            ctx, [(KeyedRequest("test_key", request), None)]
+            ctx, [(Request(key="test_key"), None)]
         )
 
         assert len(results) == 1
@@ -379,7 +367,7 @@ class TestSharedMemoryTransportBufferPUT:
         # Handle put with matching existing tensor returns existing
         buffer._contexts = [ShmContext(descriptor=descriptor)]
         results2 = await buffer.handle_put_request(
-            ctx, [(KeyedRequest("test_key", request), shm_tensor)]
+            ctx, [(Request(key="test_key"), shm_tensor)]
         )
         assert results2[0] is shm_tensor
 
@@ -406,14 +394,11 @@ class TestSharedMemoryTransportBufferPUT:
             ShmContext(descriptor=descriptor2),
         ]
 
-        req1 = MockRequest()
-        req2 = MockRequest()
-
         results = await buffer.handle_put_request(
             ctx,
             [
-                (KeyedRequest("k1", req1), None),  # new tensor
-                (KeyedRequest("k2", req2), None),  # new tensor
+                (Request(key="k1"), None),  # new tensor
+                (Request(key="k2"), None),  # new tensor
             ],
         )
 
@@ -441,8 +426,8 @@ class TestSharedMemoryTransportBufferPUT:
         results = await buffer.handle_put_request(
             ctx,
             [
-                (KeyedRequest("tensor_key", MockRequest()), None),
-                (KeyedRequest("obj_key", MockRequest(is_object=True)), None),
+                (Request(key="tensor_key"), None),
+                (Request(key="obj_key", is_object=True), None),
             ],
         )
 
@@ -655,7 +640,7 @@ class TestSharedMemoryTransportBufferGPU:
         buffer = SharedMemoryTransportBuffer(ref)
 
         tensor = torch.randn(50, 50, device="cuda")
-        entries = [KeyedRequest("test_key", MockRequest(tensor_val=tensor))]
+        entries = [Request(key="test_key", tensor_val=tensor)]
 
         shm_tensor = allocate_shared_tensor(tensor.shape, tensor.dtype)
         descriptor = SharedMemoryDescriptor.from_tensor(shm_tensor)
@@ -681,8 +666,8 @@ class TestSharedMemoryTransportBufferBatch:
 
         # Simulate post-handshake: no existing descriptors (all None)
         entries = [
-            KeyedRequest("k1", MockRequest(tensor_val=t1)),
-            KeyedRequest("k2", MockRequest(tensor_val=t2)),
+            Request(key="k1", tensor_val=t1),
+            Request(key="k2", tensor_val=t2),
         ]
         descriptors = [None, None]
         await buffer._post_handshake(descriptors, entries)
@@ -713,9 +698,9 @@ class TestSharedMemoryTransportBufferBatch:
         results = await buffer.recv_handshake(
             ctx,
             [
-                (KeyedRequest("k1", MockRequest()), existing_tensor),
-                (KeyedRequest("k2", MockRequest()), None),
-                (KeyedRequest("k3", MockRequest()), "not_a_tensor"),
+                (Request(key="k1"), existing_tensor),
+                (Request(key="k2"), None),
+                (Request(key="k3"), "not_a_tensor"),
             ],
         )
 

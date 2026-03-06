@@ -22,7 +22,7 @@ except ImportError:
 
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.types import KeyedRequest, Request
+from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -65,16 +65,16 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             tensor = tensor.unsqueeze(0)
         return tensor.view(torch.uint8).flatten()
 
-    async def _pre_put_hook(self, entries: list[KeyedRequest]) -> None:
+    async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Hook to perform any pre-put operations on the buffer."""
-        assert len(entries) == 1
-        request = entries[0].request
+        assert len(requests) == 1
+        request = requests[0]
 
         if request.is_object:
             return
         self.allocate(request.tensor_val)
 
-    async def _pre_get_hook(self, key, request: Request) -> None:
+    async def _pre_get_hook(self, request: Request) -> None:
         """Hook to perform any pre-get operations on the buffer."""
 
         # keep request for later
@@ -86,7 +86,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         meta = None
         if request.tensor_val is None:
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                key, request.meta_only()
+                request.key, request.meta_only()
             )
             if isinstance(meta, str) or meta is None:
                 return  # objects don't get handled
@@ -100,10 +100,10 @@ class MonarchRDMATransportBuffer(TransportBuffer):
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[KeyedRequest, Any]],
+        entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         assert len(entries) == 1
-        (key, request), current_object = entries[0]
+        request, current_object = entries[0]
 
         if request.is_object:
             self.is_object = True

@@ -7,7 +7,7 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, NamedTuple, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -93,6 +93,7 @@ class Request:
     """Request object encapsulating data to be stored or retrieved from TorchStore.
 
     Attributes:
+        key (str): The storage key for this request.
         tensor_val (Optional[torch.Tensor]): The actual tensor data to store/retrieve.
             For DTensors, this contains the local tensor shard.
         tensor_slice (Optional[TensorSlice]): Metadata about distributed tensor sharding,
@@ -101,6 +102,7 @@ class Request:
         is_object (bool): Flag indicating whether this request contains a non-tensor object.
     """
 
+    key: str = ""
     tensor_val: torch.Tensor | None = None
     tensor_slice: TensorSlice | None = None
     objects: Any | None = None
@@ -109,6 +111,7 @@ class Request:
     @classmethod
     def from_any(
         cls,
+        key: str,
         value: torch.Tensor | DTensor | None,
         tensor_slice: TensorSlice | None = None,
     ) -> "Request":
@@ -118,6 +121,7 @@ class Request:
         use from_objects() directly.
 
         Args:
+            key: The storage key for this request.
             value: The value to create a request from. Can be a Tensor, DTensor, or None.
             tensor_slice: Optional tensor slice specification. Cannot be provided when
                 value is a DTensor (DTensor has its own sharding info).
@@ -147,9 +151,9 @@ class Request:
                     f"(placements: {value.placements}, mesh size: {value.device_mesh.size()}). "
                     "Treating as regular tensor for storage."
                 )
-                request = cls.from_tensor(value._local_tensor)
+                request = cls.from_tensor(key, value._local_tensor)
             else:
-                request = cls.from_dtensor(value)
+                request = cls.from_dtensor(key, value)
         elif isinstance(value, torch.Tensor):
             # Validate shape match if both tensor and slice are provided
             if tensor_slice is not None and tensor_slice.local_shape != value.shape:
@@ -157,12 +161,12 @@ class Request:
                     f"Requested tensor slice shape {tensor_slice.local_shape} "
                     f"does not match tensor shape {value.shape}"
                 )
-            request = cls.from_tensor(value)
+            request = cls.from_tensor(key, value)
             request.tensor_slice = tensor_slice
         elif value is None:
             # Mostly empty request - used for GET when we don't know the stored type
             # (passing tensor_slice implies the user knows a tensor is stored)
-            request = cls(tensor_slice=tensor_slice)
+            request = cls(key=key, tensor_slice=tensor_slice)
         else:
             raise TypeError(
                 f"from_any accepts None, torch.Tensor, or DTensor, got {type(value)}. "
@@ -172,7 +176,7 @@ class Request:
         return request
 
     @classmethod
-    def from_dtensor(cls, dtensor: DTensor) -> "Request":
+    def from_dtensor(cls, key: str, dtensor: DTensor) -> "Request":
         coordinates = dtensor.device_mesh.get_coordinate()
         _, offsets = _compute_local_shape_and_global_offset(
             dtensor.shape,
@@ -189,36 +193,29 @@ class Request:
             dtensor.device_mesh.shape,
         )
         return cls(
+            key=key,
             tensor_val=dtensor._local_tensor,
             tensor_slice=tensor_slice,
         )
 
     @classmethod
-    def from_tensor(cls, tensor: torch.Tensor) -> "Request":
-        return cls(tensor_val=tensor)
+    def from_tensor(cls, key: str, tensor: torch.Tensor) -> "Request":
+        return cls(key=key, tensor_val=tensor)
 
     @classmethod
-    def from_objects(cls, objects) -> "Request":
-        return cls(objects=objects, is_object=True)
+    def from_objects(cls, key: str, objects) -> "Request":
+        return cls(key=key, objects=objects, is_object=True)
 
     @classmethod
-    def from_tensor_slice(cls, tensor_slice: TensorSlice) -> "Request":
-        return cls(tensor_slice=copy.deepcopy(tensor_slice))
+    def from_tensor_slice(cls, key: str, tensor_slice: TensorSlice) -> "Request":
+        return cls(key=key, tensor_slice=copy.deepcopy(tensor_slice))
 
     def meta_only(self) -> "Request":
         """Returns a copy of this request with tensor_val set to None."""
         return Request(
+            key=self.key,
             tensor_val=None,
             tensor_slice=self.tensor_slice,
             objects=self.objects,
             is_object=self.is_object,
         )
-
-
-class KeyedRequest(NamedTuple):
-    key: str
-    request: Request
-
-    def meta_only(self) -> "KeyedRequest":
-        """Return a copy with request.tensor_val stripped."""
-        return KeyedRequest(key=self.key, request=self.request.meta_only())

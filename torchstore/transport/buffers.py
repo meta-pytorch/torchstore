@@ -10,7 +10,7 @@ import torch
 
 from torchstore.logging import LatencyTracker
 from torchstore.transport.torchcomms.cache import RdmaTransportCache
-from torchstore.transport.types import KeyedRequest, Request
+from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -146,7 +146,7 @@ class TransportBuffer:
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
 
-    def requires_handshake(self, entries: list[KeyedRequest]) -> bool:
+    def requires_handshake(self, requests: list[Request]) -> bool:
         """Determine if a handshake is needed before the operation.
 
         Override this method for custom handshake logic (e.g., cached connections).
@@ -154,23 +154,23 @@ class TransportBuffer:
         Default implementation returns False.
 
         Args:
-            entries: List of KeyedRequest for the current operation.
+            requests: List of Request for the current operation.
         """
         return False
 
     # Client-side interface. Called by the client to send/recv data to the storage volume.
-    async def put_to_storage_volume(self, entries: list[KeyedRequest]) -> None:
+    async def put_to_storage_volume(self, requests: list[Request]) -> None:
         if self.supports_batch_puts:
-            await self._put_entries(entries)
+            await self._put_requests(requests)
         else:
-            for entry in entries:
-                await self._put_entries([entry])
+            for request in requests:
+                await self._put_requests([request])
 
-    async def _put_entries(self, entries: list[KeyedRequest]) -> None:
+    async def _put_requests(self, requests: list[Request]) -> None:
         l = LatencyTracker("put")
-        meta_requests = [e.meta_only() for e in entries]
+        meta_requests = [r.meta_only() for r in requests]
         try:
-            if self.requires_handshake(entries):
+            if self.requires_handshake(requests):
                 await self._pre_handshake()
                 l.track_step("pre_handshake")
                 handshake_results = (
@@ -179,10 +179,10 @@ class TransportBuffer:
                     )
                 )
                 l.track_step("volume.handshake.call")
-                await self._post_handshake(handshake_results, entries)
+                await self._post_handshake(handshake_results, requests)
                 l.track_step("post_handshake")
 
-            await self._pre_put_hook(entries)
+            await self._pre_put_hook(requests)
             l.track_step("_pre_put_hook")
 
             await self.storage_volume_ref.volume.put.call(self, meta_requests)
@@ -193,25 +193,25 @@ class TransportBuffer:
             l.track_e2e()
 
     # batching not supported on get yet
-    async def get_from_storage_volume(self, key, request: Request):
+    async def get_from_storage_volume(self, request: Request):
         try:
-            entries = [KeyedRequest(key, request)]
-            if self.requires_handshake(entries):
+            requests = [request]
+            if self.requires_handshake(requests):
                 await self._pre_handshake()
                 handshake_results = (
                     await self.storage_volume_ref.volume.handshake.call_one(
-                        self, [KeyedRequest(key, request.meta_only())]
+                        self, [request.meta_only()]
                     )
                 )
-                await self._post_handshake(handshake_results, entries)
+                await self._post_handshake(handshake_results, requests)
 
-            await self._pre_get_hook(key, request)
+            await self._pre_get_hook(request)
 
             # when fetching data, we may need to handle the response from the storage volume
             # TODO: think of a good prefix to differentiate this between remote handlers
             response = await self._handle_storage_volume_response(
                 await self.storage_volume_ref.volume.get.call_one(
-                    key, self, request.meta_only()
+                    request.key, self, request.meta_only()
                 )
             )
         finally:
@@ -231,7 +231,7 @@ class TransportBuffer:
     async def _post_handshake(
         self,
         handshake_results: list[Any],
-        entries: list[KeyedRequest],
+        requests: list[Request],
     ) -> None:
         """Process the result of a handshake on the client side.
 
@@ -243,10 +243,10 @@ class TransportBuffer:
     async def _drop(self, response: Any):
         pass
 
-    async def _pre_put_hook(self, entries: list[KeyedRequest]):
+    async def _pre_put_hook(self, requests: list[Request]):
         pass
 
-    async def _pre_get_hook(self, key: str, request: Request):
+    async def _pre_get_hook(self, request: Request):
         pass
 
     async def _handle_storage_volume_response(self, response: Any) -> Any:
@@ -258,7 +258,7 @@ class TransportBuffer:
     async def recv_handshake(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[KeyedRequest, Any]],
+        entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         # called on the storage volume side
         raise NotImplementedError()
@@ -266,7 +266,7 @@ class TransportBuffer:
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[KeyedRequest, Any]],
+        entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         # called on the storage volume side
         raise NotImplementedError()

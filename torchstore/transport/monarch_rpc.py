@@ -16,7 +16,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.types import KeyedRequest, Request
+from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -41,13 +41,13 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         state["inplace_tensor"] = None
         return state
 
-    async def _pre_put_hook(self, entries: list[KeyedRequest]) -> None:
+    async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Store data from request to be serialized with this buffer."""
-        assert len(entries) == 1
-        request = entries[0].request
+        assert len(requests) == 1
+        request = requests[0]
         self.data = request.objects if request.is_object else request.tensor_val
 
-    async def _pre_get_hook(self, key: str, request: Request) -> None:
+    async def _pre_get_hook(self, request: Request) -> None:
         """Store data from request to be serialized with this buffer."""
         # tensor_val is None if not Tensor or not inplace
         self.inplace_tensor = request.tensor_val
@@ -55,7 +55,7 @@ class MonarchRPCTransportBuffer(TransportBuffer):
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[KeyedRequest, Any]],
+        entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """Return the data from the buffer to be stored."""
         assert len(entries) == 1

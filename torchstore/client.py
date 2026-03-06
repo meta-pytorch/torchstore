@@ -14,12 +14,7 @@ from torch.distributed.tensor import DTensor
 from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
-from torchstore.transport import (
-    create_transport_buffer,
-    KeyedRequest,
-    Request,
-    TensorSlice,
-)
+from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.transport.buffers import TransportContext
 from torchstore.utils import (
     assemble_tensor,
@@ -73,10 +68,10 @@ class LocalClient:
         requests = []
         for key, value in entries:
             if isinstance(value, (torch.Tensor, DTensor)):
-                request = Request.from_any(value)
+                request = Request.from_any(key, value)
             else:
-                request = Request.from_objects(value)
-            requests.append(KeyedRequest(key, request))
+                request = Request.from_objects(key, value)
+            requests.append(request)
 
         storage_volume_ref = self.strategy.select_storage_volume()
         transport_buffer = create_transport_buffer(storage_volume_ref)
@@ -119,10 +114,10 @@ class LocalClient:
         logger.debug(f"Fetching {key}")
         latency_tracker = LatencyTracker(f"get:{key}")
 
-        request = Request.from_any(inplace_tensor, tensor_slice_spec)
+        request = Request.from_any(key, inplace_tensor, tensor_slice_spec)
 
         # Fetch the data
-        fetched = await self._fetch(key, request)
+        fetched = await self._fetch(request)
         latency_tracker.track_step("fetch")
 
         # TODO: remove this copy and instead assert.
@@ -146,18 +141,17 @@ class LocalClient:
 
     async def _fetch(
         self,
-        key: str,
         request: Request,
     ) -> torch.Tensor | Any:
         """Unified fetch that handles tensors, objects, and tensor slices.
 
         Args:
-            key: Storage key to fetch.
-            request: Request containing tensor_slice and optional inplace tensor.
+            request: Request containing key, tensor_slice and optional inplace tensor.
 
         Returns:
             The fetched data (tensor, assembled tensor, or object).
         """
+        key = request.key
         volume_map = await self._locate_volumes(key)
         partial_results = []
 
@@ -182,9 +176,9 @@ class LocalClient:
             # no sharding for objects or regular tensors.
             if storage_info.object_type == ObjectType.OBJECT:
                 request.is_object = True
-                return await transport_buffer.get_from_storage_volume(key, request)
+                return await transport_buffer.get_from_storage_volume(request)
             if storage_info.object_type == ObjectType.TENSOR:
-                return await transport_buffer.get_from_storage_volume(key, request)
+                return await transport_buffer.get_from_storage_volume(request)
 
             # Has tensor slices - fetch each relevant slice
             for stored_slice in storage_info.tensor_slices:
@@ -210,17 +204,17 @@ class LocalClient:
 
                 if dest_view is not None:
                     # Pass the view as tensor_val - transport writes directly inplace
-                    slice_request = Request.from_tensor_slice(fetch_slice)
+                    slice_request = Request.from_tensor_slice(key, fetch_slice)
                     slice_request.tensor_val = dest_view
-                    await transport_buffer.get_from_storage_volume(key, slice_request)
+                    await transport_buffer.get_from_storage_volume(slice_request)
                     partial_results.append((dest_view, fetch_slice))
                 else:
                     # TODO: ensure this is not in the common path, or that we have a solution for
                     # this pattern since it creates a new allocation on every fetch, and should be
                     # is generally avoidable.
-                    slice_request = Request.from_tensor_slice(fetch_slice)
+                    slice_request = Request.from_tensor_slice(key, fetch_slice)
                     local_tensor = await transport_buffer.get_from_storage_volume(
-                        key, slice_request
+                        slice_request
                     )
                     partial_results.append((local_tensor, fetch_slice))
 

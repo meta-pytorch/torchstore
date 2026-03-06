@@ -9,7 +9,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.types import KeyedRequest, Request
+from torchstore.transport.types import Request
 
 try:
     from torchcomms._transport import RdmaMemory, RdmaRemoteBuffer
@@ -66,9 +66,9 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             self.storage_volume_ref.volume_id, device
         )
 
-    def requires_handshake(self, entries: list[KeyedRequest]) -> bool:
+    def requires_handshake(self, requests: list[Request]) -> bool:
         """Setup transport from request if needed, then check if handshake is required."""
-        request = entries[0].request
+        request = requests[0]
         if not request.is_object:
             self._setup_local_transport(request.tensor_val)
 
@@ -78,7 +78,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     async def _post_handshake(
         self,
         handshake_results: list[Any],
-        entries: list[KeyedRequest],
+        requests: list[Request],
     ) -> None:
         """Connect local transport to peer after handshake."""
         self._local_transport.connect(handshake_results[0])
@@ -86,7 +86,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     async def recv_handshake(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[KeyedRequest, Any]],
+        entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """Confirm a handshake initiated by the local client (storage volume side)."""
         transport_cache = ctx.get_rdma_transport_cache()
@@ -110,20 +110,20 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         self.rdma_memory = RdmaMemory(tensor)
         self.rdma_remote_buffer = self.rdma_memory.to_remote_buffer()
 
-    async def _pre_put_hook(self, entries: list[KeyedRequest]) -> None:
+    async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Allocate RDMA memory for put (transport already set up)."""
-        assert len(entries) == 1
-        request = entries[0].request
+        assert len(requests) == 1
+        request = requests[0]
         if request.is_object:
             return
         self._allocate(request.tensor_val)
 
-    async def _pre_get_hook(self, key: str, request: Request) -> None:
+    async def _pre_get_hook(self, request: Request) -> None:
         """Fetch metadata if needed and allocate RDMA buffers."""
         tensor_like = request.tensor_val
         if tensor_like is None:
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                key, request.meta_only()
+                request.key, request.meta_only()
             )
             if isinstance(meta, str) or meta is None:
                 return  # Objects don't need RDMA setup
@@ -144,11 +144,11 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[KeyedRequest, Any]],
+        entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
         assert len(entries) == 1
-        (key, request), maybe_tensor = entries[0]
+        request, maybe_tensor = entries[0]
 
         if request.is_object:
             return [request.objects]
