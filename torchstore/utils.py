@@ -24,22 +24,37 @@ logger = getLogger(__name__)
 
 def get_destination_view(
     dest_tensor: torch.Tensor,
-    dest_slice: "TensorSlice",
+    dest_slice: "TensorSlice | None",
     fetch_slice: "TensorSlice",
 ) -> torch.Tensor | None:
     """Get a view of the destination tensor where the fetched slice should be written.
 
     Args:
         dest_tensor: The destination tensor (must be contiguous)
-        dest_slice: TensorSlice describing the destination tensor's position in global space
+        dest_slice: TensorSlice describing the destination tensor's position in global space.
+            If None, the destination tensor is assumed to cover the full global shape
+            (offsets all zero, shape = dest_tensor.shape).
         fetch_slice: TensorSlice describing the slice being fetched
 
     Returns:
         A view of dest_tensor for the region where fetch_slice should be written,
         or None if the fetch_slice doesn't map to a contiguous region in dest_tensor.
     """
+    from torchstore.transport import TensorSlice  # inline to avoid circular import
+
     if not dest_tensor.is_contiguous():
         return None
+
+    # When no dest_slice is provided, the dest tensor covers the full global shape
+    if dest_slice is None:
+        shape = tuple(dest_tensor.shape)
+        dest_slice = TensorSlice(
+            offsets=tuple(0 for _ in shape),
+            coordinates=None,
+            global_shape=shape,
+            local_shape=shape,
+            mesh_shape=None,
+        )
 
     # Compute the local indices within dest_tensor where fetch_slice should be written
     slices = []

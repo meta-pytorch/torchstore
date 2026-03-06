@@ -150,12 +150,11 @@ class LocalClient:
             for volume_id in volume_map.keys()
         }
 
-        # only attempt inplace if buffer has support, tensor is contiguous, and tensor_slice is provided
+        # attempt inplace if buffer supports it and we have a contiguous tensor
         use_inplace_views = (
             all(tb.supports_inplace_resharding for tb in transport_buffer_map.values())
             and request.tensor_val is not None
             and request.tensor_val.is_contiguous()
-            and request.tensor_slice is not None
         )
 
         for volume_id, storage_info in volume_map.items():
@@ -181,7 +180,7 @@ class LocalClient:
                     if fetch_slice is None:
                         continue
 
-                # Try to get a view of the destination tensor for inplace writes
+                # Try to get a view of the destination tensor for inplace writes.
                 dest_view = (
                     get_destination_view(
                         request.tensor_val, request.tensor_slice, fetch_slice
@@ -207,7 +206,7 @@ class LocalClient:
                     partial_results.append((local_tensor, fetch_slice))
 
         # Check if all results share memory with the destination tensor (inplace)
-        if use_inplace_views and tensors_overlap_in_memory(
+        if request.tensor_val is not None and tensors_overlap_in_memory(
             partial_results, request.tensor_val
         ):
             return request.tensor_val
