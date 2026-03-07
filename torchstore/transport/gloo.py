@@ -16,11 +16,11 @@ import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
 
 from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
     from torchstore.transport.pipe import StorageVolumeRef
-    from torchstore.transport.types import Request
 import os
 
 import torch.distributed as dist
@@ -131,7 +131,7 @@ class GlooTransportBuffer(TransportBuffer):
             None  # Background task for receiving tensor
         )
 
-    def requires_handshake(self, request: "Request") -> bool:
+    def requires_handshake(self, requests: list[Request]) -> bool:
         """Determine if a handshake is needed.
 
         Returns False if a cached connection already exists for this volume,
@@ -205,8 +205,10 @@ class GlooTransportBuffer(TransportBuffer):
         return state
 
     async def recv_handshake(
-        self, ctx: "TransportContext", current_object: Any = None
-    ) -> None:
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[Request, Any]],
+    ) -> list[None]:
         """Called on storage volume side to set up the process group.
 
         Creates TCPStore and ProcessGroup on storage side (rank 1).
@@ -251,9 +253,13 @@ class GlooTransportBuffer(TransportBuffer):
             f"Storage volume finished gloo process group setup for store_key={self.store_key}"
         )
 
-        return None
+        return [None]
 
-    async def _post_handshake(self, handshake_result: Any) -> None:
+    async def _post_handshake(
+        self,
+        handshake_results: list[Any],
+        requests: list[Request],
+    ) -> None:
         """Await ProcessGroup creation that was started in _pre_handshake.
 
         The PG creation was started concurrently with the handshake RPC,
@@ -276,13 +282,16 @@ class GlooTransportBuffer(TransportBuffer):
 
         logger.info(f"Finished gloo handshake with StorageVolume:[{volume_id}]")
 
-    async def _pre_put_hook(self, request: "Request") -> None:
+    async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Start sending tensor before put RPC.
 
         Called after handshake completes, before put.call().
         Starts the send as a background task so it runs concurrently
         with the storage volume's recv in handle_put_request.
         """
+        assert len(requests) == 1
+        request = requests[0]
+
         # Check if this is an object (non-tensor) PUT
         if request.is_object:
             self.is_object = True
@@ -307,13 +316,15 @@ class GlooTransportBuffer(TransportBuffer):
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        request: "Request",
-        maybe_tensor: torch.Tensor | None,
-    ) -> Any:
+        entries: list[tuple[Request, Any]],
+    ) -> list[Any]:
         """Called by storage volume. Receive tensor from client via gloo process group."""
+        assert len(entries) == 1
+        request, maybe_tensor = entries[0]
+
         if request.is_object:
             self.is_object = True
-            return request.objects
+            return [request.objects]
 
         # Allocate destination tensor if needed
         tensor = maybe_tensor
@@ -325,9 +336,9 @@ class GlooTransportBuffer(TransportBuffer):
         # Receive tensor from client via gloo
         tensor = await self._receive_tensor(tensor, ctx)
 
-        return tensor
+        return [tensor]
 
-    async def _pre_get_hook(self, key: str, request: "Request") -> None:
+    async def _pre_get_hook(self, request: Request) -> None:
         """Start receiving tensor before get RPC.
 
         Called after handshake completes, before get.call().
@@ -341,13 +352,13 @@ class GlooTransportBuffer(TransportBuffer):
             self.shape = torch.Size(request.tensor_slice.local_shape)
             # Need to fetch dtype from storage since slice doesn't have it
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                key, request.meta_only()
+                request.key, request.meta_only()
             )
             self.dtype = meta[1]
         else:
             # Need to fetch metadata to know shape/dtype for allocation
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                key, request.meta_only()
+                request.key, request.meta_only()
             )
             if isinstance(meta, str) or meta is None:
                 # It's an object, not a tensor
@@ -368,7 +379,7 @@ class GlooTransportBuffer(TransportBuffer):
             )
         )
 
-    async def handle_get_request(self, ctx: "TransportContext", data: Any) -> None:
+    async def handle_get_request(self, ctx: "TransportContext", data) -> None:
         """Called by storage volume. Send tensor to client via gloo process group."""
         if not isinstance(data, torch.Tensor):
             self.is_object = True

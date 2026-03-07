@@ -153,6 +153,25 @@ async def put(
     return await cl.put(key, value)
 
 
+async def put_batch(
+    entries: list[tuple[str, torch.Tensor | Any]],
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> None:
+    """Store multiple key-value pairs in a single batched operation.
+
+    Args:
+        entries: List of (key, value) tuples to store.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Example:
+        >>> t1 = torch.randn(100, 100)
+        >>> t2 = torch.randn(50, 50)
+        >>> await put_batch([("key1", t1), ("key2", t2)])
+    """
+    cl = await client(store_name)
+    return await cl.put_batch(entries)
+
+
 async def get(
     key: str,
     inplace_tensor: torch.Tensor | None = None,
