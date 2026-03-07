@@ -338,13 +338,15 @@ class GlooTransportBuffer(TransportBuffer):
 
         return [tensor]
 
-    async def _pre_get_hook(self, request: Request) -> None:
+    async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Start receiving tensor before get RPC.
 
         Called after handshake completes, before get.call().
         Starts the recv as a background task so it runs concurrently
         with the storage volume's send in handle_get_request.
         """
+        assert len(requests) == 1
+        request = requests[0]
         # TODO: support in place get with receiving directly to request.tensor_val
 
         # If request specifies a tensor slice, use its shape
@@ -352,13 +354,13 @@ class GlooTransportBuffer(TransportBuffer):
             self.shape = torch.Size(request.tensor_slice.local_shape)
             # Need to fetch dtype from storage since slice doesn't have it
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                request.key, request.meta_only()
+                request.meta_only()
             )
             self.dtype = meta[1]
         else:
             # Need to fetch metadata to know shape/dtype for allocation
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                request.key, request.meta_only()
+                request.meta_only()
             )
             if isinstance(meta, str) or meta is None:
                 # It's an object, not a tensor
@@ -379,8 +381,14 @@ class GlooTransportBuffer(TransportBuffer):
             )
         )
 
-    async def handle_get_request(self, ctx: "TransportContext", data) -> None:
+    async def handle_get_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[Request, Any]],
+    ) -> None:
         """Called by storage volume. Send tensor to client via gloo process group."""
+        assert len(entries) == 1
+        _, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True
             self.objects = data
@@ -391,13 +399,13 @@ class GlooTransportBuffer(TransportBuffer):
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
-    ) -> Any:
+    ) -> list[Any]:
         """Process the response from storage volume after get.
 
         The tensor data was received via gloo in the background recv task.
         """
         if transport_buffer.is_object:
-            return transport_buffer.objects
+            return [transport_buffer.objects]
 
         # Wait for the recv to complete
         if self._recv_task is not None:
@@ -408,7 +416,7 @@ class GlooTransportBuffer(TransportBuffer):
                     f"receive_tensor returned None (is_object={self.is_object}, "
                     f"shape={self.shape}, dtype={self.dtype})"
                 )
-            return tensor
+            return [tensor]
 
         raise RuntimeError(f"No recv task available (is_object={self.is_object})")
 

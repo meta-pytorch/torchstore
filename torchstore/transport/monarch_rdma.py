@@ -74,8 +74,10 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             return
         self.allocate(request.tensor_val)
 
-    async def _pre_get_hook(self, request: Request) -> None:
+    async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Hook to perform any pre-get operations on the buffer."""
+        assert len(requests) == 1
+        request = requests[0]
 
         # keep request for later
         self.request = request
@@ -86,7 +88,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         meta = None
         if request.tensor_val is None:
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                request.key, request.meta_only()
+                request.meta_only()
             )
             if isinstance(meta, str) or meta is None:
                 return  # objects don't get handled
@@ -125,7 +127,13 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         return [tensor]
 
-    async def handle_get_request(self, ctx: "TransportContext", data: Any):
+    async def handle_get_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[Request, Any]],
+    ) -> None:
+        assert len(entries) == 1
+        _, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True
             self.objects = data
@@ -144,9 +152,9 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _handle_storage_volume_response(
         self, transport_buffer: TransportBuffer
-    ) -> Any:
+    ) -> list[Any]:
         if transport_buffer.is_object:
-            return transport_buffer.objects
+            return [transport_buffer.objects]
 
         # If user provided an inplace tensor but we had to make a contiguous copy
         # during allocate(), the RDMA data landed in self.tensor (the copy), not
@@ -154,11 +162,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         if self.request.tensor_val is not None:
             if self.request.tensor_val.data_ptr() != self.tensor.data_ptr():
                 self.request.tensor_val.copy_(self.tensor)
-            return self.request.tensor_val
+            return [self.request.tensor_val]
 
         # self.byte_view already points to the byte view of self.tensor
         # so the data is already in self.tensor after the RDMA write completes
-        return self.tensor
+        return [self.tensor]
 
     async def drop(self) -> None:
         """Explicitly clean up RDMA buffers to prevent kernel memory leak.
