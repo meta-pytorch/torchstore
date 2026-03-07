@@ -56,30 +56,17 @@ async def get_state_dict(store, key, user_state_dict: dict | None = None, strict
     if strict and user_mapping is not None:
         assert user_mapping == fetched_mapping
 
-    fetched_state_dict = {}
-    for flattened_key in fetched_mapping.keys():
-        inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
-        fetched_state_dict[flattened_key] = await store.get(
-            f"{key}{DELIM}{flattened_key}",
-            inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
-        )
+    flattened_keys = list(fetched_mapping.keys())
+    full_keys = [f"{key}{DELIM}{fk}" for fk in flattened_keys]
 
-    # # Prepare all the coroutines first
-    # coros = []
-    # keys = []
-    # for flattened_key in fetched_mapping.keys():
-    #     inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
-    #     keys.append(flattened_key)
-    #     coros.append(
-    #         store.get(
-    #             f"{key}{DELIM}{flattened_key}",
-    #             inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
-    #         )
-    #     )
-    # # Run all requests concurrently
-    # results = await asyncio.gather(*coros)
-    # # Build the result dictionary
-    # fetched_state_dict = dict(zip(keys, results))
+    inplace_tensors = {}
+    for fk in flattened_keys:
+        t = user_flattened_state_dict.get(fk, None)
+        if isinstance(t, torch.Tensor):
+            inplace_tensors[f"{key}{DELIM}{fk}"] = t
+
+    results = await store.get_batch(full_keys, inplace_tensors or None)
+    fetched_state_dict = {fk: results[f"{key}{DELIM}{fk}"] for fk in flattened_keys}
 
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
 

@@ -74,8 +74,9 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             return
         self.allocate(request.tensor_val)
 
-    async def _pre_get_hook(self, request: Request) -> None:
+    async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Hook to perform any pre-get operations on the buffer."""
+        request = requests[0]
 
         # keep request for later
         self.request = request
@@ -125,7 +126,12 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         return [tensor]
 
-    async def handle_get_request(self, ctx: "TransportContext", data: Any):
+    async def handle_get_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[Request, Any]],
+    ) -> None:
+        _entry, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True
             self.objects = data
@@ -144,9 +150,9 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _handle_storage_volume_response(
         self, transport_buffer: TransportBuffer
-    ) -> Any:
+    ) -> list[Any]:
         if transport_buffer.is_object:
-            return transport_buffer.objects
+            return [transport_buffer.objects]
 
         # If user provided an inplace tensor but we had to make a contiguous copy
         # during allocate(), the RDMA data landed in self.tensor (the copy), not
@@ -154,11 +160,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         if self.request.tensor_val is not None:
             if self.request.tensor_val.data_ptr() != self.tensor.data_ptr():
                 self.request.tensor_val.copy_(self.tensor)
-            return self.request.tensor_val
+            return [self.request.tensor_val]
 
         # self.byte_view already points to the byte view of self.tensor
         # so the data is already in self.tensor after the RDMA write completes
-        return self.tensor
+        return [self.tensor]
 
     async def drop(self) -> None:
         """Explicitly clean up RDMA buffers to prevent kernel memory leak.
