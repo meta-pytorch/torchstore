@@ -49,6 +49,7 @@ class MonarchRPCTransportBuffer(TransportBuffer):
 
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Store data from request to be serialized with this buffer."""
+        assert len(requests) == 1
         request = requests[0]
         # tensor_val is None if not Tensor or not inplace
         self.inplace_tensor = request.tensor_val
@@ -68,6 +69,7 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> None:
         """Store the data to be sent back to the client."""
+        assert len(entries) == 1
         _, data = entries[0]
         self.data = data
 

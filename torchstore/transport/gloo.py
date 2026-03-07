@@ -345,6 +345,7 @@ class GlooTransportBuffer(TransportBuffer):
         Starts the recv as a background task so it runs concurrently
         with the storage volume's send in handle_get_request.
         """
+        assert len(requests) == 1
         request = requests[0]
         # TODO: support in place get with receiving directly to request.tensor_val
 
@@ -386,6 +387,7 @@ class GlooTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> None:
         """Called by storage volume. Send tensor to client via gloo process group."""
+        assert len(entries) == 1
         _, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True
