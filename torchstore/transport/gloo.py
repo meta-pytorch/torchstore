@@ -354,13 +354,13 @@ class GlooTransportBuffer(TransportBuffer):
             self.shape = torch.Size(request.tensor_slice.local_shape)
             # Need to fetch dtype from storage since slice doesn't have it
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                request.key, request.meta_only()
+                request.meta_only()
             )
             self.dtype = meta[1]
         else:
             # Need to fetch metadata to know shape/dtype for allocation
             meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                request.key, request.meta_only()
+                request.meta_only()
             )
             if isinstance(meta, str) or meta is None:
                 # It's an object, not a tensor
