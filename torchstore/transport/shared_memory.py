@@ -259,7 +259,6 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
-
         # SHM only needs handshake during PUT, not GET
         self._needs_handshake: bool = False
 
