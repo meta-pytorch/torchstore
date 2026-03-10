@@ -120,6 +120,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Fetch metadata if needed and allocate RDMA buffers."""
+        assert len(requests) == 1
         request = requests[0]
         tensor_like = request.tensor_val
         if tensor_like is None:
@@ -179,6 +180,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
+        assert len(entries) == 1
         _, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True

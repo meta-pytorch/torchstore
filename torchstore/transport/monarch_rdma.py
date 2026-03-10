@@ -76,6 +76,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Hook to perform any pre-get operations on the buffer."""
+        assert len(requests) == 1
         request = requests[0]
 
         # keep request for later
@@ -131,6 +132,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         ctx: "TransportContext",
         entries: list[tuple[Request, Any]],
     ) -> None:
+        assert len(entries) == 1
         _, data = entries[0]
         if not isinstance(data, torch.Tensor):
             self.is_object = True
