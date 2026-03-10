@@ -56,17 +56,18 @@ async def get_state_dict(store, key, user_state_dict: dict | None = None, strict
     if strict and user_mapping is not None:
         assert user_mapping == fetched_mapping
 
+    get_id = lambda fk: f"{key}{DELIM}{fk}"
     flattened_keys = list(fetched_mapping.keys())
-    full_keys = [f"{key}{DELIM}{fk}" for fk in flattened_keys]
+    full_keys = [get_id(fk) for fk in flattened_keys]
 
     inplace_tensors = {}
     for fk in flattened_keys:
         t = user_flattened_state_dict.get(fk, None)
         if isinstance(t, torch.Tensor):
-            inplace_tensors[f"{key}{DELIM}{fk}"] = t
+            inplace_tensors[get_id(fk)] = t
 
     results = await store.get_batch(full_keys, inplace_tensors or None)
-    fetched_state_dict = {fk: results[f"{key}{DELIM}{fk}"] for fk in flattened_keys}
+    fetched_state_dict = {fk: results[get_id(fk)] for fk in flattened_keys}
 
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
 
