@@ -151,7 +151,7 @@ class ShmContext:
 
     descriptor: SharedMemoryDescriptor | None = None
     object: Any = None
-    is_object: bool = False
+    use_rpc: bool = False
 
 
 @dataclass
@@ -314,9 +314,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         for request, descriptor in zip(requests, handshake_results, strict=True):
             key = request.key
             if request.is_object:
-                self._contexts.append(
-                    ShmContext(object=request.objects, is_object=True)
-                )
+                self._contexts.append(ShmContext(object=request.objects, use_rpc=True))
                 continue
 
             tensor = request.tensor_val
@@ -356,11 +354,13 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     ) -> list[Any]:
         """SV side: handle batch of put requests for tensors and objects."""
         results = []
-        for (request, current_object), ctx in zip(entries, self._contexts, strict=True):
-            if ctx.is_object:
-                results.append(ctx.object)
+        for (request, current_object), shm_ctx in zip(
+            entries, self._contexts, strict=True
+        ):
+            if shm_ctx.use_rpc:
+                results.append(shm_ctx.object)
             else:
-                descriptor = ctx.descriptor
+                descriptor = shm_ctx.descriptor
                 assert descriptor is not None, f"No descriptor for {request.key}"
 
                 # Ensure server-side storage hasn't changed since handshake
@@ -390,10 +390,11 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         ctx: "TransportContext",
         entries: list[tuple[Request, Any]],
     ) -> None:
+        """Derive descriptor from stored tensor if backed by shared memory."""
         self._contexts = []
         for request, data in entries:
-            if not isinstance(data, torch.Tensor):
-                self._contexts.append(ShmContext(object=data, is_object=True))
+            if request.is_object or not isinstance(data, torch.Tensor):
+                self._contexts.append(ShmContext(object=data, use_rpc=True))
                 continue
 
             descriptor = SharedMemoryDescriptor.from_tensor(data)
@@ -405,7 +406,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                     f"Key {request.key} is a view or not in shared memory, "
                     "using RPC fallback"
                 )
-                self._contexts.append(ShmContext(object=data, is_object=True))
+                self._contexts.append(ShmContext(object=data, use_rpc=True))
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
@@ -413,12 +414,14 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         results = []
         shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
 
-        for request, ctx in zip(self._batch_requests, transport_buffer._contexts):
+        for request, shm_ctx in zip(
+            self._batch_requests, transport_buffer._contexts, strict=True
+        ):
             client_tensor = request.tensor_val
 
             # Path 1: Object or RPC fallback
-            if ctx.is_object:
-                data = ctx.object
+            if shm_ctx.use_rpc:
+                data = shm_ctx.object
                 if isinstance(data, torch.Tensor) and client_tensor is not None:
                     client_tensor.copy_(data)
                     results.append(client_tensor)
@@ -427,7 +430,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                 continue
 
             # Path 2: SHM
-            descriptor = ctx.descriptor
+            descriptor = shm_ctx.descriptor
             assert (
                 descriptor is not None
             ), f"No descriptor or data for key {request.key}"

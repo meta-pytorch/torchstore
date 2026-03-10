@@ -143,12 +143,7 @@ class LocalClient:
 
         per_key_requests: dict[str, Request] = {}
         for key in keys:
-            inplace = inplace_map.get(key)
-            per_key_requests[key] = (
-                Request.from_any(key, inplace)
-                if inplace is not None
-                else Request(key=key)
-            )
+            per_key_requests[key] = Request.from_any(key, inplace_map.get(key))
 
         results = await self._fetch(per_key_requests)
         latency_tracker.track_step("fetch")
@@ -303,13 +298,17 @@ class LocalClient:
             else:
                 local_tensors = [t for t, _ in parts]
                 global_offsets = [s.offsets for _, s in parts]
+                # TODO: this is yet another new allocation on every fetch.
                 final_results[key] = assemble_tensor(local_tensors, global_offsets)
                 if request.tensor_slice is not None:
                     assert final_results[key].shape == request.tensor_slice.local_shape
 
         for key in keys:
             if key not in final_results:
-                raise RuntimeError(f"No results found for key '{key}'")
+                raise RuntimeError(
+                    f"No results found for key '{key}'. If this key contains "
+                    "tensor slices, no stored slices intersect with the requested slice."
+                )
 
         return final_results
 

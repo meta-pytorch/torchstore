@@ -374,41 +374,6 @@ class TestSharedMemoryTransportBufferPUT:
         assert results2[0] is shm_tensor
 
     @pytest.mark.asyncio
-    async def test_handle_put_batch_request_tensors(self):
-        """Verify SV handles batch of tensor put requests."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
-
-        # Setup two tensor entries
-        t1 = torch.randn(10, 10)
-        shm_tensor1 = allocate_shared_tensor(t1.shape, t1.dtype)
-        shm_tensor1.copy_(t1)
-        descriptor1 = SharedMemoryDescriptor.from_tensor(shm_tensor1)
-
-        t2 = torch.randn(5, 5)
-        shm_tensor2 = allocate_shared_tensor(t2.shape, t2.dtype)
-        shm_tensor2.copy_(t2)
-        descriptor2 = SharedMemoryDescriptor.from_tensor(shm_tensor2)
-
-        buffer._contexts = [
-            ShmContext(descriptor=descriptor1),
-            ShmContext(descriptor=descriptor2),
-        ]
-
-        results = await buffer.handle_put_request(
-            ctx,
-            [
-                (Request(key="k1"), None),  # new tensor
-                (Request(key="k2"), None),  # new tensor
-            ],
-        )
-
-        assert len(results) == 2
-        assert torch.allclose(results[0], t1)
-        assert torch.allclose(results[1], t2)
-
-    @pytest.mark.asyncio
     async def test_handle_put_batch_request_mixed(self):
         """Verify SV handles batch with both tensor and object entries."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
@@ -422,7 +387,7 @@ class TestSharedMemoryTransportBufferPUT:
         descriptor1 = SharedMemoryDescriptor.from_tensor(shm_tensor1)
         buffer._contexts = [
             ShmContext(descriptor=descriptor1),
-            ShmContext(object={"value": 99}, is_object=True),
+            ShmContext(object={"value": 99}, use_rpc=True),
         ]
 
         results = await buffer.handle_put_request(
@@ -459,7 +424,7 @@ class TestSharedMemoryTransportBufferGET:
             buffer._contexts[0].descriptor.storage_handle
             == expected_descriptor.storage_handle
         )
-        assert buffer._contexts[0].is_object is False
+        assert buffer._contexts[0].use_rpc is False
 
     @pytest.mark.asyncio
     async def test_handle_get_non_shared_fallback(self):
@@ -475,7 +440,7 @@ class TestSharedMemoryTransportBufferGET:
         await buffer.handle_get_request(ctx, [(request, data)])
 
         assert len(buffer._contexts) == 1
-        assert buffer._contexts[0].is_object is True
+        assert buffer._contexts[0].use_rpc is True
         assert buffer._contexts[0].object is data
 
     @pytest.mark.asyncio
@@ -495,7 +460,7 @@ class TestSharedMemoryTransportBufferGET:
 
         # Should fall back to RPC because it's a view
         assert len(buffer._contexts) == 1
-        assert buffer._contexts[0].is_object is True
+        assert buffer._contexts[0].use_rpc is True
         assert buffer._contexts[0].object is view_tensor
 
     @pytest.mark.asyncio
@@ -511,7 +476,7 @@ class TestSharedMemoryTransportBufferGET:
         await buffer.handle_get_request(ctx, [(request, data)])
 
         assert len(buffer._contexts) == 1
-        assert buffer._contexts[0].is_object is True
+        assert buffer._contexts[0].use_rpc is True
         assert buffer._contexts[0].object == data
 
     @pytest.mark.asyncio
@@ -556,7 +521,7 @@ class TestSharedMemoryTransportBufferGET:
 
         response1 = SharedMemoryTransportBuffer(ref)
         rpc_data = torch.randn(10, 10)
-        response1._contexts = [ShmContext(object=rpc_data, is_object=True)]
+        response1._contexts = [ShmContext(object=rpc_data, use_rpc=True)]
 
         results1 = await buffer1._handle_storage_volume_response(response1)
         assert len(results1) == 1
@@ -569,7 +534,7 @@ class TestSharedMemoryTransportBufferGET:
 
         response2 = SharedMemoryTransportBuffer(ref)
         rpc_data2 = torch.randn(10, 10)
-        response2._contexts = [ShmContext(object=rpc_data2, is_object=True)]
+        response2._contexts = [ShmContext(object=rpc_data2, use_rpc=True)]
 
         results2 = await buffer2._handle_storage_volume_response(response2)
         assert len(results2) == 1
@@ -749,52 +714,6 @@ class TestSharedMemoryTransportBufferBatch:
         assert buffer._batch_requests == []
 
     @pytest.mark.asyncio
-    async def test_handle_get_request_shm_tensors(self):
-        """SV populates _contexts with descriptors for shared tensors."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
-
-        t1 = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
-        t2 = allocate_shared_tensor(torch.Size([5, 5]), torch.float32)
-
-        entries = [
-            (Request(key="k1"), t1),
-            (Request(key="k2"), t2),
-        ]
-        await buffer.handle_get_request(ctx, entries)
-
-        assert len(buffer._contexts) == 2
-        assert buffer._contexts[0].descriptor is not None
-        assert buffer._contexts[1].descriptor is not None
-        assert buffer._contexts[0].descriptor.shape == torch.Size([10, 10])
-        assert buffer._contexts[1].descriptor.shape == torch.Size([5, 5])
-        assert buffer._contexts[0].is_object is False
-        assert buffer._contexts[1].is_object is False
-
-    @pytest.mark.asyncio
-    async def test_handle_get_request_objects(self):
-        """SV stores non-tensors in _contexts as objects."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
-
-        obj1 = {"data": 1}
-        obj2 = [1, 2, 3]
-
-        entries = [
-            (Request(key="k1", is_object=True), obj1),
-            (Request(key="k2", is_object=True), obj2),
-        ]
-        await buffer.handle_get_request(ctx, entries)
-
-        assert len(buffer._contexts) == 2
-        assert buffer._contexts[0].is_object is True
-        assert buffer._contexts[1].is_object is True
-        assert buffer._contexts[0].object == {"data": 1}
-        assert buffer._contexts[1].object == [1, 2, 3]
-
-    @pytest.mark.asyncio
     async def test_handle_get_request_mixed(self):
         """Mix of SHM tensors, objects, and RPC fallback tensors."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
@@ -817,40 +736,15 @@ class TestSharedMemoryTransportBufferBatch:
         # SHM path
         assert buffer._contexts[0].descriptor is not None
         assert buffer._contexts[0].descriptor.shape == torch.Size([10, 10])
-        assert buffer._contexts[0].is_object is False
+        assert buffer._contexts[0].use_rpc is False
 
         # Object path
-        assert buffer._contexts[1].is_object is True
+        assert buffer._contexts[1].use_rpc is True
         assert buffer._contexts[1].object == {"key": "val"}
 
         # RPC fallback path (non-shared tensor)
-        assert buffer._contexts[2].is_object is True
+        assert buffer._contexts[2].use_rpc is True
         assert buffer._contexts[2].object is rpc_tensor
-
-    @pytest.mark.asyncio
-    async def test_handle_get_response_shm(self):
-        """Client-side SHM attach + copy to inplace."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-
-        dest = torch.zeros(10, 10)
-        buffer._batch_requests = [Request(key="test_key", tensor_val=dest)]
-
-        shm_tensor = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
-        original = torch.randn(10, 10)
-        shm_tensor.copy_(original)
-        descriptor = SharedMemoryDescriptor.from_tensor(shm_tensor)
-
-        response = SharedMemoryTransportBuffer(ref)
-        response._contexts = [ShmContext(descriptor=descriptor)]
-
-        results = await buffer._handle_storage_volume_response(response)
-
-        assert len(results) == 1
-        assert results[0] is dest
-        assert torch.allclose(dest, original)
-
-        ref.transport_context.reset()
 
     @pytest.mark.asyncio
     async def test_handle_get_response_mixed(self):
@@ -872,7 +766,7 @@ class TestSharedMemoryTransportBufferBatch:
         response = SharedMemoryTransportBuffer(ref)
         response._contexts = [
             ShmContext(descriptor=descriptor),
-            ShmContext(object={"data": 42}, is_object=True),
+            ShmContext(object={"data": 42}, use_rpc=True),
         ]
 
         results = await buffer._handle_storage_volume_response(response)
@@ -883,25 +777,6 @@ class TestSharedMemoryTransportBufferBatch:
         assert results[1] == {"data": 42}
 
         ref.transport_context.reset()
-
-    @pytest.mark.asyncio
-    async def test_handle_get_response_rpc_fallback(self):
-        """Client-side fallback path."""
-        ref = MockStorageVolumeRef(volume_hostname="localhost")
-        buffer = SharedMemoryTransportBuffer(ref)
-
-        dest = torch.zeros(10, 10)
-        buffer._batch_requests = [Request(key="test_key", tensor_val=dest)]
-
-        rpc_data = torch.randn(10, 10)
-        response = SharedMemoryTransportBuffer(ref)
-        response._contexts = [ShmContext(object=rpc_data, is_object=True)]
-
-        results = await buffer._handle_storage_volume_response(response)
-
-        assert len(results) == 1
-        assert results[0] is dest
-        assert torch.allclose(dest, rpc_data)
 
 
 if __name__ == "__main__":
