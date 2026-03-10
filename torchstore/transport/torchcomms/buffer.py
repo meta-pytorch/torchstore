@@ -4,7 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from dataclasses import dataclass, replace
+from functools import cache
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -20,6 +22,11 @@ except ImportError:
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
     from torchstore.transport.buffers import TransportContext
+
+
+@cache
+def _client_rdma_cache_enabled() -> bool:
+    return os.environ.get("TORCHSTORE_CLIENT_RDMA_CACHE", "1") == "1"
 
 
 @dataclass
@@ -108,7 +115,11 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     def _allocate_ctx(self, tensor: torch.Tensor) -> RdmaContext:
         self._assert_valid_tensor(tensor, tensor.dtype, tensor.shape)
-        rdma_memory = RdmaMemory(tensor)
+        if _client_rdma_cache_enabled():
+            cache = self.storage_volume_ref.transport_context.get_rdma_memory_cache()
+            rdma_memory = cache.get_or_register(tensor)
+        else:
+            rdma_memory = RdmaMemory(tensor)
         return RdmaContext(
             rdma_memory=rdma_memory,
             rdma_remote_buffer=rdma_memory.to_remote_buffer(),
@@ -164,6 +175,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
         transport = None
 
+        rdma_mem_cache = ctx.get_rdma_memory_cache()
+
         results = []
         for (request, maybe_tensor), rdma_ctx in zip(
             entries, self._contexts, strict=True
@@ -183,7 +196,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             assert rdma_ctx.rdma_remote_buffer is not None
             self._assert_valid_tensor(maybe_tensor, rdma_ctx.dtype, rdma_ctx.shape)
 
-            receiving_buffer = RdmaMemory(maybe_tensor)
+            receiving_buffer = rdma_mem_cache.get_or_register(maybe_tensor)
             res = transport.read(
                 receiving_buffer.to_mutable_view(), rdma_ctx.rdma_remote_buffer
             )
@@ -199,6 +212,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
         transport = None
+        rdma_mem_cache = ctx.get_rdma_memory_cache()
 
         for (request, data), rdma_ctx in zip(entries, self._contexts, strict=True):
             if not isinstance(data, torch.Tensor):
@@ -216,13 +230,17 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                 )
                 contiguous_buffer.copy_(tensor)
                 tensor = contiguous_buffer
+                # Ephemeral copy — don't cache
+                rdma_memory = RdmaMemory(tensor)
+            else:
+                # Stable tensor from kv — cache the registration
+                rdma_memory = rdma_mem_cache.get_or_register(tensor)
 
             if transport is None:
                 transport = ctx.get_rdma_transport_cache().get(self.address, 0)[0]
 
             assert rdma_ctx.rdma_remote_buffer is not None
             self._assert_valid_tensor(tensor, rdma_ctx.dtype, rdma_ctx.shape)
-            rdma_memory = RdmaMemory(tensor)
 
             res = transport.write(rdma_memory.to_view(), rdma_ctx.rdma_remote_buffer)
             assert res == 0, f"RDMA write failed: conn code {res}"

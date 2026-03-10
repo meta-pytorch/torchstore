@@ -9,7 +9,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from torchstore.logging import LatencyTracker
-from torchstore.transport.torchcomms.cache import RdmaTransportCache
+from torchstore.transport.torchcomms.cache import RdmaMemoryCache, RdmaTransportCache
 from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 class TransportContext:
     RDMA_TRANSPORT_CACHE = "rdma_transport_cache"
+    RDMA_MEMORY_CACHE = "rdma_memory_cache"
     SHM_CACHE = "shm_cache"
 
     def __init__(self):
@@ -31,6 +32,17 @@ class TransportContext:
         if self.RDMA_TRANSPORT_CACHE not in self.transport_context:
             self.transport_context[self.RDMA_TRANSPORT_CACHE] = RdmaTransportCache()
         return self.transport_context[self.RDMA_TRANSPORT_CACHE]
+
+    def get_rdma_memory_cache(self) -> RdmaMemoryCache:
+        if self.RDMA_MEMORY_CACHE not in self.transport_context:
+            self.transport_context[self.RDMA_MEMORY_CACHE] = RdmaMemoryCache()
+        return self.transport_context[self.RDMA_MEMORY_CACHE]
+
+    def clear_data_caches(self) -> None:
+        """Clear data-dependent caches (e.g. RDMA memory registrations)."""
+        cache = self.transport_context.get(self.RDMA_MEMORY_CACHE)
+        if cache is not None:
+            cache.clear()
 
     def get_shm_cache(self) -> "SharedMemoryCache":
         """Get shared memory cache, lazily initializing if needed.
