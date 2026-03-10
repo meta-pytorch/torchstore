@@ -87,9 +87,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         # identify and allocate ahead of time
         meta = None
         if request.tensor_val is None:
-            meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                request.meta_only()
-            )
+            meta = (
+                await self.storage_volume_ref.volume.get_meta.call_one(
+                    [request.meta_only()]
+                )
+            )[0]
             if isinstance(meta, str) or meta is None:
                 return  # objects don't get handled
 
