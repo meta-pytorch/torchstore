@@ -71,9 +71,11 @@ class StorageVolume(Actor):
 
     @endpoint
     async def get(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
     ) -> TransportBuffer:
-        return await self.store.get(key, transport_buffer, request)
+        return await self.store.get(transport_buffer, requests)
 
     @endpoint
     async def get_meta(
@@ -107,7 +109,9 @@ class StorageImpl:
         raise NotImplementedError()
 
     async def get(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
     ) -> TransportBuffer:
         """Retrieve data from the storage backend."""
         raise NotImplementedError()
@@ -301,14 +305,16 @@ class InMemoryStore(StorageImpl):
         self.kv[key] = data
 
     async def get(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
     ) -> TransportBuffer:
-        if key not in self.kv:
-            raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
-
-        data = self._get_data(request, key)
-        await transport_buffer.handle_get_request(self.transport_context, data)
-
+        data_entries = []
+        for request in requests:
+            if request.key not in self.kv:
+                raise KeyError(f"Key '{request.key}' not found. {list(self.kv.keys())=}")
+            data_entries.append((request, self._get_data(request, request.key)))
+        await transport_buffer.handle_get_request(self.transport_context, data_entries)
         return transport_buffer
 
     def _get_data(self, request, key):

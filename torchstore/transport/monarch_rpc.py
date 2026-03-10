@@ -47,8 +47,9 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         request = requests[0]
         self.data = request.objects if request.is_object else request.tensor_val
 
-    async def _pre_get_hook(self, request: Request) -> None:
+    async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Store data from request to be serialized with this buffer."""
+        request = requests[0]
         # tensor_val is None if not Tensor or not inplace
         self.inplace_tensor = request.tensor_val
 
@@ -61,21 +62,26 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         assert len(entries) == 1
         return [self.data]
 
-    async def handle_get_request(self, ctx: "TransportContext", data) -> None:
+    async def handle_get_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[Request, Any]],
+    ) -> None:
         """Store the data to be sent back to the client."""
+        _entry, data = entries[0]
         self.data = data
 
     async def _handle_storage_volume_response(
         self, transport_buffer: "TransportBuffer"
-    ) -> Any:
+    ) -> list[Any]:
         """Extract the data from the response buffer."""
 
         # Satisfies requirement that transport buffers handle writing inplace
         if self.inplace_tensor is not None:
             self.inplace_tensor.copy_(transport_buffer.data)
-            return self.inplace_tensor
+            return [self.inplace_tensor]
 
-        return transport_buffer.data
+        return [transport_buffer.data]
 
     async def drop(self) -> None:
         """Clean up stored references for RPC transport."""
