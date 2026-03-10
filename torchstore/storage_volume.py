@@ -80,10 +80,9 @@ class StorageVolume(Actor):
     @endpoint
     async def get_meta(
         self,
-        key: str,
-        request: Request | None = None,
+        request: Request,
     ) -> tuple[torch.Size, torch.dtype] | str:
-        return await self.store.get_meta(key, request)
+        return await self.store.get_meta(request)
 
     @endpoint
     async def delete(self, key: str) -> None:
@@ -116,9 +115,7 @@ class StorageImpl:
         """Retrieve data from the storage backend."""
         raise NotImplementedError()
 
-    async def get_meta(
-        self, key: str, request: Request | None = None
-    ) -> tuple[torch.Size, torch.dtype] | str:
+    async def get_meta(self, request: Request) -> tuple[torch.Size, torch.dtype] | str:
         """Get metadata about stored data."""
         raise NotImplementedError()
 
@@ -227,19 +224,18 @@ class InMemoryStore(StorageImpl):
             indices.append(slice(start, end))
         return tensor[tuple(indices)]
 
-    def _get_sharded_tensor(self, request: Request, key: str) -> torch.Tensor | None:
+    def _get_sharded_tensor(self, request: Request) -> torch.Tensor | None:
         """
         Searches stored shards and returns one which completely contains the requested tensor slice
 
         Args:
             request: Request object containing the tensor_slice specification
-            key: Storage key identifying the tensor shards to search.
 
         Returns:
             The extracted tensor slice if found completely within a stored shard,
             None otherwise.
         """
-        for shard in self.kv[key].values():
+        for shard in self.kv[request.key].values():
             stored_slice = shard["slice"]
             stored_tensor = shard["tensor"]
 
@@ -315,11 +311,12 @@ class InMemoryStore(StorageImpl):
                 raise KeyError(
                     f"Key '{request.key}' not found. {list(self.kv.keys())=}"
                 )
-            data_entries.append((request, self._get_data(request, request.key)))
+            data_entries.append((request, self._get_data(request)))
         await transport_buffer.handle_get_request(self.transport_context, data_entries)
         return transport_buffer
 
-    def _get_data(self, request, key):
+    def _get_data(self, request):
+        key = request.key
         val = self.kv[key]
         if isinstance(val, dict) and "obj" in val:
             return val["obj"]
@@ -340,7 +337,7 @@ class InMemoryStore(StorageImpl):
                 f"Key '{key}' contains sharded tensor but no tensor_slice was requested"
             )
 
-        extracted_tensor = self._get_sharded_tensor(request, key)
+        extracted_tensor = self._get_sharded_tensor(request)
 
         if extracted_tensor is not None:
             return extracted_tensor
@@ -351,9 +348,9 @@ class InMemoryStore(StorageImpl):
 
     async def get_meta(
         self,
-        key: str,
-        request: Request | None = None,
+        request: Request,
     ) -> tuple[torch.Size, torch.dtype] | str:
+        key = request.key
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
 
@@ -368,8 +365,8 @@ class InMemoryStore(StorageImpl):
         if "tensor" in stored_object:
             return stored_object["tensor"].shape, stored_object["tensor"].dtype
 
-        if request is not None and request.tensor_slice is not None:
-            extracted_tensor = self._get_sharded_tensor(request, key)
+        if request.tensor_slice is not None:
+            extracted_tensor = self._get_sharded_tensor(request)
             if extracted_tensor is not None:
                 return extracted_tensor.shape, extracted_tensor.dtype
 
