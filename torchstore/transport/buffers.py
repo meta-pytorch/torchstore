@@ -65,13 +65,13 @@ class TransportBuffer:
     Lifecycle: PUT Operation
     ------------------------
     All put operations go through `put_to_storage_volume(entries)` which accepts a
-    list of (key, request) tuples. The base class dispatches to `_put_entries`:
+    list of (key, request) tuples. The base class dispatches to `_put_requests`:
 
     - If `supports_batch_puts` is True (e.g., SharedMemory), the entire list is
-      passed to `_put_entries` in a single call.
-    - Otherwise, `_put_entries` is called once per entry with a single-element list.
+      passed to `_put_requests` in a single call.
+    - Otherwise, `_put_requests` is called once per entry with a single-element list.
 
-    `_put_entries(entries)`:
+    `_put_requests(entries)`:
     1. Optionally performs handshake if `requires_handshake(entries)` returns True
     2. Calls `_pre_put_hook(entries)` [CLIENT] - allocate local buffers, prepare data
     3. Sends to StorageVolume via `volume.put.call()`
@@ -130,7 +130,7 @@ class TransportBuffer:
     supports_inplace_resharding : bool
         Whether this transport supports inplace resharding.
     supports_batch_puts : bool
-        If True, `put_to_storage_volume` passes all entries to `_put_entries`
+        If True, `put_to_storage_volume` passes all entries to `_put_requests`
         in a single call. If False (default), entries are dispatched one at a time.
 
     Parameters

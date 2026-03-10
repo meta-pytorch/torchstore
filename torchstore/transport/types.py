@@ -7,7 +7,7 @@
 import copy
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -15,9 +15,6 @@ from torch.distributed.tensor._utils import _compute_local_shape_and_global_offs
 from torch.distributed.tensor.placement_types import Replicate
 
 logger = getLogger(__name__)
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass

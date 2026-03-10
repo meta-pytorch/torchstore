@@ -150,7 +150,7 @@ class ShmContext:
     """Per-entry state for SHM batch operations."""
 
     descriptor: SharedMemoryDescriptor | None = None
-    object: Any = None
+    objects: Any = None
     is_object: bool = False
 
 
@@ -320,7 +320,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             key = request.key
             if request.is_object:
                 self._contexts.append(
-                    ShmContext(object=request.objects, is_object=True)
+                    ShmContext(objects=request.objects, is_object=True)
                 )
                 continue
 
@@ -361,11 +361,11 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     ) -> list[Any]:
         """SV side: handle batch of put requests for tensors and objects."""
         results = []
-        for (request, current_object), ctx in zip(entries, self._contexts, strict=True):
-            if ctx.is_object:
-                results.append(ctx.object)
+        for (request, current_object), shm_ctx in zip(entries, self._contexts, strict=True):
+            if shm_ctx.is_object:
+                results.append(shm_ctx.objects)
             else:
-                descriptor = ctx.descriptor
+                descriptor = shm_ctx.descriptor
                 assert descriptor is not None, f"No descriptor for {request.key}"
 
                 # Ensure server-side storage hasn't changed since handshake

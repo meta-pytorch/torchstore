@@ -53,20 +53,23 @@ class LocalClient:
     @torch.no_grad
     async def put(self, key: str, value: torch.Tensor | Any):
         latency_tracker = LatencyTracker(f"put:{key}")
-        await self.put_batch([(key, value)])
+        await self.put_batch({key: value})
         latency_tracker.track_e2e()
 
     @torch.no_grad
-    async def put_batch(self, entries: list[tuple[str, torch.Tensor | Any]]):
+    async def put_batch(self, entries: dict[str, torch.Tensor | Any]):
         """Batch put multiple key-value pairs in a single operation.
 
         Args:
-            entries: List of (key, value) tuples to store.
+            entries: Dict mapping keys to values to store.
         """
+        if not entries:
+            return
+
         latency_tracker = LatencyTracker("put_batch")
 
         requests = []
-        for key, value in entries:
+        for key, value in entries.items():
             if isinstance(value, (torch.Tensor, DTensor)):
                 request = Request.from_any(key, value)
             else:

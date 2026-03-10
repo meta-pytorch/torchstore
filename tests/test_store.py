@@ -420,23 +420,28 @@ async def test_put_batch_basic(strategy_params, transport_type):
         @endpoint
         async def put_batch(self, prefix: str, offset: int, device: str):
             t1, t2 = self._make_tensors(offset, device)
+            obj = {"rank": self.rank, "offset": offset}
             await ts.put_batch(
-                [
-                    (f"{prefix}_tensor1_{self.rank}", t1),
-                    (f"{prefix}_tensor2_{self.rank}", t2),
-                ]
+                {
+                    f"{prefix}_tensor1_{self.rank}": t1,
+                    f"{prefix}_tensor2_{self.rank}": t2,
+                    f"{prefix}_object_{self.rank}": obj,
+                }
             )
 
         @endpoint
         async def get_and_verify(self, prefix: str, offset: int):
             t1 = await ts.get(f"{prefix}_tensor1_{self.rank}")
             t2 = await ts.get(f"{prefix}_tensor2_{self.rank}")
+            obj = await ts.get(f"{prefix}_object_{self.rank}")
 
             expected_t1 = torch.tensor([self.rank + 1 + offset] * 10)
             expected_t2 = torch.tensor([self.rank + 100 + offset] * 5)
+            expected_obj = {"rank": self.rank, "offset": offset}
 
             assert torch.equal(t1, expected_t1), f"t1: {t1} != {expected_t1}"
             assert torch.equal(t2, expected_t2), f"t2: {t2} != {expected_t2}"
+            assert obj == expected_obj, f"obj: {obj} != {expected_obj}"
             return True
 
     volume_world_size, strategy = strategy_params
