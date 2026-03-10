@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any
+from typing import Any, overload
 
 import torch
 from monarch.actor import get_or_spawn_controller, ProcMesh
@@ -217,23 +217,38 @@ async def get(
     return await cl.get(key, inplace_tensor, tensor_slice_spec)
 
 
+@overload
 async def get_batch(
     keys: list[str],
-    inplace_tensors: dict[str, torch.Tensor | DTensor] | None = None,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> dict[str, Any]:
+    ...
+
+
+@overload
+async def get_batch(
+    keys: dict[str, torch.Tensor | DTensor | None],
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> dict[str, Any]:
+    ...
+
+
+async def get_batch(
+    keys: list[str] | dict[str, torch.Tensor | DTensor | None],
     store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> dict[str, Any]:
     """Retrieve multiple keys from the distributed store in a single batched operation.
 
     Args:
-        keys: List of keys to retrieve.
-        inplace_tensors: Optional mapping of key -> pre-allocated tensor for in-place retrieval.
+        keys: Either a list of keys to retrieve, or a dict mapping keys to
+            optional pre-allocated tensors for in-place retrieval.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
 
     Returns:
         dict mapping each key to its fetched data.
     """
     cl = await client(store_name)
-    return await cl.get_batch(keys, inplace_tensors)
+    return await cl.get_batch(keys)
 
 
 async def delete(
