@@ -20,13 +20,14 @@ from typing import Any, TYPE_CHECKING
 
 import torch
 
+from torchstore.logging import LatencyTracker
 from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.types import Request
 from torchstore.utils import get_local_hostname
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
     from torchstore.transport.buffers import TransportContext
-    from torchstore.transport.types import Request
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ def allocate_shared_tensor(shape: torch.Size, dtype: torch.dtype) -> torch.Tenso
 SHOULD_PIN_SHM = os.environ.get("TORCHSTORE_PIN_SHM", "1") == "1"
 MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "0") == "1"
 # Disabling by default on initial release
-SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "0") == "1"
+SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1"
 
 
 def pin_memory(tensor: torch.Tensor) -> None:
@@ -145,6 +146,15 @@ class SharedMemoryDescriptor:
 
 
 @dataclass
+class ShmContext:
+    """Per-entry state for SHM batch operations."""
+
+    descriptor: SharedMemoryDescriptor | None = None
+    objects: Any = None
+    is_object: bool = False
+
+
+@dataclass
 class SharedMemoryEntry:
     """Entry wrapping PyTorch shared storage."""
 
@@ -231,15 +241,10 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     PUT
 
-    1. Client: _pre_put_hook: Prepare the input tensor and specify that handshake is needed
-                            (to check if shared memory descriptor already exists on storage volume side)
-    2. SV: recv_handshake: Return a descriptor for the current stored object if possible. Fail hard
-                           if there's already a stored tensor that's not shared (we can revisit this)
-    3. Client: _post_handshake: (1) If storage volume returned a descriptor, try to attach to it from cache,
-                                or cache it if its new.
-                                (2) If there's no descriptor, allocate memory and store the new descriptor
-    4. SV: handle_put_request: (1) Verify the client passed descriptor matches the store object if it exists,
-                                   Otherwise get the new allocated tensor
+    1. Client: requires_handshake checks if any entry has a tensor (needs SHM handshake)
+    2. SV: recv_handshake: Return descriptors for existing tensors, None for new
+    3. Client: _post_handshake: Build _contexts — allocate/attach SHM for tensors, capture objects
+    4. SV: handle_put_request: Route objects/tensors from _contexts
 
     GET
     1. _pre_get_hook: Save some metadata
@@ -248,6 +253,8 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     3. _handle_storage_volume_response: Parse server response and copy data according to path
 
     """
+
+    supports_batch_puts = True
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
@@ -260,88 +267,120 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         # Client-side only (excluded from serialization)
         self._client_tensor: torch.Tensor | None = None
-        # Put needs a handshake, get does not
+        # SHM only needs handshake during PUT, not GET
         self._needs_handshake: bool = False
 
-    def requires_handshake(self, request: "Request") -> bool:
-        if self._needs_handshake:
-            assert request.tensor_val is not None
+        # Batch state – one context per processed entry
+        self._contexts: list[ShmContext] = []
 
-            self._client_tensor = request.tensor_val
-            if not self._client_tensor.is_contiguous():
-                self._client_tensor = self._client_tensor.contiguous()
-
+    def requires_handshake(self, requests: list[Request]) -> bool:
         return self._needs_handshake
 
-    async def _pre_put_hook(self, request: "Request"):
-        if request.is_object:
-            self.is_object = True
-            self.objects = request.objects
-
-    async def put_to_storage_volume(self, key, request: "Request"):
-        """Override to capture key and prepare state before handshake check."""
-        if request.tensor_val is not None:
-            self._needs_handshake = True
-        self._key = key
-        await super().put_to_storage_volume(key, request)
+    async def put_to_storage_volume(self, requests: list[Request]) -> None:
+        self._needs_handshake = True
+        await super().put_to_storage_volume(requests)
 
     async def recv_handshake(
-        self, ctx: "TransportContext", current_object: Any = None
-    ) -> "SharedMemoryDescriptor | None":
-        """Storage volume: return existing descriptor if available, else None."""
-        if not isinstance(current_object, torch.Tensor):
-            # No existing tensor - client will allocate shared memory
-            return None
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[Request, Any]],
+    ) -> list["SharedMemoryDescriptor | None"]:
+        """Storage volume: return existing descriptors if available, else None."""
+        results = []
+        for entry, current_object in entries:
+            if not isinstance(current_object, torch.Tensor):
+                # No existing tensor - client will allocate shared memory
+                results.append(None)
+            else:
+                # return existing descriptor for re-use
+                descriptor = SharedMemoryDescriptor.from_tensor(current_object)
+                assert descriptor is not None, "Stored tensor is not in shared memory."
+                results.append(descriptor)
+        return results
 
-        # return existing descriptor for re-use
-        descriptor = SharedMemoryDescriptor.from_tensor(current_object)
-        assert descriptor is not None, "Stored tensor is not in shared memory."
-        return descriptor
+    async def _post_handshake(
+        self,
+        handshake_results: list[Any],
+        requests: list[Request],
+    ) -> None:
+        """Build _contexts and prepare data for each request.
 
-    async def _post_handshake(self, handshake_result: Any) -> None:
-        """Client: grab existing tensor OR allocate new one, then copy data."""
-        descriptor: SharedMemoryDescriptor | None = handshake_result
+        For tensor requests: attaches to an existing SHM segment (if the SV
+        returned a descriptor) or allocates a new one, then copies data with
+        non_blocking=True. For object requests: captures the object directly.
+        Synchronizes after all copies to ensure GPU->CPU DMA completes.
+        """
+        latency_tracker = LatencyTracker("post_handshake")
+
         shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
 
-        if descriptor is not None:
-            # Reuse existing segment
-            client_entry = shm_cache.attach(self._key, descriptor)
-        else:
-            # Allocate new shared memory on client side
-            client_entry, descriptor = shm_cache.allocate(
-                self._key, self._client_tensor.shape, self._client_tensor.dtype
-            )
+        self._contexts = []
+        devices_to_sync: set[torch.device] = set()
+        for request, descriptor in zip(requests, handshake_results, strict=True):
+            key = request.key
+            if request.is_object:
+                self._contexts.append(
+                    ShmContext(objects=request.objects, is_object=True)
+                )
+                continue
 
-        self.shm_descriptor = descriptor
+            tensor = request.tensor_val
+            assert tensor is not None
 
-        # Copy tensor data to shared memory
-        shm_tensor = client_entry.get_tensor()
-        shm_tensor.copy_(self._client_tensor)
+            if not tensor.is_contiguous():
+                tensor = tensor.cpu().contiguous()
+
+            if tensor.is_cuda:
+                devices_to_sync.add(tensor.device)
+
+            if descriptor is not None:
+                # Reuse existing segment
+                client_entry = shm_cache.attach(key, descriptor)
+            else:
+                # Allocate new shared memory on client side
+                client_entry, descriptor = shm_cache.allocate(
+                    key, tensor.shape, tensor.dtype
+                )
+
+            self._contexts.append(ShmContext(descriptor=descriptor))
+
+            # Copy tensor data to shared memory
+            shm_tensor = client_entry.get_tensor()
+            shm_tensor.copy_(tensor, non_blocking=True)
+        latency_tracker.track_step("alloc_and_copy")
+
+        # Wait for async copies (GPU->CPU DMA) on involved devices only
+        for device in devices_to_sync:
+            torch.cuda.synchronize(device)
+        latency_tracker.track_step("cuda_synchronize")
 
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        request: "Request",
-        current_object: Any,
-    ) -> Any:
-        """Attach to shared memory segment and return tensor for storage."""
-        if request.is_object or self.is_object:
-            return self.objects
+        entries: list[tuple[Request, Any]],
+    ) -> list[Any]:
+        """SV side: handle batch of put requests for tensors and objects."""
+        results = []
+        for (request, current_object), shm_ctx in zip(
+            entries, self._contexts, strict=True
+        ):
+            if shm_ctx.is_object:
+                results.append(shm_ctx.objects)
+            else:
+                descriptor = shm_ctx.descriptor
+                assert descriptor is not None, f"No descriptor for {request.key}"
 
-        assert self.shm_descriptor is not None, f"No descriptor for {self._key}"
-
-        # Ensure server-side storage hasn't changed since handshake
-        if isinstance(current_object, torch.Tensor):
-            existing_descriptor = SharedMemoryDescriptor.from_tensor(current_object)
-            assert existing_descriptor is not None
-            assert (
-                existing_descriptor.storage_handle == self.shm_descriptor.storage_handle
-            )
-            return current_object
-
-        # New segment - attach and return
-        entry = self.shm_descriptor.attach()
-        return entry.get_tensor()
+                # Ensure server-side storage hasn't changed since handshake
+                if isinstance(current_object, torch.Tensor):
+                    existing = SharedMemoryDescriptor.from_tensor(current_object)
+                    assert existing is not None
+                    assert existing.storage_handle == descriptor.storage_handle
+                    results.append(current_object)
+                else:
+                    # New segment - attach and return
+                    shm_entry = descriptor.attach()
+                    results.append(shm_entry.get_tensor())
+        return results
 
     def __getstate__(self) -> dict[str, Any]:
         """Exclude non-serializable objects when sending buffer to storage volume."""
@@ -351,9 +390,9 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         state["storage_volume_ref"] = None
         return state
 
-    async def _pre_get_hook(self, key: str, request: "Request") -> None:
+    async def _pre_get_hook(self, request: Request) -> None:
         """Prepare for receiving - may fetch metadata if not provided."""
-        self._key = key
+        self._key = request.key
         self._client_tensor = request.tensor_val
 
     async def handle_get_request(self, ctx: "TransportContext", data: Any) -> None:
@@ -415,3 +454,4 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         """
         self._client_tensor = None
         self.objects = None
+        self._contexts = []

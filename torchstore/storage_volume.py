@@ -55,15 +55,19 @@ class StorageVolume(Actor):
 
     @endpoint
     async def handshake(
-        self, transport_buffer: TransportBuffer, key: str, request: Request
-    ) -> Any | None:
-        return await self.store.handshake(transport_buffer, key, request)
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> list[Any]:
+        return await self.store.handshake(transport_buffer, requests)
 
     @endpoint
     async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
     ) -> None:
-        await self.store.put(key, transport_buffer, request)
+        await self.store.put(transport_buffer, requests)
 
     @endpoint
     async def get(
@@ -95,8 +99,10 @@ class StorageImpl:
         self.transport_context = TransportContext()
 
     async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
-    ) -> TransportBuffer | None:
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> None:
         """Store data in the storage backend."""
         raise NotImplementedError()
 
@@ -117,8 +123,10 @@ class StorageImpl:
         raise NotImplementedError()
 
     async def handshake(
-        self, transport_buffer: TransportBuffer, key: str, request: "Request"
-    ) -> Any | None:
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> list[Any]:
         raise NotImplementedError()
 
 
@@ -130,21 +138,20 @@ class InMemoryStore(StorageImpl):
         super().__init__()
 
     async def handshake(
-        self, transport_buffer: TransportBuffer, key: str, request: "Request"
-    ) -> Any | None:
-        current_object = self._extract_existing(key, request)
-        return await transport_buffer.recv_handshake(
-            self.transport_context, current_object
-        )
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> list[Any]:
+        pairs = [(request, self._extract_existing(request)) for request in requests]
+        return await transport_buffer.recv_handshake(self.transport_context, pairs)
 
-    def _extract_existing(self, key: str, request: "Request") -> torch.Tensor | None:
+    def _extract_existing(self, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
 
         Looks up the key in kv storage and extracts the tensor if it exists.
         Only asserts on type mismatches between existing data and incoming request.
 
         Args:
-            key: The storage key to look up
             request: The incoming put request
 
         Returns:
@@ -153,7 +160,7 @@ class InMemoryStore(StorageImpl):
         Raises:
             AssertionError: If there's a type mismatch between existing data and request.
         """
-        current_object = self.kv.get(key, None)
+        current_object = self.kv.get(request.key, None)
 
         if current_object is None:
             return None
@@ -261,19 +268,27 @@ class InMemoryStore(StorageImpl):
                 return extracted_tensor
 
     async def put(
-        self, key: str, transport_buffer: TransportBuffer, request: Request
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
     ) -> None:
         # Extract existing tensor for potential in-place update
-        current_obj = self._extract_existing(key, request)
+        entries_with_current_obj = [
+            (request, self._extract_existing(request)) for request in requests
+        ]
 
         # fetch from remote
-        data = await transport_buffer.handle_put_request(
-            self.transport_context,
-            request,
-            current_obj,
+        results = await transport_buffer.handle_put_request(
+            self.transport_context, entries_with_current_obj
         )
 
         # store locally
+        for request, result in zip(requests, results, strict=True):
+            self._store(request, result)
+
+    def _store(self, request: "Request", data: Any) -> None:
+        """Store data in kv, wrapping objects and handling DTensor shards."""
+        key = request.key
         if request.is_object:
             self.kv[key] = {"obj": data}
             return

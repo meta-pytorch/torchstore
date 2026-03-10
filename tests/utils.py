@@ -144,7 +144,7 @@ class DTensorActor(Actor):
         tensor = self.original_tensor.to("cpu")
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
 
-        dtensor_request = Request.from_any(dtensor)
+        dtensor_request = Request.from_any("", dtensor)
         tensor_slice = dtensor_request.tensor_slice
 
         t = time.perf_counter()

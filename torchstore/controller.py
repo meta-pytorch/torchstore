@@ -188,8 +188,10 @@ class Controller(Actor):
         return volume_map
 
     @endpoint
-    async def notify_put(
-        self, key: str, request: Request, storage_volume_id: str
+    async def notify_put_batch(
+        self,
+        requests: list[Request],
+        storage_volume_id: str,
     ) -> None:
         """Notify the controller that data has been stored in a storage volume.
 
@@ -197,15 +199,20 @@ class Controller(Actor):
         maintain the distributed storage index.
 
         Args:
-            key (str): The unique identifier for the stored data.
-            request (Request): The storage request containing metadata about the stored data.
-            storage_volume_id (str): ID of the storage volume where the data was stored.
+            requests: List of Requests (meta-only, no tensor data).
+            storage_volume_id: ID of the storage volume where the data was stored.
         """
         self.assert_initialized()
+
+        for request in requests:
+            self._notify_put(request, storage_volume_id)
+
+    def _notify_put(self, request: Request, storage_volume_id: str) -> None:
         assert (
             request.tensor_val is None
         ), "request should not contain tensor data, as this will significantly increase e2e latency"
 
+        key = request.key
         if key not in self.keys_to_storage_volumes:
             self.keys_to_storage_volumes[key] = {}
 

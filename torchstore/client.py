@@ -53,24 +53,42 @@ class LocalClient:
     @torch.no_grad
     async def put(self, key: str, value: torch.Tensor | Any):
         latency_tracker = LatencyTracker(f"put:{key}")
+        await self.put_batch({key: value})
+        latency_tracker.track_e2e()
 
-        # Create request based on value type
-        if isinstance(value, (torch.Tensor, DTensor)):
-            request = Request.from_any(value)
-        else:
-            request = Request.from_objects(value)
+    @torch.no_grad
+    async def put_batch(self, entries: dict[str, torch.Tensor | Any]):
+        """Batch put multiple key-value pairs in a single operation.
+
+        Args:
+            entries: Dict mapping keys to values to store.
+        """
+        assert (
+            isinstance(entries, dict) and entries
+        ), "put_batch requires a non-empty dict"
+
+        latency_tracker = LatencyTracker("put_batch")
+
+        requests = []
+        for key, value in entries.items():
+            if isinstance(value, (torch.Tensor, DTensor)):
+                request = Request.from_any(key, value)
+            else:
+                request = Request.from_objects(key, value)
+            requests.append(request)
 
         storage_volume_ref = self.strategy.select_storage_volume()
         transport_buffer = create_transport_buffer(storage_volume_ref)
         latency_tracker.track_step("create transport buffer")
 
-        await transport_buffer.put_to_storage_volume(key, request)
+        await transport_buffer.put_to_storage_volume(requests)
         latency_tracker.track_step("put_to_storage_volume")
 
-        await self._controller.notify_put.call(
-            key, request.meta_only(), storage_volume_ref.volume_id
+        await self._controller.notify_put_batch.call(
+            [r.meta_only() for r in requests],
+            storage_volume_ref.volume_id,
         )
-        latency_tracker.track_step("notify_put")
+        latency_tracker.track_step("notify_put_batch")
         latency_tracker.track_e2e()
 
     @torch.no_grad
@@ -100,10 +118,10 @@ class LocalClient:
         logger.debug(f"Fetching {key}")
         latency_tracker = LatencyTracker(f"get:{key}")
 
-        request = Request.from_any(inplace_tensor, tensor_slice_spec)
+        request = Request.from_any(key, inplace_tensor, tensor_slice_spec)
 
         # Fetch the data
-        fetched = await self._fetch(key, request)
+        fetched = await self._fetch(request)
         latency_tracker.track_step("fetch")
 
         # TODO: remove this copy and instead assert.
@@ -127,18 +145,17 @@ class LocalClient:
 
     async def _fetch(
         self,
-        key: str,
         request: Request,
     ) -> torch.Tensor | Any:
         """Unified fetch that handles tensors, objects, and tensor slices.
 
         Args:
-            key: Storage key to fetch.
-            request: Request containing tensor_slice and optional inplace tensor.
+            request: Request containing key, tensor_slice and optional inplace tensor.
 
         Returns:
             The fetched data (tensor, assembled tensor, or object).
         """
+        key = request.key
         volume_map = await self._locate_volumes(key)
         partial_results = []
 
@@ -163,9 +180,9 @@ class LocalClient:
             # no sharding for objects or regular tensors.
             if storage_info.object_type == ObjectType.OBJECT:
                 request.is_object = True
-                return await transport_buffer.get_from_storage_volume(key, request)
+                return await transport_buffer.get_from_storage_volume(request)
             if storage_info.object_type == ObjectType.TENSOR:
-                return await transport_buffer.get_from_storage_volume(key, request)
+                return await transport_buffer.get_from_storage_volume(request)
 
             # Has tensor slices - fetch each relevant slice
             for stored_slice in storage_info.tensor_slices:
@@ -191,17 +208,17 @@ class LocalClient:
 
                 if dest_view is not None:
                     # Pass the view as tensor_val - transport writes directly inplace
-                    slice_request = Request.from_tensor_slice(fetch_slice)
+                    slice_request = Request.from_tensor_slice(key, fetch_slice)
                     slice_request.tensor_val = dest_view
-                    await transport_buffer.get_from_storage_volume(key, slice_request)
+                    await transport_buffer.get_from_storage_volume(slice_request)
                     partial_results.append((dest_view, fetch_slice))
                 else:
                     # TODO: ensure this is not in the common path, or that we have a solution for
                     # this pattern since it creates a new allocation on every fetch, and should be
                     # is generally avoidable.
-                    slice_request = Request.from_tensor_slice(fetch_slice)
+                    slice_request = Request.from_tensor_slice(key, fetch_slice)
                     local_tensor = await transport_buffer.get_from_storage_volume(
-                        key, slice_request
+                        slice_request
                     )
                     partial_results.append((local_tensor, fetch_slice))
 
