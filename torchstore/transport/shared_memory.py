@@ -361,7 +361,9 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     ) -> list[Any]:
         """SV side: handle batch of put requests for tensors and objects."""
         results = []
-        for (request, current_object), shm_ctx in zip(entries, self._contexts, strict=True):
+        for (request, current_object), shm_ctx in zip(
+            entries, self._contexts, strict=True
+        ):
             if shm_ctx.is_object:
                 results.append(shm_ctx.objects)
             else:

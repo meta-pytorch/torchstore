@@ -168,8 +168,6 @@ async def put_batch(
         >>> t2 = torch.randn(50, 50)
         >>> await put_batch({"key1": t1, "key2": t2})
     """
-    if not entries:
-        return
     cl = await client(store_name)
     return await cl.put_batch(entries)
 

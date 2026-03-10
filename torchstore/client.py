@@ -63,8 +63,9 @@ class LocalClient:
         Args:
             entries: Dict mapping keys to values to store.
         """
-        if not entries:
-            return
+        assert (
+            isinstance(entries, dict) and entries
+        ), "put_batch requires a non-empty dict"
 
         latency_tracker = LatencyTracker("put_batch")
 
