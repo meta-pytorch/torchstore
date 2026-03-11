@@ -5,8 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+from collections import defaultdict
 from logging import getLogger
-from typing import Any, overload
+from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -209,7 +210,6 @@ class LocalClient:
         volume_maps = await self._locate_volumes(keys)
         all_volume_ids: set[str] = {vid for vm in volume_maps.values() for vid in vm}
 
-        # Eagerly create transport buffers for all volumes
         transport_buffer_map = {
             volume_id: create_transport_buffer(
                 self.strategy.get_storage_volume(volume_id)
@@ -217,14 +217,32 @@ class LocalClient:
             for volume_id in all_volume_ids
         }
 
-        # Expand entries per volume
-        volume_requests: dict[str, list[Request]] = {}
+        volume_requests, direct_keys = self._build_volume_requests(
+            requests, volume_maps, transport_buffer_map
+        )
+
+        fetch_pairs = await self._fetch_results(volume_requests, transport_buffer_map)
+
+        return self._assemble_results(keys, requests, fetch_pairs, direct_keys)
+
+    def _build_volume_requests(
+        self,
+        requests: list[Request],
+        volume_maps: dict[str, dict],
+        transport_buffer_map: dict,
+    ) -> tuple[dict[str, list[Request]], set[str]]:
+        """Expand per-key requests into per-volume request lists.
+
+        Returns:
+            (volume_requests, direct_keys) where direct_keys holds keys stored
+            as OBJECT or TENSOR (complete results, not assembled from slices).
+        """
+        volume_requests: dict[str, list[Request]] = defaultdict(list)
+        direct_keys: set[str] = set()
 
         for request in requests:
-            key = request.key
-            volume_map = volume_maps[key]
+            volume_map = volume_maps[request.key]
 
-            # attempt inplace if buffer supports it and we have a contiguous tensor
             use_inplace = (
                 all(
                     transport_buffer_map[vid].supports_inplace_resharding
@@ -235,94 +253,114 @@ class LocalClient:
             )
 
             for volume_id, storage_info in volume_map.items():
-                volume_requests.setdefault(volume_id, [])
-
-                # no sharding for objects or regular tensors.
                 if storage_info.object_type == ObjectType.OBJECT:
-                    obj_request = Request(key=key, is_object=True)
-                    volume_requests[volume_id].append(obj_request)
+                    volume_requests[volume_id].append(
+                        Request(key=request.key, is_object=True)
+                    )
+                    direct_keys.add(request.key)
                     break
                 elif storage_info.object_type == ObjectType.TENSOR:
                     volume_requests[volume_id].append(request)
+                    direct_keys.add(request.key)
                     break
                 else:
-                    # TENSOR_SLICE
-                    for stored_slice in storage_info.tensor_slices:
-                        fetch_slice = stored_slice
-                        if request.tensor_slice is not None:
-                            # TODO: we should also continue if we have already fetched this region in a previous call
-                            # and also return completely if we've already fetched all regions. This is extra inneficient
-                            # in the case of DP, where we fetch all Replicate shards unnecessarily
-                            fetch_slice = get_slice_intersection(
-                                stored_slice, request.tensor_slice
-                            )
-                            if fetch_slice is None:
-                                continue
-
-                        slice_request = Request.from_tensor_slice(key, fetch_slice)
-
-                        if use_inplace:
-                            # Try to get a view of the destination tensor for inplace writes
-                            dest_view = get_destination_view(
-                                request.tensor_val,
-                                request.tensor_slice,
-                                fetch_slice,
-                            )
-                            if dest_view is not None:
-                                # Pass the view as tensor_val - transport writes directly inplace
-                                slice_request.tensor_val = dest_view
-
-                        volume_requests[volume_id].append(slice_request)
-
-        # Fetch per volume. direct results go straight to final_results
-        final_results: dict[str, Any] = {}
-        partial_results: dict[str, list[tuple[Any, TensorSlice]]] = {}
-
-        async def _fetch_from_volume(vol_id, vol_entries):
-            return (
-                vol_id,
-                vol_entries,
-                await transport_buffer_map[vol_id].get_from_storage_volume(vol_entries),
-            )
-
-        volume_fetch_results = await asyncio.gather(
-            *[_fetch_from_volume(vid, ents) for vid, ents in volume_requests.items()]
-        )
-
-        for volume_id, entries, results in volume_fetch_results:
-            for result, request in zip(results, entries):
-                object_type = volume_maps[request.key][volume_id].object_type
-                if object_type in (ObjectType.OBJECT, ObjectType.TENSOR):
-                    final_results[request.key] = result
-                else:
-                    partial_results.setdefault(request.key, []).append(
-                        (result, request.tensor_slice)
+                    volume_requests[volume_id].extend(
+                        self._expand_tensor_slices(request, storage_info, use_inplace)
                     )
 
-        # Assemble sliced results
+        return dict(volume_requests), direct_keys
+
+    def _expand_tensor_slices(
+        self,
+        request: Request,
+        storage_info,
+        use_inplace: bool,
+    ) -> list[Request]:
+        """Expand a single key's tensor slices into sub-requests."""
+        sub_requests = []
+        for stored_slice in storage_info.tensor_slices:
+            fetch_slice = stored_slice
+            if request.tensor_slice is not None:
+                # TODO: we should also continue if we have already fetched this region in a previous call
+                # and also return completely if we've already fetched all regions. This is extra inneficient
+                # in the case of DP, where we fetch all Replicate shards unnecessarily
+                fetch_slice = get_slice_intersection(stored_slice, request.tensor_slice)
+                if fetch_slice is None:
+                    continue
+
+            slice_request = Request.from_tensor_slice(request.key, fetch_slice)
+
+            if use_inplace:
+                dest_view = get_destination_view(
+                    request.tensor_val,
+                    request.tensor_slice,
+                    fetch_slice,
+                )
+                if dest_view is not None:
+                    slice_request.tensor_val = dest_view
+
+            sub_requests.append(slice_request)
+        return sub_requests
+
+    async def _fetch_results(
+        self,
+        volume_requests: dict[str, list[Request]],
+        transport_buffer_map: dict,
+    ) -> list[tuple[Request, Any]]:
+        """Fetch from all volumes in parallel. Returns (sub_request, result) pairs."""
+
+        async def _fetch_one(volume_id: str, sub_requests: list[Request]):
+            results = await transport_buffer_map[volume_id].get_from_storage_volume(
+                sub_requests
+            )
+            return list(zip(sub_requests, results))
+
+        per_volume = await asyncio.gather(
+            *[_fetch_one(vid, reqs) for vid, reqs in volume_requests.items()]
+        )
+        # Flatten list-of-lists into a single list of (sub_request, result) pairs
+        return [pair for pairs in per_volume for pair in pairs]
+
+    def _assemble_results(
+        self,
+        keys: list[str],
+        requests: list[Request],
+        fetch_pairs: list[tuple[Request, Any]],
+        direct_keys: set[str],
+    ) -> dict[str, Any]:
+        """Classify fetch results and assemble tensor slices into final values."""
+        final: dict[str, Any] = {}
+        slice_parts: dict[str, list[tuple[Any, TensorSlice]]] = defaultdict(list)
+
+        for sub_request, result in fetch_pairs:
+            if sub_request.key in direct_keys:
+                final[sub_request.key] = result
+            else:
+                slice_parts[sub_request.key].append((result, sub_request.tensor_slice))
+
         request_by_key = {r.key: r for r in requests}
-        for key, parts in partial_results.items():
+        for key, parts in slice_parts.items():
             request = request_by_key[key]
             if request.tensor_val is not None and tensors_overlap_in_memory(
                 parts, request.tensor_val
             ):
-                final_results[key] = request.tensor_val
+                final[key] = request.tensor_val
             else:
                 local_tensors = [t for t, _ in parts]
                 global_offsets = [s.offsets for _, s in parts]
                 # TODO: this is yet another new allocation on every fetch.
-                final_results[key] = assemble_tensor(local_tensors, global_offsets)
+                final[key] = assemble_tensor(local_tensors, global_offsets)
                 if request.tensor_slice is not None:
-                    assert final_results[key].shape == request.tensor_slice.local_shape
+                    assert final[key].shape == request.tensor_slice.local_shape
 
         for key in keys:
-            if key not in final_results:
+            if key not in final:
                 raise RuntimeError(
                     f"No results found for key '{key}'. If this key contains "
                     "tensor slices, no stored slices intersect with the requested slice."
                 )
 
-        return final_results
+        return final
 
     async def keys(self, prefix: str | None = None) -> list[str]:
         """
