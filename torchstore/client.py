@@ -6,7 +6,7 @@
 
 import asyncio
 from logging import getLogger
-from typing import Any
+from typing import Any, overload
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -119,7 +119,7 @@ class LocalClient:
         latency_tracker = LatencyTracker(f"get:{key}")
 
         request = Request.from_any(key, inplace_tensor, tensor_slice_spec)
-        results = await self._fetch({key: request})
+        results = await self._fetch([request])
         latency_tracker.track_step("fetch")
 
         result = self._apply_inplace(results[key], inplace_tensor, request)
@@ -129,33 +129,39 @@ class LocalClient:
     @torch.no_grad
     async def get_batch(
         self,
-        keys: list[str],
-        inplace_tensors: dict[str, torch.Tensor | DTensor] | None = None,
+        keys: list[str] | dict[str, torch.Tensor | DTensor | None],
     ) -> dict[str, Any]:
         """Batch get multiple keys in a single operation.
 
         Args:
-            keys: List of keys to fetch.
-            inplace_tensors: Optional mapping of key -> pre-allocated tensor for
-                in-place retrieval.
+            keys: Either a list of keys to fetch, or a dict mapping keys to
+                optional pre-allocated tensors for in-place retrieval.
 
         Returns:
             dict mapping each key to its fetched data.
         """
         latency_tracker = LatencyTracker("get_batch")
-        inplace_map = inplace_tensors or {}
 
-        per_key_requests: dict[str, Request] = {}
-        for key in keys:
-            per_key_requests[key] = Request.from_any(key, inplace_map.get(key))
+        if not keys:
+            raise ValueError("get_batch requires a non-empty dict or list")
 
-        results = await self._fetch(per_key_requests)
+        inplace_dict = {}
+        if isinstance(keys, dict):
+            inplace_dict = keys
+        elif isinstance(keys, list):
+            if len(keys) != len(set(keys)):
+                raise ValueError("get_batch keys must be unique")
+        else:
+            raise TypeError(f"get_batch expects list[str] or dict, got {type(keys)}")
+
+        requests = [Request.from_any(key, inplace_dict.get(key)) for key in keys]
+        results = await self._fetch(requests)
         latency_tracker.track_step("fetch")
 
         final_results: dict[str, Any] = {}
-        for key in keys:
-            final_results[key] = self._apply_inplace(
-                results[key], inplace_map.get(key), per_key_requests[key]
+        for req in requests:
+            final_results[req.key] = self._apply_inplace(
+                results[req.key], inplace_dict.get(req.key), req
             )
 
         latency_tracker.track_e2e()
@@ -189,7 +195,7 @@ class LocalClient:
 
     async def _fetch(
         self,
-        requests: dict[str, Request],
+        requests: list[Request],
     ) -> dict[str, Any]:
         """Locate volumes, expand entries, fetch per-volume, assemble results.
 
@@ -199,7 +205,7 @@ class LocalClient:
         Returns:
             dict mapping each key to its raw fetched data (before inplace copy-back).
         """
-        keys = list(requests)
+        keys = [r.key for r in requests]
         volume_maps = await self._locate_volumes(keys)
         all_volume_ids: set[str] = {vid for vm in volume_maps.values() for vid in vm}
 
@@ -214,7 +220,8 @@ class LocalClient:
         # Expand entries per volume
         volume_requests: dict[str, list[Request]] = {}
 
-        for key, request in requests.items():
+        for request in requests:
+            key = request.key
             volume_map = volume_maps[key]
 
             # attempt inplace if buffer supports it and we have a contiguous tensor
@@ -293,8 +300,9 @@ class LocalClient:
                     )
 
         # Assemble sliced results
+        request_by_key = {r.key: r for r in requests}
         for key, parts in partial_results.items():
-            request = requests[key]
+            request = request_by_key[key]
             if request.tensor_val is not None and tensors_overlap_in_memory(
                 parts, request.tensor_val
             ):
