@@ -149,7 +149,9 @@ class LocalClient:
         for key in keys:
             inplace = inplace_map.get(key)
             per_key_requests[key] = (
-                Request.from_any(key, inplace) if inplace is not None else Request(key=key)
+                Request.from_any(key, inplace)
+                if inplace is not None
+                else Request(key=key)
             )
 
         results = await self._fetch(per_key_requests)
@@ -274,10 +276,18 @@ class LocalClient:
         final_results: dict[str, Any] = {}
         partial_results: dict[str, list[tuple[Any, TensorSlice]]] = {}
 
-        for volume_id, entries in volume_requests.items():
-            results = await transport_buffer_map[volume_id].get_from_storage_volume(
-                entries
+        async def _fetch_from_volume(vol_id, vol_entries):
+            return (
+                vol_id,
+                vol_entries,
+                await transport_buffer_map[vol_id].get_from_storage_volume(vol_entries),
             )
+
+        volume_fetch_results = await asyncio.gather(
+            *[_fetch_from_volume(vid, ents) for vid, ents in volume_requests.items()]
+        )
+
+        for volume_id, entries, results in volume_fetch_results:
             for result, request in zip(results, entries):
                 object_type = volume_maps[request.key][volume_id].object_type
                 if object_type in (ObjectType.OBJECT, ObjectType.TENSOR):
@@ -290,9 +300,8 @@ class LocalClient:
         # Assemble sliced results
         for key, parts in partial_results.items():
             request = requests[key]
-            if (
-                request.tensor_val is not None
-                and tensors_overlap_in_memory(parts, request.tensor_val)
+            if request.tensor_val is not None and tensors_overlap_in_memory(
+                parts, request.tensor_val
             ):
                 final_results[key] = request.tensor_val
             else:
