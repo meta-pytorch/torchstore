@@ -18,7 +18,7 @@ Typical usage (RL trainer → generator weight sync):
     # Source side (trainer, called once at setup):
     source = DirectWeightSyncSource()
     handles = source.register(model.state_dict(), rank=dist.get_rank())
-    await ts.put(f"policy_rdma/rank_{rank}", handles)
+    await ts.put(f"{RDMA_KEY_PREFIX}/rank_{rank}", handles)
 
     # After each optimizer.step():
     source.refresh()
@@ -39,6 +39,8 @@ from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import get_slice_intersection
 
 logger = logging.getLogger(__name__)
+
+RDMA_KEY_PREFIX = "policy_rdma"
 
 
 @dataclass
