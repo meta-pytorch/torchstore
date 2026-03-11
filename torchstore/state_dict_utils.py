@@ -58,13 +58,13 @@ async def get_state_dict(store, key, user_state_dict: dict | None = None, strict
 
     get_id = lambda fk: f"{key}{DELIM}{fk}"
     flattened_keys = list(fetched_mapping.keys())
-    full_keys = [get_id(fk) for fk in flattened_keys]
 
     get_batch_dict = {}
     for fk in flattened_keys:
         t = user_flattened_state_dict.get(fk, None)
+        # inplace can only be a tensor, so skip non-tensor values
         if t is not None and not isinstance(t, torch.Tensor):
-            raise TypeError(f"Expected tensor or None for key '{fk}', got {type(t)}")
+            t = None
         get_batch_dict[get_id(fk)] = t
 
     results = await store.get_batch(get_batch_dict)
