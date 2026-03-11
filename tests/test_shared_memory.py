@@ -308,7 +308,7 @@ class TestSharedMemoryTransportBufferPUT:
 
         await buffer._post_handshake([None], requests)
 
-        assert buffer._contexts[0].objectss == obj
+        assert buffer._contexts[0].objects == obj
 
     @pytest.mark.asyncio
     async def test_post_handshake_allocates_and_copies(self):

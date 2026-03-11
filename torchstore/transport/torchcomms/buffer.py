@@ -124,9 +124,11 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         request = requests[0]
         tensor_like = request.tensor_val
         if tensor_like is None:
-            meta = await self.storage_volume_ref.volume.get_meta.call_one(
-                request.meta_only()
-            )
+            meta = (
+                await self.storage_volume_ref.volume.get_meta.call_one(
+                    [request.meta_only()]
+                )
+            )[0]
             if isinstance(meta, str) or meta is None:
                 return  # Objects don't need RDMA setup
             if request.tensor_slice is not None:

@@ -80,9 +80,9 @@ class StorageVolume(Actor):
     @endpoint
     async def get_meta(
         self,
-        request: Request,
-    ) -> tuple[torch.Size, torch.dtype] | str:
-        return await self.store.get_meta(request)
+        requests: list[Request],
+    ) -> list[tuple[torch.Size, torch.dtype] | str]:
+        return await self.store.get_meta(requests)
 
     @endpoint
     async def delete(self, key: str) -> None:
@@ -115,7 +115,9 @@ class StorageImpl:
         """Retrieve data from the storage backend."""
         raise NotImplementedError()
 
-    async def get_meta(self, request: Request) -> tuple[torch.Size, torch.dtype] | str:
+    async def get_meta(
+        self, requests: list[Request]
+    ) -> list[tuple[torch.Size, torch.dtype] | str]:
         """Get metadata about stored data."""
         raise NotImplementedError()
 
@@ -348,8 +350,11 @@ class InMemoryStore(StorageImpl):
 
     async def get_meta(
         self,
-        request: Request,
-    ) -> tuple[torch.Size, torch.dtype] | str:
+        requests: list[Request],
+    ) -> list[tuple[torch.Size, torch.dtype] | str]:
+        return [self._get_meta(request) for request in requests]
+
+    def _get_meta(self, request: Request) -> tuple[torch.Size, torch.dtype] | str:
         key = request.key
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
