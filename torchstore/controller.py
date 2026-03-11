@@ -177,7 +177,11 @@ class Controller(Actor):
                 raise KeyError(f"Unable to locate {key} in any storage volumes.")
             volume_map = self.keys_to_storage_volumes[key]
             if not self._is_dtensor_fully_committed(key, volume_map):
-                raise KeyError(f"DTensor '{key}' is only partially committed.")
+                raise KeyError(
+                    f"DTensor '{key}' is only partially committed. "
+                    f"Not all shards have been stored yet. "
+                    f"Please ensure all ranks complete their put() operations."
+                )
             result[key] = volume_map
         return result
 
