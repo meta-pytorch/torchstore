@@ -210,7 +210,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         assert res == 0, f"RDMA write failed: conn code {res}"
 
     async def _handle_storage_volume_response(
-        self, transport_buffer: "TransportBuffer"
+        self, requests: list[Request], transport_buffer: "TransportBuffer"
     ) -> list[Any]:
         """Extract data from response buffer on client side."""
         if transport_buffer.is_object:

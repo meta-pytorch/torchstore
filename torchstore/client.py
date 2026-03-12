@@ -115,6 +115,9 @@ class LocalClient:
         Returns:
             The fetched data. If inplace_tensor was provided, returns it after
             populating with the fetched data.
+
+        Raises:
+            KeyError: If the key does not exist.
         """
         logger.debug(f"Fetching {key}")
         latency_tracker = LatencyTracker(f"get:{key}")
@@ -134,12 +137,18 @@ class LocalClient:
     ) -> dict[str, Any]:
         """Batch get multiple keys in a single operation.
 
+        All-or-nothing: if any key is missing, the entire batch raises
+        and no partial results are returned.
+
         Args:
             keys: Either a list of keys to fetch, or a dict mapping keys to
                 optional pre-allocated tensors for in-place retrieval.
 
         Returns:
             dict mapping each key to its fetched data.
+
+        Raises:
+            KeyError: If any key does not exist.
         """
         latency_tracker = LatencyTracker("get_batch")
 
@@ -210,6 +219,7 @@ class LocalClient:
         volume_maps = await self._locate_volumes(keys)
         all_volume_ids: set[str] = {vid for vm in volume_maps.values() for vid in vm}
 
+        # eagerly make transport buffers for all volumes
         transport_buffer_map = {
             volume_id: create_transport_buffer(
                 self.strategy.get_storage_volume(volume_id)
@@ -217,13 +227,16 @@ class LocalClient:
             for volume_id in all_volume_ids
         }
 
-        volume_requests, direct_keys = self._build_volume_requests(
+        # collect the requests for each volume
+        volume_requests, whole_keys = self._build_volume_requests(
             requests, volume_maps, transport_buffer_map
         )
 
+        # fetch (request, volume_result) pairs from all volumes in parallel
         fetch_pairs = await self._fetch_results(volume_requests, transport_buffer_map)
 
-        return self._assemble_results(keys, requests, fetch_pairs, direct_keys)
+        # assemble final results
+        return self._assemble_results(requests, fetch_pairs, whole_keys)
 
     def _build_volume_requests(
         self,
@@ -234,11 +247,11 @@ class LocalClient:
         """Expand per-key requests into per-volume request lists.
 
         Returns:
-            (volume_requests, direct_keys) where direct_keys holds keys stored
+            (volume_requests, whole_keys) where whole_keys holds keys stored
             as OBJECT or TENSOR (complete results, not assembled from slices).
         """
         volume_requests: dict[str, list[Request]] = defaultdict(list)
-        direct_keys: set[str] = set()
+        whole_keys: set[str] = set()
 
         for request in requests:
             volume_map = volume_maps[request.key]
@@ -257,18 +270,18 @@ class LocalClient:
                     volume_requests[volume_id].append(
                         Request(key=request.key, is_object=True)
                     )
-                    direct_keys.add(request.key)
+                    whole_keys.add(request.key)
                     break
                 elif storage_info.object_type == ObjectType.TENSOR:
                     volume_requests[volume_id].append(request)
-                    direct_keys.add(request.key)
+                    whole_keys.add(request.key)
                     break
                 else:
                     volume_requests[volume_id].extend(
                         self._expand_tensor_slices(request, storage_info, use_inplace)
                     )
 
-        return dict(volume_requests), direct_keys
+        return dict(volume_requests), whole_keys
 
     def _expand_tensor_slices(
         self,
@@ -313,7 +326,7 @@ class LocalClient:
             results = await transport_buffer_map[volume_id].get_from_storage_volume(
                 sub_requests
             )
-            return list(zip(sub_requests, results))
+            return list(zip(sub_requests, results, strict=True))
 
         per_volume = await asyncio.gather(
             *[_fetch_one(vid, reqs) for vid, reqs in volume_requests.items()]
@@ -323,17 +336,16 @@ class LocalClient:
 
     def _assemble_results(
         self,
-        keys: list[str],
         requests: list[Request],
         fetch_pairs: list[tuple[Request, Any]],
-        direct_keys: set[str],
+        whole_keys: set[str],
     ) -> dict[str, Any]:
         """Classify fetch results and assemble tensor slices into final values."""
         final: dict[str, Any] = {}
         slice_parts: dict[str, list[tuple[Any, TensorSlice]]] = defaultdict(list)
 
         for sub_request, result in fetch_pairs:
-            if sub_request.key in direct_keys:
+            if sub_request.key in whole_keys:
                 final[sub_request.key] = result
             else:
                 slice_parts[sub_request.key].append((result, sub_request.tensor_slice))
@@ -353,10 +365,10 @@ class LocalClient:
                 if request.tensor_slice is not None:
                     assert final[key].shape == request.tensor_slice.local_shape
 
-        for key in keys:
-            if key not in final:
+        for r in requests:
+            if r.key not in final:
                 raise RuntimeError(
-                    f"No results found for key '{key}'. If this key contains "
+                    f"No results found for key '{r.key}'. If this key contains "
                     "tensor slices, no stored slices intersect with the requested slice."
                 )
 

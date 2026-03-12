@@ -153,7 +153,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         await self.rdma_buffer.write_from(byte_view)
 
     async def _handle_storage_volume_response(
-        self, transport_buffer: TransportBuffer
+        self, requests: list[Request], transport_buffer: TransportBuffer
     ) -> list[Any]:
         if transport_buffer.is_object:
             return [transport_buffer.objects]

@@ -190,6 +190,9 @@ async def get(
     Returns:
         The stored tensor, tensor slice, or object.
 
+    Raises:
+        KeyError: If the key does not exist.
+
     Example:
         >>> # Get full tensor
         >>> tensor = await get("my_tensor")
@@ -239,6 +242,9 @@ async def get_batch(
 ) -> dict[str, Any]:
     """Retrieve multiple keys from the distributed store in a single batched operation.
 
+    All-or-nothing: if any key is missing, the entire batch raises
+    and no partial results are returned.
+
     Args:
         keys: Either a list of keys to retrieve, or a dict mapping keys to
             optional pre-allocated tensors for in-place retrieval.
@@ -246,6 +252,9 @@ async def get_batch(
 
     Returns:
         dict mapping each key to its fetched data.
+
+    Raises:
+        KeyError: If any key does not exist.
     """
     cl = await client(store_name)
     return await cl.get_batch(keys)

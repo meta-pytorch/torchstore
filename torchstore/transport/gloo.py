@@ -397,7 +397,7 @@ class GlooTransportBuffer(TransportBuffer):
         await self._send_tensor(data, ctx)
 
     async def _handle_storage_volume_response(
-        self, transport_buffer: "TransportBuffer"
+        self, requests: list[Request], transport_buffer: "TransportBuffer"
     ) -> list[Any]:
         """Process the response from storage volume after get.
 
@@ -510,3 +510,5 @@ class GlooTransportBuffer(TransportBuffer):
         if self._send_task is not None:
             await self._send_task
             self._send_task = None
+        self.is_object = False
+        self.objects = None
