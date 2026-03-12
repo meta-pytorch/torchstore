@@ -11,7 +11,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 try:
-    from monarch.rdma import is_rdma_available as monarch_rdma_available, RDMABuffer
+    from monarch.rdma import is_ibverbs_available as monarch_rdma_available, RDMABuffer
 except ImportError:
     monarch_rdma_available = lambda: False
 
