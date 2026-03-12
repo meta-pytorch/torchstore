@@ -264,7 +264,10 @@ async def exists(key: str, store_name: str = DEFAULT_TORCHSTORE_NAME) -> bool:
 
 
 async def put_state_dict(
-    state_dict: dict[str, Any], key: str, store_name: str = DEFAULT_TORCHSTORE_NAME
+    state_dict: dict[str, Any],
+    key: str,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+    direct_rdma: bool = False,
 ) -> None:
     """Store a PyTorch model state_dict in the distributed store.
 
@@ -272,6 +275,10 @@ async def put_state_dict(
         state_dict (dict): Model state_dict to store.
         key (str): Unique identifier for the state_dict.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+        direct_rdma (bool): If True, register RDMA handles pointing at the
+            caller's GPU memory instead of copying data to a StorageVolume.
+            First call registers handles; subsequent calls refresh staging
+            buffers for non-contiguous params.
 
     Example:
         >>> model = torch.nn.Linear(10, 5)
@@ -279,7 +286,7 @@ async def put_state_dict(
     """
     cl = await client(store_name)
     await torchstore.state_dict_utils.put_state_dict(
-        store=cl, state_dict=state_dict, key=key
+        store=cl, state_dict=state_dict, key=key, direct_rdma=direct_rdma
     )
 
 
@@ -288,14 +295,19 @@ async def get_state_dict(
     user_state_dict: dict[str, Any] | None = None,
     strict: bool = True,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
+    direct_rdma: bool = False,
 ) -> dict[str, Any]:
     """Retrieve a PyTorch model state_dict from the distributed store.
 
     Args:
         key (str): Unique identifier of the state_dict to retrieve.
         user_state_dict (dict, optional): Pre-existing state_dict to merge with.
+            Required when ``direct_rdma=True`` (destination tensors for in-place writes).
         strict (bool): Whether to enforce strict loading. Defaults to True.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+        direct_rdma (bool): If True, pull weights directly from the source's
+            GPU memory via one-sided RDMA reads. Handles are fetched from
+            TorchStore on the first call and cached for subsequent calls.
 
     Returns:
         dict: The retrieved state_dict.
@@ -306,5 +318,5 @@ async def get_state_dict(
     """
     cl = await client(store_name)
     return await torchstore.state_dict_utils.get_state_dict(
-        cl, key, user_state_dict, strict
+        cl, key, user_state_dict, strict, direct_rdma=direct_rdma
     )
