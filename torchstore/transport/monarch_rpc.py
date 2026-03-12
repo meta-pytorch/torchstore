@@ -74,7 +74,7 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         self.data = data
 
     async def _handle_storage_volume_response(
-        self, transport_buffer: "TransportBuffer"
+        self, requests: list[Request], transport_buffer: "TransportBuffer"
     ) -> list[Any]:
         """Extract the data from the response buffer."""
 

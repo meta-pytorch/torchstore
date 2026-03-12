@@ -65,6 +65,7 @@ async def get_state_dict(store, key, user_state_dict: dict | None = None, strict
         # inplace can only be a tensor, so skip non-tensor values
         if t is not None and not isinstance(t, torch.Tensor):
             t = None
+            logger.warning(f"non-tensor value found for in-place: {fk}")
         get_batch_dict[get_id(fk)] = t
 
     results = await store.get_batch(get_batch_dict)

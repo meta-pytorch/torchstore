@@ -115,6 +115,9 @@ class LocalClient:
         Returns:
             The fetched data. If inplace_tensor was provided, returns it after
             populating with the fetched data.
+
+        Raises:
+            KeyError: If the key does not exist.
         """
         logger.debug(f"Fetching {key}")
         latency_tracker = LatencyTracker(f"get:{key}")
@@ -134,12 +137,18 @@ class LocalClient:
     ) -> dict[str, Any]:
         """Batch get multiple keys in a single operation.
 
+        All-or-nothing: if any key is missing, the entire batch raises
+        and no partial results are returned.
+
         Args:
             keys: Either a list of keys to fetch, or a dict mapping keys to
                 optional pre-allocated tensors for in-place retrieval.
 
         Returns:
             dict mapping each key to its fetched data.
+
+        Raises:
+            KeyError: If any key does not exist.
         """
         latency_tracker = LatencyTracker("get_batch")
 
@@ -210,6 +219,7 @@ class LocalClient:
         volume_maps = await self._locate_volumes(keys)
         all_volume_ids: set[str] = {vid for vm in volume_maps.values() for vid in vm}
 
+        # eagerly make transport buffers for all volumes
         transport_buffer_map = {
             volume_id: create_transport_buffer(
                 self.strategy.get_storage_volume(volume_id)
@@ -217,12 +227,15 @@ class LocalClient:
             for volume_id in all_volume_ids
         }
 
+        # collect the requests for each volume
         volume_requests, direct_keys = self._build_volume_requests(
             requests, volume_maps, transport_buffer_map
         )
 
+        # fetch (request, volume_result) pairs from all volumes in parallel
         fetch_pairs = await self._fetch_results(volume_requests, transport_buffer_map)
 
+        # assemble final results
         return self._assemble_results(keys, requests, fetch_pairs, direct_keys)
 
     def _build_volume_requests(
@@ -313,7 +326,7 @@ class LocalClient:
             results = await transport_buffer_map[volume_id].get_from_storage_volume(
                 sub_requests
             )
-            return list(zip(sub_requests, results))
+            return list(zip(sub_requests, results, strict=True))
 
         per_volume = await asyncio.gather(
             *[_fetch_one(vid, reqs) for vid, reqs in volume_requests.items()]

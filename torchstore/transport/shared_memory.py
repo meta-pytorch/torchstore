@@ -147,7 +147,13 @@ class SharedMemoryDescriptor:
 
 @dataclass
 class ShmContext:
-    """Per-entry state for SHM batch operations."""
+    """Per-entry state for SHM batch operations.
+
+    use_rpc is True when the entry can't use shared memory:
+    - Non-tensor data (objects, strings, None)
+    - Tensors that are views/slices of a larger shared storage
+    - Tensors not backed by shared memory
+    """
 
     descriptor: SharedMemoryDescriptor | None = None
     objects: Any = None
@@ -265,9 +271,6 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         # Batch state – one context per processed entry
         self._contexts: list[ShmContext] = []
 
-        # Batch GET client-only state (excluded from serialization)
-        self._batch_requests: list[Request] = []
-
     def requires_handshake(self, requests: list[Request]) -> bool:
         return self._needs_handshake
 
@@ -378,12 +381,8 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     def __getstate__(self) -> dict[str, Any]:
         """Exclude non-serializable objects when sending buffer to storage volume."""
         state = self.__dict__.copy()
-        state["_batch_requests"] = None
         state["storage_volume_ref"] = None
         return state
-
-    async def _pre_get_hook(self, requests: list[Request]) -> None:
-        self._batch_requests = requests
 
     async def handle_get_request(
         self,
@@ -409,14 +408,12 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                 self._contexts.append(ShmContext(objects=data, use_rpc=True))
 
     async def _handle_storage_volume_response(
-        self, transport_buffer: "TransportBuffer"
+        self, requests: list[Request], transport_buffer: "TransportBuffer"
     ) -> list[Any]:
         results = []
         shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
 
-        for request, shm_ctx in zip(
-            self._batch_requests, transport_buffer._contexts, strict=True
-        ):
+        for request, shm_ctx in zip(requests, transport_buffer._contexts, strict=True):
             client_tensor = request.tensor_val
 
             # Path 1: Object or RPC fallback
@@ -456,4 +453,3 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     async def drop(self) -> None:
         self._contexts = []
-        self._batch_requests = []
