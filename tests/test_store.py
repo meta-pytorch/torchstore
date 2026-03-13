@@ -390,7 +390,7 @@ async def test_shm_cache_reuse_on_same_key_puts(strategy_params):
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
 @pytest.mark.asyncio
-async def test_put_batch_basic(strategy_params, transport_type):
+async def test_batch_basic(strategy_params, transport_type):
     """Test batch put/get functionality for multiple key-value pairs.
 
     Runs two put/get cycles, mutating tensor data between them.
@@ -431,9 +431,15 @@ async def test_put_batch_basic(strategy_params, transport_type):
 
         @endpoint
         async def get_and_verify(self, prefix: str, offset: int):
-            t1 = await ts.get(f"{prefix}_tensor1_{self.rank}")
-            t2 = await ts.get(f"{prefix}_tensor2_{self.rank}")
-            obj = await ts.get(f"{prefix}_object_{self.rank}")
+            keys = [
+                f"{prefix}_tensor1_{self.rank}",
+                f"{prefix}_tensor2_{self.rank}",
+                f"{prefix}_object_{self.rank}",
+            ]
+            results = await ts.get_batch(keys)
+            t1 = results[keys[0]]
+            t2 = results[keys[1]]
+            obj = results[keys[2]]
 
             expected_t1 = torch.tensor([self.rank + 1 + offset] * 10)
             expected_t2 = torch.tensor([self.rank + 100 + offset] * 5)

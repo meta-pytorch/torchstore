@@ -64,33 +64,35 @@ class TransportBuffer:
 
     Lifecycle: PUT Operation
     ------------------------
-    All put operations go through `put_to_storage_volume(entries)` which accepts a
-    list of (key, request) tuples. The base class dispatches to `_put_requests`:
+    All put operations go through `put_to_storage_volume(requests)` which accepts a
+    list of Request entries. The base class dispatches to `_put_requests`:
 
     - If `supports_batch_puts` is True (e.g., SharedMemory), the entire list is
       passed to `_put_requests` in a single call.
     - Otherwise, `_put_requests` is called once per entry with a single-element list.
 
-    `_put_requests(entries)`:
-    1. Optionally performs handshake if `requires_handshake(entries)` returns True
-    2. Calls `_pre_put_hook(entries)` [CLIENT] - allocate local buffers, prepare data
+    `_put_requests(requests)`:
+    1. Optionally performs handshake if `requires_handshake(requests)` returns True
+    2. Calls `_pre_put_hook(requests)` [CLIENT] - allocate local buffers, prepare data
     3. Sends to StorageVolume via `volume.put.call()`
     4. Client calls `drop()` [CLIENT] - cleanup resources (e.g., deregister RDMA memory)
 
     Lifecycle: GET Operation
     ------------------------
-    1. Client creates TransportBuffer
-    2. Client calls `get_from_storage_volume(key, request)` which:
-       a. Optionally performs handshake
-       b. Invokes `_pre_get_hook(key, request)` [CLIENT] - allocate receive buffers
-       c. Serializes self and sends to StorageVolume
-    3. StorageVolume receives buffer and calls `handle_get_request(...)` [STORAGE VOLUME]
-       - Writes stored tensor data into the transport buffer (e.g., RDMA write)
-       - Returns the buffer with data ready to be read
-    4. Client calls `_handle_storage_volume_response(response)` [CLIENT]
-       - Extracts tensor data from the response buffer
-       - Copies into user's tensor if inplace, or returns new tensor
-    5. Client calls `drop()` [CLIENT] - cleanup resources
+    All get operations go through `get_from_storage_volume(requests)` which accepts a
+    list of Request entries. The base class dispatches to `_get_requests`:
+
+    - If `supports_batch_gets` is True (e.g., SharedMemory), the entire list is
+      passed to `_get_requests` in a single call.
+    - Otherwise, `_get_requests` is called once per entry with a single-element list.
+
+    `_get_requests(requests)`:
+      1. Optionally performs handshake if `requires_handshake(requests)` returns True
+      2. Calls `_pre_get_hook(requests)` [CLIENT] - save metadata for response handling
+      3. Sends to StorageVolume via `volume.get.call()`
+      4. StorageVolume calls `handle_get_request(ctx, entries)` [STORAGE VOLUME]
+      5. Client calls `_handle_storage_volume_response(requests, response)` [CLIENT]
+      6. Calls `drop()` [CLIENT] - cleanup resources
 
     Methods Called on CLIENT (Local Process)
     ----------------------------------------
@@ -118,7 +120,8 @@ class TransportBuffer:
     - `_handle_storage_volume_response`: How to extract data from response on client
 
     Optionally override:
-    - `supports_batch_puts`: Set True if the transport can handle multiple entries at once
+    - `supports_batch_puts`: Set True if the transport can handle multiple entries at once for puts
+    - `supports_batch_gets`: Set True if the transport can handle multiple entries at once for gets
     - `requires_handshake`: Return True if a handshake is needed before put/get
     - `_pre_put_hook`: Custom buffer allocation for puts
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
@@ -130,8 +133,11 @@ class TransportBuffer:
     supports_inplace_resharding : bool
         Whether this transport supports inplace resharding.
     supports_batch_puts : bool
-        If True, `put_to_storage_volume` passes all entries to `_put_requests`
-        in a single call. If False (default), entries are dispatched one at a time.
+        If True, `put_to_storage_volume` passes all requests to `_put_requests`
+        in a single call. If False (default), requests are dispatched one at a time.
+    supports_batch_gets : bool
+        If True, `get_from_storage_volume` passes all requests to `_get_requests`
+        in a single call. If False (default), requests are dispatched one at a time.
 
     Parameters
     ----------
@@ -141,7 +147,10 @@ class TransportBuffer:
     """
 
     supports_inplace_resharding: bool = True
+
+    # Transitionary period. These should eventually be TRUE for all transports.
     supports_batch_puts: bool = False
+    supports_batch_gets: bool = False
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
@@ -192,31 +201,43 @@ class TransportBuffer:
             l.track_step("drop")
             l.track_e2e()
 
-    # batching not supported on get yet
-    async def get_from_storage_volume(self, request: Request):
+    async def get_from_storage_volume(self, requests: list[Request]) -> list[Any]:
+        if self.supports_batch_gets:
+            return await self._get_requests(requests)
+        else:
+            results = []
+            for request in requests:
+                results.extend(await self._get_requests([request]))
+            return results
+
+    async def _get_requests(self, requests: list[Request]) -> list[Any]:
+        l = LatencyTracker("get")
+        meta_requests = [r.meta_only() for r in requests]
         try:
-            requests = [request]
             if self.requires_handshake(requests):
                 await self._pre_handshake()
+                l.track_step("pre_handshake")
                 handshake_results = (
                     await self.storage_volume_ref.volume.handshake.call_one(
-                        self, [request.meta_only()]
+                        self, meta_requests
                     )
                 )
+                l.track_step("volume.handshake.call")
                 await self._post_handshake(handshake_results, requests)
+                l.track_step("post_handshake")
 
-            await self._pre_get_hook(request)
+            await self._pre_get_hook(requests)
+            l.track_step("_pre_get_hook")
 
-            # when fetching data, we may need to handle the response from the storage volume
-            # TODO: think of a good prefix to differentiate this between remote handlers
             response = await self._handle_storage_volume_response(
-                await self.storage_volume_ref.volume.get.call_one(
-                    request.key, self, request.meta_only()
-                )
+                requests,
+                await self.storage_volume_ref.volume.get.call_one(self, meta_requests),
             )
+            l.track_step("volume.get.call")
         finally:
             await self.drop()
-
+            l.track_step("drop")
+            l.track_e2e()
         return response
 
     async def _pre_handshake(self) -> None:
@@ -246,10 +267,12 @@ class TransportBuffer:
     async def _pre_put_hook(self, requests: list[Request]):
         pass
 
-    async def _pre_get_hook(self, request: Request):
+    async def _pre_get_hook(self, requests: list[Request]):
         pass
 
-    async def _handle_storage_volume_response(self, response: Any) -> Any:
+    async def _handle_storage_volume_response(
+        self, requests: list[Request], response: Any
+    ) -> list[Any]:
         raise NotImplementedError()
 
     # StorageVolume handlers -- must be implemented by concrete implementaiton
@@ -271,7 +294,11 @@ class TransportBuffer:
         # called on the storage volume side
         raise NotImplementedError()
 
-    async def handle_get_request(self, ctx: "TransportContext", data) -> None:
+    async def handle_get_request(
+        self,
+        ctx: "TransportContext",
+        entries: list[tuple[Request, Any]],
+    ) -> None:
         # called on the storage volume side
         raise NotImplementedError()
 

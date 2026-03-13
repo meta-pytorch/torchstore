@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+from collections import defaultdict
 from logging import getLogger
 from typing import Any
 
@@ -43,10 +44,10 @@ class LocalClient:
         self.strategy: TorchStoreStrategy = strategy
         self.transport_context = TransportContext()
 
-    async def _locate_volumes(self, key: str):
+    async def _locate_volumes(self, keys: list[str]):
         """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""
         try:
-            return await self._controller.locate_volumes.call_one(key)
+            return await self._controller.locate_volumes.call_one(keys)
         except Exception as e:
             raise KeyError(str(e)) from e
 
@@ -114,16 +115,79 @@ class LocalClient:
         Returns:
             The fetched data. If inplace_tensor was provided, returns it after
             populating with the fetched data.
+
+        Raises:
+            KeyError: If the key does not exist.
         """
         logger.debug(f"Fetching {key}")
         latency_tracker = LatencyTracker(f"get:{key}")
 
         request = Request.from_any(key, inplace_tensor, tensor_slice_spec)
-
-        # Fetch the data
-        fetched = await self._fetch(request)
+        results = await self._fetch([request])
         latency_tracker.track_step("fetch")
 
+        result = self._apply_inplace(results[key], inplace_tensor, request)
+        latency_tracker.track_e2e()
+        return result
+
+    @torch.no_grad
+    async def get_batch(
+        self,
+        keys: list[str] | dict[str, torch.Tensor | DTensor | None],
+    ) -> dict[str, Any]:
+        """Batch get multiple keys in a single operation.
+
+        All-or-nothing: if any key is missing, the entire batch raises
+        and no partial results are returned.
+
+        Args:
+            keys: Either a list of keys to fetch, or a dict mapping keys to
+                optional pre-allocated tensors for in-place retrieval.
+
+        Returns:
+            dict mapping each key to its fetched data.
+
+        Raises:
+            KeyError: If any key does not exist.
+        """
+        latency_tracker = LatencyTracker("get_batch")
+
+        if not keys:
+            raise ValueError("get_batch requires a non-empty dict or list")
+
+        inplace_dict = {}
+        if isinstance(keys, dict):
+            inplace_dict = keys
+        elif isinstance(keys, list):
+            if len(keys) != len(set(keys)):
+                raise ValueError("get_batch keys must be unique")
+        else:
+            raise TypeError(f"get_batch expects list[str] or dict, got {type(keys)}")
+
+        requests = [Request.from_any(key, inplace_dict.get(key)) for key in keys]
+        results = await self._fetch(requests)
+        latency_tracker.track_step("fetch")
+
+        final_results: dict[str, Any] = {}
+        for req in requests:
+            final_results[req.key] = self._apply_inplace(
+                results[req.key], inplace_dict.get(req.key), req
+            )
+
+        latency_tracker.track_e2e()
+        return final_results
+
+    def _apply_inplace(
+        self,
+        fetched: Any,
+        inplace_tensor: torch.Tensor | DTensor | None,
+        request: Request,
+    ) -> Any:
+        """Handle inplace copy-back for DTensor resharding cases.
+
+        Always returns inplace if provided. Copies fetched data into
+        request.tensor_val when data_ptr differs (resharding produced a new tensor).
+        """
         # TODO: remove this copy and instead assert.
         # unfortunately, during resharding cases, we don't yet support writing inplace
         # from multiple regions into the inplace tensor, which leads to _fetch returning
@@ -134,117 +198,181 @@ class LocalClient:
         ):
             # request tensor_val is a ref to _local_tensor if inplace is dtensor.
             request.tensor_val.copy_(fetched)
-            latency_tracker.track_e2e()
             return inplace_tensor
-
-        latency_tracker.track_e2e()
-
         # returning inplace_tensor since fetched will point to _local_tensor in
         # the case of DTensor.
         return inplace_tensor if inplace_tensor is not None else fetched
 
     async def _fetch(
         self,
-        request: Request,
-    ) -> torch.Tensor | Any:
-        """Unified fetch that handles tensors, objects, and tensor slices.
+        requests: list[Request],
+    ) -> dict[str, Any]:
+        """Locate volumes, expand entries, fetch per-volume, assemble results.
 
         Args:
-            request: Request containing key, tensor_slice and optional inplace tensor.
+            requests: Pre-built Request per key (may include tensor_slice).
 
         Returns:
-            The fetched data (tensor, assembled tensor, or object).
+            dict mapping each key to its raw fetched data (before inplace copy-back).
         """
-        key = request.key
-        volume_map = await self._locate_volumes(key)
-        partial_results = []
+        keys = [r.key for r in requests]
+        volume_maps = await self._locate_volumes(keys)
+        all_volume_ids: set[str] = {vid for vm in volume_maps.values() for vid in vm}
 
-        # Eagerly create transport buffers for all volumes
+        # eagerly make transport buffers for all volumes
         transport_buffer_map = {
             volume_id: create_transport_buffer(
                 self.strategy.get_storage_volume(volume_id)
             )
-            for volume_id in volume_map.keys()
+            for volume_id in all_volume_ids
         }
 
-        # attempt inplace if buffer supports it and we have a contiguous tensor
-        use_inplace_views = (
-            all(tb.supports_inplace_resharding for tb in transport_buffer_map.values())
-            and request.tensor_val is not None
-            and request.tensor_val.is_contiguous()
+        # collect the requests for each volume
+        volume_requests, whole_keys = self._build_volume_requests(
+            requests, volume_maps, transport_buffer_map
         )
 
-        for volume_id, storage_info in volume_map.items():
-            transport_buffer = transport_buffer_map[volume_id]
+        # fetch (request, volume_result) pairs from all volumes in parallel
+        fetch_pairs = await self._fetch_results(volume_requests, transport_buffer_map)
 
-            # no sharding for objects or regular tensors.
-            if storage_info.object_type == ObjectType.OBJECT:
-                request.is_object = True
-                return await transport_buffer.get_from_storage_volume(request)
-            if storage_info.object_type == ObjectType.TENSOR:
-                return await transport_buffer.get_from_storage_volume(request)
+        # assemble final results
+        return self._assemble_results(requests, fetch_pairs, whole_keys)
 
-            # Has tensor slices - fetch each relevant slice
-            for stored_slice in storage_info.tensor_slices:
-                fetch_slice = stored_slice
-                if request.tensor_slice is not None:
-                    # TODO: we should also continue if we have already fetched this region in a previous call
-                    # and also return completely if we've already fetched all regions. This is extra inneficient
-                    # in the case of DP, where we fetch all Replicate shards unnecessarily
-                    fetch_slice = get_slice_intersection(
-                        stored_slice, request.tensor_slice
-                    )
-                    if fetch_slice is None:
-                        continue
+    def _build_volume_requests(
+        self,
+        requests: list[Request],
+        volume_maps: dict[str, dict],
+        transport_buffer_map: dict,
+    ) -> tuple[dict[str, list[Request]], set[str]]:
+        """Expand per-key requests into per-volume request lists.
 
-                # Try to get a view of the destination tensor for inplace writes.
-                dest_view = (
-                    get_destination_view(
-                        request.tensor_val, request.tensor_slice, fetch_slice
-                    )
-                    if use_inplace_views
-                    else None
+        Returns:
+            (volume_requests, whole_keys) where whole_keys holds keys stored
+            as OBJECT or TENSOR (complete results, not assembled from slices).
+        """
+        volume_requests: dict[str, list[Request]] = defaultdict(list)
+        whole_keys: set[str] = set()
+
+        for request in requests:
+            volume_map = volume_maps[request.key]
+
+            use_inplace = (
+                all(
+                    transport_buffer_map[vid].supports_inplace_resharding
+                    for vid in volume_map
                 )
-
-                if dest_view is not None:
-                    # Pass the view as tensor_val - transport writes directly inplace
-                    slice_request = Request.from_tensor_slice(key, fetch_slice)
-                    slice_request.tensor_val = dest_view
-                    await transport_buffer.get_from_storage_volume(slice_request)
-                    partial_results.append((dest_view, fetch_slice))
-                else:
-                    # TODO: ensure this is not in the common path, or that we have a solution for
-                    # this pattern since it creates a new allocation on every fetch, and should be
-                    # is generally avoidable.
-                    slice_request = Request.from_tensor_slice(key, fetch_slice)
-                    local_tensor = await transport_buffer.get_from_storage_volume(
-                        slice_request
-                    )
-                    partial_results.append((local_tensor, fetch_slice))
-
-        # Check if all results share memory with the destination tensor (inplace)
-        if request.tensor_val is not None and tensors_overlap_in_memory(
-            partial_results, request.tensor_val
-        ):
-            return request.tensor_val
-
-        # Tensor was not resharded inplace, requires us to rebuild the slice 'manually'
-        if not partial_results:
-            raise RuntimeError(
-                f"No tensor slices found for key '{key}' that intersect with the requested slice"
+                and request.tensor_val is not None
+                and request.tensor_val.is_contiguous()
             )
 
-        local_tensors = []
-        global_offsets = []
-        for local_tensor, slice_info in partial_results:
-            local_tensors.append(local_tensor)
-            global_offsets.append(slice_info.offsets)
+            for volume_id, storage_info in volume_map.items():
+                if storage_info.object_type == ObjectType.OBJECT:
+                    volume_requests[volume_id].append(
+                        Request(key=request.key, is_object=True)
+                    )
+                    whole_keys.add(request.key)
+                    break
+                elif storage_info.object_type == ObjectType.TENSOR:
+                    volume_requests[volume_id].append(request)
+                    whole_keys.add(request.key)
+                    break
+                else:
+                    volume_requests[volume_id].extend(
+                        self._expand_tensor_slices(request, storage_info, use_inplace)
+                    )
 
-        # TODO: this is yet another new allocation on every fetch.
-        assembled_tensor = assemble_tensor(local_tensors, global_offsets)
-        if request.tensor_slice is not None:
-            assert assembled_tensor.shape == request.tensor_slice.local_shape
-        return assembled_tensor
+        return dict(volume_requests), whole_keys
+
+    def _expand_tensor_slices(
+        self,
+        request: Request,
+        storage_info,
+        use_inplace: bool,
+    ) -> list[Request]:
+        """Expand a single key's tensor slices into sub-requests."""
+        sub_requests = []
+        for stored_slice in storage_info.tensor_slices:
+            fetch_slice = stored_slice
+            if request.tensor_slice is not None:
+                # TODO: we should also continue if we have already fetched this region in a previous call
+                # and also return completely if we've already fetched all regions. This is extra inneficient
+                # in the case of DP, where we fetch all Replicate shards unnecessarily
+                fetch_slice = get_slice_intersection(stored_slice, request.tensor_slice)
+                if fetch_slice is None:
+                    continue
+
+            slice_request = Request.from_tensor_slice(request.key, fetch_slice)
+
+            if use_inplace:
+                dest_view = get_destination_view(
+                    request.tensor_val,
+                    request.tensor_slice,
+                    fetch_slice,
+                )
+                if dest_view is not None:
+                    slice_request.tensor_val = dest_view
+
+            sub_requests.append(slice_request)
+        return sub_requests
+
+    async def _fetch_results(
+        self,
+        volume_requests: dict[str, list[Request]],
+        transport_buffer_map: dict,
+    ) -> list[tuple[Request, Any]]:
+        """Fetch from all volumes in parallel. Returns (sub_request, result) pairs."""
+
+        async def _fetch_one(volume_id: str, sub_requests: list[Request]):
+            results = await transport_buffer_map[volume_id].get_from_storage_volume(
+                sub_requests
+            )
+            return list(zip(sub_requests, results, strict=True))
+
+        per_volume = await asyncio.gather(
+            *[_fetch_one(vid, reqs) for vid, reqs in volume_requests.items()]
+        )
+        # Flatten list-of-lists into a single list of (sub_request, result) pairs
+        return [pair for pairs in per_volume for pair in pairs]
+
+    def _assemble_results(
+        self,
+        requests: list[Request],
+        fetch_pairs: list[tuple[Request, Any]],
+        whole_keys: set[str],
+    ) -> dict[str, Any]:
+        """Classify fetch results and assemble tensor slices into final values."""
+        final: dict[str, Any] = {}
+        slice_parts: dict[str, list[tuple[Any, TensorSlice]]] = defaultdict(list)
+
+        for sub_request, result in fetch_pairs:
+            if sub_request.key in whole_keys:
+                final[sub_request.key] = result
+            else:
+                slice_parts[sub_request.key].append((result, sub_request.tensor_slice))
+
+        request_by_key = {r.key: r for r in requests}
+        for key, parts in slice_parts.items():
+            request = request_by_key[key]
+            if request.tensor_val is not None and tensors_overlap_in_memory(
+                parts, request.tensor_val
+            ):
+                final[key] = request.tensor_val
+            else:
+                local_tensors = [t for t, _ in parts]
+                global_offsets = [s.offsets for _, s in parts]
+                # TODO: this is yet another new allocation on every fetch.
+                final[key] = assemble_tensor(local_tensors, global_offsets)
+                if request.tensor_slice is not None:
+                    assert final[key].shape == request.tensor_slice.local_shape
+
+        for r in requests:
+            if r.key not in final:
+                raise RuntimeError(
+                    f"No results found for key '{r.key}'. If this key contains "
+                    "tensor slices, no stored slices intersect with the requested slice."
+                )
+
+        return final
 
     async def keys(self, prefix: str | None = None) -> list[str]:
         """
@@ -275,7 +403,7 @@ class LocalClient:
             KeyError: If the key does not exist in the store.
         """
         latency_tracker = LatencyTracker(f"delete:{key}")
-        volume_map = await self._controller.locate_volumes.call_one(key)
+        volume_map = (await self._controller.locate_volumes.call_one([key]))[key]
 
         async def delete_from_volume(volume_id: str):
             volume_ref = self.strategy.get_storage_volume(volume_id)
@@ -306,7 +434,7 @@ class LocalClient:
         try:
             # Use the controller to check if key exists
             # This is efficient as it only checks metadata
-            await self._controller.locate_volumes.call_one(key)
+            await self._controller.locate_volumes.call_one([key])
             return True
         except Exception as e:
             # Controller raises KeyError if key doesn't exist, but it comes wrapped

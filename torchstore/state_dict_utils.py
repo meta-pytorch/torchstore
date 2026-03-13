@@ -56,30 +56,20 @@ async def get_state_dict(store, key, user_state_dict: dict | None = None, strict
     if strict and user_mapping is not None:
         assert user_mapping == fetched_mapping
 
-    fetched_state_dict = {}
-    for flattened_key in fetched_mapping.keys():
-        inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
-        fetched_state_dict[flattened_key] = await store.get(
-            f"{key}{DELIM}{flattened_key}",
-            inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
-        )
+    get_id = lambda fk: f"{key}{DELIM}{fk}"
+    flattened_keys = list(fetched_mapping.keys())
 
-    # # Prepare all the coroutines first
-    # coros = []
-    # keys = []
-    # for flattened_key in fetched_mapping.keys():
-    #     inplace_tensor = user_flattened_state_dict.get(flattened_key, None)
-    #     keys.append(flattened_key)
-    #     coros.append(
-    #         store.get(
-    #             f"{key}{DELIM}{flattened_key}",
-    #             inplace_tensor if isinstance(inplace_tensor, torch.Tensor) else None,
-    #         )
-    #     )
-    # # Run all requests concurrently
-    # results = await asyncio.gather(*coros)
-    # # Build the result dictionary
-    # fetched_state_dict = dict(zip(keys, results))
+    get_batch_dict = {}
+    for fk in flattened_keys:
+        t = user_flattened_state_dict.get(fk, None)
+        # inplace can only be a tensor, so skip non-tensor values
+        if t is not None and not isinstance(t, torch.Tensor):
+            t = None
+            logger.warning(f"non-tensor value found for in-place: {fk}")
+        get_batch_dict[get_id(fk)] = t
+
+    results = await store.get_batch(get_batch_dict)
+    fetched_state_dict = {fk: results[get_id(fk)] for fk in flattened_keys}
 
     return unflatten_state_dict(fetched_state_dict, fetched_mapping)
 
