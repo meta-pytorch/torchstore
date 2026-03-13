@@ -410,44 +410,44 @@ async def test_batch_basic(strategy_params, transport_type):
             os.environ["LOCAL_RANK"] = str(self.rank)
             os.environ["HOSTNAME"] = socket.gethostname()
 
-        def _make_tensors(
-            self, offset: int, device: str
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            t1 = torch.tensor([self.rank + 1 + offset] * 10, device=device)
-            t2 = torch.tensor([self.rank + 100 + offset] * 5, device=device)
-            return t1, t2
+        def _make_batch(self, prefix: str, offset: int, device: str) -> dict:
+            """Build a batch with tensors, an object, and a cross-device tensor if CUDA."""
+            batch = {
+                f"{prefix}_tensor1_{self.rank}": torch.tensor(
+                    [self.rank + 1 + offset] * 10, device=device
+                ),
+                f"{prefix}_tensor2_{self.rank}": torch.tensor(
+                    [self.rank + 100 + offset] * 5, device=device
+                ),
+                f"{prefix}_object_{self.rank}": {
+                    "rank": self.rank,
+                    "offset": offset,
+                },
+            }
+            # Mix a CPU tensor into the CUDA batch to test multi-device batching
+            if device == "cuda":
+                batch[f"{prefix}_cpu_{self.rank}"] = torch.tensor(
+                    [self.rank + 200 + offset] * 8, device="cpu"
+                )
+            return batch
 
         @endpoint
         async def put_batch(self, prefix: str, offset: int, device: str):
-            t1, t2 = self._make_tensors(offset, device)
-            obj = {"rank": self.rank, "offset": offset}
-            await ts.put_batch(
-                {
-                    f"{prefix}_tensor1_{self.rank}": t1,
-                    f"{prefix}_tensor2_{self.rank}": t2,
-                    f"{prefix}_object_{self.rank}": obj,
-                }
-            )
+            await ts.put_batch(self._make_batch(prefix, offset, device))
 
         @endpoint
-        async def get_and_verify(self, prefix: str, offset: int):
-            keys = [
-                f"{prefix}_tensor1_{self.rank}",
-                f"{prefix}_tensor2_{self.rank}",
-                f"{prefix}_object_{self.rank}",
-            ]
-            results = await ts.get_batch(keys)
-            t1 = results[keys[0]]
-            t2 = results[keys[1]]
-            obj = results[keys[2]]
-
-            expected_t1 = torch.tensor([self.rank + 1 + offset] * 10)
-            expected_t2 = torch.tensor([self.rank + 100 + offset] * 5)
-            expected_obj = {"rank": self.rank, "offset": offset}
-
-            assert torch.equal(t1, expected_t1), f"t1: {t1} != {expected_t1}"
-            assert torch.equal(t2, expected_t2), f"t2: {t2} != {expected_t2}"
-            assert obj == expected_obj, f"obj: {obj} != {expected_obj}"
+        async def get_and_verify(self, prefix: str, offset: int, device: str):
+            expected = self._make_batch(prefix, offset, device)
+            results = await ts.get_batch(list(expected.keys()))
+            for key, expected_val in expected.items():
+                actual = results[key]
+                if isinstance(expected_val, torch.Tensor):
+                    expected_cpu = expected_val.cpu()
+                    assert torch.equal(
+                        actual, expected_cpu
+                    ), f"{key}: {actual} != {expected_cpu}"
+                else:
+                    assert actual == expected_val, f"{key}: {actual} != {expected_val}"
             return True
 
     volume_world_size, strategy = strategy_params
@@ -471,13 +471,13 @@ async def test_batch_basic(strategy_params, transport_type):
 
             # Cycle 1: initial put/get
             await actor_mesh.put_batch.call(prefix, 0, device)
-            results = await actor_mesh.get_and_verify.call(prefix, 0)
+            results = await actor_mesh.get_and_verify.call(prefix, 0, device)
             for pt, ok in results:
                 assert ok
 
             # Cycle 2: mutate data (same shape, different values) and overwrite
             await actor_mesh.put_batch.call(prefix, 1000, device)
-            results = await actor_mesh.get_and_verify.call(prefix, 1000)
+            results = await actor_mesh.get_and_verify.call(prefix, 1000, device)
             for pt, ok in results:
                 assert ok
     finally:
