@@ -43,6 +43,12 @@ class LocalClient:
         self.strategy: TorchStoreStrategy = strategy
         self.transport_context = TransportContext()
 
+        # Direct RDMA weight sync cache (used by state_dict_utils when direct_rdma=True)
+        self._direct_rdma_source = None  # DirectWeightSyncSource, lazily created
+        self._direct_rdma_dest = None  # DirectWeightSyncDest, lazily created
+        self._direct_rdma_registered: set[str] = set()
+        self._direct_rdma_handles: dict[str, dict[str, list]] = {}
+
     async def _locate_volumes(self, key: str):
         """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""
         try:
