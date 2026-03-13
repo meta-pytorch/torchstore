@@ -70,8 +70,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             self.storage_volume_ref.transport_context.get_rdma_transport_cache()
         )
         volume_id = self.storage_volume_ref.volume_id
-        transport, address, is_new = transport_cache.get(volume_id, device)
-        device_index = transport_cache._device_to_index(device)
+        transport, address, is_new = transport_cache.get_or_create(volume_id, device)
+        device_index = transport_cache.device_to_index(device)
         self._transports[device_index] = transport
         self.addresses[device_index] = address
         if is_new:
@@ -81,7 +81,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         """SV side: look up the transport for a given client device_index."""
         client_addr = self.addresses[device_index]
         # SV transports are always on CPU (device 0), created by recv_handshake
-        return ctx.get_rdma_transport_cache()._get(client_addr, 0)[0]
+        return ctx.get_rdma_transport_cache().get(client_addr, 0)[0]
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         """Set up transports for all unique devices in the batch."""
@@ -196,11 +196,13 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             assert rdma_ctx.rdma_remote_buffer is not None
             self._assert_valid_tensor(maybe_tensor, rdma_ctx.dtype, rdma_ctx.shape)
 
+            # TODO: replace sequential reads with true batch RDMA operations (coming to torchcomms)
             receiving_buffer = RdmaMemory(maybe_tensor)
             res = transport.read(
                 receiving_buffer.to_mutable_view(), rdma_ctx.rdma_remote_buffer
             )
-            assert res == 0, f"RDMA read failed: conn code {res}"
+            if res != 0:
+                raise RuntimeError(f"RDMA read failed: conn code {res}")
             results.append(maybe_tensor)
 
         return results
@@ -210,7 +212,11 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         ctx: "TransportContext",
         entries: list[tuple[Request, Any]],
     ) -> None:
-        """Called by storage volume. Write to client's dest RdmaMemory (get)."""
+        """Called by storage volume. Write to client's dest RdmaMemory (get).
+
+        Note: SV determination of is_object is authoritative and mutates _contexts
+        sent back to the client.
+        """
         for (_, data), rdma_ctx in zip(entries, self._contexts, strict=True):
             if not isinstance(data, torch.Tensor):
                 rdma_ctx.is_object = True
@@ -232,10 +238,12 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
             assert rdma_ctx.rdma_remote_buffer is not None
             self._assert_valid_tensor(tensor, rdma_ctx.dtype, rdma_ctx.shape)
+            # TODO: replace sequential writes with true batch RDMA operations (coming to torchcomms)
             rdma_memory = RdmaMemory(tensor)
 
             res = transport.write(rdma_memory.to_view(), rdma_ctx.rdma_remote_buffer)
-            assert res == 0, f"RDMA write failed: conn code {res}"
+            if res != 0:
+                raise RuntimeError(f"RDMA write failed: conn code {res}")
 
     async def _handle_storage_volume_response(
         self, requests: list[Request], transport_buffer: "TransportBuffer"
