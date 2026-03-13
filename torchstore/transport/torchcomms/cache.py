@@ -63,10 +63,15 @@ class RdmaTransportCache:
         index = self._device_to_index(device)
         return self.transports[key][index]
 
-    def get(self, key: str, device: torch.device | int):
+    def get(
+        self, key: str, device: torch.device | int
+    ) -> tuple["RdmaTransport", bytes, bool]:
+        """Get or create a transport for (key, device). Returns (transport, address, is_new)"""
         if not self.contains(key, device):
-            return self.put(key, device)
-        return self._get(key, device)
+            transport, address = self.put(key, device)
+            return transport, address, True
+        transport, address = self._get(key, device)
+        return transport, address, False
 
     def contains(self, key: str, device: torch.device | int) -> bool:
         index = self._device_to_index(device)
