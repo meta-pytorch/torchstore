@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass, replace
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -12,7 +13,7 @@ from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.types import Request
 
 try:
-    from torchcomms._transport import RdmaMemory, RdmaRemoteBuffer
+    from torchcomms._transport import RdmaMemory
 except ImportError:
     pass
 
@@ -21,10 +22,26 @@ if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
 
 
+@dataclass
+class RdmaContext:
+    """Per-entry state for TorchComms RDMA batch operations."""
+
+    rdma_memory: Any = None  # LOCAL only — stripped in __getstate__
+    rdma_remote_buffer: Any = None  # Serialized — SV uses this for RDMA read/write
+    tensor_ref: torch.Tensor | None = None  # LOCAL only — GET destination tensor
+    shape: torch.Size | None = None  # Serialized
+    dtype: torch.dtype | None = None  # Serialized
+    is_object: bool = False  # Serialized
+    objects: Any = None  # Serialized — carries non-tensor data
+
+
 class TorchCommsRdmaTransportBuffer(TransportBuffer):
     """
     Transport buffer implementation using TorchComms RDMA for efficient tensor transfer.
     """
+
+    supports_batch_puts = True
+    supports_batch_gets = True
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef") -> None:
         super().__init__(storage_volume_ref)
@@ -32,22 +49,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         # local client's rdmatransport address. used by storage volume to retrieve cached peer transport.
         self.address: bytes | None = None
 
-        self.tensor_ref: torch.Tensor | None = (
-            None  # reference to local client's destination tensor
-        )
-        self.rdma_memory: RdmaMemory | None = (
-            None  # must be kept alive until transport is done
-        )
-        self.rdma_remote_buffer: RdmaRemoteBuffer | None = (
-            None  # remote reference of rdma memory
-        )
-
-        self.shape: torch.Size | None = None
-        self.dtype: torch.dtype | None = None
-
-        # Object handling fields (non-tensor data)
-        self.is_object: bool = False
-        self.objects: Any = None
+        # Batch state – one context per processed request
+        self._contexts: list[RdmaContext] = []
 
         # Connection state for handshake
         self._local_transport: Any = None
@@ -68,11 +71,10 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         """Setup transport from request if needed, then check if handshake is required."""
-        request = requests[0]
-        if not request.is_object:
-            self._setup_local_transport(request.tensor_val)
-
-            return not self._connection_exists
+        for request in requests:
+            if not request.is_object:
+                self._setup_local_transport(request.tensor_val)
+                return not self._connection_exists
         return False
 
     async def _post_handshake(
@@ -97,53 +99,62 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     def __getstate__(self) -> dict[str, Any]:
         """Serialize the state of the buffer, excluding non-serializable components."""
         state = self.__dict__.copy()
-        state["rdma_memory"] = None
-        state["tensor_ref"] = None
         state["storage_volume_ref"] = None
         state["_local_transport"] = None
+        state["_contexts"] = [
+            replace(ctx, rdma_memory=None, tensor_ref=None) for ctx in self._contexts
+        ]
         return state
 
-    def _allocate(self, tensor: torch.Tensor) -> None:
-        self.shape = tensor.shape
-        self.dtype = tensor.dtype
-        self._assert_valid_tensor(tensor, self.dtype, self.shape)
-        self.rdma_memory = RdmaMemory(tensor)
-        self.rdma_remote_buffer = self.rdma_memory.to_remote_buffer()
+    def _allocate_ctx(self, tensor: torch.Tensor) -> RdmaContext:
+        self._assert_valid_tensor(tensor, tensor.dtype, tensor.shape)
+        rdma_memory = RdmaMemory(tensor)
+        return RdmaContext(
+            rdma_memory=rdma_memory,
+            rdma_remote_buffer=rdma_memory.to_remote_buffer(),
+            tensor_ref=tensor,
+            shape=tensor.shape,
+            dtype=tensor.dtype,
+        )
 
     async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Allocate RDMA memory for put (transport already set up)."""
-        assert len(requests) == 1
-        request = requests[0]
-        if request.is_object:
-            return
-        self._allocate(request.tensor_val)
+        self._contexts = []
+        for request in requests:
+            if request.is_object:
+                self._contexts.append(
+                    RdmaContext(is_object=True, objects=request.objects)
+                )
+            else:
+                self._contexts.append(self._allocate_ctx(request.tensor_val))
 
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Fetch metadata if needed and allocate RDMA buffers."""
-        assert len(requests) == 1
-        request = requests[0]
-        tensor_like = request.tensor_val
-        if tensor_like is None:
-            meta = (
-                await self.storage_volume_ref.volume.get_meta.call_one(
-                    [request.meta_only()]
+        # 1. fetch metadata in a single batch, preserving order
+        meta_requests = [req.meta_only() for req in requests if req.tensor_val is None]
+        meta_iterator = iter(
+            await self.storage_volume_ref.volume.get_meta.call_one(meta_requests)
+            if meta_requests
+            else []
+        )
+
+        # 2. build contexts
+        self._contexts = []
+        for request in requests:
+            if request.tensor_val is not None:
+                tensor_ref = request.tensor_val
+            else:
+                meta = next(meta_iterator)
+                if isinstance(meta, str) or meta is None:
+                    self._contexts.append(RdmaContext(is_object=True))
+                    continue
+                if request.tensor_slice is not None:
+                    meta = (request.tensor_slice.local_shape, *meta[1:])
+                tensor_ref = torch.zeros(
+                    meta[0], dtype=meta[1], device=torch.device("cpu")
                 )
-            )[0]
-            if isinstance(meta, str) or meta is None:
-                return  # Objects don't need RDMA setup
-            if request.tensor_slice is not None:
-                meta = (request.tensor_slice.local_shape, *meta[1:])
-            tensor_like = meta
 
-        if isinstance(tensor_like, tuple):
-            self.tensor_ref = torch.zeros(
-                tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
-            )
-        else:
-            assert isinstance(tensor_like, torch.Tensor)
-            self.tensor_ref = tensor_like
-
-        self._allocate(self.tensor_ref)
+            self._contexts.append(self._allocate_ctx(tensor_ref))
 
     async def handle_put_request(
         self,
@@ -151,30 +162,35 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
-        assert len(entries) == 1
-        request, maybe_tensor = entries[0]
+        transport = None
 
-        if request.is_object:
-            return [request.objects]
+        results = []
+        for (request, maybe_tensor), rdma_ctx in zip(
+            entries, self._contexts, strict=True
+        ):
+            if rdma_ctx.is_object:
+                results.append(rdma_ctx.objects)
+                continue
 
-        if maybe_tensor is None:
-            maybe_tensor = torch.zeros(
-                self.shape, dtype=self.dtype, device=torch.device("cpu")
+            if transport is None:
+                transport = ctx.get_rdma_transport_cache().get(self.address, 0)[0]
+
+            if maybe_tensor is None:
+                maybe_tensor = torch.zeros(
+                    rdma_ctx.shape, dtype=rdma_ctx.dtype, device=torch.device("cpu")
+                )
+
+            assert rdma_ctx.rdma_remote_buffer is not None
+            self._assert_valid_tensor(maybe_tensor, rdma_ctx.dtype, rdma_ctx.shape)
+
+            receiving_buffer = RdmaMemory(maybe_tensor)
+            res = transport.read(
+                receiving_buffer.to_mutable_view(), rdma_ctx.rdma_remote_buffer
             )
+            assert res == 0, f"RDMA read failed: conn code {res}"
+            results.append(maybe_tensor)
 
-        assert self.rdma_remote_buffer is not None
-        self._assert_valid_tensor(maybe_tensor, self.dtype, self.shape)
-
-        transport_cache = ctx.get_rdma_transport_cache()
-        transport = transport_cache.get(self.address, 0)[0]
-
-        receiving_buffer = RdmaMemory(maybe_tensor)
-        res = transport.read(
-            receiving_buffer.to_mutable_view(), self.rdma_remote_buffer
-        )
-        assert res == 0, f"RDMA read failed: conn code {res}"
-
-        return [maybe_tensor]
+        return results
 
     async def handle_get_request(
         self,
@@ -182,49 +198,53 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
-        assert len(entries) == 1
-        _, data = entries[0]
-        if not isinstance(data, torch.Tensor):
-            self.is_object = True
-            self.objects = data
-            return
+        transport = None
 
-        tensor = data
+        for (request, data), rdma_ctx in zip(entries, self._contexts, strict=True):
+            if not isinstance(data, torch.Tensor):
+                rdma_ctx.is_object = True
+                rdma_ctx.objects = data
+                continue
 
-        if not tensor.is_contiguous():
-            contiguous_buffer = torch.zeros_like(
-                tensor,
-                device="cpu",
-                memory_format=torch.contiguous_format,
-            )
-            contiguous_buffer.copy_(tensor)
-            tensor = contiguous_buffer
+            tensor = data
 
-        assert self.rdma_remote_buffer is not None
-        self._assert_valid_tensor(tensor, self.dtype, self.shape)
-        rdma_memory = RdmaMemory(tensor)
+            if not tensor.is_contiguous():
+                contiguous_buffer = torch.zeros_like(
+                    tensor,
+                    device="cpu",
+                    memory_format=torch.contiguous_format,
+                )
+                contiguous_buffer.copy_(tensor)
+                tensor = contiguous_buffer
 
-        transport_cache = ctx.get_rdma_transport_cache()
-        transport, _ = transport_cache.get(self.address, 0)
-        res = transport.write(rdma_memory.to_view(), self.rdma_remote_buffer)
-        assert res == 0, f"RDMA write failed: conn code {res}"
+            if transport is None:
+                transport = ctx.get_rdma_transport_cache().get(self.address, 0)[0]
+
+            assert rdma_ctx.rdma_remote_buffer is not None
+            self._assert_valid_tensor(tensor, rdma_ctx.dtype, rdma_ctx.shape)
+            rdma_memory = RdmaMemory(tensor)
+
+            res = transport.write(rdma_memory.to_view(), rdma_ctx.rdma_remote_buffer)
+            assert res == 0, f"RDMA write failed: conn code {res}"
 
     async def _handle_storage_volume_response(
         self, requests: list[Request], transport_buffer: "TransportBuffer"
     ) -> list[Any]:
         """Extract data from response buffer on client side."""
-        if transport_buffer.is_object:
-            return [transport_buffer.objects]
-
-        # Data was written directly into self.tensor_ref via RDMA
-        return [self.tensor_ref]
+        results = []
+        for client_ctx, sv_ctx in zip(
+            self._contexts, transport_buffer._contexts, strict=True
+        ):
+            if sv_ctx.is_object:
+                results.append(sv_ctx.objects)
+            else:
+                results.append(client_ctx.tensor_ref)
+        return results
 
     async def drop(self) -> None:
         """Clean up any resources held by this buffer."""
-        if self.rdma_remote_buffer is not None:
-            del self.rdma_remote_buffer
-            self.rdma_remote_buffer = None
-        if self.rdma_memory is not None:
-            del self.rdma_memory
-            self.rdma_memory = None
-        self.tensor_ref = None
+        for ctx in self._contexts:
+            ctx.rdma_remote_buffer = None
+            ctx.rdma_memory = None
+            ctx.tensor_ref = None
+        self._contexts = []
