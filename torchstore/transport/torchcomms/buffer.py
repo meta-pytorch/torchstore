@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -33,6 +33,13 @@ class RdmaContext:
     dtype: torch.dtype | None = None  # Serialized
     is_object: bool = False  # Serialized
     objects: Any = None  # Serialized — carries non-tensor data
+    device_index: int = 0  # Serialized — identifies which transport/address to use
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["rdma_memory"] = None
+        state["tensor_ref"] = None
+        return state
 
 
 class TorchCommsRdmaTransportBuffer(TransportBuffer):
@@ -46,64 +53,72 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     def __init__(self, storage_volume_ref: "StorageVolumeRef") -> None:
         super().__init__(storage_volume_ref)
 
-        # local client's rdmatransport address. used by storage volume to retrieve cached peer transport.
-        self.address: bytes | None = None
+        # {device_index: client_address}, used by SV to look up corresponding peer transport
+        self.addresses: dict[int, bytes] = {}
+        # device_indexes that need a new SV-side connection (handshake)
+        self._devices_to_connect: set[int] = set()
+        # {device_index: RdmaTransport}, client local transport lookup
+        self._transports: dict[int, Any] = {}
 
         # Batch state – one context per processed request
         self._contexts: list[RdmaContext] = []
 
-        # Connection state for handshake
-        self._local_transport: Any = None
-        self._connection_exists: bool = False
-
     def _setup_local_transport(self, tensor: torch.Tensor | None) -> None:
-        """Get local transport from cache and check if connection exists."""
+        """Ensure a local transport exists for the tensor's device."""
         device = tensor.device if tensor is not None else 0
         transport_cache = (
             self.storage_volume_ref.transport_context.get_rdma_transport_cache()
         )
-        self._connection_exists = transport_cache.contains(
-            self.storage_volume_ref.volume_id, device
-        )
-        self._local_transport, self.address = transport_cache.get(
-            self.storage_volume_ref.volume_id, device
-        )
+        volume_id = self.storage_volume_ref.volume_id
+        transport, address, is_new = transport_cache.get(volume_id, device)
+        device_index = transport_cache._device_to_index(device)
+        self._transports[device_index] = transport
+        self.addresses[device_index] = address
+        if is_new:
+            self._devices_to_connect.add(device_index)
+
+    def _get_sv_transport(self, ctx: "TransportContext", device_index: int) -> Any:
+        """SV side: look up the transport for a given client device_index."""
+        client_addr = self.addresses[device_index]
+        # SV transports are always on CPU (device 0), created by recv_handshake
+        return ctx.get_rdma_transport_cache()._get(client_addr, 0)[0]
 
     def requires_handshake(self, requests: list[Request]) -> bool:
-        """Setup transport from request if needed, then check if handshake is required."""
+        """Set up transports for all unique devices in the batch."""
         for request in requests:
             if not request.is_object:
                 self._setup_local_transport(request.tensor_val)
-                return not self._connection_exists
-        return False
+        return len(self._devices_to_connect) > 0
 
     async def _post_handshake(
         self,
         handshake_results: list[Any],
         requests: list[Request],
     ) -> None:
-        """Connect local transport to peer after handshake."""
-        self._local_transport.connect(handshake_results[0])
+        """Connect each local transport to its SV peer."""
+        for device_index, sv_address in handshake_results:
+            self._transports[device_index].connect(sv_address)
 
     async def recv_handshake(
         self,
         ctx: "TransportContext",
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
-        """Confirm a handshake initiated by the local client (storage volume side)."""
+        """SV side: create a transport per new client device, connect, return SV addresses."""
         transport_cache = ctx.get_rdma_transport_cache()
-        transport, addr = transport_cache.put(self.address, device=0)
-        transport.connect(self.address)
-        return [addr]
+        results = []
+        for device_index in self._devices_to_connect:
+            client_address = self.addresses[device_index]
+            transport, sv_addr = transport_cache.put(client_address, device=0)
+            transport.connect(client_address)
+            results.append((device_index, sv_addr))
+        return results
 
     def __getstate__(self) -> dict[str, Any]:
         """Serialize the state of the buffer, excluding non-serializable components."""
         state = self.__dict__.copy()
         state["storage_volume_ref"] = None
-        state["_local_transport"] = None
-        state["_contexts"] = [
-            replace(ctx, rdma_memory=None, tensor_ref=None) for ctx in self._contexts
-        ]
+        state["_transports"] = {}
         return state
 
     def _allocate_ctx(self, tensor: torch.Tensor) -> RdmaContext:
@@ -115,6 +130,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             tensor_ref=tensor,
             shape=tensor.shape,
             dtype=tensor.dtype,
+            device_index=0 if tensor.device.type == "cpu" else tensor.device.index,
         )
 
     async def _pre_put_hook(self, requests: list[Request]) -> None:
@@ -132,11 +148,13 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         """Fetch metadata if needed and allocate RDMA buffers."""
         # 1. fetch metadata in a single batch, preserving order
         meta_requests = [req.meta_only() for req in requests if req.tensor_val is None]
-        meta_iterator = iter(
-            await self.storage_volume_ref.volume.get_meta.call_one(meta_requests)
-            if meta_requests
-            else []
-        )
+        if meta_requests:
+            meta_results = await self.storage_volume_ref.volume.get_meta.call_one(
+                meta_requests
+            )
+        else:
+            meta_results = []
+        meta_iterator = iter(meta_results)
 
         # 2. build contexts
         self._contexts = []
@@ -162,18 +180,13 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
-        transport = None
-
         results = []
-        for (request, maybe_tensor), rdma_ctx in zip(
-            entries, self._contexts, strict=True
-        ):
+        for (_, maybe_tensor), rdma_ctx in zip(entries, self._contexts, strict=True):
             if rdma_ctx.is_object:
                 results.append(rdma_ctx.objects)
                 continue
 
-            if transport is None:
-                transport = ctx.get_rdma_transport_cache().get(self.address, 0)[0]
+            transport = self._get_sv_transport(ctx, rdma_ctx.device_index)
 
             if maybe_tensor is None:
                 maybe_tensor = torch.zeros(
@@ -198,9 +211,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
-        transport = None
-
-        for (request, data), rdma_ctx in zip(entries, self._contexts, strict=True):
+        for (_, data), rdma_ctx in zip(entries, self._contexts, strict=True):
             if not isinstance(data, torch.Tensor):
                 rdma_ctx.is_object = True
                 rdma_ctx.objects = data
@@ -217,8 +228,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                 contiguous_buffer.copy_(tensor)
                 tensor = contiguous_buffer
 
-            if transport is None:
-                transport = ctx.get_rdma_transport_cache().get(self.address, 0)[0]
+            transport = self._get_sv_transport(ctx, rdma_ctx.device_index)
 
             assert rdma_ctx.rdma_remote_buffer is not None
             self._assert_valid_tensor(tensor, rdma_ctx.dtype, rdma_ctx.shape)
