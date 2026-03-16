@@ -30,6 +30,8 @@ async def put_state_dict(store, state_dict, key, direct_rdma=False):
     caller's GPU memory and only the handles (not tensor data) are stored
     in TorchStore.  On the first call the handles are registered; on
     subsequent calls only non-contiguous staging buffers are refreshed.
+    ``state_dict`` may be ``None`` on subsequent calls to skip the
+    (potentially expensive) ``model.state_dict()`` construction.
     ``torch.distributed`` must be initialised before using this mode.
     """
     if direct_rdma:
@@ -129,8 +131,12 @@ async def _put_state_dict_direct_rdma(store, state_dict, key):
     """Register or refresh RDMA handles and publish via TorchStore.
 
     First call for a given key: registers RDMA handles for each param,
-    stores handles in TorchStore as objects.
+    stores handles in TorchStore as objects.  ``state_dict`` must be
+    provided on this first call.
+
     Subsequent calls: refreshes staging buffers for non-contiguous params.
+    ``state_dict`` may be ``None`` to skip building it when only a refresh
+    is needed.
     """
     from torchstore.direct_weight_sync import DirectWeightSyncSource
 
@@ -138,6 +144,9 @@ async def _put_state_dict_direct_rdma(store, state_dict, key):
         store._direct_rdma_source = DirectWeightSyncSource()
 
     if key not in store._direct_rdma_registered:
+        assert state_dict is not None, (
+            "state_dict is required on first put_state_dict call with direct_rdma=True"
+        )
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         handles = store._direct_rdma_source.register(state_dict, rank=rank)

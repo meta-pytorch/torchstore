@@ -264,7 +264,7 @@ async def exists(key: str, store_name: str = DEFAULT_TORCHSTORE_NAME) -> bool:
 
 
 async def put_state_dict(
-    state_dict: dict[str, Any],
+    state_dict: dict[str, Any] | None,
     key: str,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
     direct_rdma: bool = False,
@@ -272,7 +272,11 @@ async def put_state_dict(
     """Store a PyTorch model state_dict in the distributed store.
 
     Args:
-        state_dict (dict): Model state_dict to store.
+        state_dict (dict or None): Model state_dict to store.  Required on the
+            first call.  When ``direct_rdma=True``, may be ``None`` on
+            subsequent calls to skip the (potentially expensive)
+            ``model.state_dict()`` construction — only staging-buffer refresh
+            is performed.
         key (str): Unique identifier for the state_dict.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
         direct_rdma (bool): If True, register RDMA handles pointing at the
