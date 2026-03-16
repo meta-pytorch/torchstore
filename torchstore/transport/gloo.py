@@ -510,6 +510,5 @@ class GlooTransportBuffer(TransportBuffer):
         if self._send_task is not None:
             await self._send_task
             self._send_task = None
-        # Reset per-request state for sequential calls through the same buffer
         self.is_object = False
         self.objects = None
