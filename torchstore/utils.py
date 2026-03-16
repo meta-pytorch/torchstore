@@ -22,6 +22,17 @@ if TYPE_CHECKING:
 logger = getLogger(__name__)
 
 
+def to_byte_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert a tensor to a flattened uint8 byte view for RDMA.
+
+    Handles 0-dimensional (scalar) tensors which cannot be directly viewed
+    with a different element size by unsqueezing first.
+    """
+    if tensor.dim() == 0:
+        tensor = tensor.unsqueeze(0)
+    return tensor.view(torch.uint8).flatten()
+
+
 def get_destination_view(
     dest_tensor: torch.Tensor,
     dest_slice: "TensorSlice | None",
