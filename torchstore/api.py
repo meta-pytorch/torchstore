@@ -4,10 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any
+from typing import Any, overload
 
 import torch
 from monarch.actor import get_or_spawn_controller, ProcMesh
+from torch.distributed.tensor import DTensor
 
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient
@@ -153,6 +154,25 @@ async def put(
     return await cl.put(key, value)
 
 
+async def put_batch(
+    entries: dict[str, torch.Tensor | Any],
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> None:
+    """Store multiple key-value pairs in a single batched operation.
+
+    Args:
+        entries: Dict mapping keys to values to store.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Example:
+        >>> t1 = torch.randn(100, 100)
+        >>> t2 = torch.randn(50, 50)
+        >>> await put_batch({"key1": t1, "key2": t2})
+    """
+    cl = await client(store_name)
+    return await cl.put_batch(entries)
+
+
 async def get(
     key: str,
     inplace_tensor: torch.Tensor | None = None,
@@ -169,6 +189,9 @@ async def get(
 
     Returns:
         The stored tensor, tensor slice, or object.
+
+    Raises:
+        KeyError: If the key does not exist.
 
     Example:
         >>> # Get full tensor
@@ -195,6 +218,46 @@ async def get(
     """
     cl = await client(store_name)
     return await cl.get(key, inplace_tensor, tensor_slice_spec)
+
+
+@overload
+async def get_batch(
+    keys: list[str],
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> dict[str, Any]:
+    ...
+
+
+@overload
+async def get_batch(
+    keys: dict[str, torch.Tensor | DTensor | None],
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> dict[str, Any]:
+    ...
+
+
+async def get_batch(
+    keys: list[str] | dict[str, torch.Tensor | DTensor | None],
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> dict[str, Any]:
+    """Retrieve multiple keys from the distributed store in a single batched operation.
+
+    All-or-nothing: if any key is missing, the entire batch raises
+    and no partial results are returned.
+
+    Args:
+        keys: Either a list of keys to retrieve, or a dict mapping keys to
+            optional pre-allocated tensors for in-place retrieval.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Returns:
+        dict mapping each key to its fetched data.
+
+    Raises:
+        KeyError: If any key does not exist.
+    """
+    cl = await client(store_name)
+    return await cl.get_batch(keys)
 
 
 async def delete(

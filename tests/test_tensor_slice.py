@@ -187,6 +187,54 @@ async def test_put_dtensor_get_full_tensor():
 
 
 @pytest.mark.asyncio
+async def test_put_dtensor_get_full_tensor_inplace():
+    """Test that inplace retrieval works when stored as DTensor shards but
+    retrieved as a full plain tensor. Verifies the fix for the case where
+    the caller provides an inplace tensor without tensor_slice and the
+    stored data is sharded (TENSOR_SLICE)."""
+
+    class GetActor(Actor):
+        @endpoint
+        async def get_tensor_inplace(self, key, inplace_tensor):
+            return await ts.get(key, inplace_tensor=inplace_tensor)
+
+    await ts.initialize(num_storage_volumes=2, strategy=ts.LocalRankStrategy())
+
+    original_tensor = torch.arange(16).reshape(4, 4).float()
+
+    with tempfile.TemporaryDirectory() as filesystem_store_dir:
+        try:
+            put_mesh = await spawn_actors(
+                2,
+                DTensorActor,
+                "dtensor_put_mesh",
+                mesh_shape=(2,),
+                original_tensor=original_tensor,
+                placements=[Shard(0)],
+                file_store_name=os.path.join(filesystem_store_dir, "inplace_test"),
+                visible_devices="0,1",
+            )
+
+            await put_mesh.do_put.call()
+
+            get_actor = await spawn_actors(1, GetActor, "get_actor_0")
+
+            # Pre-allocate a destination tensor with the full shape
+            inplace_dest = torch.zeros(4, 4)
+            fetched_tensor = await get_actor.get_tensor_inplace.call_one(
+                "test_key", inplace_dest
+            )
+
+            assert torch.equal(
+                original_tensor, fetched_tensor
+            ), f"Data mismatch: expected {original_tensor}, got {fetched_tensor}"
+
+        finally:
+            await put_mesh.destroy_process_group.call()
+            await ts.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_dtensor_fetch_slice():
     """
     Test DTensor slice optimization by storing a DTensor across multiple volumes
