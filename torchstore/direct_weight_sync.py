@@ -110,6 +110,7 @@ class DirectWeightSyncSource:
                 so that :meth:`refresh` can re-cast from the original
                 source tensors after optimizer updates.
 
+
         Returns a dict of serializable :class:`RDMAWeightHandle` objects
         that can be stored in TorchStore or sent to the destination actor.
         """

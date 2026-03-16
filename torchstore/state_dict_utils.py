@@ -59,6 +59,7 @@ async def put_state_dict(
     (potentially expensive) ``model.state_dict()`` construction.
     ``torch.distributed`` must be initialised before using this mode.
 
+
     Args:
         transfer_dtype: If set, cast weights to this dtype for transfer.
             Only used with ``direct_rdma=True``. Allows the source to
