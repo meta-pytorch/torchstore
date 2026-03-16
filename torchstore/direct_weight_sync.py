@@ -36,7 +36,7 @@ from dataclasses import dataclass
 import torch
 
 from torchstore.transport.types import Request, TensorSlice
-from torchstore.utils import get_slice_intersection
+from torchstore.utils import get_slice_intersection, to_byte_view
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +56,6 @@ class RDMAWeightHandle:
     rdma_buffer: object  # monarch.rdma.RDMABuffer
     tensor_slice: TensorSlice  # shard position in the global tensor
     source_rank: int
-
-
-def _to_byte_view(tensor: torch.Tensor) -> torch.Tensor:
-    """Convert a tensor to a flat uint8 view for RDMA."""
-    if tensor.dim() == 0:
-        tensor = tensor.unsqueeze(0)
-    return tensor.view(torch.uint8).flatten()
 
 
 def _request_to_slice(req: Request, param: torch.Tensor) -> TensorSlice:
@@ -118,7 +111,7 @@ class DirectWeightSyncSource:
 
         for name, param in state_dict.items():
             # Use TorchStore's Request to extract local tensor + shard metadata
-            req = Request.from_any(param)
+            req = Request.from_any(name, param)
             local_tensor = req.tensor_val
             tensor_slice = _request_to_slice(req, param)
 
@@ -133,7 +126,7 @@ class DirectWeightSyncSource:
                 num_staged += 1
 
             # Register the contiguous buffer with RDMA
-            rdma_buf = RDMABuffer(_to_byte_view(buf_tensor))
+            rdma_buf = RDMABuffer(to_byte_view(buf_tensor))
 
             handles[name] = RDMAWeightHandle(
                 rdma_buffer=rdma_buf,
@@ -233,7 +226,7 @@ class DirectWeightSyncDest:
                 continue
 
             # Extract dest shard metadata using Request
-            dest_req = Request.from_any(param)
+            dest_req = Request.from_any(name, param)
             dest_tensor = dest_req.tensor_val
             dest_slice = _request_to_slice(dest_req, param)
 
@@ -263,7 +256,7 @@ class DirectWeightSyncDest:
                     ops.append(
                         _TransferOp(
                             rdma_buffer=handle.rdma_buffer,
-                            dest_byte_view=_to_byte_view(dest_tensor),
+                            dest_byte_view=to_byte_view(dest_tensor),
                         )
                     )
                 elif is_exact:
@@ -276,7 +269,7 @@ class DirectWeightSyncDest:
                     ops.append(
                         _TransferOp(
                             rdma_buffer=handle.rdma_buffer,
-                            dest_byte_view=_to_byte_view(recv),
+                            dest_byte_view=to_byte_view(recv),
                             dest_tensor=dest_tensor,
                             recv_buffer=recv,
                         )
@@ -302,7 +295,7 @@ class DirectWeightSyncDest:
                     ops.append(
                         _TransferOp(
                             rdma_buffer=handle.rdma_buffer,
-                            dest_byte_view=_to_byte_view(recv),
+                            dest_byte_view=to_byte_view(recv),
                             dest_tensor=dest_tensor,
                             recv_buffer=recv,
                             src_slices=tuple(

@@ -14,11 +14,11 @@ import pytest
 import torch
 
 from torchstore.direct_weight_sync import (
-    _to_byte_view,
     DirectWeightSyncDest,
     DirectWeightSyncSource,
     RDMAWeightHandle,
 )
+from torchstore.utils import to_byte_view
 from torchstore.transport.types import TensorSlice
 
 pytestmark = pytest.mark.asyncio
@@ -63,7 +63,7 @@ def _make_sharded_handles(
             local_shape=tuple(local_shape),
             mesh_shape=(num_shards,),
         )
-        buf = MockRDMABuffer(_to_byte_view(shard_data))
+        buf = MockRDMABuffer(to_byte_view(shard_data))
         handles.append(
             RDMAWeightHandle(
                 rdma_buffer=buf,
@@ -89,7 +89,7 @@ def _make_replicated_handles(
             local_shape=tuple(original.shape),
             mesh_shape=(num_ranks,),
         )
-        buf = MockRDMABuffer(_to_byte_view(data))
+        buf = MockRDMABuffer(to_byte_view(data))
         handles.append(
             RDMAWeightHandle(
                 rdma_buffer=buf,
@@ -188,7 +188,7 @@ async def test_refresh():
     source._staging["weight"] = (staging_buf, source_tensor)
 
     # Create mock handle pointing at the staging buffer
-    mock_buf = MockRDMABuffer(_to_byte_view(staging_buf))
+    mock_buf = MockRDMABuffer(to_byte_view(staging_buf))
     handle = RDMAWeightHandle(
         rdma_buffer=mock_buf,
         tensor_slice=TensorSlice(

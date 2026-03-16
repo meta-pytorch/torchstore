@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections import defaultdict
+from dataclasses import dataclass, field
 from logging import getLogger
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -18,6 +20,27 @@ DELIM = "/"
 MAPPING = "MAPPING"
 
 logger = getLogger(__name__)
+
+
+@dataclass
+class _DirectRDMACache:
+    """Per-client cache for direct RDMA weight sync state."""
+
+    source: Any = None  # DirectWeightSyncSource, lazily created
+    dest: Any = None  # DirectWeightSyncDest, lazily created
+    registered: set = field(default_factory=set)
+    handles: dict = field(default_factory=dict)
+
+
+_rdma_cache: dict[int, _DirectRDMACache] = {}
+
+
+def _get_rdma_cache(store) -> _DirectRDMACache:
+    """Get or create the RDMA cache for a given client."""
+    key = id(store)
+    if key not in _rdma_cache:
+        _rdma_cache[key] = _DirectRDMACache()
+    return _rdma_cache[key]
 
 
 async def put_state_dict(store, state_dict, key, direct_rdma=False):
@@ -132,22 +155,24 @@ async def _put_state_dict_direct_rdma(store, state_dict, key):
     """
     from torchstore.direct_weight_sync import DirectWeightSyncSource
 
-    if store._direct_rdma_source is None:
-        store._direct_rdma_source = DirectWeightSyncSource()
+    cache = _get_rdma_cache(store)
 
-    if key not in store._direct_rdma_registered:
+    if cache.source is None:
+        cache.source = DirectWeightSyncSource()
+
+    if key not in cache.registered:
         assert (
             state_dict is not None
         ), "state_dict is required on first put_state_dict call with direct_rdma=True"
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        handles = store._direct_rdma_source.register(state_dict, rank=rank)
+        handles = cache.source.register(state_dict, rank=rank)
         await store.put(f"{key}/rank_{rank}", handles)
         if rank == 0:
             await store.put(f"{key}/num_ranks", world_size)
-        store._direct_rdma_registered.add(key)
+        cache.registered.add(key)
     else:
-        store._direct_rdma_source.refresh()
+        cache.source.refresh()
 
 
 async def _get_state_dict_direct_rdma(store, key, user_state_dict):
@@ -159,16 +184,18 @@ async def _get_state_dict_direct_rdma(store, key, user_state_dict):
     """
     from torchstore.direct_weight_sync import DirectWeightSyncDest
 
-    if store._direct_rdma_dest is None:
-        store._direct_rdma_dest = DirectWeightSyncDest()
+    cache = _get_rdma_cache(store)
 
-    if key not in store._direct_rdma_handles:
+    if cache.dest is None:
+        cache.dest = DirectWeightSyncDest()
+
+    if key not in cache.handles:
         num_ranks = await store.get(f"{key}/num_ranks")
         all_handles = defaultdict(list)
         for r in range(num_ranks):
             rank_handles = await store.get(f"{key}/rank_{r}")
             for name, handle in rank_handles.items():
                 all_handles[name].append(handle)
-        store._direct_rdma_handles[key] = all_handles
+        cache.handles[key] = all_handles
 
-    await store._direct_rdma_dest.pull(store._direct_rdma_handles[key], user_state_dict)
+    await cache.dest.pull(cache.handles[key], user_state_dict)

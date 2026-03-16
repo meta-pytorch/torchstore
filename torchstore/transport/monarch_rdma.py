@@ -23,6 +23,7 @@ except ImportError:
 
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.types import Request
+from torchstore.utils import to_byte_view
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -53,17 +54,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         self.shape: torch.Size | None = None
         self.dtype: torch.dtype | None = None
         self.is_object: bool = False
-
-    @staticmethod
-    def _to_byte_view(tensor: torch.Tensor) -> torch.Tensor:
-        """Convert tensor to a flattened uint8 byte view.
-
-        Handles 0-dimensional (scalar) tensors which cannot be directly viewed
-        with a different element size by unsqueezing first.
-        """
-        if tensor.dim() == 0:
-            tensor = tensor.unsqueeze(0)
-        return tensor.view(torch.uint8).flatten()
 
     async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Hook to perform any pre-put operations on the buffer."""
@@ -124,7 +114,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
 
-        byte_view = self._to_byte_view(tensor)
+        byte_view = to_byte_view(tensor)
         await self.rdma_buffer.read_into(byte_view)
 
         return [tensor]
@@ -149,7 +139,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         assert self.rdma_buffer is not None
 
         # Write directly from tensor byte view (no chunking)
-        byte_view = self._to_byte_view(tensor)
+        byte_view = to_byte_view(tensor)
         await self.rdma_buffer.write_from(byte_view)
 
     async def _handle_storage_volume_response(
@@ -230,6 +220,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
 
         self._assert_valid_tensor(tensor, self.dtype, self.shape)
 
-        byte_view = self._to_byte_view(tensor)
+        byte_view = to_byte_view(tensor)
         self.byte_view = byte_view
         self.rdma_buffer = RDMABuffer(byte_view)
