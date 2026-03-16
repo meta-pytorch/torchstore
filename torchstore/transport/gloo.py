@@ -92,6 +92,19 @@ def _gloo_factory(
     return pg
 
 
+class GlooProcessGroupCache:
+    """Cache for Gloo process groups, keyed by store_key."""
+
+    def __init__(self) -> None:
+        self._process_groups: dict[str, ProcessGroup] = {}
+
+    def put(self, store_key: str, pg: ProcessGroup) -> None:
+        self._process_groups[store_key] = pg
+
+    def get(self, store_key: str) -> ProcessGroup:
+        return self._process_groups[store_key]
+
+
 class GlooTransportBuffer(TransportBuffer):
     """Transport buffer implementation using PyTorch distributed (gloo backend) for tensor transfer.
 
@@ -216,8 +229,6 @@ class GlooTransportBuffer(TransportBuffer):
         transport_context: the TransportContext from the StorageVolume to which the pg will be added
 
         """
-        ctx = ctx.get_transport_context()
-
         logger.info(
             f"Storage volume setting up gloo process group with TCPStore at "
             f"{self.master_addr}:{self.master_port}"
@@ -247,7 +258,7 @@ class GlooTransportBuffer(TransportBuffer):
         pg = await asyncio.to_thread(create_pg)
 
         # Cache the process group
-        ctx[self.store_key] = pg
+        ctx.get(GlooProcessGroupCache).put(self.store_key, pg)
 
         logger.info(
             f"Storage volume finished gloo process group setup for store_key={self.store_key}"
@@ -272,9 +283,9 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Cache the connection info and process group
         _store_addrs[volume_id] = (self.master_addr, self.master_port, self.store_key)
-        self.storage_volume_ref.transport_context.get_transport_context()[
-            self.store_key
-        ] = pg
+        self.storage_volume_ref.transport_context.get(GlooProcessGroupCache).put(
+            self.store_key, pg
+        )
 
         # Clear references
         self._tcp_store = None
@@ -438,8 +449,7 @@ class GlooTransportBuffer(TransportBuffer):
             )
 
         # Get process group from transport context
-        ctx = transport_context.get_transport_context()
-        pg = ctx[self.store_key]
+        pg = transport_context.get(GlooProcessGroupCache).get(self.store_key)
 
         # Determine remote rank based on our rank in the PG
         my_rank = pg.rank()
@@ -479,12 +489,7 @@ class GlooTransportBuffer(TransportBuffer):
             tensor = tensor.contiguous()
 
         # Get process group from transport context
-        ctx = transport_context.get_transport_context()
-
-        try:
-            pg = ctx[self.store_key]
-        except Exception as e:
-            raise RuntimeError(f"ctx.keys(): {ctx.keys()}") from e
+        pg = transport_context.get(GlooProcessGroupCache).get(self.store_key)
 
         # Determine remote rank based on our rank in the PG
         my_rank = pg.rank()

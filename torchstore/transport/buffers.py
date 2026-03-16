@@ -4,46 +4,35 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, TypeVar
 
 import torch
 
 from torchstore.logging import LatencyTracker
-from torchstore.transport.torchcomms.cache import RdmaTransportCache
 from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
-    from torchstore.transport.shared_memory import SharedMemoryCache
+
+T = TypeVar("T")
 
 
 class TransportContext:
-    RDMA_TRANSPORT_CACHE = "rdma_transport_cache"
-    SHM_CACHE = "shm_cache"
+    """Generic type-keyed registry for per-transport caches.
 
-    def __init__(self):
-        self.transport_context = {}
+    Each transport defines its own cache class and accesses it via
+    ctx.get(MyCacheType). Caches are lazily created on first access.
+    Adding a new transport does NOT require modifying this class.
+    """
 
-    def get_transport_context(self) -> dict[Any, Any]:
-        return self.transport_context
+    def __init__(self) -> None:
+        self._caches: dict[type, object] = {}
 
-    def get_rdma_transport_cache(self) -> RdmaTransportCache:
-        if self.RDMA_TRANSPORT_CACHE not in self.transport_context:
-            self.transport_context[self.RDMA_TRANSPORT_CACHE] = RdmaTransportCache()
-        return self.transport_context[self.RDMA_TRANSPORT_CACHE]
-
-    def get_shm_cache(self) -> "SharedMemoryCache":
-        """Get shared memory cache, lazily initializing if needed.
-
-        This cache is used by both storage (for allocation) and client (for attachment).
-
-        Note: Import is inside function to avoid cyclic import
-        """
-        from torchstore.transport.shared_memory import SharedMemoryCache
-
-        if self.SHM_CACHE not in self.transport_context:
-            self.transport_context[self.SHM_CACHE] = SharedMemoryCache()
-        return self.transport_context[self.SHM_CACHE]
+    def get(self, cache_type: type[T]) -> T:
+        """Get or lazily create a cache by its type (calls cache_type() if new)."""
+        if cache_type not in self._caches:
+            self._caches[cache_type] = cache_type()
+        return self._caches[cache_type]  # type: ignore[return-value]
 
 
 class TransportBuffer:

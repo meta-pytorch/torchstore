@@ -310,7 +310,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         """
         latency_tracker = LatencyTracker("post_handshake")
 
-        shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
+        shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
 
         self._contexts = []
         devices_to_sync: set[torch.device] = set()
@@ -411,7 +411,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         self, requests: list[Request], transport_buffer: "TransportBuffer"
     ) -> list[Any]:
         results = []
-        shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
+        shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
 
         for request, shm_ctx in zip(requests, transport_buffer._contexts, strict=True):
             client_tensor = request.tensor_val

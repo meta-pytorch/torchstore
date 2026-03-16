@@ -16,7 +16,6 @@ from torchstore.controller import ObjectType
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer, Request, TensorSlice
-from torchstore.transport.buffers import TransportContext
 from torchstore.utils import (
     assemble_tensor,
     get_destination_view,
@@ -42,7 +41,6 @@ class LocalClient:
     ):
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
-        self.transport_context = TransportContext()
 
     async def _locate_volumes(self, keys: list[str]):
         """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""

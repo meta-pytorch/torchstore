@@ -14,6 +14,7 @@ import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torchstore.logging import init_logging
 from torchstore.transport import TransportType
+from torchstore.transport.shared_memory import SharedMemoryCache
 from torchstore.utils import spawn_actors
 
 from .utils import main, strategy_params, transport_plus_strategy_params
@@ -363,7 +364,7 @@ async def test_shm_cache_reuse_on_same_key_puts(strategy_params):
 
             # Get the cache from the strategy's transport context
             local_client = await ts.client()
-            shm_cache = local_client.strategy.transport_context.get_shm_cache()
+            shm_cache = local_client.strategy.transport_context.get(SharedMemoryCache)
             entries_for_key = [k for k in shm_cache._entries.keys() if k[0] == key]
             return len(entries_for_key)
 

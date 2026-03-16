@@ -24,13 +24,17 @@ class MockTransportContext:
     """Mock TransportContext for testing."""
 
     def __init__(self):
-        self._shm_cache = SharedMemoryCache()
+        self._caches: dict[type, object] = {}
 
-    def get_shm_cache(self):
-        return self._shm_cache
+    def get(self, cache_type: type):
+        if cache_type not in self._caches:
+            self._caches[cache_type] = cache_type()
+        return self._caches[cache_type]
 
     def reset(self):
-        self._shm_cache.clear()
+        if SharedMemoryCache in self._caches:
+            self._caches[SharedMemoryCache].clear()
+        self._caches.clear()
 
 
 class MockStorageVolumeRef:
@@ -231,7 +235,7 @@ class TestSharedMemoryCache:
     async def test_cache_reuse_on_same_key_puts(self):
         """Test that putting twice to same key with same-spec tensor reuses cache entry."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
-        shm_cache = ref.transport_context.get_shm_cache()
+        shm_cache = ref.transport_context.get(SharedMemoryCache)
 
         # First PUT: allocate new shared memory
         buffer1 = SharedMemoryTransportBuffer(ref)
@@ -503,7 +507,7 @@ class TestSharedMemoryTransportBufferGET:
 
         # Verify entry is cached
         cache_key = ("test_key", descriptor.storage_handle)
-        assert cache_key in ref.transport_context.get_shm_cache()._entries
+        assert cache_key in ref.transport_context.get(SharedMemoryCache)._entries
 
         ref.transport_context.reset()
 
