@@ -18,8 +18,8 @@ from torchstore.direct_weight_sync import (
     DirectWeightSyncSource,
     RDMAWeightHandle,
 )
-from torchstore.utils import to_byte_view
 from torchstore.transport.types import TensorSlice
+from torchstore.utils import to_byte_view
 
 pytestmark = pytest.mark.asyncio
 
