@@ -331,6 +331,7 @@ async def put_state_dict(
     key: str,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
     direct_rdma: bool = False,
+    transfer_dtype: "torch.dtype | None" = None,
 ) -> None:
     """Store a PyTorch model state_dict in the distributed store.
 
@@ -346,6 +347,10 @@ async def put_state_dict(
             caller's GPU memory instead of copying data to a StorageVolume.
             First call registers handles; subsequent calls refresh staging
             buffers for non-contiguous params.
+        transfer_dtype (torch.dtype, optional): If set, cast weights to this
+            dtype for transfer. Only used with ``direct_rdma=True``. Allows
+            the source to keep higher-precision master weights (e.g. float32)
+            while transferring in a lower precision (e.g. bfloat16).
 
     Example:
         >>> model = torch.nn.Linear(10, 5)
@@ -353,7 +358,11 @@ async def put_state_dict(
     """
     cl = await client(store_name)
     await torchstore.state_dict_utils.put_state_dict(
-        store=cl, state_dict=state_dict, key=key, direct_rdma=direct_rdma
+        store=cl,
+        state_dict=state_dict,
+        key=key,
+        direct_rdma=direct_rdma,
+        transfer_dtype=transfer_dtype,
     )
 
 

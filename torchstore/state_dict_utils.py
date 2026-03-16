@@ -43,7 +43,9 @@ def _get_rdma_cache(store) -> _DirectRDMACache:
     return _rdma_cache[key]
 
 
-async def put_state_dict(store, state_dict, key, direct_rdma=False):
+async def put_state_dict(
+    store, state_dict, key, direct_rdma=False, transfer_dtype=None
+):
     """Store a state dict in TorchStore.
 
     When ``direct_rdma=False`` (default), each parameter is stored in a
@@ -56,9 +58,15 @@ async def put_state_dict(store, state_dict, key, direct_rdma=False):
     ``state_dict`` may be ``None`` on subsequent calls to skip the
     (potentially expensive) ``model.state_dict()`` construction.
     ``torch.distributed`` must be initialised before using this mode.
+
+    Args:
+        transfer_dtype: If set, cast weights to this dtype for transfer.
+            Only used with ``direct_rdma=True``. Allows the source to
+            keep higher-precision master weights while transferring in a
+            lower precision (e.g. bfloat16).
     """
     if direct_rdma:
-        await _put_state_dict_direct_rdma(store, state_dict, key)
+        await _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype)
         return
 
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
@@ -142,7 +150,7 @@ def _state_dict_size(state_dict):
 # ---------------------------------------------------------------------------
 
 
-async def _put_state_dict_direct_rdma(store, state_dict, key):
+async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=None):
     """Register or refresh RDMA handles and publish via TorchStore.
 
     First call for a given key: registers RDMA handles for each param,
@@ -166,7 +174,9 @@ async def _put_state_dict_direct_rdma(store, state_dict, key):
         ), "state_dict is required on first put_state_dict call with direct_rdma=True"
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        handles = cache.source.register(state_dict, rank=rank)
+        handles = cache.source.register(
+            state_dict, rank=rank, transfer_dtype=transfer_dtype
+        )
         await store.put(f"{key}/rank_{rank}", handles)
         if rank == 0:
             await store.put(f"{key}/num_ranks", world_size)
