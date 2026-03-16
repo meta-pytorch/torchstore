@@ -43,14 +43,15 @@ class RdmaTransportCache:
             logging.info(f"Failed to init RdmaTransportCache: {e}")
             return None
 
-    def _device_to_index(self, device: torch.device | int) -> int:
+    @staticmethod
+    def device_to_index(device: torch.device | int) -> int:
         if isinstance(device, int):
             return device
         else:
             return 0 if device.type == "cpu" else device.index
 
     def put(self, key: str, device: torch.device | int) -> TransportAndAddress:
-        index = self._device_to_index(device)
+        index = self.device_to_index(device)
         transport = RdmaTransport(torch.device(index))
 
         if key not in self.transports:
@@ -59,15 +60,20 @@ class RdmaTransportCache:
         self.transports[key][index] = val
         return val
 
-    def _get(self, key: str, device: torch.device | int) -> TransportAndAddress:
-        index = self._device_to_index(device)
+    def get(self, key: str, device: torch.device | int) -> TransportAndAddress:
+        index = self.device_to_index(device)
         return self.transports[key][index]
 
-    def get(self, key: str, device: torch.device | int):
+    def get_or_create(
+        self, key: str, device: torch.device | int
+    ) -> tuple["RdmaTransport", bytes, bool]:
+        """Get or create a transport for (key, device). Returns (transport, address, is_new)"""
         if not self.contains(key, device):
-            return self.put(key, device)
-        return self._get(key, device)
+            transport, address = self.put(key, device)
+            return transport, address, True
+        transport, address = self.get(key, device)
+        return transport, address, False
 
     def contains(self, key: str, device: torch.device | int) -> bool:
-        index = self._device_to_index(device)
+        index = self.device_to_index(device)
         return key in self.transports and index in self.transports[key]
