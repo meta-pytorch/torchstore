@@ -62,9 +62,9 @@ async def get_state_dict(
     tensors are available for in-place writes.
     """
     if direct_rdma:
-        assert user_state_dict is not None, (
-            "user_state_dict is required for direct_rdma mode"
-        )
+        assert (
+            user_state_dict is not None
+        ), "user_state_dict is required for direct_rdma mode"
         await _get_state_dict_direct_rdma(store, key, user_state_dict)
         return user_state_dict
 
@@ -136,9 +136,9 @@ async def _put_state_dict_direct_rdma(store, state_dict, key):
         store._direct_rdma_source = DirectWeightSyncSource()
 
     if key not in store._direct_rdma_registered:
-        assert state_dict is not None, (
-            "state_dict is required on first put_state_dict call with direct_rdma=True"
-        )
+        assert (
+            state_dict is not None
+        ), "state_dict is required on first put_state_dict call with direct_rdma=True"
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         handles = store._direct_rdma_source.register(state_dict, rank=rank)
@@ -171,6 +171,4 @@ async def _get_state_dict_direct_rdma(store, key, user_state_dict):
                 all_handles[name].append(handle)
         store._direct_rdma_handles[key] = all_handles
 
-    await store._direct_rdma_dest.pull(
-        store._direct_rdma_handles[key], user_state_dict
-    )
+    await store._direct_rdma_dest.pull(store._direct_rdma_handles[key], user_state_dict)

@@ -243,9 +243,7 @@ class DirectWeightSyncDest:
 
             for handle in handles:
                 # Use get_slice_intersection to find overlap
-                intersection = get_slice_intersection(
-                    handle.tensor_slice, dest_slice
-                )
+                intersection = get_slice_intersection(handle.tensor_slice, dest_slice)
                 if intersection is None:
                     continue
 
@@ -309,9 +307,7 @@ class DirectWeightSyncDest:
                             recv_buffer=recv,
                             src_slices=tuple(
                                 slice(o, o + s)
-                                for o, s in zip(
-                                    src_local, intersection.local_shape
-                                )
+                                for o, s in zip(src_local, intersection.local_shape)
                             ),
                             dest_slices=tuple(
                                 slice(o, o + s)
@@ -357,11 +353,9 @@ class DirectWeightSyncDest:
                 # recv_buffer contains the full source shard
                 # op.recv_buffer[op.src_slices] extracts the overlap from the source
                 # op.dest_tensor[op.dest_slices] targets where it goes in the dest
-                op.dest_tensor[op.dest_slices].copy_(
-                    op.recv_buffer[op.src_slices]
-                )
+                op.dest_tensor[op.dest_slices].copy_(op.recv_buffer[op.src_slices])
             else:
                 # Non-contiguous exact match: full copy
-                # recv_buffer is the contiguous version of what we want in the 
+                # recv_buffer is the contiguous version of what we want in the
                 # dest_tensor, after the RDMA read
                 op.dest_tensor.copy_(op.recv_buffer)

@@ -14,10 +14,10 @@ import pytest
 import torch
 
 from torchstore.direct_weight_sync import (
+    _to_byte_view,
     DirectWeightSyncDest,
     DirectWeightSyncSource,
     RDMAWeightHandle,
-    _to_byte_view,
 )
 from torchstore.transport.types import TensorSlice
 
@@ -127,7 +127,9 @@ async def test_exact_match():
 async def test_resharding(num_shards, shard_dim):
     """Source is sharded, dest is full tensor → Case 3 (resharding)."""
     original = torch.arange(512 * 512, dtype=torch.float32).reshape(512, 512)
-    handles = _make_sharded_handles(original, num_shards=num_shards, shard_dim=shard_dim)
+    handles = _make_sharded_handles(
+        original, num_shards=num_shards, shard_dim=shard_dim
+    )
 
     dest = torch.zeros_like(original)
     sync = DirectWeightSyncDest()
