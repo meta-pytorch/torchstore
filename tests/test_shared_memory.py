@@ -8,6 +8,7 @@
 
 import pytest
 import torch
+from torchstore.transport.buffers import TransportContext
 from torchstore.transport.shared_memory import (
     allocate_shared_tensor,
     is_local_to_volume,
@@ -20,30 +21,13 @@ from torchstore.transport.types import Request
 from torchstore.utils import get_local_hostname
 
 
-class MockTransportContext:
-    """Mock TransportContext for testing."""
-
-    def __init__(self):
-        self._caches: dict[type, object] = {}
-
-    def get(self, cache_type: type):
-        if cache_type not in self._caches:
-            self._caches[cache_type] = cache_type()
-        return self._caches[cache_type]
-
-    def reset(self):
-        if SharedMemoryCache in self._caches:
-            self._caches[SharedMemoryCache].clear()
-        self._caches.clear()
-
-
 class MockStorageVolumeRef:
     """Mock StorageVolumeRef for testing."""
 
     def __init__(self, volume_hostname=None, volume_id="test_volume"):
         self.volume_hostname = volume_hostname
         self.volume_id = volume_id
-        self.transport_context = MockTransportContext()
+        self.transport_context = TransportContext()
 
 
 class TestHelperFunctions:
@@ -268,7 +252,7 @@ class TestSharedMemoryCache:
         entry = shm_cache._entries[("test_key", first_descriptor.storage_handle)]
         assert torch.allclose(entry.get_tensor(), tensor2)
 
-        ref.transport_context.reset()
+        ref.transport_context.clear()
 
 
 class TestSharedMemoryTransportBuffer:
@@ -341,14 +325,14 @@ class TestSharedMemoryTransportBufferPUT:
         assert buffer2._contexts[0].descriptor is descriptor
         assert torch.allclose(shm_tensor, tensor2)
 
-        ref.transport_context.reset()
+        ref.transport_context.clear()
 
     @pytest.mark.asyncio
     async def test_handle_put_attaches_and_returns_tensor(self):
         """Test handle_put_request attaches to new segment and returns tensor."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
+        ctx = TransportContext()
 
         # Setup: create segment and store descriptor
         tensor = torch.randn(50, 50)
@@ -378,7 +362,7 @@ class TestSharedMemoryTransportBufferPUT:
         """Verify SV handles batch with both tensor and object entries."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
+        ctx = TransportContext()
 
         # Tensor entry via SHM
         t1 = torch.randn(10, 10)
@@ -410,7 +394,7 @@ class TestSharedMemoryTransportBufferGET:
         """Test handle_get_request populates _contexts for shared tensor."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
+        ctx = TransportContext()
 
         data = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
         expected_descriptor = SharedMemoryDescriptor.from_tensor(data)
@@ -431,7 +415,7 @@ class TestSharedMemoryTransportBufferGET:
         """Test handle_get_request falls back to RPC for non-shared tensor."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
+        ctx = TransportContext()
 
         data = torch.randn(50, 50)
         assert not data.is_shared()
@@ -448,7 +432,7 @@ class TestSharedMemoryTransportBufferGET:
         """Test handle_get_request falls back to RPC for view/slice tensor."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
+        ctx = TransportContext()
 
         # Create a view of a shared tensor
         full_tensor = allocate_shared_tensor(torch.Size([100]), torch.float32)
@@ -468,7 +452,7 @@ class TestSharedMemoryTransportBufferGET:
         """Test handle_get_request handles non-tensor data."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
+        ctx = TransportContext()
 
         data = {"key": "value", "list": [1, 2, 3]}
 
@@ -509,7 +493,7 @@ class TestSharedMemoryTransportBufferGET:
         cache_key = ("test_key", descriptor.storage_handle)
         assert cache_key in ref.transport_context.get(SharedMemoryCache)._entries
 
-        ref.transport_context.reset()
+        ref.transport_context.clear()
 
     @pytest.mark.asyncio
     async def test_handle_response_rpc_fallback(self):
@@ -598,7 +582,7 @@ class TestSharedMemoryTransportBufferGET:
 
         # Test with MUTABLE_SHM=True - should return tensor backed by shared memory
         monkeypatch.setattr(shm_module, "MUTABLE_SHM", True)
-        ref.transport_context.reset()  # Clear cache to force re-attach
+        ref.transport_context.clear()  # Clear cache to force re-attach
         buffer2 = SharedMemoryTransportBuffer(ref)
         requests2 = [Request(key="test_key", tensor_val=None)]
 
@@ -616,7 +600,7 @@ class TestSharedMemoryTransportBufferGET:
         result2.fill_(123.0)
         assert torch.all(shm_tensor == 123.0)
 
-        ref.transport_context.reset()
+        ref.transport_context.clear()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -639,7 +623,7 @@ class TestSharedMemoryTransportBufferGPU:
 
         assert torch.allclose(shm_tensor, tensor.cpu())
 
-        ref.transport_context.reset()
+        ref.transport_context.clear()
 
 
 class TestSharedMemoryTransportBufferBatch:
@@ -673,14 +657,14 @@ class TestSharedMemoryTransportBufferBatch:
         entry2 = buffer._contexts[1].descriptor.attach()
         assert torch.allclose(entry2.get_tensor(), t2)
 
-        ref.transport_context.reset()
+        ref.transport_context.clear()
 
     @pytest.mark.asyncio
     async def test_recv_handshake(self):
         """Verify SV returns descriptors for existing tensors, None for new."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
+        ctx = TransportContext()
 
         existing_tensor = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
         expected_descriptor = SharedMemoryDescriptor.from_tensor(existing_tensor)
@@ -716,7 +700,7 @@ class TestSharedMemoryTransportBufferBatch:
         """Mix of SHM tensors, objects, and RPC fallback tensors."""
         ref = MockStorageVolumeRef(volume_hostname="localhost")
         buffer = SharedMemoryTransportBuffer(ref)
-        ctx = MockTransportContext()
+        ctx = TransportContext()
 
         shm_tensor = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
         obj_data = {"key": "val"}
@@ -774,7 +758,7 @@ class TestSharedMemoryTransportBufferBatch:
         assert torch.allclose(dest_tensor, original)
         assert results[1] == {"data": 42}
 
-        ref.transport_context.reset()
+        ref.transport_context.clear()
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from torchstore.logging import LatencyTracker
-from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.buffers import TransportBuffer, TransportCache
 from torchstore.transport.types import Request
 from torchstore.utils import get_local_hostname
 
@@ -190,7 +190,7 @@ class SharedMemoryEntry:
         return self._tensor
 
 
-class SharedMemoryCache:
+class SharedMemoryCache(TransportCache):
     """Client-side cache for shared memory segments.
 
     Uses (key, storage_handle) as cache key. Stale entries (after delete/re-PUT)

@@ -15,7 +15,7 @@ import portpicker
 import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
 
-from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.buffers import TransportBuffer, TransportCache
 from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
@@ -92,7 +92,7 @@ def _gloo_factory(
     return pg
 
 
-class GlooProcessGroupCache:
+class GlooProcessGroupCache(TransportCache):
     """Cache for Gloo process groups, keyed by store_key."""
 
     def __init__(self) -> None:
@@ -103,6 +103,9 @@ class GlooProcessGroupCache:
 
     def get(self, store_key: str) -> ProcessGroup:
         return self._process_groups[store_key]
+
+    def clear(self) -> None:
+        self._process_groups.clear()
 
 
 class GlooTransportBuffer(TransportBuffer):

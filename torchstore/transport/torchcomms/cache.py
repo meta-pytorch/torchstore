@@ -9,6 +9,8 @@ from functools import cache
 
 import torch
 
+from torchstore.transport.buffers import TransportCache
+
 try:
     from torchcomms._transport import RdmaTransport
 
@@ -29,7 +31,7 @@ def torchcomms_rdma_available() -> bool:
 TransportAndAddress = tuple["RdmaTransport", bytes]
 
 
-class RdmaTransportCache:
+class RdmaTransportCache(TransportCache):
     def __init__(self) -> None:
         assert torchcomms_rdma_available(), "TorchComms RDMA is not available."
         # {key: {device: (transport, address)}}
@@ -77,3 +79,6 @@ class RdmaTransportCache:
     def contains(self, key: str, device: torch.device | int) -> bool:
         index = self.device_to_index(device)
         return key in self.transports and index in self.transports[key]
+
+    def clear(self) -> None:
+        self.transports.clear()

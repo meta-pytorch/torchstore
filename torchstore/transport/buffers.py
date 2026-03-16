@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from abc import ABC, abstractmethod
 from typing import Any, TYPE_CHECKING, TypeVar
 
 import torch
@@ -14,25 +15,41 @@ from torchstore.transport.types import Request
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
 
-T = TypeVar("T")
+
+class TransportCache(ABC):
+    """Base class for per-transport caches stored in TransportContext."""
+
+    @abstractmethod
+    def clear(self) -> None:
+        ...
+
+
+T = TypeVar("T", bound=TransportCache)
 
 
 class TransportContext:
     """Generic type-keyed registry for per-transport caches.
 
-    Each transport defines its own cache class and accesses it via
-    ctx.get(MyCacheType). Caches are lazily created on first access.
-    Adding a new transport does NOT require modifying this class.
+    Each transport defines its own cache class (extending TransportCache)
+    and accesses it via ctx.get(MyCacheType). Caches are lazily created
+    on first access. Adding a new transport does NOT require modifying
+    this class.
     """
 
     def __init__(self) -> None:
-        self._caches: dict[type, object] = {}
+        self._caches: dict[type[TransportCache], TransportCache] = {}
 
     def get(self, cache_type: type[T]) -> T:
         """Get or lazily create a cache by its type (calls cache_type() if new)."""
         if cache_type not in self._caches:
             self._caches[cache_type] = cache_type()
         return self._caches[cache_type]  # type: ignore[return-value]
+
+    def clear(self) -> None:
+        """Clear all caches."""
+        for cache in self._caches.values():
+            cache.clear()
+        self._caches.clear()
 
 
 class TransportBuffer:
