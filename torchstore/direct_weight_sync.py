@@ -98,8 +98,18 @@ class DirectWeightSyncSource:
         self,
         state_dict: dict[str, torch.Tensor],
         rank: int,
+        transfer_dtype: torch.dtype | None = None,
     ) -> dict[str, RDMAWeightHandle]:
         """Create RDMA handles for every parameter in *state_dict*.
+
+        Args:
+            state_dict: Model state dict to register.
+            rank: This process's rank.
+            transfer_dtype: If set, cast all params to this dtype for
+                transfer. A staging buffer is allocated for every param
+                so that :meth:`refresh` can re-cast from the original
+                source tensors after optimizer updates.
+
 
         Returns a dict of serializable :class:`RDMAWeightHandle` objects
         that can be stored in TorchStore or sent to the destination actor.
@@ -115,12 +125,18 @@ class DirectWeightSyncSource:
             local_tensor = req.tensor_val
             tensor_slice = _request_to_slice(req, param)
 
-            # Contiguous: RDMA handle points directly at param memory.
-            # Non-contiguous (e.g. Shard(1) column slices): allocate a
-            # contiguous staging buffer and copy into it.
-            if local_tensor.is_contiguous():
+            if transfer_dtype is not None:
+                # Always stage: cast to transfer dtype for RDMA transfer.
+                # refresh() will re-copy from the original source tensor.
+                buf_tensor = local_tensor.to(transfer_dtype).contiguous()
+                self._staging[name] = (buf_tensor, local_tensor)
+                num_staged += 1
+            elif local_tensor.is_contiguous():
+                # Contiguous: RDMA handle points directly at param memory.
                 buf_tensor = local_tensor
             else:
+                # Non-contiguous (e.g. Shard(1) column slices): allocate a
+                # contiguous staging buffer and copy into it.
                 buf_tensor = local_tensor.contiguous()
                 self._staging[name] = (buf_tensor, local_tensor)
                 num_staged += 1
@@ -142,10 +158,16 @@ class DirectWeightSyncSource:
         return handles
 
     def refresh(self) -> int:
-        """Re-copy non-contiguous params into their staging buffers.
+        """Re-copy source params into their staging buffers.
 
-        Contiguous params need no refresh because RDMA handles point
-        directly at the param memory that the optimizer updated in-place.
+        For non-contiguous params, this copies the latest data into a
+        contiguous staging buffer. For dtype-cast params, this re-casts
+        from the original source tensor. ``copy_()`` handles both cases
+        (contiguity and dtype conversion).
+
+        Contiguous params without dtype casting need no refresh because
+        RDMA handles point directly at the param memory that the optimizer
+        updated in-place.
 
         Returns the number of staging buffers refreshed.
         """

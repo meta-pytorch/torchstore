@@ -221,3 +221,56 @@ async def test_refresh():
     sync2 = DirectWeightSyncDest()
     await sync2.pull(all_handles, {"weight": dest2})
     assert torch.equal(dest2, torch.full((10, 5), 99.0))
+
+
+async def test_transfer_dtype():
+    """Source is float32, transfer_dtype=bfloat16 → staging casts, dest gets bfloat16."""
+    source = DirectWeightSyncSource()
+
+    # Float32 source tensor (simulates model param)
+    original = torch.arange(100, dtype=torch.float32).reshape(10, 10)
+
+    # Set up staging with bfloat16 cast (simulates register(transfer_dtype=bfloat16))
+    # Mock RDMABuffer by patching — register() calls RDMABuffer internally,
+    # so we need to test via the staging + mock handle approach instead.
+    staging_buf = original.to(torch.bfloat16).contiguous()
+    source._staging["weight"] = (staging_buf, original)
+
+    # Create mock handle pointing at the bfloat16 staging buffer
+    mock_buf = MockRDMABuffer(to_byte_view(staging_buf))
+    handle = RDMAWeightHandle(
+        rdma_buffer=mock_buf,
+        tensor_slice=TensorSlice(
+            offsets=(0, 0),
+            coordinates=(0,),
+            global_shape=(10, 10),
+            local_shape=(10, 10),
+            mesh_shape=(1,),
+        ),
+        source_rank=0,
+    )
+
+    # Pull into bfloat16 dest (matching transfer dtype)
+    dest = torch.zeros(10, 10, dtype=torch.bfloat16)
+    sync = DirectWeightSyncDest()
+    await sync.pull({"weight": [handle]}, {"weight": dest})
+
+    # Values should match (float32 → bfloat16 → bfloat16)
+    expected = original.to(torch.bfloat16)
+    assert torch.equal(dest, expected)
+
+    # All params should be staged (due to transfer_dtype)
+    assert "weight" in source._staging
+
+    # Modify source (simulates optimizer.step() updating float32 param)
+    original.fill_(42.0)
+
+    # Refresh re-casts float32 → bfloat16 into staging buffer
+    source.refresh()
+    assert torch.equal(staging_buf, torch.full((10, 10), 42.0, dtype=torch.bfloat16))
+
+    # Second pull sees updated values
+    dest2 = torch.zeros(10, 10, dtype=torch.bfloat16)
+    sync2 = DirectWeightSyncDest()
+    await sync2.pull({"weight": [handle]}, {"weight": dest2})
+    assert torch.equal(dest2, torch.full((10, 10), 42.0, dtype=torch.bfloat16))
