@@ -33,6 +33,8 @@ class RdmaContext:
     shape: torch.Size | None = None  # Serialized
     dtype: torch.dtype | None = None  # Serialized
     is_object: bool = False  # Serialized
+
+    # These can be overwritten by the SV on GET paths.
     objects: Any = None  # Serialized — carries non-tensor data
     device_index: int = 0  # Serialized — identifies which transport/address to use
 
@@ -277,3 +279,4 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             ctx.rdma_memory = None
             ctx.tensor_ref = None
         self._contexts = []
+        self._devices_to_connect = set()
