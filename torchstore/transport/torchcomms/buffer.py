@@ -241,7 +241,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         """
         rdma_mem_cache = ctx.get(RdmaMemoryCache)
 
-
         for entry, rdma_ctx in zip(entries, self._contexts, strict=True):
             _, data = entry
             if not isinstance(data, torch.Tensor):
