@@ -21,7 +21,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from torchstore.logging import LatencyTracker
-from torchstore.transport.buffers import TransportBuffer
+from torchstore.transport.buffers import TransportBuffer, TransportCache
 from torchstore.transport.types import Request
 from torchstore.utils import get_local_hostname
 
@@ -190,7 +190,7 @@ class SharedMemoryEntry:
         return self._tensor
 
 
-class SharedMemoryCache:
+class SharedMemoryCache(TransportCache):
     """Client-side cache for shared memory segments.
 
     Uses (key, storage_handle) as cache key. Stale entries (after delete/re-PUT)
@@ -310,7 +310,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         """
         latency_tracker = LatencyTracker("post_handshake")
 
-        shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
+        shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
 
         self._contexts = []
         devices_to_sync: set[torch.device] = set()
@@ -411,7 +411,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         self, requests: list[Request], transport_buffer: "TransportBuffer"
     ) -> list[Any]:
         results = []
-        shm_cache = self.storage_volume_ref.transport_context.get_shm_cache()
+        shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
 
         for request, shm_ctx in zip(requests, transport_buffer._contexts, strict=True):
             client_tensor = request.tensor_val

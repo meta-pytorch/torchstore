@@ -69,8 +69,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     def _setup_local_transport(self, tensor: torch.Tensor | None) -> None:
         """Ensure a local transport exists for the tensor's device."""
         device = tensor.device if tensor is not None else 0
-        transport_cache = (
-            self.storage_volume_ref.transport_context.get_rdma_transport_cache()
+        transport_cache = self.storage_volume_ref.transport_context.get(
+            RdmaTransportCache
         )
         volume_id = self.storage_volume_ref.volume_id
         transport, address, is_new = transport_cache.get_or_create(volume_id, device)
@@ -86,7 +86,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         The SV always uses CPU (device 0 NIC) as its RDMA device
         """
         client_addr = self.addresses[device_index]
-        return ctx.get_rdma_transport_cache().get(client_addr, 0)[0]
+        return ctx.get(RdmaTransportCache).get(client_addr, 0)[0]
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         """Set up transports for all unique devices in the batch."""
@@ -110,7 +110,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """SV side: create a transport per new client device, connect, return SV addresses."""
-        transport_cache = ctx.get_rdma_transport_cache()
+        transport_cache = ctx.get(RdmaTransportCache)
         results = []
         for device_index in self._devices_to_connect:
             client_address = self.addresses[device_index]
