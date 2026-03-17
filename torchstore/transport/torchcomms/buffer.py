@@ -4,13 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
 import torch
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.torchcomms.cache import RdmaTransportCache
+from torchstore.transport.torchcomms.cache import RdmaMemoryCache, RdmaTransportCache
 from torchstore.transport.types import Request
 
 try:
@@ -21,6 +22,13 @@ except ImportError:
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
     from torchstore.transport.buffers import TransportContext
+
+
+# I'd like caching of user owned pinned memory to be toggleable.
+# yes, I understand we're introduce many "magic" vars. A follow up will
+# be to provide a clear TorchStrategy level config for these switches
+def _client_rdma_cache_enabled() -> bool:
+    return os.environ.get("TORCHSTORE_CLIENT_RDMA_CACHE", "1") == "1"
 
 
 @dataclass
@@ -128,7 +136,11 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     def _allocate_ctx(self, tensor: torch.Tensor) -> RdmaContext:
         self._assert_valid_tensor(tensor, tensor.dtype, tensor.shape)
-        rdma_memory = RdmaMemory(tensor)
+        if _client_rdma_cache_enabled():
+            cache = self.storage_volume_ref.transport_context.get(RdmaMemoryCache)
+            rdma_memory = cache.get_or_register(tensor)
+        else:
+            rdma_memory = RdmaMemory(tensor)
         return RdmaContext(
             rdma_memory=rdma_memory,
             rdma_remote_buffer=rdma_memory.to_remote_buffer(),
@@ -185,6 +197,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
+        rdma_mem_cache = ctx.get(RdmaMemoryCache)
+
         results = []
         for entry, rdma_ctx in zip(entries, self._contexts, strict=True):
             _, maybe_tensor = entry
@@ -206,7 +220,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
             self._assert_valid_tensor(maybe_tensor, rdma_ctx.dtype, rdma_ctx.shape)
 
             # TODO: replace sequential reads with true batch RDMA operations (coming to torchcomms)
-            receiving_buffer = RdmaMemory(maybe_tensor)
+            receiving_buffer = rdma_mem_cache.get_or_register(maybe_tensor)
             res = transport.read(
                 receiving_buffer.to_mutable_view(), rdma_ctx.rdma_remote_buffer
             )
@@ -226,6 +240,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         Note: SV determination of is_object is authoritative and mutates _contexts
         sent back to the client.
         """
+        rdma_mem_cache = ctx.get(RdmaMemoryCache)
+
         for entry, rdma_ctx in zip(entries, self._contexts, strict=True):
             _, data = entry
             if not isinstance(data, torch.Tensor):
@@ -243,6 +259,11 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                 )
                 contiguous_buffer.copy_(tensor)
                 tensor = contiguous_buffer
+                # staging copy is lost, don't cache it
+                rdma_memory = RdmaMemory(tensor)
+            else:
+                # stable tensor from SV, cache the registration
+                rdma_memory = rdma_mem_cache.get_or_register(tensor)
 
             transport = self._get_sv_transport(ctx, rdma_ctx.device_index)
 
@@ -252,7 +273,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                 )
             self._assert_valid_tensor(tensor, rdma_ctx.dtype, rdma_ctx.shape)
             # TODO: replace sequential writes with true batch RDMA operations (coming to torchcomms)
-            rdma_memory = RdmaMemory(tensor)
 
             res = transport.write(rdma_memory.to_view(), rdma_ctx.rdma_remote_buffer)
             if res != 0:
