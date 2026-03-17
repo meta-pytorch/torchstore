@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import weakref
 from functools import cache
 
 import torch
@@ -12,7 +13,7 @@ import torch
 from torchstore.transport.buffers import TransportCache
 
 try:
-    from torchcomms._transport import RdmaTransport
+    from torchcomms._transport import RdmaMemory, RdmaTransport
 
     torchcomms_available = True
 except ImportError:
@@ -82,3 +83,42 @@ class RdmaTransportCache(TransportCache):
 
     def clear(self) -> None:
         self.transports.clear()
+
+
+class RdmaMemoryCache:
+    """Cache for RDMA memory registrations.
+
+    Keyed on (data_ptr, nbytes) — if data_ptr matches, the pinned region is
+    still valid.  Avoids repeated ibv_reg_mr kernel calls for stable tensors.
+
+    A weakref on each tensor's ``untyped_storage()`` auto-evicts the entry when
+    the underlying memory is released (i.e. no more live tensors reference that
+    storage).  This makes the cache safe for both server-side (stable kv
+    tensors) and client-side (user-owned, transient) use.
+    """
+
+    def __init__(self) -> None:
+        # {(data_ptr, nbytes): RdmaMemory}
+        self._cache: dict[tuple[int, int], "RdmaMemory"] = {}
+        # parallel dict keeping the weakref alive so the callback can fire
+        self._storage_refs: dict[tuple[int, int], weakref.ref] = {}
+
+    def get_or_register(self, tensor: torch.Tensor) -> "RdmaMemory":
+        key = (tensor.data_ptr(), tensor.nbytes)
+        if key in self._cache:
+            return self._cache[key]
+
+        mem = RdmaMemory(tensor)
+        self._cache[key] = mem
+        self._storage_refs[key] = weakref.ref(
+            tensor.untyped_storage(), lambda _ref, _k=key: self._evict(_k)
+        )
+        return mem
+
+    def _evict(self, key: tuple[int, int]) -> None:
+        self._cache.pop(key, None)
+        self._storage_refs.pop(key, None)
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self._storage_refs.clear()
