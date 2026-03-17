@@ -12,7 +12,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.torchcomms.cache import RdmaTransportCache
+from torchstore.transport.torchcomms.cache import RdmaMemoryCache, RdmaTransportCache
 from torchstore.transport.types import Request
 
 try:
@@ -136,7 +136,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     def _allocate_ctx(self, tensor: torch.Tensor) -> RdmaContext:
         self._assert_valid_tensor(tensor, tensor.dtype, tensor.shape)
         if _client_rdma_cache_enabled():
-            cache = self.storage_volume_ref.transport_context.get_rdma_memory_cache()
+            cache = self.storage_volume_ref.transport_context.get(RdmaMemoryCache)
             rdma_memory = cache.get_or_register(tensor)
         else:
             rdma_memory = RdmaMemory(tensor)
@@ -196,7 +196,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """Called by storage volume. Read from client's source RdmaMemory (put)."""
-        rdma_mem_cache = ctx.get_rdma_memory_cache()
+        rdma_mem_cache = ctx.get(RdmaMemoryCache)
 
         results = []
         for entry, rdma_ctx in zip(entries, self._contexts, strict=True):
@@ -239,7 +239,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
         Note: SV determination of is_object is authoritative and mutates _contexts
         sent back to the client.
         """
-        rdma_mem_cache = ctx.get_rdma_memory_cache()
+        rdma_mem_cache = ctx.get(RdmaMemoryCache)
 
 
         for entry, rdma_ctx in zip(entries, self._contexts, strict=True):

@@ -85,7 +85,7 @@ class RdmaTransportCache(TransportCache):
         self.transports.clear()
 
 
-class RdmaMemoryCache:
+class RdmaMemoryCache(TransportCache):
     """Cache for RDMA memory registrations.
 
     Keyed on (data_ptr, nbytes) — if data_ptr matches, the pinned region is

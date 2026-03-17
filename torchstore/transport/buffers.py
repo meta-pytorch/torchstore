@@ -10,7 +10,6 @@ from typing import Any, TYPE_CHECKING, TypeVar
 import torch
 
 from torchstore.logging import LatencyTracker
-from torchstore.transport.torchcomms.cache import RdmaMemoryCache
 from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
@@ -51,14 +50,6 @@ class TransportContext:
         for cache in self._caches.values():
             cache.clear()
         self._caches.clear()
-
-    def get_rdma_memory_cache(self) -> RdmaMemoryCache:
-        return self.get(RdmaMemoryCache)
-
-    def clear_data_caches(self) -> None:
-        """Clear data-dependent caches (e.g. RDMA memory registrations)."""
-        if RdmaMemoryCache in self._caches:
-            self._caches[RdmaMemoryCache].clear()
 
 
 class TransportBuffer:
