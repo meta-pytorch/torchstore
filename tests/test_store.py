@@ -485,5 +485,53 @@ async def test_batch_basic(strategy_params, transport_type):
         await ts.shutdown()
 
 
+@pytest.mark.parametrize(*transport_plus_strategy_params())
+@pytest.mark.asyncio
+async def test_noncontiguous_put(strategy_params, transport_type):
+    """Test that non-contiguous tensors (e.g. column slices) survive put/get."""
+
+    class PutGetActor(Actor):
+        def __init__(self, world_size):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            os.environ["LOCAL_RANK"] = str(self.rank)
+            os.environ["HOSTNAME"] = socket.gethostname()
+
+        @endpoint
+        async def put(self):
+            # Column slice → non-contiguous, simulates Shard(1) resharding
+            backing = torch.arange(20, dtype=torch.float32).reshape(4, 5)
+            col_slice = backing[:, :3]
+            assert not col_slice.is_contiguous()
+            await ts.put(f"key_{self.rank}", col_slice)
+
+        @endpoint
+        async def get(self, rank_offset=0):
+            other_rank = (self.rank + rank_offset) % self.world_size
+            return await ts.get(f"key_{other_rank}")
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(
+        num_storage_volumes=volume_world_size, strategy=strategy(transport_type)
+    )
+    actor_mesh_0 = await spawn_actors(
+        volume_world_size, PutGetActor, "actor_mesh_0", world_size=volume_world_size
+    )
+    actor_mesh_1 = await spawn_actors(
+        volume_world_size, PutGetActor, "actor_mesh_1", world_size=volume_world_size
+    )
+
+    expected = torch.arange(20, dtype=torch.float32).reshape(4, 5)[:, :3].contiguous()
+
+    try:
+        await actor_mesh_0.put.call()
+        tensors = await actor_mesh_1.get.call()
+        for pt, val in tensors:
+            assert torch.equal(val, expected), f"rank {pt.rank}: {val} != {expected}"
+    finally:
+        await ts.shutdown()
+
+
 if __name__ == "__main__":
     main(__file__)

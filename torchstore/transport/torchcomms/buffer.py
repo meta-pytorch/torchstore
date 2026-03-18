@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
+from logging import getLogger
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -17,6 +18,8 @@ try:
     from torchcomms._transport import RdmaMemory
 except ImportError:
     pass
+
+logger = getLogger(__name__)
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -147,7 +150,15 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                     RdmaContext(is_object=True, objects=request.objects)
                 )
             else:
-                self._contexts.append(self._allocate_ctx(request.tensor_val))
+                tensor = request.tensor_val
+                if not tensor.is_contiguous():
+                    logger.warning(
+                        f"Non-contiguous tensor for PUT ({request.key}), "
+                        "staging a contiguous CPU copy"
+                    )
+                    # stage contiguous copy on CPU to avoid GPU OOM
+                    tensor = tensor.cpu().contiguous()
+                self._contexts.append(self._allocate_ctx(tensor))
 
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Fetch metadata if needed and allocate RDMA buffers."""

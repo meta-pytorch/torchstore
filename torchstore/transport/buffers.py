@@ -314,7 +314,7 @@ class TransportBuffer:
         tensor: torch.Tensor,
         dtype: torch.dtype,
         shape: torch.Size,
-        must_be_contiguous=False,
+        must_be_contiguous=True,
     ) -> None:
         assert isinstance(tensor, torch.Tensor)
         assert tensor.dtype == dtype, f"{tensor.dtype} != {dtype}"
