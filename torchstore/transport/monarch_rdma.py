@@ -209,7 +209,7 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             # monarch sometimes really doesn't like gpu tensors, so we convert to cpu
             # this makes things way slower, and hopefully will be fixed in the future
             if MONARCH_RDMA_EAGER_D2H:
-                tensor = tensor_like.cpu()
+                tensor = tensor.cpu()
 
         self.tensor = tensor
 
