@@ -153,8 +153,8 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                 tensor = request.tensor_val
                 if not tensor.is_contiguous():
                     logger.warning(
-                        f"Non-contiguous tensor for PUT ({request.key}), "
-                        "staging a contiguous CPU copy"
+                        f"PUT called with non-contiguous tensor (key={request.key}), "
+                        "creating a contiguous CPU copy"
                     )
                     # stage contiguous copy on CPU to avoid GPU OOM
                     tensor = tensor.cpu().contiguous()
