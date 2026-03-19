@@ -390,3 +390,4 @@ class InMemoryStore(StorageImpl):
 
     def reset(self) -> None:
         self.kv = {}
+        self.transport_context.clear()
