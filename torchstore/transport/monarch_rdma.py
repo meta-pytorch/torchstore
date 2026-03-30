@@ -14,8 +14,10 @@ try:
     from monarch.rdma import RDMABuffer
 
     try:
+        # monarch >= 0.4.0
         from monarch.rdma import is_ibverbs_available as monarch_rdma_available
     except ImportError:
+        # monarch < 0.4.0
         from monarch.rdma import is_rdma_enabled as monarch_rdma_available
 except ImportError:
     monarch_rdma_available = lambda: False
