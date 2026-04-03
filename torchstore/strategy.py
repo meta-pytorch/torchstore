@@ -164,7 +164,8 @@ class HostStrategy(TorchStoreStrategy):
 class LocalRankStrategy(TorchStoreStrategy):
     """Strategy that maps storage volumes based on LOCAL_RANK environment variable.
 
-    Each process uses its LOCAL_RANK to determine which storage volume to connect to.
+    Each process uses its LOCAL_RANK to determine which storage volume to connect to
+    for writing data.
     This strategy requires the LOCAL_RANK environment variable to be set and assumes
     one storage volume per local rank.
 
