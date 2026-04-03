@@ -15,7 +15,7 @@ in shared memory, allowing:
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -52,11 +52,12 @@ MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "0") == "1"
 SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1"
 
 
-def pin_memory(tensor: torch.Tensor) -> None:
-    """Pin tensor's memory for faster CUDA transfers.
+def pin_memory(storage: torch.UntypedStorage) -> None:
+    """Pin storage's memory for faster CUDA transfers.
 
     Uses cudaHostRegister with cudaHostRegisterPortable flag to make the
-    memory accessible from all CUDA contexts.
+    memory accessible from all CUDA contexts. Pins the entire SHM segment
+    so all views benefit from DMA.
     """
     if not SHOULD_PIN_SHM or not torch.cuda.is_available():
         return
@@ -65,11 +66,11 @@ def pin_memory(tensor: torch.Tensor) -> None:
     if cudart is None:
         return  # No CUDA runtime available, skip pinning
 
-    data_ptr = tensor.data_ptr()
-    size = tensor.numel() * tensor.element_size()
+    data_ptr = storage.data_ptr()
+    size = storage.size()
     err = int(cudart.cudaHostRegister(data_ptr, size, 1))  # cudaHostRegisterPortable
     if err == 712:  # cudaErrorHostMemoryAlreadyRegistered
-        logger.info("[SHM] Tensor is already pinned.")
+        logger.info("[SHM] Storage is already pinned.")
         return
     if err != 0:
         raise RuntimeError(
@@ -78,8 +79,8 @@ def pin_memory(tensor: torch.Tensor) -> None:
         )
 
 
-def unpin_memory(tensor: torch.Tensor) -> None:
-    """Unpin tensor's memory."""
+def unpin_memory(storage: torch.UntypedStorage) -> None:
+    """Unpin storage's memory."""
     if not SHOULD_PIN_SHM or not torch.cuda.is_available():
         return
 
@@ -87,9 +88,9 @@ def unpin_memory(tensor: torch.Tensor) -> None:
     if cudart is None:
         return
 
-    err = int(cudart.cudaHostUnregister(tensor.data_ptr()))
+    err = int(cudart.cudaHostUnregister(storage.data_ptr()))
     if err == 713:  # cudaErrorHostMemoryNotRegistered
-        logger.info("[SHM] Tensor is already unpinned.")
+        logger.info("[SHM] Storage is already unpinned.")
         return
     if err != 0:
         logger.warning(f"cudaHostUnregister failed with error {err}")
@@ -108,34 +109,52 @@ class SharedMemoryDescriptor:
     size: int
     shape: torch.Size
     dtype: torch.dtype
+    storage_offset: int = 0
+    stride: tuple[int, ...] | None = None
 
     @classmethod
     def from_tensor(cls, tensor: torch.Tensor) -> "SharedMemoryDescriptor | None":
         """Derive SharedMemoryDescriptor from a tensor backed by shared memory.
 
-        Returns None if the tensor is not shared or is a view/slice of a larger
-        shared tensor (which can't be efficiently represented as shared memory).
+        Returns None if the tensor is not in shared memory. Views/slices of
+        shared tensors are supported via storage_offset and stride fields.
         """
         if not tensor.is_shared():
             logger.info("Tensor is not in shared memory.")
             return None
 
-        # Check if tensor is a view/slice of a larger storage
-        expected_size = tensor.numel() * tensor.element_size()
         storage = tensor.untyped_storage()
-        if storage.size() != expected_size:
-            # Tensor is a view/slice - can't use shared memory for this
-            logger.info("Tensor is a view/slice, cannot use shared memory.")
-            return None
-
         manager_handle, storage_handle, size = storage._share_filename_cpu_()
+        stride = tensor.stride() if not tensor.is_contiguous() else None
         return cls(
             manager_handle=manager_handle,
             storage_handle=storage_handle,
             size=size,
             shape=tensor.shape,
             dtype=tensor.dtype,
+            storage_offset=tensor.storage_offset(),
+            stride=stride,
         )
+
+    def is_full_storage_view(self, storage_nbytes: int) -> bool:
+        """Whether this descriptor represents the whole storage as a tensor."""
+        return (
+            self.storage_offset == 0
+            and self.stride is None
+            and storage_nbytes == self.shape.numel() * self.dtype.itemsize
+        )
+
+    def resolved_stride(self) -> tuple[int, ...]:
+        """Return the descriptor stride, inferring contiguous layout when omitted."""
+        if self.stride is not None:
+            return self.stride
+
+        stride = []
+        s = 1
+        for dim in reversed(self.shape):
+            stride.append(s)
+            s *= dim
+        return tuple(reversed(stride))
 
     def attach(self) -> "SharedMemoryEntry":
         """Client-side: attach to shared storage."""
@@ -151,7 +170,6 @@ class ShmContext:
 
     use_rpc is True when the entry can't use shared memory:
     - Non-tensor data (objects, strings, None)
-    - Tensors that are views/slices of a larger shared storage
     - Tensors not backed by shared memory
     """
 
@@ -166,7 +184,6 @@ class SharedMemoryEntry:
 
     storage: torch.UntypedStorage
     descriptor: SharedMemoryDescriptor
-    _tensor: torch.Tensor | None = field(default=None, repr=False)
 
     @property
     def name(self) -> str:
@@ -182,23 +199,25 @@ class SharedMemoryEntry:
 
     def get_tensor(self) -> torch.Tensor:
         """Create tensor view backed by shared storage."""
-        if self._tensor is None:
-            # Create tensor from storage with proper dtype/shape
-            self._tensor = (
-                torch.empty(0, dtype=self.dtype).set_(self.storage).view(self.shape)
-            )
-        return self._tensor
+        base = torch.empty(0, dtype=self.dtype).set_(self.storage)
+        d = self.descriptor
+        if d.is_full_storage_view(self.storage.size()):
+            return base.view(d.shape)
+
+        return torch.as_strided(base, d.shape, d.resolved_stride(), d.storage_offset)
 
 
 class SharedMemoryCache(TransportCache):
     """Client-side cache for shared memory segments.
 
-    Uses (key, storage_handle) as cache key. Stale entries (after delete/re-PUT)
-    are never accessed because the server returns new handles.
+    Caches at the storage level using (key, storage_handle) as cache key.
+    Different views of the same storage share the same cached mmap and pin.
+    Stale entries (after delete/re-PUT) are never accessed because the server
+    returns new handles.
     """
 
     def __init__(self):
-        self._entries: dict[tuple[str, bytes], SharedMemoryEntry] = {}
+        self._storages: dict[tuple[str, bytes], torch.UntypedStorage] = {}
 
     def allocate(
         self,
@@ -214,22 +233,23 @@ class SharedMemoryCache(TransportCache):
         return entry, descriptor
 
     def attach(self, key: str, descriptor: SharedMemoryDescriptor) -> SharedMemoryEntry:
-        """Attach to shared memory segment, caching the entry."""
+        """Attach to shared memory segment, caching the storage."""
         cache_key = (key, descriptor.storage_handle)
 
-        if cache_key in self._entries:
-            return self._entries[cache_key]
+        if cache_key not in self._storages:
+            entry = descriptor.attach()
+            pin_memory(entry.storage)
+            self._storages[cache_key] = entry.storage
 
-        entry = descriptor.attach()
-        pin_memory(entry.get_tensor())
-        self._entries[cache_key] = entry
-        return entry
+        return SharedMemoryEntry(
+            storage=self._storages[cache_key], descriptor=descriptor
+        )
 
     def clear(self) -> None:
         """Clear all entries."""
-        for entry in self._entries.values():
-            unpin_memory(entry.get_tensor())
-        self._entries.clear()
+        for storage in self._storages.values():
+            unpin_memory(storage)
+        self._storages.clear()
 
     def __del__(self):
         self.clear()
@@ -255,7 +275,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     GET
     1. _pre_get_hook: Save some metadata
     2. handle_get_request: Return the shared memory descriptor if possible.
-                           Fallback to RPC if stored tensor is object, not shared, or a view (resharding case)
+                           Fallback to RPC if stored tensor is object or not shared
     3. _handle_storage_volume_response: Parse server response and copy data according to path
 
     """
@@ -293,6 +313,10 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                 # return existing descriptor for re-use
                 descriptor = SharedMemoryDescriptor.from_tensor(current_object)
                 assert descriptor is not None, "Stored tensor is not in shared memory."
+                # Reject PUTs from tensor views (I don't see a legit use case for this)
+                assert (
+                    descriptor.storage_offset == 0 and descriptor.stride is None
+                ), "PUT expects full-storage tensors, not views."
                 results.append(descriptor)
         return results
 
@@ -400,10 +424,9 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             if descriptor is not None:
                 self._contexts.append(ShmContext(descriptor=descriptor))
             else:
-                # View or not in shared memory — RPC fallback
+                # Non-shared tensor - RPC fallback (should not occur for SHM-stored data)
                 logger.debug(
-                    f"Key {request.key} is a view or not in shared memory, "
-                    "using RPC fallback"
+                    f"Key {request.key} not in shared memory, using RPC fallback"
                 )
                 self._contexts.append(ShmContext(objects=data, use_rpc=True))
 

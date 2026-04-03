@@ -365,7 +365,7 @@ async def test_shm_cache_reuse_on_same_key_puts(strategy_params):
             # Get the cache from the strategy's transport context
             local_client = await ts.client()
             shm_cache = local_client.strategy.transport_context.get(SharedMemoryCache)
-            entries_for_key = [k for k in shm_cache._entries.keys() if k[0] == key]
+            entries_for_key = [k for k in shm_cache._storages.keys() if k[0] == key]
             return len(entries_for_key)
 
     volume_world_size, strategy = strategy_params
