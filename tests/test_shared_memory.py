@@ -121,18 +121,27 @@ class TestSharedMemoryDescriptor:
         assert descriptor is None
 
     def test_from_tensor_view(self):
-        """Test from_tensor returns None for view/slice tensor."""
+        """Test from_tensor returns valid descriptor for view/slice tensor."""
         # Allocate shared memory tensor
         full_tensor = allocate_shared_tensor(torch.Size([100]), torch.float32)
+        full_tensor.copy_(torch.arange(100, dtype=torch.float32))
 
-        # Create a view/slice (storage.size() != tensor.numel() * element_size)
+        # Create a contiguous view/slice
         view_tensor = full_tensor[:50]
-        assert view_tensor.is_shared()  # Still shared, but is a view
+        assert view_tensor.is_shared()
 
         descriptor = SharedMemoryDescriptor.from_tensor(view_tensor)
 
-        # Should return None because it's a view
-        assert descriptor is None
+        # Should return a valid descriptor with storage_offset=0, no stride (contiguous)
+        assert descriptor is not None
+        assert descriptor.shape == torch.Size([50])
+        assert descriptor.storage_offset == 0
+        assert descriptor.stride is None
+
+        # Verify data round-trips correctly
+        entry = descriptor.attach()
+        result = entry.get_tensor()
+        assert torch.allclose(result, torch.arange(50, dtype=torch.float32))
 
     def test_attach_and_get_tensor(self):
         """Test attaching to a segment via descriptor and getting tensor."""
@@ -181,15 +190,14 @@ class TestSharedMemoryCache:
         assert descriptor.shape == shape
         assert descriptor.dtype == dtype
 
-        # Verify entry is cached
+        # Verify storage is cached
         cache_key = ("test_key", descriptor.storage_handle)
-        assert cache_key in cache._entries
-        assert cache._entries[cache_key] is entry
+        assert cache_key in cache._storages
 
         cache.clear()
 
-    def test_attach_caches_entry(self):
-        """Test that entries are cached and reused on attach."""
+    def test_attach_caches_storage(self):
+        """Test that storages are cached and reused on attach."""
         cache = SharedMemoryCache()
         shape = torch.Size([10, 10])
         dtype = torch.float32
@@ -203,15 +211,15 @@ class TestSharedMemoryCache:
         assert entry1 is not None
         assert entry1.shape == shape
 
-        # Second attach with same key and handle returns cached entry
+        # Second attach with same key and handle reuses cached storage
         entry2 = cache.attach("test_key", descriptor)
-        assert entry2 is entry1
+        assert entry2.storage.data_ptr() == entry1.storage.data_ptr()
 
-        # Different handle creates different entry
+        # Different handle creates different storage
         tensor2 = allocate_shared_tensor(shape, dtype)
         descriptor2 = SharedMemoryDescriptor.from_tensor(tensor2)
         entry3 = cache.attach("test_key", descriptor2)
-        assert entry3 is not entry1
+        assert entry3.storage.data_ptr() != entry1.storage.data_ptr()
         assert entry3.descriptor.storage_handle != entry1.descriptor.storage_handle
 
         cache.clear()
@@ -230,7 +238,7 @@ class TestSharedMemoryCache:
 
         cache.clear()
 
-        assert len(cache._entries) == 0
+        assert len(cache._storages) == 0
 
     @pytest.mark.asyncio
     async def test_cache_reuse_on_same_key_puts(self, ref):
@@ -244,8 +252,8 @@ class TestSharedMemoryCache:
 
         await buffer1._post_handshake([None], requests1)  # No existing descriptor
 
-        # Verify cache has 1 entry after first PUT
-        assert len(shm_cache._entries) == 1
+        # Verify cache has 1 storage after first PUT
+        assert len(shm_cache._storages) == 1
         first_descriptor = buffer1._contexts[0].descriptor
 
         # Second PUT: reuse existing shared memory
@@ -257,15 +265,18 @@ class TestSharedMemoryCache:
             [first_descriptor], requests2
         )  # Existing descriptor from handshake
 
-        # Verify cache still has only 1 entry (same SHM reused)
-        assert len(shm_cache._entries) == 1
+        # Verify cache still has only 1 storage (same SHM reused)
+        assert len(shm_cache._storages) == 1
         assert (
             buffer2._contexts[0].descriptor.storage_handle
             == first_descriptor.storage_handle
         )
 
-        # Verify the data was updated
-        entry = shm_cache._entries[("test_key", first_descriptor.storage_handle)]
+        # Verify the data was updated — reconstruct entry from cached storage
+        storage = shm_cache._storages[("test_key", first_descriptor.storage_handle)]
+        from torchstore.transport.shared_memory import SharedMemoryEntry
+
+        entry = SharedMemoryEntry(storage=storage, descriptor=first_descriptor)
         assert torch.allclose(entry.get_tensor(), tensor2)
 
 
@@ -427,22 +438,25 @@ class TestSharedMemoryTransportBufferGET:
         assert buffer._contexts[0].objects is data
 
     @pytest.mark.asyncio
-    async def test_handle_get_view_fallback(self, ref, ctx):
-        """Test handle_get_request falls back to RPC for view/slice tensor."""
+    async def test_handle_get_view_uses_shm(self, ref, ctx):
+        """Test handle_get_request uses SHM path for view/slice tensor."""
         buffer = SharedMemoryTransportBuffer(ref)
 
         # Create a view of a shared tensor
         full_tensor = allocate_shared_tensor(torch.Size([100]), torch.float32)
-        view_tensor = full_tensor[:50]
+        full_tensor.copy_(torch.arange(100, dtype=torch.float32))
+        view_tensor = full_tensor[10:60]
         assert view_tensor.is_shared()
 
         request = Request(key="test_key")
         await buffer.handle_get_request(ctx, [(request, view_tensor)])
 
-        # Should fall back to RPC because it's a view
+        # Should use SHM path, not RPC
         assert len(buffer._contexts) == 1
-        assert buffer._contexts[0].use_rpc is True
-        assert buffer._contexts[0].objects is view_tensor
+        assert buffer._contexts[0].use_rpc is False
+        assert buffer._contexts[0].descriptor is not None
+        assert buffer._contexts[0].descriptor.shape == torch.Size([50])
+        assert buffer._contexts[0].descriptor.storage_offset == 10
 
     @pytest.mark.asyncio
     async def test_handle_get_object(self, ref, ctx):
@@ -483,9 +497,9 @@ class TestSharedMemoryTransportBufferGET:
         assert results[0] is dest_tensor
         assert torch.allclose(dest_tensor, original_data)
 
-        # Verify entry is cached
+        # Verify storage is cached
         cache_key = ("test_key", descriptor.storage_handle)
-        assert cache_key in ref.transport_context.get(SharedMemoryCache)._entries
+        assert cache_key in ref.transport_context.get(SharedMemoryCache)._storages
 
     @pytest.mark.asyncio
     async def test_handle_response_rpc_fallback(self, ref):
@@ -730,6 +744,104 @@ class TestSharedMemoryTransportBufferBatch:
         assert results[0] is dest_tensor
         assert torch.allclose(dest_tensor, original)
         assert results[1] == {"data": 42}
+
+
+class TestViewAwareSharedMemory:
+    """Tests for view-aware SharedMemoryDescriptor and cache."""
+
+    def test_from_tensor_view_descriptor(self):
+        """from_tensor() on contiguous and non-contiguous views returns valid descriptors."""
+        full_tensor = allocate_shared_tensor(torch.Size([10, 10]), torch.float32)
+        full_tensor.copy_(torch.arange(100, dtype=torch.float32).view(10, 10))
+
+        # Contiguous row slice: rows 2-4
+        row_view = full_tensor[2:5]
+        assert row_view.is_contiguous()
+        row_desc = SharedMemoryDescriptor.from_tensor(row_view)
+        assert row_desc is not None
+        assert row_desc.shape == torch.Size([3, 10])
+        assert row_desc.storage_offset == 20  # 2 * 10 elements
+        assert row_desc.stride is None  # contiguous
+
+        row_entry = row_desc.attach()
+        assert torch.allclose(
+            row_entry.get_tensor(),
+            torch.arange(20, 50, dtype=torch.float32).view(3, 10),
+        )
+
+        # Non-contiguous column slice: column 3
+        col_view = full_tensor[:, 3]
+        assert not col_view.is_contiguous()
+        col_desc = SharedMemoryDescriptor.from_tensor(col_view)
+        assert col_desc is not None
+        assert col_desc.shape == torch.Size([10])
+        assert col_desc.storage_offset == 3
+        assert col_desc.stride == (10,)
+
+        col_entry = col_desc.attach()
+        expected = torch.arange(100, dtype=torch.float32).view(10, 10)[:, 3]
+        assert torch.allclose(col_entry.get_tensor(), expected)
+
+    def test_cache_shares_storage_across_views(self):
+        """Two views of the same stored tensor share the same cached storage."""
+        cache = SharedMemoryCache()
+        full_tensor = allocate_shared_tensor(torch.Size([100]), torch.float32)
+        full_tensor.copy_(torch.arange(100, dtype=torch.float32))
+
+        view_a = full_tensor[:50]
+        view_b = full_tensor[50:]
+
+        desc_a = SharedMemoryDescriptor.from_tensor(view_a)
+        desc_b = SharedMemoryDescriptor.from_tensor(view_b)
+        assert desc_a is not None and desc_b is not None
+        # Same underlying storage handle
+        assert desc_a.storage_handle == desc_b.storage_handle
+
+        entry_a = cache.attach("key", desc_a)
+        entry_b = cache.attach("key", desc_b)
+
+        # Same cached storage (same data_ptr)
+        assert entry_a.storage.data_ptr() == entry_b.storage.data_ptr()
+
+        # But different tensor views
+        assert torch.allclose(
+            entry_a.get_tensor(), torch.arange(50, dtype=torch.float32)
+        )
+        assert torch.allclose(
+            entry_b.get_tensor(), torch.arange(50, 100, dtype=torch.float32)
+        )
+
+        cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_handle_get_view_e2e_response(self, ref, ctx):
+        """Full round-trip: SV handle_get_request with a view → client response via SHM."""
+        # SV side: store a full tensor, serve a view
+        full_tensor = allocate_shared_tensor(torch.Size([100]), torch.float32)
+        full_tensor.copy_(torch.arange(100, dtype=torch.float32))
+        view_tensor = full_tensor[20:70]
+
+        sv_buffer = SharedMemoryTransportBuffer(ref)
+        request = Request(key="test_key")
+        await sv_buffer.handle_get_request(ctx, [(request, view_tensor)])
+
+        # Verify SV chose SHM path
+        assert sv_buffer._contexts[0].use_rpc is False
+        assert sv_buffer._contexts[0].descriptor is not None
+        assert sv_buffer._contexts[0].descriptor.storage_offset == 20
+
+        # Client side: receive response and reconstruct data
+        client_buffer = SharedMemoryTransportBuffer(ref)
+        dest_tensor = torch.zeros(50)
+        client_requests = [Request(key="test_key", tensor_val=dest_tensor)]
+
+        results = await client_buffer._handle_storage_volume_response(
+            client_requests, sv_buffer
+        )
+
+        assert len(results) == 1
+        assert results[0] is dest_tensor
+        assert torch.allclose(dest_tensor, torch.arange(20, 70, dtype=torch.float32))
 
 
 if __name__ == "__main__":
