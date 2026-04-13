@@ -27,51 +27,47 @@ For more information on what Monarch is, see https://github.com/meta-pytorch/mon
 
 ## Installation
 
-### Nightly Setup
+### uv (Recommended)
 ```bash
-conda create -n torchstore python=3.12
-conda activate torchstore
-pip install torch
-
-git clone git@github.com:meta-pytorch/monarch.git
-python monarch/scripts/install_nightly.py
+uv venv --python 3.12
+source .venv/bin/activate
 
 git clone git@github.com:meta-pytorch/torchstore.git
 cd torchstore
-pip install -e .
+
+# Core development install.
+uv sync --extra dev
+
+# CUDA 12.8 + torchcomms 0.2.0 from the PyTorch cu128 index.
+uv sync --extra dev --extra cu128
+
+# CUDA 13.0 + torchcomms 0.2.0 from the PyTorch cu130 index.
+uv sync --extra dev --extra cu130
 ```
 
+### pip
 
-### Development Installation
-
-To install the package in development mode:
+If you prefer `pip`, use the matching PyTorch CUDA index explicitly:
 
 ```bash
 conda create -n torchstore python=3.12
 conda activate torchstore
 
-# Clone the repository
-git clone git@github.com:meta-pytorch/torchstore.git
-cd torchstore
-
-# Install in development mode
+# Base install
 pip install -e .
 
-# Install development dependencies
-pip install -e '.[dev]'
+# Development install with CUDA 12.8 wheels
+pip install -e '.[dev,cu128]' --extra-index-url https://download.pytorch.org/whl/cu128
 
-# NOTE: It's common to run into libpytorch issues. A good workaround is to export:
-# export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+# Development install with CUDA 13.0 wheels
+pip install -e '.[dev,cu130]' --extra-index-url https://download.pytorch.org/whl/cu130
 ```
-
-
 
 ### Regular Installation
 
-To install the package directly from the repository:
-
 ```bash
-pip install git+https://github.com/your-username/torchstore.git
+pip install 'torchstore[cu128] @ git+https://github.com/meta-pytorch/torchstore.git' \
+  --extra-index-url https://download.pytorch.org/whl/cu128
 ```
 
 Once installed, you can import it in your Python code:
@@ -182,8 +178,16 @@ class DTensorActor(Actor):
 
 # Testing
 
-Pytest is used for testing. For an examples of how to run tests (and get logs), see:
-`TORCHSTORE_LOG_LEVEL=DEBUG pytest -vs --log-cli-level=DEBUG tests/test_models.py::test_basic
+Pytest is used for testing.
+
+For a quick installation smoke test, run:
+`uv run pytest -q tests/test_store.py -k 'test_basic and MonarchRPC'`
+
+This selects the Monarch RPC parametrizations of `test_basic` without needing
+the extra transport env-var overrides.
+
+For a more verbose test run with logs, use:
+`TORCHSTORE_LOG_LEVEL=DEBUG uv run pytest -vs --log-cli-level=DEBUG tests/test_store.py::test_basic`
 
 ## License
 
