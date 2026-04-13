@@ -21,9 +21,9 @@ classifiers = [
 ]
 dependencies = [
     "pygtrie",
-    "torch==2.9.0",
     "portpicker",
-    "torchmonarch==0.2.0"
+    "torch",
+    "torchmonarch==0.4.1",
 ] #todo: add toml
 
 [project.urls]
@@ -31,6 +31,16 @@ dependencies = [
 "Bug Tracker" = "https://github.com/meta-pytorch/torchstore/issues"
 
 [project.optional-dependencies]
+cu128 = [
+    # torchcomms wheels are CUDA-specific and depend on the matching torch wheel.
+    "torch==2.11.0",
+    "torchcomms==0.2.0 ; sys_platform == 'linux'",
+]
+cu130 = [
+    # torchcomms wheels are CUDA-specific and depend on the matching torch wheel.
+    "torch==2.11.0",
+    "torchcomms==0.2.0 ; sys_platform == 'linux'",
+]
 dev = [
     "anyio",
     "expecttest",
@@ -53,10 +63,29 @@ exclude = ["assets*", "tests*", "docs*"]
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url  = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url  = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu128" }
+torch = [
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+torchcomms = [
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
 
 [tool.uv]
 index-strategy = "unsafe-best-match"
 prerelease = "allow"
+conflicts = [
+    [
+        { extra = "cu128" },
+        { extra = "cu130" },
+    ],
+]
