@@ -162,16 +162,17 @@ class HostStrategy(TorchStoreStrategy):
 
 
 class LocalRankStrategy(TorchStoreStrategy):
-    """Strategy that maps storage volumes based on LOCAL_RANK environment variable.
+    """Strategy that maps storage volumes based on rank environment variables.
 
-    Each process uses its LOCAL_RANK to determine which storage volume to connect to.
-    This strategy requires the LOCAL_RANK environment variable to be set and assumes
-    one storage volume per local rank.
+    Storage volumes are identified by Monarch proc rank. Clients prefer the global
+    ``RANK`` environment variable when it is available, so that every rank gets a
+    distinct storage volume, and fall back to ``LOCAL_RANK`` for existing
+    actor-based callers that do not set ``RANK``.
 
     When using this strategy, data is moved to a storage volume that is spawned on the
     mesh passed into ``ts.initialize(mesh=...)``. The storage volumes are distributed
     across the mesh, and each client process connects to its corresponding volume based
-    on its LOCAL_RANK.
+    on its resolved rank ID.
     """
 
     @classmethod
@@ -181,6 +182,9 @@ class LocalRankStrategy(TorchStoreStrategy):
 
     @classmethod
     def get_client_id(cls):
+        rank = os.environ.get("RANK")
+        if rank is not None:
+            return rank
         return os.environ["LOCAL_RANK"]
 
 
