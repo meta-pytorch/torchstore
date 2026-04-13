@@ -39,18 +39,18 @@ class TransportType(Enum):
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
-    Prefers SharedMemory for same-host transfers, then MonarchRDMA if available,
-    otherwise falls back to MonarchRPC.
+    Prefers SharedMemory for same-host transfers, then TorchCommsRDMA,
+    then MonarchRDMA, then Gloo, otherwise falls back to MonarchRPC.
     """
     # Prefer SharedMemory for same-host transfers
     if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
         return TransportType.SharedMemory
 
-    # Fall back to RDMA if available
-    if monarch_rdma_transport_available():
-        return TransportType.MonarchRDMA
-    elif torchcomms_rdma_available():
+    # Fall back to RDMA if available (prefer TorchComms over Monarch RDMA)
+    if torchcomms_rdma_available():
         return TransportType.TorchCommsRDMA
+    elif monarch_rdma_transport_available():
+        return TransportType.MonarchRDMA
     elif gloo_available():
         return TransportType.Gloo
 
