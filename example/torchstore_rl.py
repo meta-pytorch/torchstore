@@ -15,8 +15,7 @@ from monarch.actor import Actor, current_rank, endpoint, proc_mesh
 
 
 class Learner(Actor):
-    def __init__(self, store):
-        self.store = store
+    def __init__(self):
         self.device = torch.device("cpu")
         self.model = torch.nn.Linear(4, 4, bias=False, device=self.device)
         self.optim = torch.optim.AdamW(
@@ -44,8 +43,7 @@ class Learner(Actor):
 
 
 class Generator(Actor):
-    def __init__(self, store):
-        self.store = store
+    def __init__(self):
         self.model = torch.nn.Linear(4, 4, bias=False, device="cuda")
         self.index = current_rank()["gpus"]
 
