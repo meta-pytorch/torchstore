@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, overload
+from typing import Any, overload, TYPE_CHECKING
 
 import torch
 from monarch.actor import get_or_spawn_controller, ProcMesh
@@ -17,11 +17,17 @@ from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
 
+if TYPE_CHECKING:
+    from torchstore.spmd import _SPMDSession
+
 # I need to keep this somewhere, so here we go
 DEFAULT_TORCHSTORE_NAME: str = "TorchStore"
 
 # cache for local clients
 _local_clent_map: dict[str, LocalClient] = {}
+
+# SPMD-initialized stores register their session here
+_spmd_state_map: dict[str, "_SPMDSession"] = {}
 
 
 async def initialize(
@@ -78,7 +84,10 @@ async def initialize(
 async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     """Shutdown and cleanup a TorchStore instance.
 
-    Gracefully shuts down all storage volumes and controllers associated with the store.
+    Gracefully shuts down all storage volumes and controllers associated with the
+    store. For SPMD-initialized stores, this delegates to the session cleanup
+    path created by ``torchstore.spmd.initialize()``, which also tears down the
+    Monarch host mesh and the background SSHJob.
 
     Args:
         store_name (str): Name of the store to shutdown. Defaults to DEFAULT_TORCHSTORE_NAME.
@@ -88,10 +97,16 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
         >>> await ts.shutdown()  # Shutdown default store
         >>> await ts.shutdown("my_custom_store")
     """
+    session = _spmd_state_map.get(store_name)
+    if session is not None:
+        await session.shutdown()
+        return
+
     controller = await _controller(store_name)
-    await controller.teardown.call()
-    global _local_clent_map
-    _local_clent_map = {}
+    try:
+        await controller.teardown.call()
+    finally:
+        reset_client(store_name)
 
 
 def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
@@ -102,6 +117,9 @@ def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
 async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:
     """Get a controller handle for interacting with the store."""
+    session = _spmd_state_map.get(store_name)
+    if session is not None:
+        return session.controller
     return await get_or_spawn_controller(store_name, Controller)
 
 
