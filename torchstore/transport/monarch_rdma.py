@@ -36,10 +36,6 @@ if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
     from torchstore.transport.buffers import TransportContext
 
-# For some reason, monarch sometimes doesn't like gpu tensors, so we convert to cpu. We noticed this in larger
-# models, like qwen3-30BA3B
-MONARCH_RDMA_EAGER_D2H = os.environ.get("TORCHSTORE_MONARCH_RDMA_EAGER_D2H", "1") == "1"
-
 
 def monarch_rdma_transport_available() -> bool:
     """Check if Monarch RDMA transport is available for use.
@@ -212,11 +208,6 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             # note: .contiguous will return a copy if this tensor is not contiguous
             # this usually shows up during resharding cases
             tensor = tensor_like.contiguous()
-
-            # monarch sometimes really doesn't like gpu tensors, so we convert to cpu
-            # this makes things way slower, and hopefully will be fixed in the future
-            if MONARCH_RDMA_EAGER_D2H:
-                tensor = tensor.cpu()
 
         self.tensor = tensor
 
