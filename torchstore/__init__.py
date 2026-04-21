@@ -7,6 +7,7 @@
 import os
 from logging import getLogger
 
+from torchstore import spmd
 from torchstore.api import (
     client,
     delete,
@@ -30,6 +31,8 @@ from torchstore.strategy import (
     TorchStoreStrategy,
 )
 
+initialize_spmd = spmd.initialize
+
 if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
     init_logging()
     logger = getLogger(__name__)
@@ -42,6 +45,7 @@ if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
 
 __all__ = [
     "initialize",
+    "initialize_spmd",
     "init_logging",
     "put",
     "put_batch",
@@ -59,4 +63,5 @@ __all__ = [
     "put_state_dict",
     "get_state_dict",
     "reset_client",
+    "spmd",
 ]
