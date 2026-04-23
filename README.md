@@ -12,7 +12,7 @@ Key Features:
 - **Automatic transport selection** — POSIX shared memory for same-host, RDMA when available, with Gloo and Monarch RPC fallbacks
 - **Configurable storage strategies** — `LocalRankStrategy` (per-rank volumes), `HostStrategy` (per-host), extensible for your specific use case
 
-> **Note:** TorchStore requires distributed jobs to be launched with [Monarch](https://github.com/meta-pytorch/monarch). Direct SPMD support is planned.
+> **Note:** TorchStore supports both Monarch-native launches and SPMD entry points (`torchrun` / `torchx`). See [SPMD Usage](#spmd-usage-torchrun--torchx) below for the latter.
 
 
 > ⚠️ **Early Development Warning** TorchStore is currently in an experimental
@@ -137,6 +137,63 @@ if __name__ == "__main__":
 # [0] [1] Rank=[1] Fetched tensor([2]) from other_rank=2
 
 ```
+
+### SPMD Usage (torchrun / torchx)
+
+If your job is launched with `torchrun` or `torchx` rather than from inside a
+Monarch runtime, use `ts.initialize_spmd()` instead of `ts.initialize()`. It
+reads the standard `RANK` / `LOCAL_RANK` / `WORLD_SIZE` / `LOCAL_WORLD_SIZE` /
+`MASTER_ADDR` / `MASTER_PORT` env vars (via `ts.spmd.SPMDEnv.from_env()`) and
+bootstraps a fresh Monarch context for you. Global rank 0 collects the worker addresses and attaches to them to build the host mesh. Cross-rank coordination is
+the caller's responsibility, typically through `torch.distributed`.
+
+```python
+import asyncio
+import os
+
+import torch
+import torch.distributed as dist
+import torchstore as ts
+
+
+async def main() -> None:
+    rank = int(os.environ["RANK"])
+    dist.init_process_group("gloo")
+
+    await ts.initialize_spmd(strategy=ts.LocalRankStrategy())
+    try:
+        if rank == 0:
+            await ts.put("demo", torch.tensor([123], dtype=torch.int64))
+            print(f"[rank=0] wrote", flush=True)
+
+        dist.barrier()  # wait for rank 0's write before reading
+        value = await ts.get("demo")
+        print(f"[rank={rank}] got {value}", flush=True)
+    finally:
+        dist.barrier()  # wait for readers before tearing down storage
+        await ts.shutdown()
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Launch with:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=2 your_script.py
+```
+
+The default `transport="ipc"` works for single-host launches. For
+multi-host jobs, pass `transport="tcp"` (or `"metatls"` /
+`"metatls-hostname"` at Meta) and `monarch_port=<port>` to control the
+port each local rank 0's worker binds on.
+
+To drive init from an explicit config instead of reading env vars,
+construct `ts.spmd.SPMDEnv(...)` directly and pass it via `env=`. For a
+complete runnable example, see
+[`example/torchstore_spmd.py`](example/torchstore_spmd.py).
 
 ### API Overview
 
