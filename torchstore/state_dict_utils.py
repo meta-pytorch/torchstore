@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from monarch.rdma import is_ibverbs_available
 from torch.distributed.checkpoint._nested_dict import (
     flatten_state_dict,
     unflatten_state_dict,
@@ -67,6 +68,12 @@ async def put_state_dict(
             lower precision (e.g. bfloat16).
     """
     if direct_rdma:
+        if not is_ibverbs_available():
+            raise RuntimeError(
+                "`direct_rdma` was set to True but RDMA is not available. "
+                "If your hardware does not have support for RDMA please set "
+                "`direct_rdma` to False."
+            )
         await _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype)
         return
 
@@ -94,6 +101,12 @@ async def get_state_dict(
     tensors are available for in-place writes.
     """
     if direct_rdma:
+        if not is_ibverbs_available():
+            raise RuntimeError(
+                "`direct_rdma` was set to True but RDMA is not available. "
+                "If your hardware does not have support for RDMA please set "
+                "`direct_rdma` to False."
+            )
         assert (
             user_state_dict is not None
         ), "user_state_dict is required for direct_rdma mode"
