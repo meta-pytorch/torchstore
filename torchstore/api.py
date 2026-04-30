@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from torchstore.spmd import _SPMDSession
 
 # I need to keep this somewhere, so here we go
-DEFAULT_TORCHSTORE_NAME: str = "TorchStore"
+DEFAULT_TORCHSTORE_NAME: str = "torchstore"
 
 # cache for local clients
 _local_clent_map: dict[str, LocalClient] = {}
