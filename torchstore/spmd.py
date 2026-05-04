@@ -4,18 +4,22 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import contextlib
 import logging
 import os
 import socket
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import cloudpickle
 from monarch._src.actor import actor_mesh
 from monarch.actor import get_or_spawn_controller
-from torch.distributed import TCPStore
+
+if TYPE_CHECKING:
+    from torch.distributed import TCPStore
 
 try:
     from monarch._src.spmd.host_mesh import host_mesh_from_store
@@ -38,6 +42,18 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 def _spmd_key(store_name: str, suffix: str) -> str:
     return f"torchstore/spmd/{store_name}/{suffix}"
+
+
+def _tcp_store_type() -> type[TCPStore]:
+    try:
+        from torch.distributed import TCPStore
+    except ImportError as e:
+        raise RuntimeError(
+            "torchstore.initialize_spmd() requires a PyTorch build with "
+            "torch.distributed and c10d support"
+        ) from e
+
+    return TCPStore
 
 
 @dataclass(frozen=True)
@@ -307,7 +323,7 @@ async def initialize(
 
     os.environ.setdefault("HOSTNAME", socket.gethostname())
 
-    rendezvous = TCPStore(
+    rendezvous = _tcp_store_type()(
         env.master_addr,
         env.master_port,
         env.world_size,
