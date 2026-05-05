@@ -228,10 +228,9 @@ class DirectWeightSyncDest:
         For each destination parameter, finds overlapping source shards
         and creates a _TransferOp describing how to read from each one.
 
-        Three cases per (source, dest) pair:
-          1. Exact match + contiguous dest -> zero-copy RDMA into param
-          2. Exact match + non-contiguous dest -> RDMA into recv buf, full copy
-          3. Partial overlap (resharding) -> RDMA into recv buf, slice copy
+        Two cases per (source, dest) pair:
+          1. Exact match -> zero-copy RDMA directly into param memory
+          2. Partial overlap (resharding) -> RDMA into recv buf, slice copy
         """
         ops: list[_TransferOp] = []
 
@@ -340,18 +339,12 @@ class DirectWeightSyncDest:
             *(op.rdma_buffer.read_into(op.dest_byte_view) for op in self._plan)
         )
 
-        # Post-read copies (only for non-contiguous or resharded ops)
+        # Post-read copies (only for resharded ops)
         for op in self._plan:
             if op.dest_tensor is None:
                 continue  # zero-copy, already in place
-            if op.src_slices is not None:
-                # Resharded: copy overlapping region
-                # recv_buffer contains the full source shard
-                # op.recv_buffer[op.src_slices] extracts the overlap from the source
-                # op.dest_tensor[op.dest_slices] targets where it goes in the dest
-                op.dest_tensor[op.dest_slices].copy_(op.recv_buffer[op.src_slices])
-            else:
-                # Non-contiguous exact match: full copy
-                # recv_buffer is the contiguous version of what we want in the
-                # dest_tensor, after the RDMA read
-                op.dest_tensor.copy_(op.recv_buffer)
+            # Resharded: copy overlapping region
+            # recv_buffer contains the full source shard
+            # op.recv_buffer[op.src_slices] extracts the overlap from the source
+            # op.dest_tensor[op.dest_slices] targets where it goes in the dest
+            op.dest_tensor[op.dest_slices].copy_(op.recv_buffer[op.src_slices])
