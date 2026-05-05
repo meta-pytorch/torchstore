@@ -134,7 +134,9 @@ class DirectWeightSyncSource:
                 self._staging[name] = (buf_tensor, local_tensor)
                 num_staged += 1
             else:
-                assert local_tensor.is_contiguous(), f"Expected contiguous tensor for key={name}, strides={local_tensor.stride()}"
+                assert (
+                    local_tensor.is_contiguous()
+                ), f"Expected contiguous tensor for key={name}, strides={local_tensor.stride()}"
                 buf_tensor = local_tensor
 
             # Register the contiguous buffer with RDMA
@@ -264,7 +266,10 @@ class DirectWeightSyncDest:
                     and handle.tensor_slice.local_shape == dest_slice.local_shape
                 )
                 if is_exact:
-                    assert dest_tensor.is_contiguous(), f"Expected contiguous dest tensor for key={name}, strides={dest_tensor.stride()}"
+                    assert dest_tensor.is_contiguous(), (
+                        f"Expected contiguous dest tensor for "
+                        f"key={name}, strides={dest_tensor.stride()}"
+                    )
                     # Zero-copy: RDMA directly into model parameter
                     ops.append(
                         _TransferOp(
