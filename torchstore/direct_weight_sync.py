@@ -82,11 +82,13 @@ def _request_to_slice(req: Request, param: torch.Tensor) -> TensorSlice:
 class DirectWeightSyncSource:
     """Manages RDMA handle registration and staging buffer refresh.
 
-    For contiguous parameters the RDMA handle points directly at param
-    memory (true zero-copy).  For non-contiguous parameters a contiguous
-    *staging buffer* is allocated and a handle is registered against it.
-    After the optimizer updates weights, call :meth:`refresh` to re-copy
-    non-contiguous params into their staging buffers.
+    RDMA handles point directly at param memory (true zero-copy). The
+    optimizer updates weights in-place, so RDMA reads always see fresh
+    values without any copy.
+
+    When ``transfer_dtype`` is set, a staging buffer is allocated per
+    param in the target dtype. Call :meth:`refresh` after each optimizer
+    step to re-cast from the source tensors into the staging buffers.
     """
 
     def __init__(self) -> None:
@@ -131,15 +133,9 @@ class DirectWeightSyncSource:
                 buf_tensor = local_tensor.to(transfer_dtype).contiguous()
                 self._staging[name] = (buf_tensor, local_tensor)
                 num_staged += 1
-            elif local_tensor.is_contiguous():
-                # Contiguous: RDMA handle points directly at param memory.
-                buf_tensor = local_tensor
             else:
-                # Non-contiguous (e.g. Shard(1) column slices): allocate a
-                # contiguous staging buffer and copy into it.
-                buf_tensor = local_tensor.contiguous()
-                self._staging[name] = (buf_tensor, local_tensor)
-                num_staged += 1
+                assert local_tensor.is_contiguous(), f"Expected contiguous tensor for key={name}, strides={local_tensor.stride()}"
+                buf_tensor = local_tensor
 
             # Register the contiguous buffer with RDMA
             rdma_buf = RDMABuffer(to_byte_view(buf_tensor))
@@ -158,16 +154,11 @@ class DirectWeightSyncSource:
         return handles
 
     def refresh(self) -> int:
-        """Re-copy source params into their staging buffers.
+        """Re-cast source params into their dtype-cast staging buffers.
 
-        For non-contiguous params, this copies the latest data into a
-        contiguous staging buffer. For dtype-cast params, this re-casts
-        from the original source tensor. ``copy_()`` handles both cases
-        (contiguity and dtype conversion).
-
-        Contiguous params without dtype casting need no refresh because
-        RDMA handles point directly at the param memory that the optimizer
-        updated in-place.
+        Only needed when ``transfer_dtype`` was set during registration.
+        Without dtype casting, RDMA handles point directly at param memory
+        that the optimizer updates in-place, so no refresh is needed.
 
         Returns the number of staging buffers refreshed.
         """
@@ -272,32 +263,17 @@ class DirectWeightSyncDest:
                     handle.tensor_slice.offsets == dest_slice.offsets
                     and handle.tensor_slice.local_shape == dest_slice.local_shape
                 )
-
-                if is_exact and dest_tensor.is_contiguous():
-                    # Case 1: RDMA directly into model parameter (zero-copy)
+                if is_exact:
+                    assert dest_tensor.is_contiguous(), f"Expected contiguous dest tensor for key={name}, strides={dest_tensor.stride()}"
+                    # Zero-copy: RDMA directly into model parameter
                     ops.append(
                         _TransferOp(
                             rdma_buffer=handle.rdma_buffer,
                             dest_byte_view=to_byte_view(dest_tensor),
                         )
                     )
-                elif is_exact:
-                    # Case 2: dest is non-contiguous, need a recv buffer
-                    recv = torch.empty(
-                        intersection.local_shape,
-                        dtype=dest_tensor.dtype,
-                        device=dest_tensor.device,
-                    )
-                    ops.append(
-                        _TransferOp(
-                            rdma_buffer=handle.rdma_buffer,
-                            dest_byte_view=to_byte_view(recv),
-                            dest_tensor=dest_tensor,
-                            recv_buffer=recv,
-                        )
-                    )
                 else:
-                    # Case 3: partial overlap (different TP), need resharding.
+                    # Partial overlap (different TP), need resharding.
                     # Read the full source shard, then copy the overlap region.
                     recv = torch.empty(
                         handle.tensor_slice.local_shape,
