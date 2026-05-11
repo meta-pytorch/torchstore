@@ -126,10 +126,6 @@ class StorageImpl:
         """Delete data from the storage backend."""
         raise NotImplementedError()
 
-    async def delete_batch(self, keys: list[str]) -> None:
-        """Delete multiple keys from the storage backend."""
-        raise NotImplementedError()
-
     async def handshake(
         self,
         transport_buffer: TransportBuffer,
@@ -392,10 +388,6 @@ class InMemoryStore(StorageImpl):
         if key not in self.kv:
             raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
         del self.kv[key]
-
-    async def delete_batch(self, keys: list[str]) -> None:
-        for key in set(keys):
-            self.kv.pop(key, None)
 
     def reset(self) -> None:
         self.kv = {}
