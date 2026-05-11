@@ -417,58 +417,6 @@ class LocalClient:
         self.strategy.transport_context.delete(key)
         latency_tracker.track_e2e()
 
-    async def delete_batch(self, keys: list[str]) -> None:
-        """
-        Delete multiple keys from the distributed store.
-
-        Missing keys are ignored to make cleanup retries idempotent.
-
-        Args:
-            keys: The keys to delete.
-
-        Returns:
-            None
-        """
-        if not isinstance(keys, list):
-            raise TypeError(f"delete_batch expects list[str], got {type(keys)}")
-
-        unique_keys = list(dict.fromkeys(keys))
-        if not unique_keys:
-            return
-
-        latency_tracker = LatencyTracker("delete_batch")
-        volume_maps = await self._controller.locate_volumes.call_one(
-            unique_keys,
-            missing_ok=True,
-            require_fully_committed=False,
-        )
-        latency_tracker.track_step("locate_volumes")
-
-        volume_to_keys: dict[str, list[str]] = defaultdict(list)
-        for key, volume_map in volume_maps.items():
-            for volume_id in volume_map:
-                volume_to_keys[volume_id].append(key)
-
-        async def delete_from_volume(volume_id: str, volume_keys: list[str]):
-            volume_ref = self.strategy.get_storage_volume(volume_id)
-            await volume_ref.volume.delete_batch.call(volume_keys)
-
-        if volume_to_keys:
-            await self._controller.notify_delete_batch.call_one(dict(volume_to_keys))
-            latency_tracker.track_step("notify_delete_batch")
-
-        await asyncio.gather(
-            *[
-                delete_from_volume(volume_id, volume_keys)
-                for volume_id, volume_keys in volume_to_keys.items()
-            ]
-        )
-        latency_tracker.track_step("volume.delete_batch")
-
-        self.strategy.transport_context.delete(unique_keys)
-        latency_tracker.track_step("transport_context.delete")
-        latency_tracker.track_e2e()
-
     async def exists(self, key: str) -> bool:
         """Check if a key exists in the distributed store.
 
