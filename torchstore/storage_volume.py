@@ -87,6 +87,7 @@ class StorageVolume(Actor):
     @endpoint
     async def delete(self, key: str) -> None:
         await self.store.delete(key)
+        self.store.transport_context.delete(key)
 
     @endpoint
     async def reset(self) -> None:

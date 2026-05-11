@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from typing import Any, TYPE_CHECKING, TypeVar
 
 import torch
@@ -18,6 +19,14 @@ if TYPE_CHECKING:
 
 class TransportCache(ABC):
     """Base class for per-transport caches stored in TransportContext."""
+
+    def delete(self, keys: set[str]) -> None:
+        """Delete per-key cache entries.
+
+        Most transport caches are not keyed by TorchStore key, so their default
+        behavior is a no-op.
+        """
+        return
 
     @abstractmethod
     def clear(self) -> None:
@@ -50,6 +59,14 @@ class TransportContext:
         for cache in self._caches.values():
             cache.clear()
         self._caches.clear()
+
+    def delete(self, keys: str | Iterable[str]) -> None:
+        """Delete cache entries associated with one or more TorchStore keys."""
+        key_set = {keys} if isinstance(keys, str) else set(keys)
+        if not key_set:
+            return
+        for cache in self._caches.values():
+            cache.delete(key_set)
 
 
 class TransportBuffer:
