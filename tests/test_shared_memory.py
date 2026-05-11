@@ -240,6 +240,57 @@ class TestSharedMemoryCache:
 
         assert len(cache._storages) == 0
 
+    def test_delete_clears_matching_keys(self):
+        """Test deleting keys removes only matching cache entries."""
+        cache = SharedMemoryCache()
+        tensor1 = allocate_shared_tensor(torch.Size([5, 5]), torch.float32)
+        tensor2 = allocate_shared_tensor(torch.Size([5, 5]), torch.float32)
+        descriptor1 = SharedMemoryDescriptor.from_tensor(tensor1)
+        descriptor2 = SharedMemoryDescriptor.from_tensor(tensor2)
+        assert descriptor1 is not None
+        assert descriptor2 is not None
+
+        try:
+            cache.attach("key1", descriptor1)
+            cache.attach("key2", descriptor2)
+
+            cache.delete({"key1", "missing"})
+
+            assert all(cache_key[0] != "key1" for cache_key in cache._storages)
+            assert any(cache_key[0] == "key2" for cache_key in cache._storages)
+
+            cache.delete({"key2"})
+
+            assert len(cache._storages) == 0
+        finally:
+            cache.clear()
+
+    def test_transport_context_delete_clears_shared_memory_cache(self):
+        """Test TransportContext.delete forwards key invalidation to SHM cache."""
+        ctx = TransportContext()
+        cache = ctx.get(SharedMemoryCache)
+        tensor1 = allocate_shared_tensor(torch.Size([5, 5]), torch.float32)
+        tensor2 = allocate_shared_tensor(torch.Size([5, 5]), torch.float32)
+        descriptor1 = SharedMemoryDescriptor.from_tensor(tensor1)
+        descriptor2 = SharedMemoryDescriptor.from_tensor(tensor2)
+        assert descriptor1 is not None
+        assert descriptor2 is not None
+
+        try:
+            cache.attach("key1", descriptor1)
+            cache.attach("key2", descriptor2)
+
+            ctx.delete("key1")
+
+            assert all(cache_key[0] != "key1" for cache_key in cache._storages)
+            assert any(cache_key[0] == "key2" for cache_key in cache._storages)
+
+            ctx.delete(["key2", "missing"])
+
+            assert len(cache._storages) == 0
+        finally:
+            ctx.clear()
+
     @pytest.mark.asyncio
     async def test_cache_reuse_on_same_key_puts(self, ref):
         """Test that putting twice to same key with same-spec tensor reuses cache entry."""

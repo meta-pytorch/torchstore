@@ -212,8 +212,6 @@ class SharedMemoryCache(TransportCache):
 
     Caches at the storage level using (key, storage_handle) as cache key.
     Different views of the same storage share the same cached mmap and pin.
-    Stale entries (after delete/re-PUT) are never accessed because the server
-    returns new handles.
     """
 
     def __init__(self):
@@ -250,6 +248,13 @@ class SharedMemoryCache(TransportCache):
         for storage in self._storages.values():
             unpin_memory(storage)
         self._storages.clear()
+
+    def delete(self, keys: set[str]) -> None:
+        """Clear cached shared-memory mappings for deleted TorchStore keys."""
+        cache_keys = [cache_key for cache_key in self._storages if cache_key[0] in keys]
+        for cache_key in cache_keys:
+            storage = self._storages.pop(cache_key)
+            unpin_memory(storage)
 
     def __del__(self):
         self.clear()

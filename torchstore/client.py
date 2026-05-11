@@ -414,6 +414,7 @@ class LocalClient:
             *[delete_from_volume(volume_id) for volume_id in volume_map]
         )
 
+        self.strategy.transport_context.delete(key)
         latency_tracker.track_e2e()
 
     async def exists(self, key: str) -> bool:
