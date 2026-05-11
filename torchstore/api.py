@@ -298,6 +298,28 @@ async def delete(
     return await cl.delete(key)
 
 
+async def delete_batch(
+    keys: list[str],
+    *,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> None:
+    """Delete multiple keys from the distributed store.
+
+    Missing keys are ignored to make cleanup retries idempotent.
+
+    Args:
+        keys: Unique identifiers of the values to delete.
+
+    Keyword Args:
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Example:
+        >>> await delete_batch(["tensor_a", "tensor_b"])
+    """
+    cl = await client(store_name=store_name)
+    return await cl.delete_batch(keys)
+
+
 async def keys(
     prefix: str | None = None,
     *,

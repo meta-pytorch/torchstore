@@ -11,6 +11,7 @@ from torchstore import spmd
 from torchstore.api import (
     client,
     delete,
+    delete_batch,
     exists,
     get,
     get_batch,
@@ -52,6 +53,7 @@ __all__ = [
     "get",
     "get_batch",
     "delete",
+    "delete_batch",
     "keys",
     "exists",
     "client",

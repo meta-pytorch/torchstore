@@ -305,6 +305,72 @@ async def test_delete(strategy_params):
         await ts.shutdown()
 
 
+@pytest.mark.parametrize(*strategy_params())
+@pytest.mark.asyncio
+async def test_delete_batch(strategy_params):
+    """Test the delete_batch() API functionality."""
+
+    class DeleteBatchTestActor(Actor):
+        def __init__(self, world_size):
+            init_logging()
+            self.world_size = world_size
+            self.rank = current_rank().rank
+            os.environ["LOCAL_RANK"] = str(self.rank)
+            os.environ["HOSTNAME"] = socket.gethostname()
+
+        @endpoint
+        async def put_rank_values(self):
+            tensor_key = f"batch_tensor_key_{self.rank}"
+            object_key = f"batch_object_key_{self.rank}"
+            await ts.put(tensor_key, torch.tensor([self.rank + 1] * 5))
+            await ts.put(object_key, {"rank": self.rank})
+            return [tensor_key, object_key]
+
+        @endpoint
+        async def delete(self, key):
+            await ts.delete(key)
+
+        @endpoint
+        async def delete_batch(self, keys):
+            await ts.delete_batch(keys)
+
+        @endpoint
+        async def exists_many(self, keys):
+            return {key: await ts.exists(key) for key in keys}
+
+    volume_world_size, strategy = strategy_params
+    await ts.initialize(num_storage_volumes=volume_world_size, strategy=strategy())
+
+    actor_mesh = await spawn_actors(
+        volume_world_size,
+        DeleteBatchTestActor,
+        "delete_batch_test_actors",
+        world_size=volume_world_size,
+    )
+
+    try:
+        put_results = await actor_mesh.put_rank_values.call()
+        keys = []
+        for _, rank_keys in put_results:
+            keys.extend(rank_keys)
+
+        actor = actor_mesh.slice(gpus=0)
+        await actor.delete_batch.call(keys + [keys[0], "missing_key"])
+
+        results = await actor_mesh.exists_many.call(keys)
+        for _, exists_result in results:
+            for key in keys:
+                assert not exists_result[key]
+
+        await actor.delete_batch.call([])
+        await actor.delete_batch.call(keys)
+
+        with pytest.raises(Exception):
+            await actor.delete.call("missing_key")
+    finally:
+        await ts.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_key_miss():
     """Test the behavior of get() when the key is missing."""

@@ -139,6 +139,8 @@ class Controller(Actor):
     async def locate_volumes(
         self,
         keys: list[str],
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
     ) -> dict[str, dict[str, StorageInfo]]:
         """Locate storage volumes containing shards of the specified keys.
 
@@ -160,6 +162,9 @@ class Controller(Actor):
 
         Args:
             keys (list[str]): The keys to locate in storage volumes.
+            missing_ok (bool): If True, omit missing keys instead of raising.
+            require_fully_committed (bool): If True, reject partially committed
+                DTensor entries.
 
         Returns:
             Dict[str, Dict[str, StorageInfo]]: Mapping from each key to a mapping from
@@ -167,16 +172,21 @@ class Controller(Actor):
                 the stored data shards.
 
         Raises:
-            KeyError: If any key is not found in any storage volumes, or if a key
-                is a DTensor that is only partially committed.
+            KeyError: If any key is not found in any storage volumes and
+                missing_ok is False, or if a key is a DTensor that is only
+                partially committed and require_fully_committed is True.
         """
         self.assert_initialized()
         result = {}
         for key in keys:
             if key not in self.keys_to_storage_volumes:
+                if missing_ok:
+                    continue
                 raise KeyError(f"Unable to locate {key} in any storage volumes.")
             volume_map = self.keys_to_storage_volumes[key]
-            if not self._is_dtensor_fully_committed(key, volume_map):
+            if require_fully_committed and not self._is_dtensor_fully_committed(
+                key, volume_map
+            ):
                 raise KeyError(
                     f"DTensor '{key}' is only partially committed. "
                     f"Not all shards have been stored yet. "
@@ -251,15 +261,36 @@ class Controller(Actor):
         maintain the distributed storage index.
         """
         self.assert_initialized()
+        self._notify_delete(key, storage_volume_id)
+
+    def _notify_delete(
+        self,
+        key: str,
+        storage_volume_id: str,
+        missing_ok: bool = False,
+    ) -> None:
+        """Remove one key-to-volume mapping from the controller index."""
         if key not in self.keys_to_storage_volumes:
+            if missing_ok:
+                return
             raise KeyError(f"Unable to locate {key} in any storage volumes.")
         if storage_volume_id not in self.keys_to_storage_volumes[key]:
+            if missing_ok:
+                return
             raise KeyError(
                 f"Unable to locate {key} in storage volume {storage_volume_id}."
             )
         del self.keys_to_storage_volumes[key][storage_volume_id]
         if len(self.keys_to_storage_volumes[key]) == 0:
             del self.keys_to_storage_volumes[key]
+
+    @endpoint
+    async def notify_delete_batch(self, volume_to_keys: dict[str, list[str]]) -> None:
+        """Notify the controller about an idempotent batch delete."""
+        self.assert_initialized()
+        for storage_volume_id, keys in volume_to_keys.items():
+            for key in keys:
+                self._notify_delete(key, storage_volume_id, missing_ok=True)
 
     def get_keys_to_storage_volumes(self) -> Mapping[str, dict[str, StorageInfo]]:
         return self.keys_to_storage_volumes
