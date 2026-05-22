@@ -90,6 +90,11 @@ class StorageVolume(Actor):
         self.store.transport_context.delete(key)
 
     @endpoint
+    async def delete_batch(self, keys: list[str]) -> None:
+        await self.store.delete_batch(keys)
+        self.store.transport_context.delete(keys)
+
+    @endpoint
     async def reset(self) -> None:
         self.store.reset()
 
