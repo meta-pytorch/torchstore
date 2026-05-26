@@ -6,12 +6,18 @@
 
 # pyre-unsafe
 import asyncio
+import os
+from functools import partial
 
 import torch
 import torchstore as ts
-from monarch.actor import Actor, current_rank, endpoint, proc_mesh
+from monarch.actor import Actor, current_rank, endpoint, shutdown_context, this_host
 
 # Run the example : python example/torchstore_rl.py
+
+
+def set_cuda_visible_devices(devices: str) -> None:
+    os.environ["CUDA_VISIBLE_DEVICES"] = devices
 
 
 class Learner(Actor):
@@ -72,13 +78,19 @@ async def main():
     num_generators = 1
 
     # TODO: Show weights re-sharding usecase.
-    learner_mesh = await proc_mesh(gpus=num_learners)
-    gen_mesh = await proc_mesh(gpus=num_generators)
+    learner_mesh = this_host().spawn_procs(
+        per_host={"gpus": num_learners},
+        bootstrap=partial(set_cuda_visible_devices, "0"),
+    )
+    gen_mesh = this_host().spawn_procs(
+        per_host={"gpus": num_generators},
+        bootstrap=partial(set_cuda_visible_devices, "1"),
+    )
 
     await ts.initialize()
 
-    learner = await learner_mesh.spawn("learner", Learner)
-    generators = await gen_mesh.spawn("generator", Generator)
+    learner = learner_mesh.spawn("learner", Learner)
+    generators = gen_mesh.spawn("generator", Generator)
 
     logits, reward = await generators.generate.call_one(
         torch.randn(4, 4, device="cuda")
@@ -91,6 +103,8 @@ async def main():
         await generators.update_weights.call_one()
 
     print("done")
+    await ts.shutdown()
 
 
 asyncio.run(main())
+shutdown_context().get(timeout=2.0)
