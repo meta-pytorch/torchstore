@@ -95,7 +95,7 @@ class TransportBuffer:
     - Otherwise, `_put_requests` is called once per entry with a single-element list.
 
     `_put_requests(requests)`:
-    1. Optionally performs handshake if `requires_handshake(requests)` returns True
+    1. Runs `perform_handshake(...)` if `requires_handshake(requests)` returns True
     2. Calls `_pre_put_hook(requests)` [CLIENT] - allocate local buffers, prepare data
     3. Sends to StorageVolume via `volume.put.call()`
     4. Client calls `drop()` [CLIENT] - cleanup resources (e.g., deregister RDMA memory)
@@ -110,7 +110,7 @@ class TransportBuffer:
     - Otherwise, `_get_requests` is called once per entry with a single-element list.
 
     `_get_requests(requests)`:
-      1. Optionally performs handshake if `requires_handshake(requests)` returns True
+      1. Runs `perform_handshake(...)` if `requires_handshake(requests)` returns True
       2. Calls `_pre_get_hook(requests)` [CLIENT] - save metadata for response handling
       3. Sends to StorageVolume via `volume.get.call()`
       4. StorageVolume calls `handle_get_request(ctx, entries)` [STORAGE VOLUME]
@@ -122,8 +122,10 @@ class TransportBuffer:
     - `__init__`: Initialize buffer with reference to target storage volume
     - `put_to_storage_volume`: Entry point for put operations (single or batch)
     - `get_from_storage_volume`: Entry point for get operations
-    - `_pre_handshake`: Prepare for handshake (if requires_handshake returns True)
-    - `_post_handshake`: Process handshake results (if requires_handshake returns True)
+    - `perform_handshake`: Orchestrate handshake setup when required
+    - `_pre_handshake`: Prepare for default one-RPC handshake
+    - `_post_handshake`: Process default one-RPC handshake results
+    - `_post_request_success`: Publish state only after the storage-volume call succeeds
     - `_pre_put_hook`: Prepare buffers before sending put request
     - `_pre_get_hook`: Prepare buffers before sending get request
     - `_handle_storage_volume_response`: Process response from storage volume
@@ -146,9 +148,10 @@ class TransportBuffer:
     - `supports_batch_puts`: Set True if the transport can handle multiple entries at once for puts
     - `supports_batch_gets`: Set True if the transport can handle multiple entries at once for gets
     - `requires_handshake`: Return True if a handshake is needed before put/get
+    - `perform_handshake`: Override for multi-step handshakes; default is one RPC
     - `_pre_put_hook`: Custom buffer allocation for puts
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
-    - `recv_handshake`: If `requires_handshake` returns True
+    - `recv_handshake`: StorageVolume side of the default handshake
     - `drop`: Resource cleanup (especially important for RDMA buffers)
 
     Attributes
@@ -203,22 +206,18 @@ class TransportBuffer:
         meta_requests = [r.meta_only() for r in requests]
         try:
             if self.requires_handshake(requests):
-                await self._pre_handshake()
-                l.track_step("pre_handshake")
-                handshake_results = (
-                    await self.storage_volume_ref.volume.handshake.call_one(
-                        self, meta_requests
-                    )
-                )
-                l.track_step("volume.handshake.call")
-                await self._post_handshake(handshake_results, requests)
-                l.track_step("post_handshake")
+                await self.perform_handshake(requests, meta_requests, l)
 
             await self._pre_put_hook(requests)
             l.track_step("_pre_put_hook")
 
             await self.storage_volume_ref.volume.put.call(self, meta_requests)
             l.track_step("volume.put.call")
+
+            # Success-only hook: transports can promote staged state here,
+            # while drop() still handles cleanup on both success and failure.
+            await self._post_request_success()
+            l.track_step("_post_request_success")
         finally:
             await self.drop()
             l.track_step("drop")
@@ -238,16 +237,7 @@ class TransportBuffer:
         meta_requests = [r.meta_only() for r in requests]
         try:
             if self.requires_handshake(requests):
-                await self._pre_handshake()
-                l.track_step("pre_handshake")
-                handshake_results = (
-                    await self.storage_volume_ref.volume.handshake.call_one(
-                        self, meta_requests
-                    )
-                )
-                l.track_step("volume.handshake.call")
-                await self._post_handshake(handshake_results, requests)
-                l.track_step("post_handshake")
+                await self.perform_handshake(requests, meta_requests, l)
 
             await self._pre_get_hook(requests)
             l.track_step("_pre_get_hook")
@@ -257,11 +247,37 @@ class TransportBuffer:
                 await self.storage_volume_ref.volume.get.call_one(self, meta_requests),
             )
             l.track_step("volume.get.call")
+
+            await self._post_request_success()
+            l.track_step("_post_request_success")
         finally:
             await self.drop()
             l.track_step("drop")
             l.track_e2e()
         return response
+
+    async def perform_handshake(
+        self,
+        requests: list[Request],
+        meta_requests: list[Request],
+        latency_tracker: LatencyTracker | None = None,
+    ) -> None:
+        """Run the transport handshake.
+
+        The default implementation preserves the single-RPC handshake behavior.
+        Transports with multi-stage setup can override this method.
+        """
+        tracker = latency_tracker or LatencyTracker("handshake")
+        await self._pre_handshake()
+        tracker.track_step("pre_handshake")
+
+        handshake_results = await self.storage_volume_ref.volume.handshake.call_one(
+            self, meta_requests
+        )
+        tracker.track_step("volume.handshake.call")
+
+        await self._post_handshake(handshake_results, requests)
+        tracker.track_step("post_handshake")
 
     async def _pre_handshake(self) -> None:
         """Prepare for handshake on the client side.
@@ -284,7 +300,13 @@ class TransportBuffer:
         """
         pass
 
-    async def _drop(self, response: Any):
+    async def _post_request_success(self) -> None:
+        """Run after the remote put/get succeeds but before request cleanup.
+
+        Use this for committing request-scoped resources into longer-lived
+        caches. ``drop()`` runs in ``finally`` and should still clean up any
+        state that was not published here.
+        """
         pass
 
     async def _pre_put_hook(self, requests: list[Request]):

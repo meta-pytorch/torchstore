@@ -31,7 +31,9 @@ class TransportType(Enum):
     Unset = auto()  # Default - lazily resolved based on availability
     MonarchRPC = auto()
     MonarchRDMA = auto()
-    TorchCommsRDMA = auto()
+    # Enum name is changed given uniflow supports more than just RDMA (i.e NVLink or TCP)
+    TorchComms = auto()
+    TorchCommsRDMA = TorchComms  # Backward compatible alias
     Gloo = auto()
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
 
@@ -39,7 +41,7 @@ class TransportType(Enum):
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
-    Prefers SharedMemory for same-host transfers, then TorchCommsRDMA,
+    Prefers SharedMemory for same-host transfers, then TorchComms,
     then MonarchRDMA, then Gloo, otherwise falls back to MonarchRPC.
     """
     # Prefer SharedMemory for same-host transfers
@@ -48,7 +50,7 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
 
     # Fall back to RDMA if available (prefer TorchComms over Monarch RDMA)
     if torchcomms_rdma_available():
-        return TransportType.TorchCommsRDMA
+        return TransportType.TorchComms
     elif monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
     elif gloo_available():
@@ -66,7 +68,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
     transport_map = {
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
-        TransportType.TorchCommsRDMA: TorchCommsRdmaTransportBuffer,
+        TransportType.TorchComms: TorchCommsRdmaTransportBuffer,
         TransportType.Gloo: GlooTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
