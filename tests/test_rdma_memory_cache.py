@@ -19,7 +19,12 @@ class MockRdmaMemory:
 def _patch_rdma_memory(monkeypatch):
     import torchstore.transport.torchcomms.cache as cache_mod
 
-    monkeypatch.setattr(cache_mod, "RdmaMemory", MockRdmaMemory, raising=False)
+    monkeypatch.setattr(
+        cache_mod,
+        "_torchcomms_transport",
+        type("MockTransportModule", (), {"RdmaMemory": MockRdmaMemory}),
+        raising=False,
+    )
 
 
 from torchstore.transport.torchcomms.cache import RdmaMemoryCache  # noqa: E402
