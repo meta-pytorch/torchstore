@@ -155,8 +155,12 @@ class InMemoryStore(StorageImpl):
         transport_buffer: TransportBuffer,
         requests: list[Request],
     ) -> list[Any]:
-        pairs = [(request, self._extract_existing(request)) for request in requests]
-        return await transport_buffer.recv_handshake(self.transport_context, pairs)
+        request_existing_pairs = [
+            (request, self._extract_existing(request)) for request in requests
+        ]
+        return await transport_buffer.recv_handshake(
+            self.transport_context, request_existing_pairs
+        )
 
     def _extract_existing(self, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
@@ -205,17 +209,6 @@ class InMemoryStore(StorageImpl):
             return None
 
         raise AssertionError(f"Unexpected current_object type: {type(current_object)}")
-
-    def _handle_dtensor(
-        self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
-    ) -> None:
-        if key not in self.kv:
-            self.kv[key] = {}
-
-        self.kv[key][tensor_slice.coordinates] = {
-            "slice": tensor_slice,
-            "tensor": tensor,
-        }
 
     def _extract_slice_from_tensor(
         self, tensor: torch.Tensor, tensor_slice: TensorSlice
@@ -285,13 +278,13 @@ class InMemoryStore(StorageImpl):
         requests: list[Request],
     ) -> None:
         # Extract existing tensor for potential in-place update
-        entries_with_current_obj = [
+        request_existing_tensor_pairs = [
             (request, self._extract_existing(request)) for request in requests
         ]
 
         # fetch from remote
         results = await transport_buffer.handle_put_request(
-            self.transport_context, entries_with_current_obj
+            self.transport_context, request_existing_tensor_pairs
         )
 
         # store locally
@@ -311,6 +304,17 @@ class InMemoryStore(StorageImpl):
             return
 
         self.kv[key] = data
+
+    def _handle_dtensor(
+        self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
+    ) -> None:
+        if key not in self.kv:
+            self.kv[key] = {}
+
+        self.kv[key][tensor_slice.coordinates] = {
+            "slice": tensor_slice,
+            "tensor": tensor,
+        }
 
     async def get(
         self,

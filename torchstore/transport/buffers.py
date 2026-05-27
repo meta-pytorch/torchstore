@@ -326,9 +326,13 @@ class TransportBuffer:
     async def recv_handshake(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[Request, Any]],
+        request_existing_pairs: list[tuple[Request, Any]],
     ) -> list[Any]:
-        # called on the storage volume side
+        """Storage-volume side hook for transport setup before a put/get.
+
+        ``request_existing_pairs`` contains each incoming request paired with
+        the currently stored object for that key, if any.
+        """
         raise NotImplementedError()
 
     async def handle_put_request(

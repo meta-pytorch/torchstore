@@ -92,6 +92,17 @@ async def get_state_dict(
     from the source's GPU memory via one-sided RDMA reads.
     ``user_state_dict`` must be provided in this mode so the destination
     tensors are available for in-place writes.
+
+    Args:
+        store: TorchStore client used to fetch the state dict entries.
+        key: Prefix under which the state dict was stored.
+        user_state_dict: Optional state dict whose tensors are used as
+            in-place destinations for fetched values. Required when
+            ``direct_rdma=True``.
+        strict: If True and ``user_state_dict`` is provided, require its
+            flattened structure to match the stored mapping.
+        direct_rdma: If True, fetch weights directly from the source's GPU
+            memory using cached RDMA handles.
     """
     if direct_rdma:
         assert (
@@ -101,37 +112,46 @@ async def get_state_dict(
         return user_state_dict
 
     try:
-        # Since the mapping is the last thing we write out, it also gaurantees the state dict is not pending
-        fetched_mapping = await store.get(f"{key}{DELIM}{MAPPING}")
+        # Since the mapping is the last thing we write out, it also guarantees the state dict is not pending
+        fetched_state_dict_mapping = await store.get(f"{key}{DELIM}{MAPPING}")
     except Exception as e:
         raise RuntimeError(
             f"Mapping is missing from the store. This most likely means there is no matching 'push' call for this key: {key=}"
         ) from e
 
-    user_flattened_state_dict, user_mapping = (
+    user_flattened_state_dict, user_state_dict_mapping = (
         flatten_state_dict(user_state_dict)
         if user_state_dict is not None
         else ({}, None)
     )
-    if strict and user_mapping is not None:
-        assert user_mapping == fetched_mapping
+    if strict and user_state_dict_mapping is not None:
+        # user provided state dict has the same flattened structure
+        # as the stored state dict
+        assert user_state_dict_mapping == fetched_state_dict_mapping
 
-    get_id = lambda fk: f"{key}{DELIM}{fk}"
-    flattened_keys = list(fetched_mapping.keys())
+    def torchstore_key_for(state_dict_key: str) -> str:
+        return f"{key}{DELIM}{state_dict_key}"
+
+    stored_state_dict_keys = list(fetched_state_dict_mapping.keys())
 
     get_batch_dict = {}
-    for fk in flattened_keys:
-        t = user_flattened_state_dict.get(fk, None)
-        # inplace can only be a tensor, so skip non-tensor values
-        if t is not None and not isinstance(t, torch.Tensor):
-            t = None
-            logger.warning(f"non-tensor value found for in-place: {fk}")
-        get_batch_dict[get_id(fk)] = t
+    for stored_state_dict_key in stored_state_dict_keys:
+        inplace_tensor = user_flattened_state_dict.get(stored_state_dict_key, None)
+        # inplace_tensor can only be a tensor, so skip non-tensor values
+        if inplace_tensor is not None and not isinstance(inplace_tensor, torch.Tensor):
+            inplace_tensor = None
+            logger.warning(
+                f"non-tensor value found for in-place: {stored_state_dict_key}"
+            )
+        get_batch_dict[torchstore_key_for(stored_state_dict_key)] = inplace_tensor
 
     results = await store.get_batch(get_batch_dict)
-    fetched_state_dict = {fk: results[get_id(fk)] for fk in flattened_keys}
+    fetched_state_dict = {
+        stored_state_dict_key: results[torchstore_key_for(stored_state_dict_key)]
+        for stored_state_dict_key in stored_state_dict_keys
+    }
 
-    return unflatten_state_dict(fetched_state_dict, fetched_mapping)
+    return unflatten_state_dict(fetched_state_dict, fetched_state_dict_mapping)
 
 
 def _state_dict_size(state_dict):

@@ -306,24 +306,33 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     async def recv_handshake(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[Request, Any]],
+        request_existing_pairs: list[tuple[Request, Any]],
     ) -> list["SharedMemoryDescriptor | None"]:
-        """Storage volume: return existing descriptors if available, else None."""
-        results = []
-        for entry, current_object in entries:
-            if not isinstance(current_object, torch.Tensor):
+        """Return shared-memory descriptors for existing tensor storage.
+
+        This runs on the storage volume before a PUT. Each pair in
+        ``request_existing_pairs`` contains the incoming request and an
+        existing tensor that can be reused for that same request, if one is
+        already stored. The returned list contains a shared-memory descriptor
+        for each existing tensor so the client can reuse the same backing
+        storage, and ``None`` for new keys or object requests so the client
+        allocates a new shared-memory segment.
+        """
+        descriptors = []
+        for _request, existing_tensor in request_existing_pairs:
+            if not isinstance(existing_tensor, torch.Tensor):
                 # No existing tensor - client will allocate shared memory
-                results.append(None)
+                descriptors.append(None)
             else:
                 # return existing descriptor for re-use
-                descriptor = SharedMemoryDescriptor.from_tensor(current_object)
+                descriptor = SharedMemoryDescriptor.from_tensor(existing_tensor)
                 assert descriptor is not None, "Stored tensor is not in shared memory."
                 # Reject PUTs from tensor views (I don't see a legit use case for this)
                 assert (
                     descriptor.storage_offset == 0 and descriptor.stride is None
                 ), "PUT expects full-storage tensors, not views."
-                results.append(descriptor)
-        return results
+                descriptors.append(descriptor)
+        return descriptors
 
     async def _post_handshake(
         self,
@@ -332,10 +341,18 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     ) -> None:
         """Build _contexts and prepare data for each request.
 
-        For tensor requests: attaches to an existing SHM segment (if the SV
-        returned a descriptor) or allocates a new one, then copies data with
-        non_blocking=True. For object requests: captures the object directly.
-        Synchronizes after all copies to ensure GPU->CPU DMA completes.
+        ``handshake_results`` is aligned with ``requests`` and contains the
+        shared-memory descriptor returned by ``recv_handshake`` for each
+        existing tensor, or ``None`` when the client should allocate a new
+        shared-memory segment.
+
+        For each tensor request, attach to the existing shared-memory segment
+        described by the storage volume, or allocate a new segment when no
+        descriptor was returned. Then copy the request tensor into that segment
+        with ``non_blocking=True``. For object requests, store the object in the
+        per-request context instead of using shared memory. After all tensor
+        copies are queued, synchronize the involved CUDA devices so GPU-to-CPU
+        copies complete before the storage volume reads the shared-memory data.
         """
         latency_tracker = LatencyTracker("post_handshake")
 
@@ -382,25 +399,25 @@ class SharedMemoryTransportBuffer(TransportBuffer):
     async def handle_put_request(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[Request, Any]],
+        request_existing_tensor_pairs: list[tuple[Request, Any]],
     ) -> list[Any]:
         """SV side: handle batch of put requests for tensors and objects."""
         results = []
-        for (request, current_object), shm_ctx in zip(
-            entries, self._contexts, strict=True
+        for (request, existing_tensor), shm_ctx in zip(
+            request_existing_tensor_pairs, self._contexts, strict=True
         ):
             if shm_ctx.use_rpc:
                 results.append(shm_ctx.objects)
             else:
-                descriptor = shm_ctx.descriptor
+                descriptor: SharedMemoryDescriptor | None = shm_ctx.descriptor
                 assert descriptor is not None, f"No descriptor for {request.key}"
 
                 # Ensure server-side storage hasn't changed since handshake
-                if isinstance(current_object, torch.Tensor):
-                    existing = SharedMemoryDescriptor.from_tensor(current_object)
+                if isinstance(existing_tensor, torch.Tensor):
+                    existing = SharedMemoryDescriptor.from_tensor(existing_tensor)
                     assert existing is not None
                     assert existing.storage_handle == descriptor.storage_handle
-                    results.append(current_object)
+                    results.append(existing_tensor)
                 else:
                     # New segment - attach and return
                     shm_entry = descriptor.attach()

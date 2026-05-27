@@ -223,7 +223,7 @@ class GlooTransportBuffer(TransportBuffer):
     async def recv_handshake(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[Request, Any]],
+        request_existing_pairs: list[tuple[Request, Any]],
     ) -> list[None]:
         """Called on storage volume side to set up the process group.
 
