@@ -20,7 +20,11 @@ from torchstore.transport.shared_memory import (
     SHM_ENABLED,
 )
 from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
-from torchstore.transport.torchcomms.cache import torchcomms_rdma_available
+from torchstore.transport.torchcomms.cache import (
+    torchcomms_rdma_available,
+    torchcomms_uniflow_available,
+)
+from torchstore.transport.torchcomms.uniflow_buffer import TorchCommsTransportBuffer
 from torchstore.transport.types import Request, TensorSlice
 
 if TYPE_CHECKING:
@@ -41,7 +45,7 @@ class TransportType(Enum):
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
-    Prefers SharedMemory for same-host transfers, then TorchComms,
+    Prefers SharedMemory for same-host transfers, then TorchComms (Uniflow RDMA/NVLink),
     then MonarchRDMA, then Gloo, otherwise falls back to MonarchRPC.
     """
     # Prefer SharedMemory for same-host transfers
@@ -49,7 +53,7 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
         return TransportType.SharedMemory
 
     # Fall back to RDMA if available (prefer TorchComms over Monarch RDMA)
-    if torchcomms_rdma_available():
+    if torchcomms_uniflow_available() or torchcomms_rdma_available():
         return TransportType.TorchComms
     elif monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
@@ -65,10 +69,18 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
     if transport_type == TransportType.Unset:
         transport_type = get_available_transport(storage_volume_ref)
 
+    if transport_type == TransportType.TorchComms:
+        # Keep one public transport type while the backend migrates from the
+        # legacy RDMA binding to Uniflow.
+        if torchcomms_uniflow_available():
+            return TorchCommsTransportBuffer(storage_volume_ref)
+        if torchcomms_rdma_available():
+            return TorchCommsRdmaTransportBuffer(storage_volume_ref)
+        raise RuntimeError("TorchComms transport is not available.")
+
     transport_map = {
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
-        TransportType.TorchComms: TorchCommsRdmaTransportBuffer,
         TransportType.Gloo: GlooTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
