@@ -118,7 +118,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
     async def recv_handshake(
         self,
         ctx: "TransportContext",
-        entries: list[tuple[Request, Any]],
+        request_existing_pairs: list[tuple[Request, Any]],
     ) -> list[Any]:
         """SV side: create a transport per new client device, connect, return SV addresses."""
         transport_cache = ctx.get(RdmaTransportCache)

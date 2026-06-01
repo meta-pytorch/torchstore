@@ -213,7 +213,7 @@ class LocalClient:
         Returns:
             dict mapping each key to its raw fetched data (before inplace copy-back).
         """
-        keys = [r.key for r in requests]
+        keys = [request.key for request in requests]
         volume_maps = await self._locate_volumes(keys)
         all_volume_ids: set[str] = {vid for vm in volume_maps.values() for vid in vm}
 
