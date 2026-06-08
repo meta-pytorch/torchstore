@@ -6,12 +6,13 @@
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
 import torch
 
 try:
-    from monarch.rdma import RDMABuffer
+    from monarch.rdma import RDMAAction, RDMABuffer
 
     try:
         # monarch >= 0.4.0
@@ -25,6 +26,11 @@ except ImportError:
     def RDMABuffer(*args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(
             "RDMABuffer is not available. This environment was likely not built with rdma support."
+        )
+
+    def RDMAAction(*args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError(
+            "RDMAAction is not available. This environment was likely not built with rdma support."
         )
 
 
@@ -48,120 +54,182 @@ def monarch_rdma_transport_available() -> bool:
     return rdma_enabled and monarch_rdma_available()
 
 
+@dataclass
+class RdmaContext:
+    """Per-entry state for one request in a Monarch RDMA batch.
+
+    The client registers ``tensor`` with an ``RDMABuffer`` and ships the
+    buffer to the storage volume; the storage volume reads from (PUT) or
+    writes into (GET) it via a batched ``RDMAAction``. ``tensor`` is local
+    to the side that owns the memory and is stripped on serialization, so
+    the storage volume only sees the remote buffer handle and the metadata.
+    """
+
+    rdma_buffer: Any = None  # serialized — SV reads/writes against it
+    tensor: torch.Tensor | None = None  # LOCAL only — registered tensor
+    shape: torch.Size | None = None  # serialized
+    dtype: torch.dtype | None = None  # serialized
+    is_object: bool = False  # serialized
+    objects: Any = None  # serialized — carries non-tensor data
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["tensor"] = None
+        return state
+
+
 class MonarchRDMATransportBuffer(TransportBuffer):
+    """Transport buffer that moves tensor data over Monarch RDMA.
+
+    A whole put/get batch is registered as one context per request and
+    transferred with a single ``RDMAAction``, so the storage volume
+    issues all reads (or writes) for the batch as one submission rather
+    than one round trip per tensor.
+
+    Tensors must be contiguous; this transport registers them directly
+    and does not stage contiguous copies.
+    """
+
+    supports_batch_puts = True
+    supports_batch_gets = True
+
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
 
-        self.rdma_buffer: Any | None = None
-        self.byte_view: torch.Tensor | None = None
-        self.shape: torch.Size | None = None
-        self.dtype: torch.dtype | None = None
-        self.is_object: bool = False
+        # One context per request, aligned with the request list.
+        self._contexts: list[RdmaContext] = []
+
+    def _allocate_ctx(self, tensor: torch.Tensor) -> RdmaContext:
+        """Register a contiguous ``tensor`` for RDMA and return its context."""
+        self._assert_valid_tensor(tensor, tensor.dtype, tensor.shape)
+        return RdmaContext(
+            rdma_buffer=RDMABuffer(to_byte_view(tensor)),
+            tensor=tensor,
+            shape=tensor.shape,
+            dtype=tensor.dtype,
+        )
 
     async def _pre_put_hook(self, requests: list[Request]) -> None:
-        """Hook to perform any pre-put operations on the buffer."""
-        assert len(requests) == 1
-        request = requests[0]
-
-        if request.is_object:
-            return
-        self.allocate(request.tensor_val)
+        """Register a buffer per tensor request (client side)."""
+        self._contexts = []
+        for request in requests:
+            if request.is_object:
+                self._contexts.append(
+                    RdmaContext(is_object=True, objects=request.objects)
+                )
+            else:
+                self._contexts.append(self._allocate_ctx(request.tensor_val))
 
     async def _pre_get_hook(self, requests: list[Request]) -> None:
-        """Hook to perform any pre-get operations on the buffer."""
-        assert len(requests) == 1
-        request = requests[0]
+        """Allocate destination buffers per request (client side).
 
-        # keep request for later
-        self.request = request
+        For requests without an inplace destination we batch a single
+        ``get_meta`` call to learn each tensor's shape/dtype before
+        allocating.
+        """
+        meta_requests = [r.meta_only() for r in requests if r.tensor_val is None]
+        if meta_requests:
+            meta_results = await self.storage_volume_ref.volume.get_meta.call_one(
+                meta_requests
+            )
+        else:
+            meta_results = []
+        meta_iterator = iter(meta_results)
 
-        # rdma buffer requires we have a pre-existing memory space locally
-        # if the user has not provided a local tensor, we need to first
-        # identify and allocate ahead of time
-        meta = None
-        if request.tensor_val is None:
-            meta = (
-                await self.storage_volume_ref.volume.get_meta.call_one(
-                    [request.meta_only()]
-                )
-            )[0]
+        self._contexts = []
+        for request in requests:
+            if request.tensor_val is not None:
+                self._contexts.append(self._allocate_ctx(request.tensor_val))
+                continue
+
+            meta = next(meta_iterator)
             if isinstance(meta, str) or meta is None:
-                return  # objects don't get handled
+                # objects don't get an RDMA buffer
+                self._contexts.append(RdmaContext(is_object=True))
+                continue
 
             # if we are fetching a tensor slice, the local shape is already known
             if request.tensor_slice is not None:
                 meta = (request.tensor_slice.local_shape, *meta[1:])
 
-        self.allocate(meta or request.tensor_val)
+            tensor = torch.empty(meta[0], dtype=meta[1], device=torch.device("cpu"))
+            self._contexts.append(self._allocate_ctx(tensor))
 
     async def handle_put_request(
         self,
         ctx: "TransportContext",
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
-        assert len(entries) == 1
-        request, current_object = entries[0]
+        """Read each client buffer into local storage (storage volume side)."""
+        action = RDMAAction()
+        has_rdma_ops = False
+        results: list[Any] = []
 
-        if request.is_object:
-            self.is_object = True
-            return [request.objects]
+        for (request, current_object), rdma_ctx in zip(
+            entries, self._contexts, strict=True
+        ):
+            if rdma_ctx.is_object:
+                results.append(rdma_ctx.objects)
+                continue
 
-        # current_object is now the extracted tensor (or None)
-        tensor = current_object
+            tensor = current_object
+            if tensor is None:
+                # happens when we haven't seen this tensor / dtensor before
+                tensor = torch.empty(
+                    rdma_ctx.shape, dtype=rdma_ctx.dtype, device=torch.device("cpu")
+                )
 
-        if tensor is None:
-            # happens when we haven't seen this tensor / dtensor before
-            tensor = torch.empty(
-                self.shape, dtype=self.dtype, device=torch.device("cpu")
-            )
+            self._assert_valid_tensor(tensor, rdma_ctx.dtype, rdma_ctx.shape)
+            action.read_remote(to_byte_view(tensor), rdma_ctx.rdma_buffer)
+            has_rdma_ops = True
+            results.append(tensor)
 
-        self._assert_valid_tensor(tensor, self.dtype, self.shape)
+        if has_rdma_ops:
+            await action.submit()
 
-        byte_view = to_byte_view(tensor)
-        await self.rdma_buffer.read_into(byte_view)
-
-        return [tensor]
+        return results
 
     async def handle_get_request(
         self,
         ctx: "TransportContext",
         entries: list[tuple[Request, Any]],
     ) -> None:
-        assert len(entries) == 1
-        _, data = entries[0]
-        if not isinstance(data, torch.Tensor):
-            self.is_object = True
-            self.objects = data
-            return
+        """Write stored data into each client buffer (storage volume side).
 
-        tensor = data
+        The storage volume's view of ``is_object`` is authoritative: it
+        mutates ``_contexts`` so the client response path can route
+        non-tensor data correctly.
+        """
+        action = RDMAAction()
+        has_rdma_ops = False
 
-        self._assert_valid_tensor(
-            tensor, self.dtype, self.shape, must_be_contiguous=False
-        )
-        assert self.rdma_buffer is not None
+        for (request, data), rdma_ctx in zip(entries, self._contexts, strict=True):
+            if not isinstance(data, torch.Tensor):
+                rdma_ctx.is_object = True
+                rdma_ctx.objects = data
+                continue
 
-        # Write directly from tensor byte view (no chunking)
-        byte_view = to_byte_view(tensor)
-        await self.rdma_buffer.write_from(byte_view)
+            self._assert_valid_tensor(
+                data, rdma_ctx.dtype, rdma_ctx.shape, must_be_contiguous=False
+            )
+            action.write_remote(rdma_ctx.rdma_buffer, to_byte_view(data))
+            has_rdma_ops = True
+
+        if has_rdma_ops:
+            await action.submit()
 
     async def _handle_storage_volume_response(
-        self, requests: list[Request], transport_buffer: TransportBuffer
+        self, requests: list[Request], transport_buffer: "TransportBuffer"
     ) -> list[Any]:
-        if transport_buffer.is_object:
-            return [transport_buffer.objects]
-
-        # If user provided an inplace tensor but we had to make a contiguous copy
-        # during allocate(), the RDMA data landed in self.tensor (the copy), not
-        # in the user's original tensor. We need to copy the data back.
-        if self.request.tensor_val is not None:
-            if self.request.tensor_val.data_ptr() != self.tensor.data_ptr():
-                self.request.tensor_val.copy_(self.tensor)
-            return [self.request.tensor_val]
-
-        # self.byte_view already points to the byte view of self.tensor
-        # so the data is already in self.tensor after the RDMA write completes
-        return [self.tensor]
+        results: list[Any] = []
+        for client_ctx, sv_ctx in zip(
+            self._contexts, transport_buffer._contexts, strict=True
+        ):
+            if sv_ctx.is_object:
+                results.append(sv_ctx.objects)
+            else:
+                results.append(client_ctx.tensor)
+        return results
 
     async def drop(self) -> None:
         """Explicitly clean up RDMA buffers to prevent kernel memory leak.
@@ -171,53 +239,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
         pages remain pinned even after the Python objects are garbage collected,
         leading to a memory leak that manifests as unbounded Inactive(anon) growth.
         """
-        if self.rdma_buffer is None:
-            return
-        try:
-            await self.rdma_buffer.drop()
-        except Exception as e:
-            logging.warning(f"Failed to drop RDMA buffer during cleanup: {e}")
-        self.rdma_buffer = None
-        self.byte_view = None
-
-    def __getstate__(self) -> dict[str, Any]:
-        # Any time that we serialize the transport buffer, the idea is
-        # that tensors will be transported via tensor_enginer.RDMABuffer, so it makes
-        # no sense to hold this reference when we are serializing
-        state = self.__dict__.copy()
-        state["byte_view"] = None
-        state["tensor"] = None
-        state["request"] = None
-        return state
-
-    def allocate(self, tensor_like: torch.Tensor | tuple) -> None:
-        """Allocates internal buffers based on either an existing tensor
-        or a Tuple of (shape, dtype)
-        """
-        logging.debug("Allocating rdma buffer")
-
-        if isinstance(tensor_like, tuple):
-            # Happens only on get if we don't have an inplace tensor.
-            # In that case, we know the size of the tensor from fetching metadata
-            tensor = torch.empty(
-                tensor_like[0], dtype=tensor_like[1], device=torch.device("cpu")
-            )
-        else:
-            assert isinstance(tensor_like, torch.Tensor)
-
-            # note: .contiguous will return a copy if this tensor is not contiguous
-            # this usually shows up during resharding cases
-            tensor = tensor_like.contiguous()
-
-        self.tensor = tensor
-
-        # store tensor meta
-        self.shape = tensor.shape
-        self.dtype = tensor.dtype
-        self.dim = tensor.dim()
-
-        self._assert_valid_tensor(tensor, self.dtype, self.shape)
-
-        byte_view = to_byte_view(tensor)
-        self.byte_view = byte_view
-        self.rdma_buffer = RDMABuffer(byte_view)
+        for rdma_ctx in self._contexts:
+            if rdma_ctx.rdma_buffer is None:
+                continue
+            try:
+                await rdma_ctx.rdma_buffer.drop()
+            except Exception as e:
+                logging.warning(f"Failed to drop RDMA buffer during cleanup: {e}")
+        self._contexts = []
