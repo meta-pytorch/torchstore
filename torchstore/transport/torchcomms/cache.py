@@ -218,7 +218,7 @@ class UniflowCache(TransportCache):
 
     @staticmethod
     def device_to_id(device: torch.device | int) -> int:
-        """Map devices to Uniflow ids; CPU uses -1 and CUDA uses its index."""
+        """Map devices to Uniflow ids; CPU uses -1, CUDA/XPU use device index."""
         if isinstance(device, int):
             return device
         return -1 if device.type == "cpu" else int(device.index)
