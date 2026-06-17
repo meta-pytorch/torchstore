@@ -13,15 +13,37 @@ import torch
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint, shutdown_context, this_host
 
-# Run the example : python example/torchstore_rl.py
+# Run the example: python example/torchstore_rl.py
 
 
-def set_cuda_visible_devices(devices: str) -> None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = devices
+def _accelerator() -> str:
+    """Return ``"cuda"`` or ``"xpu"`` based on what's available, else ``"cpu"``."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return "cpu"
+
+
+_ACCEL = _accelerator()
+
+
+def _set_visible_devices(devices: str) -> None:
+    """Pin one process to a single accelerator tile.
+
+    Sets the env var that the active backend honors —
+    ``CUDA_VISIBLE_DEVICES`` for CUDA, ``ZE_AFFINITY_MASK`` for XPU.
+    """
+    if _ACCEL == "cuda":
+        os.environ["CUDA_VISIBLE_DEVICES"] = devices
+    elif _ACCEL == "xpu":
+        os.environ["ZE_AFFINITY_MASK"] = devices
 
 
 class Learner(Actor):
     def __init__(self):
+        # Trainer stays on CPU for the toy model — keeps the example
+        # focused on weight-sharing semantics, not training perf.
         self.device = torch.device("cpu")
         self.model = torch.nn.Linear(4, 4, bias=False, device=self.device)
         self.optim = torch.optim.AdamW(
@@ -44,47 +66,45 @@ class Learner(Actor):
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optim.step()
         print("[learner] weights: ", self.model.state_dict())
-        # Put weights in to torch.store
         await ts.put_state_dict(self.model.state_dict(), key="toy_app")
 
 
 class Generator(Actor):
     def __init__(self):
-        self.model = torch.nn.Linear(4, 4, bias=False, device="cuda")
+        self.device = torch.device(_ACCEL if _ACCEL != "cpu" else "cpu")
+        self.model = torch.nn.Linear(4, 4, bias=False, device=self.device)
         self.index = current_rank()["gpus"]
 
     @endpoint
     async def update_weights(self):
         print(f"[generator {self.index}] original weights: {self.model.state_dict()}")
-        # Fetch weights from torch.store
         await ts.get_state_dict(key="toy_app", user_state_dict=self.model.state_dict())
         print(f"[generator {self.index}] new weights: {self.model.state_dict()}")
 
     @endpoint
     async def generate(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        inputs = inputs.to("cuda")
+        inputs = inputs.to(self.device)
         logits = self.model(inputs)
         reward = torch.sum(logits)
         return logits, reward
 
 
 async def main():
-    """
-    The example code shows how to use torchstore to share weights between
-    trainer/learner and generator apps. The weights are shared synchronously
-    between the two apps.
+    """Trainer/generator weight-sharing demo. The chosen accelerator
+    (CUDA, XPU, or CPU fallback) is autodetected from what's available
+    on the host; transport selection inside TorchStore is automatic
+    (SHM intra-host, xccl on XPU, gloo otherwise).
     """
     num_learners = 1
     num_generators = 1
 
-    # TODO: Show weights re-sharding usecase.
     learner_mesh = this_host().spawn_procs(
         per_host={"gpus": num_learners},
-        bootstrap=partial(set_cuda_visible_devices, "0"),
+        bootstrap=partial(_set_visible_devices, "0"),
     )
     gen_mesh = this_host().spawn_procs(
         per_host={"gpus": num_generators},
-        bootstrap=partial(set_cuda_visible_devices, "1"),
+        bootstrap=partial(_set_visible_devices, "1"),
     )
 
     await ts.initialize()
@@ -92,13 +112,14 @@ async def main():
     learner = learner_mesh.spawn("learner", Learner)
     generators = gen_mesh.spawn("generator", Generator)
 
+    seed_device = _ACCEL if _ACCEL != "cpu" else "cpu"
     logits, reward = await generators.generate.call_one(
-        torch.randn(4, 4, device="cuda")
+        torch.randn(4, 4, device=seed_device)
     )
     for _ in range(3):
         await learner.step.call_one(logits, reward)
         logits, reward = await generators.generate.call_one(
-            torch.randn(4, 4, device="cuda")
+            torch.randn(4, 4, device=seed_device)
         )
         await generators.update_weights.call_one()
 

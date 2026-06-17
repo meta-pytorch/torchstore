@@ -26,6 +26,7 @@ from torchstore.transport.torchcomms.cache import (
 )
 from torchstore.transport.torchcomms.uniflow_buffer import TorchCommsTransportBuffer
 from torchstore.transport.types import Request, TensorSlice
+from torchstore.transport.xccl import xccl_available, XcclTransportBuffer
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -39,14 +40,20 @@ class TransportType(Enum):
     TorchComms = auto()
     TorchCommsRDMA = TorchComms  # Backward compatible alias
     Gloo = auto()
+    XCCL = auto()  # Intel oneCCL via torch.distributed; device-resident on XPU
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
 
 
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
-    Prefers SharedMemory for same-host transfers, then TorchComms (Uniflow RDMA/NVLink),
-    then MonarchRDMA, then Gloo, otherwise falls back to MonarchRPC.
+    Order: SharedMemory (same-host) > TorchComms (Uniflow RDMA/NVLink) >
+    MonarchRDMA (ibverbs) > XCCL (XPU device-resident) > Gloo (TCP/CPU) >
+    MonarchRPC (last resort).
+
+    XCCL beats Gloo on XPU because it keeps tensors on device. Gloo is kept
+    as the universal cross-platform fallback for non-XPU hosts and as a
+    safety net if xccl init fails.
     """
     # Prefer SharedMemory for same-host transfers
     if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
@@ -57,6 +64,8 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
         return TransportType.TorchComms
     elif monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
+    elif xccl_available():
+        return TransportType.XCCL
     elif gloo_available():
         return TransportType.Gloo
 
@@ -82,6 +91,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
         TransportType.Gloo: GlooTransportBuffer,
+        TransportType.XCCL: XcclTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
 
