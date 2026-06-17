@@ -52,14 +52,26 @@ MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "0") == "1"
 SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1"
 
 
-def pin_memory(storage: torch.UntypedStorage) -> None:
-    """Pin storage's memory for faster CUDA transfers.
+def _is_xpu_available() -> bool:
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
 
-    Uses cudaHostRegister with cudaHostRegisterPortable flag to make the
-    memory accessible from all CUDA contexts. Pins the entire SHM segment
-    so all views benefit from DMA.
+
+def pin_memory(storage: torch.UntypedStorage) -> None:
+    """Pin storage's memory for faster accelerator transfers.
+
+    On CUDA, uses cudaHostRegister with cudaHostRegisterPortable so the
+    memory is accessible from all CUDA contexts. The entire SHM segment
+    is pinned so all views benefit from DMA.
+
+    On XPU, ``torch.xpu`` does not yet expose a portable host-register
+    equivalent, so this becomes a no-op when XPU is the active backend.
+    Tensor copies still complete correctly; they just can't use
+    page-locked DMA.
     """
-    if not SHOULD_PIN_SHM or not torch.cuda.is_available():
+    if not SHOULD_PIN_SHM:
+        return
+    if not torch.cuda.is_available():
+        # XPU (or CPU) — no portable hostRegister API yet, skip pinning.
         return
 
     cudart = torch.cuda.cudart()
@@ -80,8 +92,10 @@ def pin_memory(storage: torch.UntypedStorage) -> None:
 
 
 def unpin_memory(storage: torch.UntypedStorage) -> None:
-    """Unpin storage's memory."""
-    if not SHOULD_PIN_SHM or not torch.cuda.is_available():
+    """Unpin storage's memory (no-op on XPU; CUDA-only otherwise)."""
+    if not SHOULD_PIN_SHM:
+        return
+    if not torch.cuda.is_available():
         return
 
     cudart = torch.cuda.cudart()
@@ -355,7 +369,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             if not tensor.is_contiguous():
                 tensor = tensor.cpu().contiguous()
 
-            if tensor.is_cuda:
+            if tensor.is_cuda or tensor.device.type == "xpu":
                 devices_to_sync.add(tensor.device)
 
             if descriptor is not None:
@@ -376,7 +390,10 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         # Wait for async copies (GPU->CPU DMA) on involved devices only
         for device in devices_to_sync:
-            torch.cuda.synchronize(device)
+            if device.type == "xpu":
+                torch.xpu.synchronize(device)
+            else:
+                torch.cuda.synchronize(device)
         latency_tracker.track_step("cuda_synchronize")
 
     async def handle_put_request(

@@ -109,7 +109,10 @@ class RdmaTransportCache(TransportCache):
         """Map devices to legacy RdmaTransport indices; CPU uses index 0."""
         if isinstance(device, int):
             return device
-        return 0 if device.type == "cpu" else int(device.index)
+        if device.type == "cpu":
+            return 0
+        # CUDA, XPU, etc. — use the device index
+        return int(device.index)
 
     def put(self, key: str, device: torch.device | int) -> TransportAndAddress:
         assert _torchcomms_transport is not None
@@ -218,7 +221,7 @@ class UniflowCache(TransportCache):
 
     @staticmethod
     def device_to_id(device: torch.device | int) -> int:
-        """Map devices to Uniflow ids; CPU uses -1 and CUDA uses its index."""
+        """Map devices to Uniflow ids; CPU uses -1, CUDA/XPU use device index."""
         if isinstance(device, int):
             return device
         return -1 if device.type == "cpu" else int(device.index)
