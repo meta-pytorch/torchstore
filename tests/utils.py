@@ -16,6 +16,10 @@ from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
 from torchstore.transport import TransportType
+from torchstore.transport.torchcomms.cache import (
+    torchcomms_rdma_available,
+    torchcomms_uniflow_available,
+)
 from torchstore.transport.types import Request
 
 logger = getLogger(__name__)
@@ -44,8 +48,8 @@ def transport_params():
     if os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.MonarchRDMA)
 
-    if os.environ.get("USE_TORCHCOMMS_RDMA", "0") == "1":
-        enabled_transport_types.append(TransportType.TorchCommsRDMA)
+    if torchcomms_uniflow_available() or torchcomms_rdma_available():
+        enabled_transport_types.append(TransportType.TorchComms)
 
     if os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.Gloo)
