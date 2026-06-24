@@ -57,6 +57,10 @@ def transport_params():
     if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.SharedMemory)
 
+    # XCCL requires client and storage volume in separate OS processes
+    # (oneCCL's per-process KVS collides otherwise). These tests run
+    # in-process, so XCCL is covered by the examples instead.
+
     return "transport_type", enabled_transport_types
 
 
