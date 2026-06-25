@@ -334,15 +334,16 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         For tensor requests: attaches to an existing SHM segment (if the SV
         returned a descriptor) or allocates a new one, then copies data with
-        non_blocking=True. For object requests: captures the object directly.
-        Synchronizes after all copies to ensure GPU->CPU DMA completes.
+        non_blocking=True. CUDA tensor copies run on request-local copy
+        streams. For object requests: captures the object directly. Waits on
+        the copy streams after all copies to ensure GPU->CPU DMA completes.
         """
         latency_tracker = LatencyTracker("post_handshake")
 
         shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
 
         self._contexts = []
-        devices_to_sync: set[torch.device] = set()
+        copy_streams: dict[torch.device, torch.cuda.Stream] = {}
         for request, descriptor in zip(requests, handshake_results, strict=True):
             key = request.key
             if request.is_object:
@@ -354,9 +355,6 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
             if not tensor.is_contiguous():
                 tensor = tensor.cpu().contiguous()
-
-            if tensor.is_cuda:
-                devices_to_sync.add(tensor.device)
 
             if descriptor is not None:
                 # Reuse existing segment
@@ -371,13 +369,21 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
             # Copy tensor data to shared memory
             shm_tensor = client_entry.get_tensor()
-            shm_tensor.copy_(tensor, non_blocking=True)
+            if tensor.is_cuda:
+                copy_stream = copy_streams.get(tensor.device)
+                if copy_stream is None:
+                    copy_stream = torch.cuda.Stream(device=tensor.device)
+                    copy_stream.wait_stream(torch.cuda.current_stream(tensor.device))
+                    copy_streams[tensor.device] = copy_stream
+                with torch.cuda.stream(copy_stream):
+                    shm_tensor.copy_(tensor, non_blocking=True)
+            else:
+                shm_tensor.copy_(tensor, non_blocking=True)
         latency_tracker.track_step("alloc_and_copy")
 
-        # Wait for async copies (GPU->CPU DMA) on involved devices only
-        for device in devices_to_sync:
-            torch.cuda.synchronize(device)
-        latency_tracker.track_step("cuda_synchronize")
+        for copy_stream in copy_streams.values():
+            copy_stream.synchronize()
+        latency_tracker.track_step("cuda_copy_stream_synchronize")
 
     async def handle_put_request(
         self,
