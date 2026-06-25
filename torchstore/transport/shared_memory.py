@@ -13,6 +13,7 @@ in shared memory, allowing:
 - Persistence - stored tensor remains in shared memory for O(1) subsequent access
 """
 
+import functools
 import logging
 import os
 from dataclasses import dataclass
@@ -52,12 +53,46 @@ MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "0") == "1"
 SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1"
 
 
+# cudaHostRegister error codes we special-case (see CUDA runtime API docs).
+_CUDA_ERROR_INVALID_VALUE = 1
+_CUDA_ERROR_MEMORY_ALLOCATION = 2
+_CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED = 712
+
+# Likely cause + remediation for the failures seen in practice.
+_PIN_FAILURE_HINTS: dict[int, str] = {
+    _CUDA_ERROR_MEMORY_ALLOCATION: (
+        "the locked-memory limit is likely exhausted -- check `ulimit -l` or the "
+        "container's memlock limit"
+    ),
+    _CUDA_ERROR_INVALID_VALUE: "the runtime rejected the host tensor / memory as invalid",
+}
+
+
+@functools.cache
+def _warn_pin_failure_once(err: int) -> None:
+    """Warn that pinning failed, at most once per distinct error code."""
+    hint = _PIN_FAILURE_HINTS.get(err, "see the CUDA runtime API docs for this code")
+    logger.warning(
+        "[SHM] cudaHostRegister failed with error %d (%s). Falling back to "
+        "unpinned shared memory: transfers remain correct but are slower and "
+        "won't overlap with compute. Set TORCHSTORE_PIN_SHM=0 to silence this "
+        "warning, or address the cause to restore pinned DMA.",
+        err,
+        hint,
+    )
+
+
 def pin_memory(storage: torch.UntypedStorage) -> None:
     """Pin storage's memory for faster CUDA transfers.
 
     Uses cudaHostRegister with cudaHostRegisterPortable flag to make the
     memory accessible from all CUDA contexts. Pins the entire SHM segment
     so all views benefit from DMA.
+
+    Pinning is a performance optimization, not a correctness requirement:
+    A registration failure therefore degrades rather than breaking. We warn
+    once and fall back to unpinned transfers, equivalent to
+    TORCHSTORE_PIN_SHM=0 for this segment.
     """
     if not SHOULD_PIN_SHM or not torch.cuda.is_available():
         return
@@ -69,14 +104,13 @@ def pin_memory(storage: torch.UntypedStorage) -> None:
     data_ptr = storage.data_ptr()
     size = storage.size()
     err = int(cudart.cudaHostRegister(data_ptr, size, 1))  # cudaHostRegisterPortable
-    if err == 712:  # cudaErrorHostMemoryAlreadyRegistered
-        logger.info("[SHM] Storage is already pinned.")
+    if err == 0:
         return
-    if err != 0:
-        raise RuntimeError(
-            f"[SHM] cudaHostRegister failed with error {err}. "
-            "Consider launching with CUDA_LAUNCH_BLOCKING=1 to debug."
-        )
+    if err == _CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED:
+        logger.debug("[SHM] Storage is already pinned.")
+        return
+
+    _warn_pin_failure_once(err)
 
 
 def unpin_memory(storage: torch.UntypedStorage) -> None:
