@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from logging import getLogger
 from typing import Any
 
 import torch
@@ -15,11 +15,12 @@ from torch.distributed.checkpoint._nested_dict import (
     flatten_state_dict,
     unflatten_state_dict,
 )
+from torchstore.logging import LatencyTracker
 
 DELIM = "/"
 MAPPING = "MAPPING"
 
-logger = getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -66,17 +67,35 @@ async def put_state_dict(
             keep higher-precision master weights while transferring in a
             lower precision (e.g. bfloat16).
     """
+    # Coarse weight-sync phase timing, logged at INFO (no TORCHSTORE_LOG_LEVEL
+    # =DEBUG / init_logging() needed) so callers can attribute latency to the
+    # major phases and compare the direct-RDMA vs CPU-staged transports.
+    tracker = LatencyTracker(
+        f"put_state_dict[{key}]/{'rdma' if direct_rdma else 'cpu_staged'}",
+        level=logging.INFO,
+    )
+
     if direct_rdma:
         await _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype)
+        # No throughput here: the direct-RDMA put only registers handles (and on
+        # repeat calls refreshes staging buffers). The bytes move on the
+        # generator's get via one-sided RDMA read, so there is no bulk transfer
+        # in put to report a GB/s for.
+        tracker.track_e2e()
         return
 
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
+    tracker.track_step("flatten")
+    nbytes = _flattened_nbytes(flattened_state_dict)
 
     # Batch all tensor entries, then put the mapping separately.
     # The mapping is stored last so it acts as a commit marker for the state dict.
     entries = {f"{key}{DELIM}{k}": v for k, v in flattened_state_dict.items()}
     await store.put_batch(entries)
+    tracker.track_step("put_batch", nbytes=nbytes)
     await store.put(f"{key}{DELIM}{MAPPING}", mapping)
+    tracker.track_step("put_mapping")
+    tracker.track_e2e(nbytes=nbytes)
 
 
 async def get_state_dict(
@@ -93,11 +112,19 @@ async def get_state_dict(
     ``user_state_dict`` must be provided in this mode so the destination
     tensors are available for in-place writes.
     """
+    tracker = LatencyTracker(
+        f"get_state_dict[{key}]/{'rdma' if direct_rdma else 'cpu_staged'}",
+        level=logging.INFO,
+    )
+
     if direct_rdma:
         assert (
             user_state_dict is not None
         ), "user_state_dict is required for direct_rdma mode"
         await _get_state_dict_direct_rdma(store, key, user_state_dict)
+        # The direct-RDMA get is the actual GPU-to-GPU transfer, so report its
+        # throughput (comparable to the CPU-staged get_batch GB/s).
+        tracker.track_e2e(nbytes=_state_dict_nbytes(user_state_dict))
         return user_state_dict
 
     try:
@@ -107,6 +134,7 @@ async def get_state_dict(
         raise RuntimeError(
             f"Mapping is missing from the store. This most likely means there is no matching 'push' call for this key: {key=}"
         ) from e
+    tracker.track_step("get_mapping")
 
     user_flattened_state_dict, user_mapping = (
         flatten_state_dict(user_state_dict)
@@ -129,21 +157,34 @@ async def get_state_dict(
         get_batch_dict[get_id(fk)] = t
 
     results = await store.get_batch(get_batch_dict)
+    nbytes = _flattened_nbytes(results)
+    tracker.track_step("get_batch", nbytes=nbytes)
     fetched_state_dict = {fk: results[get_id(fk)] for fk in flattened_keys}
 
-    return unflatten_state_dict(fetched_state_dict, fetched_mapping)
+    out = unflatten_state_dict(fetched_state_dict, fetched_mapping)
+    tracker.track_step("unflatten")
+    tracker.track_e2e(nbytes=nbytes)
+    return out
+
+
+def _flattened_nbytes(flattened_state_dict) -> int:
+    """Total byte size of the tensor values in an already-flattened state dict."""
+    return sum(
+        t.numel() * t.element_size()
+        for t in flattened_state_dict.values()
+        if isinstance(t, torch.Tensor)
+    )
+
+
+def _state_dict_nbytes(state_dict) -> int:
+    """Total tensor byte size of a (possibly nested) state dict."""
+    sd, _ = flatten_state_dict(state_dict)
+    return _flattened_nbytes(sd)
 
 
 def _state_dict_size(state_dict):
     """Returns the size of the state dict in MBs"""
-    size = 0
-    sd, _ = flatten_state_dict(state_dict)
-    for tensor in sd.values():
-        if not isinstance(tensor, torch.Tensor):
-            continue
-
-        size += tensor.numel() * tensor.element_size()
-    return size // (1024 * 1024)
+    return _state_dict_nbytes(state_dict) // (1024 * 1024)
 
 
 # ---------------------------------------------------------------------------
