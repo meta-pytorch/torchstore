@@ -86,6 +86,11 @@ async def put_state_dict(
 
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
     tracker.track_step("flatten")
+    # TODO: when transfer_dtype actually casts (source dtype != transfer_dtype),
+    # this allocates a full auxiliary copy of the floating weights. Fold the cast
+    # into the per-tensor staging copy (allocate the staging buffer at
+    # transfer_dtype and copy_ into it) so peak extra memory is one tensor, not
+    # the whole state dict.
     flattened_state_dict = _cast_floating_tensors(flattened_state_dict, transfer_dtype)
     tracker.track_step("cast")
     nbytes = _flattened_nbytes(flattened_state_dict)
