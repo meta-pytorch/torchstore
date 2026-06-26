@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from enum import auto, Enum
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,9 @@ from torchstore.transport.types import Request, TensorSlice
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
+
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class TransportType(Enum):
@@ -63,11 +67,27 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
     return TransportType.MonarchRPC
 
 
+def _log_transport_resolution(
+    storage_volume_ref: "StorageVolumeRef", transport_type: TransportType
+) -> None:
+    logger.info(
+        "[ts-transport] resolved=%s (uniflow=%s, tc_rdma=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
+        transport_type.name,
+        torchcomms_uniflow_available(),
+        torchcomms_rdma_available(),
+        monarch_rdma_transport_available(),
+        gloo_available(),
+        SHM_ENABLED and is_local_to_volume(storage_volume_ref),
+    )
+
+
 def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> TransportBuffer:
     transport_type = storage_volume_ref.default_transport_type
 
     if transport_type == TransportType.Unset:
         transport_type = get_available_transport(storage_volume_ref)
+
+    _log_transport_resolution(storage_volume_ref, transport_type)
 
     if transport_type == TransportType.TorchComms:
         # Keep one public transport type while the backend migrates from the

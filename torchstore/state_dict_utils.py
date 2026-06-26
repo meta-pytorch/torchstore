@@ -62,10 +62,9 @@ async def put_state_dict(
 
 
     Args:
-        transfer_dtype: If set, cast weights to this dtype for transfer.
-            Only used with ``direct_rdma=True``. Allows the source to
-            keep higher-precision master weights while transferring in a
-            lower precision (e.g. bfloat16).
+        transfer_dtype: If set, cast floating-point weights to this dtype for
+            transfer. Allows the source to keep higher-precision master weights
+            while transferring in a lower precision (e.g. bfloat16).
     """
     # Coarse weight-sync phase timing, logged at INFO (no TORCHSTORE_LOG_LEVEL
     # =DEBUG / init_logging() needed) so callers can attribute latency to the
@@ -86,6 +85,10 @@ async def put_state_dict(
 
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
     tracker.track_step("flatten")
+    flattened_state_dict = _cast_floating_tensors(
+        flattened_state_dict, transfer_dtype
+    )
+    tracker.track_step("cast")
     nbytes = _flattened_nbytes(flattened_state_dict)
 
     # Batch all tensor entries, then put the mapping separately.
@@ -174,6 +177,21 @@ def _flattened_nbytes(flattened_state_dict) -> int:
         for t in flattened_state_dict.values()
         if isinstance(t, torch.Tensor)
     )
+
+
+def _cast_floating_tensors(flattened_state_dict, dtype):
+    if dtype is None:
+        return flattened_state_dict
+    return {
+        key: value.to(dtype)
+        if (
+            isinstance(value, torch.Tensor)
+            and value.is_floating_point()
+            and value.dtype != dtype
+        )
+        else value
+        for key, value in flattened_state_dict.items()
+    }
 
 
 def _state_dict_nbytes(state_dict) -> int:
