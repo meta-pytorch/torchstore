@@ -6,6 +6,8 @@
 
 """Unit tests for shared memory transport."""
 
+import logging
+
 import pytest
 import torch
 from torchstore.transport.buffers import TransportContext
@@ -329,6 +331,107 @@ class TestSharedMemoryCache:
 
         entry = SharedMemoryEntry(storage=storage, descriptor=first_descriptor)
         assert torch.allclose(entry.get_tensor(), tensor2)
+
+
+class _FakeCudart:
+    """Stand-in for torch.cuda.cudart() that forces a chosen register result."""
+
+    def __init__(self, register_err: int):
+        self.register_err = register_err
+        self.register_calls = 0
+
+    def cudaHostRegister(self, ptr, size, flags):
+        self.register_calls += 1
+        return self.register_err
+
+    def cudaHostUnregister(self, ptr):
+        return 0
+
+
+class TestPinMemoryFailOpen:
+    """A pin failure must degrade (warn once) rather than break TS.
+
+    Pinning is a performance optimization; copies into unpinned shared memory
+    are still correct. These tests fake cudart so they run without a GPU.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_warn_cache(self):
+        # _warn_pin_failure_once memoizes its log; clear so each test starts fresh.
+        import torchstore.transport.shared_memory as shm_module
+
+        shm_module._warn_pin_failure_once.cache_clear()
+        yield
+        shm_module._warn_pin_failure_once.cache_clear()
+
+    @pytest.fixture
+    def force_pin_error(self, monkeypatch):
+        """Drive pin_memory down the cudaHostRegister path with a given error."""
+        import torchstore.transport.shared_memory as shm_module
+
+        def _apply(err: int) -> _FakeCudart:
+            fake = _FakeCudart(register_err=err)
+            monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+            monkeypatch.setattr(torch.cuda, "cudart", lambda: fake)
+            monkeypatch.setattr(shm_module, "SHOULD_PIN_SHM", True)
+            return fake
+
+        return _apply
+
+    def test_pin_failure_does_not_raise_and_warns_once(self, force_pin_error, caplog):
+        import torchstore.transport.shared_memory as shm_module
+
+        fake = force_pin_error(shm_module._CUDA_ERROR_MEMORY_ALLOCATION)
+        tensor = allocate_shared_tensor(torch.Size([4, 4]), torch.float32)
+
+        with caplog.at_level(
+            logging.WARNING, logger="torchstore.transport.shared_memory"
+        ):
+            shm_module.pin_memory(tensor.untyped_storage())  # must not raise
+            shm_module.pin_memory(tensor.untyped_storage())  # second time: still fine
+
+        # Both attempts hit cudaHostRegister, but only one warning is emitted.
+        assert fake.register_calls == 2
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        # The warning is actionable: names the likely cause and the silence knob.
+        msg = warnings[0].getMessage()
+        assert "ulimit -l" in msg
+        assert "TORCHSTORE_PIN_SHM=0" in msg
+
+    def test_attach_still_usable_when_pin_fails(self, force_pin_error):
+        import torchstore.transport.shared_memory as shm_module
+
+        force_pin_error(shm_module._CUDA_ERROR_MEMORY_ALLOCATION)
+
+        cache = SharedMemoryCache()
+        tensor = allocate_shared_tensor(torch.Size([8, 8]), torch.float32)
+        data = torch.randn(8, 8)
+        tensor.copy_(data)
+        descriptor = SharedMemoryDescriptor.from_tensor(tensor)
+        assert descriptor is not None
+
+        try:
+            # attach() pins on the cold path; a failure there must not propagate.
+            entry = cache.attach("k", descriptor)
+            # Segment is cached (unpinned) and data round-trips correctly.
+            assert ("k", descriptor.storage_handle) in cache._storages
+            assert torch.allclose(entry.get_tensor(), data)
+        finally:
+            cache.clear()
+
+    def test_already_registered_is_silent(self, force_pin_error, caplog):
+        import torchstore.transport.shared_memory as shm_module
+
+        force_pin_error(shm_module._CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED)
+        tensor = allocate_shared_tensor(torch.Size([4, 4]), torch.float32)
+
+        with caplog.at_level(
+            logging.WARNING, logger="torchstore.transport.shared_memory"
+        ):
+            shm_module.pin_memory(tensor.untyped_storage())  # benign no-op
+
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
 class TestSharedMemoryTransportBuffer:
