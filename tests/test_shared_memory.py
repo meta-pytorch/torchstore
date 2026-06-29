@@ -4,12 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Unit tests for shared memory transport."""
+"""Tests for shared memory transport (unit tests + one e2e ts.put check)."""
+
+import os
 
 import logging
 
 import pytest
 import torch
+import torchstore as ts
+from monarch.actor import Actor, current_rank, endpoint
+from torchstore.logging import init_logging
+from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.shared_memory import (
     allocate_shared_tensor,
@@ -20,7 +26,7 @@ from torchstore.transport.shared_memory import (
     ShmContext,
 )
 from torchstore.transport.types import Request
-from torchstore.utils import get_local_hostname
+from torchstore.utils import get_local_hostname, spawn_actors
 
 
 class MockStorageVolumeRef:
@@ -775,6 +781,32 @@ class TestSharedMemoryTransportBufferGPU:
 
         assert torch.allclose(shm_tensor, tensor.cpu())
 
+    @pytest.mark.asyncio
+    async def test_gpu_put_does_not_block_on_unrelated_stream(self, ref) -> None:
+        buffer = SharedMemoryTransportBuffer(ref)
+        tensor = torch.randn(50, 50, device="cuda")
+        entries = [Request(key="test_key", tensor_val=tensor)]
+        shm_tensor = allocate_shared_tensor(tensor.shape, tensor.dtype)
+        descriptor = SharedMemoryDescriptor.from_tensor(shm_tensor)
+
+        await buffer._post_handshake([descriptor], entries)
+
+        unrelated = torch.cuda.Stream()
+        with torch.cuda.stream(unrelated):
+            torch.cuda._sleep(2_000_000_000)  # long kernel on an unrelated stream
+        assert not unrelated.query(), "sanity: unrelated stream should be busy"
+
+        # Warm PUT: segment already cached+pinned, so only the copy runs.
+        await buffer._post_handshake([descriptor], entries)
+
+        assert not unrelated.query(), (
+            "warm GPU PUT blocked on unrelated stream work "
+            "(device-wide sync regression)"
+        )
+
+        unrelated.synchronize()
+        assert torch.allclose(shm_tensor, tensor.cpu())
+
 
 class TestSharedMemoryTransportBufferBatch:
     """Tests for SharedMemoryTransportBuffer batch operations."""
@@ -996,6 +1028,55 @@ class TestViewAwareSharedMemory:
         assert len(results) == 1
         assert results[0] is dest_tensor
         assert torch.allclose(dest_tensor, torch.arange(20, 70, dtype=torch.float32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.asyncio
+async def test_shm_put_does_not_block_on_unrelated_stream() -> None:
+    # E2E: a warm SHM ts.put of a GPU tensor must not stall on unrelated GPU work.
+
+    class StreamProbeActor(Actor):
+        def __init__(self):
+            init_logging()
+            os.environ["LOCAL_RANK"] = str(current_rank().rank)
+
+        @endpoint
+        async def run(self):
+            assert torch.cuda.is_available()
+            key = "weights"
+            tensor = torch.randn(50, 50, device="cuda")
+
+            # Prime: first PUT allocates + pins the SHM segment (device-syncs).
+            await ts.put(key, tensor)
+
+            unrelated = torch.cuda.Stream()
+            with torch.cuda.stream(unrelated):
+                torch.cuda._sleep(2_000_000_000)  # long unrelated kernel
+            assert not unrelated.query(), "sanity: unrelated stream should be busy"
+
+            # Warm PUT: segment already pinned/cached, so only the copy runs.
+            await ts.put(key, tensor)
+
+            still_busy = not unrelated.query()
+            unrelated.synchronize()
+            assert still_busy, (
+                "warm ts.put blocked on unrelated stream work "
+                "(device-wide sync regression)"
+            )
+
+            # Sanity: value round-trips through the store.
+            got = await ts.get(key)
+            assert torch.allclose(got.cpu(), tensor.cpu())
+
+    await ts.initialize(
+        num_storage_volumes=1,
+        strategy=ts.LocalRankStrategy(TransportType.SharedMemory),
+    )
+    actor_mesh = await spawn_actors(1, StreamProbeActor, "shm_stream_probe")
+    try:
+        await actor_mesh.run.call()
+    finally:
+        await ts.shutdown()
 
 
 if __name__ == "__main__":

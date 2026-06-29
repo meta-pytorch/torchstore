@@ -114,7 +114,7 @@ class TransportBuffer:
       2. Calls `_pre_get_hook(requests)` [CLIENT] - save metadata for response handling
       3. Sends to StorageVolume via `volume.get.call()`
       4. StorageVolume calls `handle_get_request(ctx, entries)` [STORAGE VOLUME]
-      5. Client calls `_handle_storage_volume_response(requests, response)` [CLIENT]
+      5. Client calls `_handle_storage_volume_response(requests, transport_buffer)` [CLIENT]
       6. Calls `drop()` [CLIENT] - cleanup resources
 
     Methods Called on CLIENT (Local Process)
@@ -316,7 +316,7 @@ class TransportBuffer:
         pass
 
     async def _handle_storage_volume_response(
-        self, requests: list[Request], response: Any
+        self, requests: list[Request], transport_buffer: "TransportBuffer"
     ) -> list[Any]:
         raise NotImplementedError()
 
