@@ -34,12 +34,12 @@ dependencies = [
 [project.optional-dependencies]
 cu128 = [
     # torchcomms wheels are CUDA-specific and depend on the matching torch wheel.
-    "torch==2.11.0",
+    "torch==2.13.0",
     "torchcomms==0.2.0 ; sys_platform == 'linux'",
 ]
 cu130 = [
     # torchcomms wheels are CUDA-specific and depend on the matching torch wheel.
-    "torch==2.11.0",
+    "torch==2.13.0",
     "torchcomms==0.2.0 ; sys_platform == 'linux'",
 ]
 dev = [
