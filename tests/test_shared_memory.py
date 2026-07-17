@@ -6,9 +6,8 @@
 
 """Tests for shared memory transport (unit tests + one e2e ts.put check)."""
 
-import os
-
 import logging
+import os
 
 import pytest
 import torch
