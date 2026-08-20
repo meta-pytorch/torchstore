@@ -102,6 +102,12 @@ class MonarchRDMATransportBuffer(TransportBuffer):
     def _allocate_ctx(self, tensor: torch.Tensor) -> RdmaContext:
         """Register a contiguous ``tensor`` for RDMA and return its context."""
         self._assert_valid_tensor(tensor, tensor.dtype, tensor.shape)
+        if tensor.numel() == 0:
+            return RdmaContext(
+                tensor=tensor,
+                shape=tensor.shape,
+                dtype=tensor.dtype,
+            )
         return RdmaContext(
             rdma_buffer=RDMABuffer(to_byte_view(tensor)),
             tensor=tensor,
@@ -180,6 +186,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
                 )
 
             self._assert_valid_tensor(tensor, rdma_ctx.dtype, rdma_ctx.shape)
+            if rdma_ctx.rdma_buffer is None:
+                if tensor.numel() != 0:
+                    raise RuntimeError("Missing remote RDMA buffer for nonempty tensor")
+                results.append(tensor)
+                continue
             action.read_remote(to_byte_view(tensor), rdma_ctx.rdma_buffer)
             has_rdma_ops = True
             results.append(tensor)
@@ -212,6 +223,10 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             self._assert_valid_tensor(
                 data, rdma_ctx.dtype, rdma_ctx.shape, must_be_contiguous=False
             )
+            if rdma_ctx.rdma_buffer is None:
+                if data.numel() != 0:
+                    raise RuntimeError("Missing remote RDMA buffer for nonempty tensor")
+                continue
             action.write_remote(rdma_ctx.rdma_buffer, to_byte_view(data))
             has_rdma_ops = True
 

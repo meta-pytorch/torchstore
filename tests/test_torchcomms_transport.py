@@ -15,7 +15,14 @@ import torchstore.transport as transport_module
 import torchstore.transport.torchcomms.cache as cache_mod
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
-from torchstore.transport.torchcomms.uniflow_buffer import TorchCommsTransportBuffer
+from torchstore.transport.torchcomms.buffer import (
+    RdmaContext as TorchCommsRdmaContext,
+    TorchCommsRdmaTransportBuffer,
+)
+from torchstore.transport.torchcomms.uniflow_buffer import (
+    TorchCommsTransportBuffer,
+    UniflowContext,
+)
 from torchstore.transport.types import Request
 
 # Unit tests authored by Codex: they cover the main TorchComms workflows and
@@ -226,6 +233,12 @@ def _clear_torchcomms_caches() -> None:
 def _set_uniflow_module(monkeypatch, module) -> None:
     monkeypatch.setattr(cache_mod, "_uniflow_transport", module, raising=False)
     _clear_torchcomms_caches()
+
+
+def _enable_fake_uniflow(monkeypatch) -> None:
+    monkeypatch.setenv("USE_TORCHCOMMS", "1")
+    monkeypatch.setenv("USE_TORCHCOMMS_RDMA", "1")
+    _set_uniflow_module(monkeypatch, _fake_uniflow_module())
 
 
 def _set_torchcomms_transport_module(monkeypatch, module) -> None:
@@ -510,6 +523,59 @@ class TestTorchCommsSelection:
             transport_module.create_transport_buffer(
                 _storage_volume_ref(default_transport_type=TransportType.TorchComms)
             )
+
+
+class TestTorchCommsEmptyTensor:
+    @pytest.mark.parametrize("backend", ["legacy", "uniflow"])
+    def test_empty_context_has_metadata_without_registration(
+        self, monkeypatch, backend
+    ) -> None:
+        if backend == "legacy":
+            buffer = TorchCommsRdmaTransportBuffer(_storage_volume_ref())
+            tensor = torch.empty(0, 8, dtype=torch.bfloat16)
+        else:
+            _enable_fake_uniflow(monkeypatch)
+            buffer = TorchCommsTransportBuffer(_storage_volume_ref())
+            tensor = torch.empty(8, 0, dtype=torch.float64)
+
+        context = buffer._allocate_ctx(tensor)
+
+        transfer_handle = (
+            context.rdma_remote_buffer if backend == "legacy" else context.export_id
+        )
+        assert transfer_handle is None
+        assert context.tensor_ref is tensor
+        assert (context.shape, context.dtype) == (tensor.shape, tensor.dtype)
+
+    @pytest.mark.parametrize("backend", ["legacy", "uniflow"])
+    @pytest.mark.parametrize("operation", ["put", "get"])
+    def test_missing_handle_rejected_for_nonempty_tensor(
+        self, monkeypatch, backend, operation
+    ) -> None:
+        tensor = torch.ones(4)
+        request = Request.from_tensor("nonempty", tensor)
+        if backend == "legacy":
+            buffer = TorchCommsRdmaTransportBuffer(_storage_volume_ref())
+            context = TorchCommsRdmaContext(shape=tensor.shape, dtype=tensor.dtype)
+            error = "Missing remote RDMA buffer for nonempty tensor"
+        else:
+            _enable_fake_uniflow(monkeypatch)
+            buffer = TorchCommsTransportBuffer(_storage_volume_ref())
+            context = UniflowContext(shape=tensor.shape, dtype=tensor.dtype)
+            error = "Missing Uniflow export id for nonempty tensor"
+        buffer._contexts = [context]
+
+        if operation == "put":
+            call = buffer.handle_put_request(
+                TransportContext(), [(request.meta_only(), None)]
+            )
+        else:
+            call = buffer.handle_get_request(
+                TransportContext(), [(request.meta_only(), tensor)]
+            )
+
+        with pytest.raises(RuntimeError, match=error):
+            asyncio.run(call)
 
 
 @requires_uniflow

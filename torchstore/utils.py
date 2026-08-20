@@ -290,9 +290,15 @@ def get_slice_intersection(
         intersect_start = max(stored_start, requested_start)
         intersect_end = min(stored_end, requested_end)
 
-        # Check if there's actually an intersection
-        if intersect_start >= intersect_end:
-            return None  # No overlap in this dimension
+        # Coincident empty intervals represent the same empty shard. Other
+        # zero-width intersections only touch at a boundary and do not overlap.
+        matching_empty_intervals = (
+            stored_start == stored_end
+            and requested_start == requested_end
+            and stored_start == requested_start
+        )
+        if intersect_start >= intersect_end and not matching_empty_intervals:
+            return None
 
         new_offsets.append(intersect_start)
         new_local_shape.append(intersect_end - intersect_start)

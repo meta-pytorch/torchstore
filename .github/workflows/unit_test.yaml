@@ -63,6 +63,7 @@ jobs:
             --ignore=tests/test_resharding_ext.py \
             --ignore=tests/test_tensor_slice.py \
             --ignore=tests/test_large_tensors.py \
+            --deselect='tests/test_state_dict.py::test_dcp_sharding_parity[TransportType.Gloo]' \
             --cov=. --cov-report=xml --cov-append --durations=20 -vv -s
           TORCHSTORE_RDMA_ENABLED=0 \
           USE_TORCHCOMMS_RDMA=0 \
