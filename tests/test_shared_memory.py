@@ -6,9 +6,8 @@
 
 """Tests for shared memory transport (unit tests + one e2e ts.put check)."""
 
-import os
-
 import logging
+import os
 
 import pytest
 import torch
@@ -345,12 +344,14 @@ class _FakeCudart:
     def __init__(self, register_err: int):
         self.register_err = register_err
         self.register_calls = 0
+        self.unregister_calls = 0
 
     def cudaHostRegister(self, ptr, size, flags):
         self.register_calls += 1
         return self.register_err
 
     def cudaHostUnregister(self, ptr):
+        self.unregister_calls += 1
         return 0
 
 
@@ -425,6 +426,24 @@ class TestPinMemoryFailOpen:
             assert torch.allclose(entry.get_tensor(), data)
         finally:
             cache.clear()
+
+    def test_zero_byte_storage_skips_cuda_registration(self, force_pin_error):
+        import torchstore.transport.shared_memory as shm_module
+
+        fake = force_pin_error(shm_module._CUDA_ERROR_INVALID_VALUE)
+        tensor = allocate_shared_tensor(torch.Size([0, 8]), torch.float32)
+        descriptor = SharedMemoryDescriptor.from_tensor(tensor)
+        assert descriptor is not None
+
+        cache = SharedMemoryCache()
+        try:
+            entry = cache.attach("empty", descriptor)
+            assert entry.get_tensor().shape == (0, 8)
+        finally:
+            cache.clear()
+
+        assert fake.register_calls == 0
+        assert fake.unregister_calls == 0
 
     def test_already_registered_is_silent(self, force_pin_error, caplog):
         import torchstore.transport.shared_memory as shm_module
