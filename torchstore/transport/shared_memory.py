@@ -94,7 +94,7 @@ def pin_memory(storage: torch.UntypedStorage) -> None:
     once and fall back to unpinned transfers, equivalent to
     TORCHSTORE_PIN_SHM=0 for this segment.
     """
-    if not SHOULD_PIN_SHM or not torch.cuda.is_available():
+    if storage.size() == 0 or not SHOULD_PIN_SHM or not torch.cuda.is_available():
         return
 
     cudart = torch.cuda.cudart()
@@ -115,7 +115,7 @@ def pin_memory(storage: torch.UntypedStorage) -> None:
 
 def unpin_memory(storage: torch.UntypedStorage) -> None:
     """Unpin storage's memory."""
-    if not SHOULD_PIN_SHM or not torch.cuda.is_available():
+    if storage.size() == 0 or not SHOULD_PIN_SHM or not torch.cuda.is_available():
         return
 
     cudart = torch.cuda.cudart()
