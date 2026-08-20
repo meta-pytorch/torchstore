@@ -10,16 +10,69 @@ import tempfile
 import pytest
 import torch
 import torchstore as ts
-from monarch.actor import Actor, current_rank, endpoint
+from monarch.actor import Actor, current_rank, endpoint, this_host
 
 # DTensor imports for DTensor slice testing
 from torch.distributed._tensor import Shard
 from torchstore.logging import init_logging
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
-from torchstore.utils import spawn_actors
+from torchstore.utils import get_slice_intersection, spawn_actors
 
 from .utils import DTensorActor, main, transport_plus_strategy_params
+
+
+@pytest.mark.parametrize(
+    "stored_offset,stored_shape,requested_offset,requested_shape,expected",
+    [
+        pytest.param((0,), (2,), (2,), (2,), None, id="touching"),
+        pytest.param((2,), (0,), (2,), (0,), ((2,), (0,)), id="matching-empty"),
+        pytest.param((2,), (0,), (3,), (0,), None, id="distinct-empty"),
+        pytest.param((2,), (0,), (2,), (1,), None, id="empty-vs-nonempty"),
+        pytest.param(
+            (0, 0),
+            (0, 8),
+            (0, 2),
+            (0, 8),
+            ((0, 2), (0, 6)),
+            id="empty-dimension-with-overlap",
+        ),
+    ],
+)
+def test_get_slice_intersection_with_empty_intervals(
+    stored_offset: tuple[int, ...],
+    stored_shape: tuple[int, ...],
+    requested_offset: tuple[int, ...],
+    requested_shape: tuple[int, ...],
+    expected: tuple[tuple[int, ...], tuple[int, ...]] | None,
+) -> None:
+    global_shape = tuple(
+        max(stored_offset[i] + size, requested_offset[i] + requested_shape[i])
+        for i, size in enumerate(stored_shape)
+    )
+    stored_slice = TensorSlice(
+        offsets=stored_offset,
+        coordinates=(0,),
+        global_shape=global_shape,
+        local_shape=stored_shape,
+        mesh_shape=(1,),
+    )
+    requested_slice = TensorSlice(
+        offsets=requested_offset,
+        coordinates=(0,),
+        global_shape=global_shape,
+        local_shape=requested_shape,
+        mesh_shape=(1,),
+    )
+
+    intersection = get_slice_intersection(stored_slice, requested_slice)
+
+    if expected is None:
+        assert intersection is None
+    else:
+        assert intersection is not None
+        assert intersection.offsets == expected[0]
+        assert intersection.local_shape == expected[1]
 
 
 @pytest.mark.parametrize(*transport_plus_strategy_params())
@@ -232,6 +285,90 @@ async def test_put_dtensor_get_full_tensor_inplace():
         finally:
             await put_mesh.destroy_process_group.call()
             await ts.shutdown()
+
+
+@pytest.mark.parametrize(
+    "case_name,original_tensor,expected_local_shapes",
+    [
+        pytest.param(
+            "locally_empty",
+            torch.arange(8, dtype=torch.float32).reshape(1, 8),
+            [(1, 8), (0, 8)],
+            id="locally-empty-shard",
+        ),
+        pytest.param(
+            "globally_empty",
+            torch.empty(0, 8, dtype=torch.bfloat16),
+            [(0, 8), (0, 8)],
+            id="globally-empty",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_batch_dtensor_with_empty_shard(
+    case_name: str,
+    original_tensor: torch.Tensor,
+    expected_local_shapes: list[tuple[int, ...]],
+) -> None:
+    """Empty DTensor shards round-trip through initial and repeated full GETs."""
+
+    class GetActor(Actor):
+        @endpoint
+        async def get_tensor(self, key, expected):
+            allocated = (await ts.get_batch([key]))[key]
+            destination = torch.empty_like(expected)
+            inplace = (await ts.get_batch({key: destination}))[key]
+            assert inplace is destination
+            return allocated, inplace
+
+    storage_proc_mesh = this_host().spawn_procs(per_host={"procs": 2})
+    put_proc_mesh = this_host().spawn_procs(per_host={"procs": 2})
+    get_proc_mesh = this_host().spawn_procs(per_host={"procs": 1})
+
+    await ts.initialize(
+        num_storage_volumes=2,
+        strategy=ts.LocalRankStrategy(TransportType.MonarchRPC),
+        mesh=storage_proc_mesh,
+    )
+
+    with tempfile.TemporaryDirectory() as filesystem_store_dir:
+        try:
+            put_mesh = await spawn_actors(
+                2,
+                DTensorActor,
+                f"empty_shard_put_mesh_{case_name}",
+                mesh=put_proc_mesh,
+                mesh_shape=(2,),
+                original_tensor=original_tensor,
+                placements=[Shard(0)],
+                file_store_name=os.path.join(filesystem_store_dir, "empty_shard_test"),
+                visible_devices="",
+                expected_local_shapes=expected_local_shapes,
+            )
+
+            await put_mesh.do_put.call()
+
+            get_actor = await spawn_actors(
+                1,
+                GetActor,
+                f"empty_shard_get_actor_{case_name}",
+                mesh=get_proc_mesh,
+            )
+            allocated, inplace = await get_actor.get_tensor.call_one(
+                "test_key", original_tensor
+            )
+
+            assert torch.equal(original_tensor, allocated)
+            assert torch.equal(original_tensor, inplace)
+            assert allocated.shape == original_tensor.shape
+            assert allocated.dtype == original_tensor.dtype
+
+        finally:
+            await put_mesh.destroy_process_group.call()
+            await ts.shutdown()
+            await put_proc_mesh.stop()
+            await get_proc_mesh.stop()
+            await storage_proc_mesh.stop()
 
 
 @pytest.mark.asyncio

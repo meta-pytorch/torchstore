@@ -399,8 +399,15 @@ class TorchCommsTransportBuffer(TransportBuffer):
 
     def _allocate_ctx(self, tensor: torch.Tensor) -> UniflowContext:
         self._assert_valid_tensor(tensor, tensor.dtype, tensor.shape)
-        uniflow_cache = self.storage_volume_ref.transport_context.get(UniflowCache)
         device_id = UniflowCache.device_to_id(tensor.device)
+        if tensor.numel() == 0:
+            return UniflowContext(
+                tensor_ref=tensor,
+                shape=tensor.shape,
+                dtype=tensor.dtype,
+                device_id=device_id,
+            )
+        uniflow_cache = self.storage_volume_ref.transport_context.get(UniflowCache)
         factory = uniflow_cache.factory(device_id)
         registration = uniflow_cache.get_or_register(tensor, factory)
         export_id = registration.registered_segment.export_id().unwrap()
@@ -519,6 +526,13 @@ class TorchCommsTransportBuffer(TransportBuffer):
                 self._assert_valid_tensor(
                     maybe_tensor, uniflow_ctx.dtype, uniflow_ctx.shape
                 )
+                if uniflow_ctx.export_id is None:
+                    if maybe_tensor.numel() != 0:
+                        raise RuntimeError(
+                            "Missing Uniflow export id for nonempty tensor"
+                        )
+                    results.append(maybe_tensor)
+                    continue
 
                 transport = self._get_sv_transport(ctx, uniflow_ctx.device_id)
                 local_registration = uniflow_cache.get_or_register(
@@ -565,6 +579,12 @@ class TorchCommsTransportBuffer(TransportBuffer):
                     tensor = contiguous_buffer
 
                 self._assert_valid_tensor(tensor, uniflow_ctx.dtype, uniflow_ctx.shape)
+                if uniflow_ctx.export_id is None:
+                    if tensor.numel() != 0:
+                        raise RuntimeError(
+                            "Missing Uniflow export id for nonempty tensor"
+                        )
+                    continue
                 transport = self._get_sv_transport(ctx, uniflow_ctx.device_id)
                 local_registration = uniflow_cache.get_or_register(tensor, factory)
                 remote_segment = cast(

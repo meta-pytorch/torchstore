@@ -86,6 +86,7 @@ class DTensorActor(Actor):
         ranks_to_skip_put: (
             list[int] | None
         ) = None,  # ranks that should skip put operation
+        expected_local_shapes: list[tuple[int, ...]] | None = None,
     ):
         self.rank = current_rank().rank
         self.mesh_shape = mesh_shape
@@ -94,6 +95,7 @@ class DTensorActor(Actor):
         self.placements = placements
         self.file_store_name = file_store_name
         self.ranks_to_skip_put = ranks_to_skip_put or []
+        self.expected_local_shapes = expected_local_shapes
 
         # torchstore will fail without this (see LocalRankStrategy)
         os.environ["LOCAL_RANK"] = str(self.rank)
@@ -127,6 +129,10 @@ class DTensorActor(Actor):
         self.rlog("distributing dtensor")
         tensor = self.original_tensor.to("cpu")
         dtensor = distribute_tensor(tensor, device_mesh, placements=self.placements)
+        if self.expected_local_shapes is not None:
+            assert (
+                tuple(dtensor.to_local().shape) == self.expected_local_shapes[self.rank]
+            )
 
         # Skip put if this rank is in the skip list
         if self.rank in self.ranks_to_skip_put:

@@ -139,6 +139,13 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     def _allocate_ctx(self, tensor: torch.Tensor) -> RdmaContext:
         self._assert_valid_tensor(tensor, tensor.dtype, tensor.shape)
+        if tensor.numel() == 0:
+            return RdmaContext(
+                tensor_ref=tensor,
+                shape=tensor.shape,
+                dtype=tensor.dtype,
+                device_index=RdmaTransportCache.device_to_index(tensor.device),
+            )
         if _client_rdma_cache_enabled():
             cache = self.storage_volume_ref.transport_context.get(RdmaMemoryCache)
             rdma_memory = cache.get_or_register(tensor)
@@ -217,18 +224,19 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
                 results.append(rdma_ctx.objects)
                 continue
 
-            transport = self._get_sv_transport(ctx, rdma_ctx.device_index)
-
             if maybe_tensor is None:
                 maybe_tensor = torch.zeros(
                     rdma_ctx.shape, dtype=rdma_ctx.dtype, device=torch.device("cpu")
                 )
 
             if rdma_ctx.rdma_remote_buffer is None:
-                raise RuntimeError(
-                    "Internal error: No remote RDMA memory reference found. cannot perform read"
-                )
+                if maybe_tensor.numel() != 0:
+                    raise RuntimeError("Missing remote RDMA buffer for nonempty tensor")
+                results.append(maybe_tensor)
+                continue
             self._assert_valid_tensor(maybe_tensor, rdma_ctx.dtype, rdma_ctx.shape)
+
+            transport = self._get_sv_transport(ctx, rdma_ctx.device_index)
 
             # TODO: replace sequential reads with true batch RDMA operations (coming to torchcomms)
             receiving_buffer = rdma_mem_cache.get_or_register(maybe_tensor)
@@ -262,6 +270,11 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
             tensor = data
 
+            if rdma_ctx.rdma_remote_buffer is None:
+                if tensor.numel() != 0:
+                    raise RuntimeError("Missing remote RDMA buffer for nonempty tensor")
+                continue
+
             if not tensor.is_contiguous():
                 contiguous_buffer = torch.zeros_like(
                     tensor,
@@ -278,10 +291,6 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
             transport = self._get_sv_transport(ctx, rdma_ctx.device_index)
 
-            if rdma_ctx.rdma_remote_buffer is None:
-                raise RuntimeError(
-                    "Internal error: No remote RDMA memory reference found. cannot perform read"
-                )
             self._assert_valid_tensor(tensor, rdma_ctx.dtype, rdma_ctx.shape)
             # TODO: replace sequential writes with true batch RDMA operations (coming to torchcomms)
 

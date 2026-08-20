@@ -53,7 +53,7 @@ class RDMAWeightHandle:
     performs a one-sided RDMA read from the source's memory.
     """
 
-    rdma_buffer: object  # monarch.rdma.RDMABuffer
+    rdma_buffer: object | None  # monarch.rdma.RDMABuffer
     tensor_slice: TensorSlice  # shard position in the global tensor
     source_rank: int
 
@@ -139,8 +139,11 @@ class DirectWeightSyncSource:
                 ), f"Expected contiguous tensor for key={name}, strides={local_tensor.stride()}"
                 buf_tensor = local_tensor
 
-            # Register the contiguous buffer with RDMA
-            rdma_buf = RDMABuffer(to_byte_view(buf_tensor))
+            rdma_buf = (
+                None
+                if buf_tensor.numel() == 0
+                else RDMABuffer(to_byte_view(buf_tensor))
+            )
 
             handles[name] = RDMAWeightHandle(
                 rdma_buffer=rdma_buf,
@@ -171,7 +174,8 @@ class DirectWeightSyncSource:
     async def cleanup(self) -> None:
         """Release all RDMA registrations."""
         for handle in self._handles.values():
-            await handle.rdma_buffer.drop()
+            if handle.rdma_buffer is not None:
+                await handle.rdma_buffer.drop()
         self._handles.clear()
         self._staging.clear()
 
@@ -253,6 +257,12 @@ class DirectWeightSyncDest:
                 intersection = get_slice_intersection(handle.tensor_slice, dest_slice)
                 if intersection is None:
                     continue
+                if 0 in intersection.local_shape:
+                    continue
+                if handle.rdma_buffer is None:
+                    raise RuntimeError(
+                        f"Missing RDMA buffer for nonempty tensor slice {name}"
+                    )
 
                 # Skip duplicate regions (replicated params)
                 region_key = (intersection.offsets, intersection.local_shape)

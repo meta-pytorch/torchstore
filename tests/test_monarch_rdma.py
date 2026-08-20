@@ -181,6 +181,35 @@ class TestMonarchRDMABatchPut:
         assert results == [1, 2]
         assert not FakeRDMAAction.instances[0].submitted
 
+    @pytest.mark.asyncio
+    async def test_empty_tensor_skips_put_and_get_rdma_operations(self, ref):
+        tensor = torch.empty(0, 8, dtype=torch.bfloat16)
+        requests = [Request.from_tensor("empty", tensor)]
+
+        put_buffer = MonarchRDMATransportBuffer(ref)
+        await put_buffer._pre_put_hook(requests)
+        put_results = await put_buffer.handle_put_request(
+            TransportContext(), _sv_entries_for_put(requests)
+        )
+
+        get_buffer = MonarchRDMATransportBuffer(
+            MockStorageVolumeRef(metas=[(tensor.shape, tensor.dtype)])
+        )
+        get_requests = [Request.from_any("empty", None)]
+        await get_buffer._pre_get_hook(get_requests)
+        await get_buffer.handle_get_request(
+            TransportContext(), [(get_requests[0], tensor)]
+        )
+        get_results = await get_buffer._handle_storage_volume_response(
+            get_requests, get_buffer
+        )
+
+        assert put_results[0].shape == get_results[0].shape == tensor.shape
+        assert put_results[0].dtype == get_results[0].dtype == tensor.dtype
+        assert put_buffer._contexts[0].rdma_buffer is None
+        assert get_buffer._contexts[0].rdma_buffer is None
+        assert all(not action.submitted for action in FakeRDMAAction.instances)
+
 
 class TestMonarchRDMABatchGet:
     """GET batch flow."""
@@ -225,6 +254,28 @@ class TestMonarchRDMABatchGet:
         results = await buffer._handle_storage_volume_response(requests, buffer)
 
         assert torch.equal(results[0], stored)
+
+    @pytest.mark.parametrize("operation", ["put", "get"])
+    @pytest.mark.asyncio
+    async def test_missing_rdma_buffer_rejected_for_nonempty_tensor(
+        self, ref, operation
+    ):
+        buffer = MonarchRDMATransportBuffer(ref)
+        tensor = torch.ones(4)
+        request = Request.from_tensor("nonempty", tensor)
+        buffer._contexts = [RdmaContext(shape=tensor.shape, dtype=tensor.dtype)]
+
+        with pytest.raises(
+            RuntimeError, match="Missing remote RDMA buffer for nonempty tensor"
+        ):
+            if operation == "put":
+                await buffer.handle_put_request(
+                    TransportContext(), [(request.meta_only(), None)]
+                )
+            else:
+                await buffer.handle_get_request(
+                    TransportContext(), [(request.meta_only(), tensor)]
+                )
 
     @pytest.mark.asyncio
     async def test_get_object_routes_through_context(self):

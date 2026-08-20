@@ -153,6 +153,38 @@ async def test_replicated_dedup():
     assert len(sync._plan) == 1
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [pytest.param((0, 8), id="empty"), pytest.param((4, 8), id="nonempty")],
+)
+async def test_missing_rdma_buffer_only_allowed_for_empty_tensor(shape):
+    tensor = torch.empty(shape, dtype=torch.bfloat16)
+    tensor_slice = TensorSlice(
+        offsets=(0, 0),
+        coordinates=(0,),
+        global_shape=shape,
+        local_shape=shape,
+        mesh_shape=(1,),
+    )
+    handles = [
+        RDMAWeightHandle(
+            rdma_buffer=None,
+            tensor_slice=tensor_slice,
+            source_rank=0,
+        )
+    ]
+
+    sync = DirectWeightSyncDest()
+    if tensor.numel() == 0:
+        await sync.pull({"weight": handles}, {"weight": tensor})
+        assert sync._plan == []
+    else:
+        with pytest.raises(
+            RuntimeError, match="Missing RDMA buffer for nonempty tensor slice weight"
+        ):
+            await sync.pull({"weight": handles}, {"weight": tensor})
+
+
 async def test_multiple_params():
     """State dict with multiple params, each handled independently."""
     w1 = torch.arange(100, dtype=torch.float32).reshape(10, 10)
