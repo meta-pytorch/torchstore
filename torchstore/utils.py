@@ -22,6 +22,24 @@ if TYPE_CHECKING:
 logger = getLogger(__name__)
 
 
+def accelerator() -> str:
+    """Return the available accelerator type: "cuda", "xpu", or "cpu"."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return "cpu"
+
+
+def set_visible_devices(devices: str) -> None:
+    """Pin a process to specific accelerator tiles via env var."""
+    accel = accelerator()
+    if accel == "cuda":
+        os.environ["CUDA_VISIBLE_DEVICES"] = devices
+    elif accel == "xpu":
+        os.environ["ZE_AFFINITY_MASK"] = devices
+
+
 def to_byte_view(tensor: torch.Tensor) -> torch.Tensor:
     """Convert a tensor to a flattened uint8 byte view for RDMA.
 
