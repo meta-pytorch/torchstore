@@ -51,9 +51,6 @@ def transport_params():
     if torchcomms_uniflow_available() or torchcomms_rdma_available():
         enabled_transport_types.append(TransportType.TorchComms)
 
-    if os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1":
-        enabled_transport_types.append(TransportType.Gloo)
-
     if os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1":
         enabled_transport_types.append(TransportType.SharedMemory)
 

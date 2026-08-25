@@ -9,7 +9,7 @@ Key Features:
 - **DTensor-aware storage** with tensor-slice retrieval and resharding across different layouts
 - **`state_dict` exchange** for checkpoint-style weight sync between actors
 - **Direct RDMA weight sync** for zero-copy GPU-to-GPU model weight transfer (one-hop, no intermediate storage for cases like synchronous RL)
-- **Automatic transport selection** — POSIX shared memory for same-host, RDMA when available, with Gloo and Monarch RPC fallbacks
+- **Automatic transport selection** — POSIX shared memory for same-host, RDMA when available, with Monarch RPC fallback
 - **Configurable storage strategies** — `LocalRankStrategy` (per-rank volumes), `HostStrategy` (per-host), extensible for your specific use case
 
 > **Note:** TorchStore supports both Monarch-native launches and SPMD entry points (`torchrun` / `torchx`). See [SPMD Usage](#spmd-usage-torchrun--torchx) below for the latter.
@@ -292,8 +292,7 @@ configuration is needed — the selection happens at runtime:
 | 1 | **POSIX Shared Memory** | Client and storage volume are on the same host |
 | 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
 | 3 | **TorchComms RDMA** | Cross-host, `torchcomms` installed |
-| 4 | **Gloo** | Cross-host fallback via collective transport |
-| 5 | **Monarch RPC** | Universal fallback, always available |
+| 4 | **Monarch RPC** | Universal fallback, always available |
 
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:
@@ -301,7 +300,7 @@ strategy:
 ```python
 from torchstore.transport import TransportType
 
-strategy = ts.LocalRankStrategy(default_transport_type=TransportType.Gloo)
+strategy = ts.LocalRankStrategy(default_transport_type=TransportType.MonarchRPC)
 await ts.initialize(num_storage_volumes=N, strategy=strategy)
 ```
 

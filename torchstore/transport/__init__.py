@@ -9,7 +9,6 @@ from enum import auto, Enum
 from typing import TYPE_CHECKING
 
 from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.gloo import gloo_available, GlooTransportBuffer
 from torchstore.transport.monarch_rdma import (
     monarch_rdma_transport_available,
     MonarchRDMATransportBuffer,
@@ -42,7 +41,6 @@ class TransportType(Enum):
     # Enum name is changed given uniflow supports more than just RDMA (i.e NVLink or TCP)
     TorchComms = auto()
     TorchCommsRDMA = TorchComms  # Backward compatible alias
-    Gloo = auto()
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
 
 
@@ -50,7 +48,7 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
     """Determine the best available transport type for the given storage volume.
 
     Prefers SharedMemory for same-host transfers, then TorchComms (Uniflow RDMA/NVLink),
-    then MonarchRDMA, then Gloo, otherwise falls back to MonarchRPC.
+    then MonarchRDMA, otherwise falls back to MonarchRPC.
     """
     # Prefer SharedMemory for same-host transfers
     if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
@@ -61,8 +59,6 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
         return TransportType.TorchComms
     elif monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
-    elif gloo_available():
-        return TransportType.Gloo
 
     return TransportType.MonarchRPC
 
@@ -71,12 +67,11 @@ def _log_transport_resolution(
     storage_volume_ref: "StorageVolumeRef", transport_type: TransportType
 ) -> None:
     logger.info(
-        "[ts-transport] resolved=%s (uniflow=%s, tc_rdma=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
+        "[ts-transport] resolved=%s (uniflow=%s, tc_rdma=%s, monarch_rdma=%s, shm=%s)",
         transport_type.name,
         torchcomms_uniflow_available(),
         torchcomms_rdma_available(),
         monarch_rdma_transport_available(),
-        gloo_available(),
         SHM_ENABLED and is_local_to_volume(storage_volume_ref),
     )
 
@@ -101,7 +96,6 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
     transport_map = {
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
-        TransportType.Gloo: GlooTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
 
