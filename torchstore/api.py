@@ -4,17 +4,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Any, overload, TYPE_CHECKING
+import asyncio
+from collections.abc import Mapping, Sequence
+from functools import partial
+from typing import TYPE_CHECKING, Any, overload
 
 import torch
-from monarch.actor import get_or_spawn_controller, ProcMesh
+from monarch.actor import current_rank, get_or_spawn_controller, ProcMesh
 from torch.distributed.tensor import DTensor
 
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient
 from torchstore.controller import Controller
+from torchstore.routing._model import RankRole
+from torchstore.routing.client import RoutingClient
+from torchstore.routing.coordinator import RoutingCoordinator
+from torchstore.routing.service import RoutingService, RoutingServiceGroup
 from torchstore.storage_volume import StorageVolume
-from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
+from torchstore.strategy import (
+    ControllerStorageVolumes,
+    MultiMeshStrategy,
+    TorchStoreStrategy,
+)
 from torchstore.transport.types import TensorSlice
 
 if TYPE_CHECKING:
@@ -26,8 +37,25 @@ DEFAULT_TORCHSTORE_NAME: str = "torchstore"
 # cache for local clients
 _local_clent_map: dict[str, LocalClient] = {}
 
+
 # SPMD-initialized stores register their session here
 _spmd_state_map: dict[str, "_SPMDSession"] = {}
+
+
+def _routing_volume_id(namespace: str) -> str:
+    """Qualify the monarch rank with its mesh's namespace."""
+    return f"{namespace}/{current_rank().rank}"
+
+
+def _routing_namespace(role: RankRole, group: int | None) -> str:
+    """The namespace of one participating mesh."""
+    if role == RankRole.PUBLISHER:
+        if group is not None:
+            raise ValueError("publishers are a single mesh and take no group")
+        return role.value
+    if group is None:
+        raise ValueError("requesters must pass the index of their relay mesh")
+    return f"{role.value}/{group}"
 
 
 async def initialize(
@@ -35,6 +63,7 @@ async def initialize(
     strategy: TorchStoreStrategy | None = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
     mesh: ProcMesh | None = None,
+    relay_meshes: Sequence[ProcMesh] | None = None,
 ) -> None:
     """Initialize the TorchStore distributed storage system.
 
@@ -46,6 +75,10 @@ async def initialize(
             Uses ControllerStorageVolumes if None and num_storage_volumes=1.
         store_name (str): Unique name for this store instance. Defaults to DEFAULT_TORCHSTORE_NAME.
         mesh (ProcMesh, optional): Monarch ProcMesh on which to spawn StorageVolumes
+        relay_meshes: Requester ProcMeshes. When set, the store runs in routing
+            mode: ``mesh`` publishes, each relay mesh requests, and every
+            participant calls ``client(state_dict=...)`` once to exchange
+            layouts and receive its precomputed routes.
 
     Raises:
         RuntimeError: If num_storage_volumes > 1 but no strategy is provided.
@@ -55,6 +88,12 @@ async def initialize(
         >>> await ts.initialize(num_storage_volumes=4, strategy=LocalRankStrategy()) # uses default namespace.
         >>> >>> await ts.initialize("my_custom_store")
     """
+    if relay_meshes is not None:
+        if strategy is None or mesh is None:
+            raise RuntimeError("routing mode requires both mesh and strategy")
+        await _initialize_routing(mesh, relay_meshes, strategy, store_name)
+        return
+
     if num_storage_volumes == 1 and strategy is None:
         strategy = ControllerStorageVolumes()
     elif strategy is None:
@@ -66,11 +105,15 @@ async def initialize(
     # ideally this is done in the controller.init
     if isinstance(strategy, ControllerStorageVolumes):
         storage_volumes = await get_or_spawn_controller(
-            "storage_volume_controller", StorageVolume, id_func=strategy.get_volume_id
+            "storage_volume_controller",
+            StorageVolume,
+            id_func=strategy.get_volume_id,
         )
     else:
         storage_volumes = await StorageVolume.spawn(
-            num_volumes=num_storage_volumes, mesh=mesh, id_func=strategy.get_volume_id
+            num_volumes=num_storage_volumes,
+            mesh=mesh,
+            id_func=strategy.get_volume_id,
         )
 
     controller = await _controller(store_name)
@@ -79,6 +122,51 @@ async def initialize(
         num_storage_volumes=num_storage_volumes,
         storage_volumes=storage_volumes,
     )
+
+
+async def _initialize_routing(
+    mesh: ProcMesh,
+    relay_meshes: Sequence[ProcMesh],
+    strategy: TorchStoreStrategy,
+    store_name: str,
+) -> None:
+    """Spawn the volumes, services and coordinator that routing mode needs."""
+    if not relay_meshes:
+        raise RuntimeError("routing mode requires at least one relay mesh")
+    if not isinstance(strategy, MultiMeshStrategy):
+        raise RuntimeError(
+            "routing mode needs a MultiMeshStrategy: publisher and relay "
+            f"volumes span several ProcMeshes, which {type(strategy).__name__} "
+            "cannot index"
+        )
+
+    namespaces = [_routing_namespace(RankRole.PUBLISHER, None)] + [
+        _routing_namespace(RankRole.REQUESTER, group)
+        for group in range(len(relay_meshes))
+    ]
+    meshes = [mesh, *relay_meshes]
+    volumes = await asyncio.gather(
+        *(
+            StorageVolume.spawn(
+                1, m, id_func=partial(_routing_volume_id, namespace)
+            )
+            for m, namespace in zip(meshes, namespaces, strict=True)
+        )
+    )
+    await strategy.set_storage_volumes(*volumes)
+
+    services = RoutingServiceGroup()
+    await services.set_services(
+        *await asyncio.gather(
+            *(
+                RoutingService.spawn(m, id_func=partial(_routing_volume_id, namespace))
+                for m, namespace in zip(meshes, namespaces, strict=True)
+            )
+        )
+    )
+
+    coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
+    await coordinator.init.call_one(services=services, strategy=strategy)
 
 
 async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
@@ -110,8 +198,7 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
 
 def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
-    """Reset the local client for a given store. Useful for refreshing client state after shutdown."""
-    global _local_clent_map
+    """Reset the cached or installed client for a given store."""
     _local_clent_map.pop(store_name, None)
 
 
@@ -123,13 +210,24 @@ async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:
     return await get_or_spawn_controller(store_name, Controller)
 
 
-async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
+async def client(
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+    *,
+    role: RankRole | str | None = None,
+    group: int | None = None,
+) -> LocalClient:
     """Get a local client handle for interacting with the store.
 
     Returns a cached LocalClient instance that provides the interface for put/get operations.
 
     Args:
         store_name (str): Name of the store to get a client for. Defaults to DEFAULT_TORCHSTORE_NAME.
+        role: Set on a rank of a store initialized with ``relay_meshes``, to get
+            a routing client: ``"publisher"`` for ranks on ``mesh``,
+            ``"requester"`` for ranks on a relay mesh. Call
+            ``register_state_dict`` on the result before using it.
+        group: Index of this rank's mesh in ``initialize(relay_meshes=...)``.
+            Required for requesters, rejected for publishers.
 
     Returns:
         LocalClient: A client instance for performing storage operations.
@@ -141,13 +239,22 @@ async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
     if store_name in _local_clent_map:
         return _local_clent_map[store_name]
 
-    controller = await _controller(store_name)
-    controller_strategy = await controller.get_controller_strategy.call_one()
-
-    local_client = LocalClient(
-        controller=controller,
-        strategy=controller_strategy,
-    )
+    if role is not None:
+        role = RankRole(role)
+        coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
+        local_client = RoutingClient(
+            _routing_volume_id(_routing_namespace(role, group)),
+            role,
+            coordinator,
+            await coordinator.strategy.call_one(),
+        )
+    else:
+        controller = await _controller(store_name)
+        controller_strategy = await controller.get_controller_strategy.call_one()
+        local_client = LocalClient(
+            controller=controller,
+            strategy=controller_strategy,
+        )
     _local_clent_map[store_name] = local_client
 
     return local_client

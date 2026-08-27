@@ -143,6 +143,48 @@ class TorchStoreStrategy:
         )
 
 
+class MultiMeshStrategy(TorchStoreStrategy):
+    """Resolves volumes that were spawned across several ProcMeshes."""
+
+    def __init__(self, default_transport_type: TransportType = TransportType.Unset):
+        super().__init__(default_transport_type)
+        self.volume_id_to_mesh = {}
+
+    @classmethod
+    def get_volume_id(cls):
+        raise NotImplementedError(
+            f"{cls.__name__} does not name volumes: callers burden"
+        )
+
+    @classmethod
+    def get_client_id(cls):
+        raise NotImplementedError(
+            f"{cls.__name__} does not map a process to a volume: callers burden "
+        )
+
+    async def set_storage_volumes(self, *storage_volumes):
+        """Index every volume mesh. IDs must be unique across the whole set."""
+        self.storage_volumes = storage_volumes[0]
+        for mesh in storage_volumes:
+            for coord, (volume_id, hostname) in await mesh.get_id.call():
+                if volume_id in self.volume_id_to_mesh:
+                    raise ValueError(f"duplicate storage volume ID {volume_id!r}")
+                self.volume_id_to_coord[volume_id] = coord
+                self.volume_id_to_hostname[volume_id] = hostname
+                self.volume_id_to_mesh[volume_id] = mesh
+
+    def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
+        return StorageVolumeRef(
+            self.volume_id_to_mesh[volume_id].slice(
+                **self.volume_id_to_coord[volume_id]
+            ),
+            volume_id,
+            self.transport_context,
+            self.default_transport_type,
+            volume_hostname=self.volume_id_to_hostname.get(volume_id),
+        )
+
+
 class HostStrategy(TorchStoreStrategy):
     """Assumes one storage volume per host.
 
