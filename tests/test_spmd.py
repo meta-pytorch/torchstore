@@ -15,12 +15,13 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torchstore as ts
+import torchstore.api as _api
 
 _WORLD_SIZE = 2
 _MASTER_ADDR = "127.0.0.1"
@@ -34,11 +35,11 @@ def _supports_monarch_spmd() -> bool:
         return False
 
     try:
-        from monarch._src.spmd.host_mesh import host_mesh_from_store
+        from monarch.job.spmd import StoreJob
     except ImportError:
         return False
 
-    return callable(host_mesh_from_store)
+    return callable(StoreJob.from_store)
 
 
 def _reserve_free_port() -> int:
@@ -65,12 +66,25 @@ def _strategy(strategy_name: str) -> ts.TorchStoreStrategy:
     raise ValueError(f"Unsupported strategy: {strategy_name}")
 
 
-async def _run_noop_cycle(strategy_name: str, store_name: str) -> dict[str, bool]:
-    await ts.initialize_spmd(strategy=_strategy(strategy_name), store_name=store_name)
+async def _run_noop_cycle(
+    strategy_name: str,
+    store_name: str,
+) -> dict[str, bool]:
+    configured = False
+
+    def configure_job(_job: Any) -> None:
+        nonlocal configured
+        configured = True
+
+    await ts.initialize_spmd(
+        strategy=_strategy(strategy_name),
+        store_name=store_name,
+        configure_job=configure_job,
+    )
     dist.barrier()
     await ts.shutdown(store_name=store_name)
     dist.barrier()
-    return {"completed": True}
+    return {"completed": True, "configured": configured}
 
 
 async def _run_env_cycle(
@@ -311,6 +325,35 @@ class SPMDEnvTest(unittest.TestCase):
                 ts.spmd.SPMDEnv.from_env()
 
 
+class SPMDInitializeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_attach_failure_cleans_up_store_job(self) -> None:
+        store_name = f"attach_failure_{uuid.uuid4().hex[:8]}"
+        env = ts.spmd.SPMDEnv(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            local_world_size=1,
+            master_addr=_MASTER_ADDR,
+            master_port=_reserve_free_port(),
+        )
+        job = MagicMock()
+        job.state.side_effect = RuntimeError("attach failed")
+
+        with (
+            patch("torchstore.spmd.TCPStore"),
+            patch("torchstore.spmd.StoreJob.from_store", return_value=job),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "attach failed"):
+                await ts.initialize_spmd(
+                    strategy=ts.HostStrategy(),
+                    store_name=store_name,
+                    env=env,
+                )
+
+        job.kill.assert_called_once_with()
+        self.assertNotIn(store_name, _api._spmd_state_map)
+
+
 @unittest.skipUnless(
     _supports_monarch_spmd(),
     "Monarch SPMD helpers are unavailable in this environment",
@@ -320,6 +363,10 @@ class SPMDTest(unittest.TestCase):
         self.assertCountEqual([result["rank"] for result in results], [0, 1])
         for result in results:
             self.assertTrue(result["scenario"]["completed"])
+            self.assertEqual(
+                result["scenario"]["configured"],
+                result["rank"] == 0,
+            )
 
     def _assert_env_results(self, results: list[dict[str, Any]]) -> None:
         self.assertCountEqual([result["rank"] for result in results], [0, 1])

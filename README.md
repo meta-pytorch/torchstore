@@ -188,6 +188,26 @@ To pass an explicit SPMD config instead of reading env vars, construct
 `ts.spmd.SPMDEnv(...)` directly and pass it via `env=`. For a complete runnable
 example, see [`example/torchstore_spmd.py`](example/torchstore_spmd.py).
 
+Use `configure_job=` to enable Monarch Job API components before the rank 0
+client attaches to the store-backed host mesh. The callback runs only on global
+rank 0:
+
+```python
+def configure_job(job):
+    job.enable_telemetry()
+    job.remote_mount(
+        "/path/to/local/source",
+        mntpoint="/path/on/workers",
+        python_exe=None,
+    )
+
+
+await ts.initialize_spmd(
+    strategy=ts.LocalRankStrategy(),
+    configure_job=configure_job,
+)
+```
+
 ### API Overview
 
 Beyond `put`/`get`, TorchStore exposes batch operations and key-management helpers:

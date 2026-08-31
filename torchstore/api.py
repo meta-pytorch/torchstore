@@ -86,8 +86,8 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
     Gracefully shuts down all storage volumes and controllers associated with the
     store. For SPMD-initialized stores, this delegates to the session cleanup
-    path created by ``torchstore.spmd.initialize()``, which also tears down the
-    Monarch host mesh and the per-host worker subprocess each local rank 0 spawned.
+    path created by ``torchstore.spmd.initialize()``, which also stops Job API
+    sidecars and tears down the Monarch host mesh.
 
     Args:
         store_name (str): Name of the store to shutdown. Defaults to DEFAULT_TORCHSTORE_NAME.
