@@ -6,6 +6,7 @@
 
 """Tests for shared memory transport (unit tests + one e2e ts.put check)."""
 
+import asyncio
 import logging
 import os
 
@@ -180,6 +181,69 @@ class TestSharedMemoryDescriptor:
 
 class TestSharedMemoryCache:
     """Test SharedMemoryCache."""
+
+    @pytest.mark.asyncio
+    async def test_lock_keys_serializes_same_key_and_cleans_up(self):
+        cache = SharedMemoryCache()
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        order: list[str] = []
+
+        async def first():
+            async with cache.lock_keys(["key"]):
+                order.append("first_entered")
+                first_entered.set()
+                await release_first.wait()
+                order.append("first_released")
+
+        async def second():
+            await first_entered.wait()
+            async with cache.lock_keys(["key"]):
+                order.append("second_entered")
+
+        first_task = asyncio.create_task(first())
+        await first_entered.wait()
+        second_task = asyncio.create_task(second())
+        await asyncio.sleep(0)
+
+        try:
+            assert order == ["first_entered"]
+            assert cache._key_locks["key"].users == 2
+        finally:
+            release_first.set()
+            await asyncio.gather(first_task, second_task)
+
+        assert order == ["first_entered", "first_released", "second_entered"]
+        assert not cache._key_locks
+
+    @pytest.mark.asyncio
+    async def test_lock_keys_allows_different_keys(self):
+        cache = SharedMemoryCache()
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        second_entered = asyncio.Event()
+
+        async def first():
+            async with cache.lock_keys(["first"]):
+                first_entered.set()
+                await release_first.wait()
+
+        async def second():
+            await first_entered.wait()
+            async with cache.lock_keys(["second"]):
+                second_entered.set()
+
+        first_task = asyncio.create_task(first())
+        await first_entered.wait()
+        second_task = asyncio.create_task(second())
+
+        try:
+            await asyncio.wait_for(second_entered.wait(), timeout=1)
+        finally:
+            release_first.set()
+            await asyncio.gather(first_task, second_task)
+
+        assert not cache._key_locks
 
     def test_allocate(self):
         """Test allocate method creates and caches shared memory."""
