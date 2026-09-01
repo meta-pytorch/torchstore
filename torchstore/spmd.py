@@ -8,6 +8,7 @@ import contextlib
 import logging
 import os
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -18,15 +19,19 @@ from monarch.actor import get_or_spawn_controller
 from torch.distributed import TCPStore
 
 try:
-    from monarch._src.spmd.host_mesh import host_mesh_from_store
+    from monarch.job.spmd import StoreJob
 except ImportError as e:
-    _host_mesh_import_error: ImportError = e
+    _store_job_import_error: ImportError = e
 
-    def host_mesh_from_store(*args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(
-            "host_mesh_from_store() is not available. This environment was not built with a version of monarch "
-            "that includes this API. Try installing nightly monarch."
-        ) from _host_mesh_import_error
+    class StoreJob:
+        """Fallback that reports a missing store-backed Monarch Job API."""
+
+        @classmethod
+        def from_store(cls, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError(
+                "StoreJob.from_store() is not available. This environment was not built with a version of monarch "
+                "that includes this API. Try installing nightly monarch."
+            ) from _store_job_import_error
 
 
 import torchstore.api as _api
@@ -116,6 +121,7 @@ class _SPMDSession:
         rendezvous: TCPStore,
         controller: Controller,
         store_name: str,
+        job: StoreJob | None,
         host_mesh: Any | None,
         is_primary: bool,
     ) -> None:
@@ -123,6 +129,7 @@ class _SPMDSession:
         self.controller = controller
         self.is_primary = is_primary
         self._store_name = store_name
+        self._job = job
         self._host_mesh = host_mesh
 
     async def shutdown(self) -> None:
@@ -141,7 +148,11 @@ class _SPMDSession:
             finally:
                 _api.reset_client(self._store_name)
 
-        # then clean up any other resources like the hostmesh
+        if self.is_primary and self._job is not None:
+            with _capture(errors):
+                self._job.kill()
+            self._job = None
+
         if self.is_primary and self._host_mesh is not None:
             with _capture(errors):
                 await self._host_mesh.shutdown()
@@ -203,8 +214,19 @@ async def _shutdown_spmd_state(
         await _shutdown(session, store_name)
 
 
-async def _best_effort_cleanup(host_mesh: Any | None) -> None:
+async def _best_effort_cleanup(
+    job: StoreJob | None,
+    host_mesh: Any | None,
+) -> None:
     """Best-effort cleanup of partial init state. Logs instead of raising."""
+    if job is not None:
+        try:
+            job.kill()
+        except Exception:
+            logger.warning(
+                "torchstore.spmd: job cleanup after init failure raised",
+                exc_info=True,
+            )
     if host_mesh is not None:
         try:
             await host_mesh.shutdown()
@@ -251,6 +273,7 @@ async def initialize(
     rendezvous_timeout: timedelta = timedelta(seconds=120),
     transport: str = "ipc",
     monarch_port: int = 26600,
+    configure_job: Callable[[StoreJob], None] | None = None,
 ) -> None:
     """Initialize TorchStore from a torchrun-style SPMD environment.
 
@@ -262,10 +285,9 @@ async def initialize(
     / ``MASTER_PORT`` env vars via :meth:`SPMDEnv.from_env`. Callers that
     need to drive init from an explicit config can build an ``SPMDEnv``
     directly and pass it via ``env=``. All ranks then call
-    :func:`monarch._src.spmd.host_mesh.host_mesh_from_store` collectively —
-    global rank 0 gets a ``HostMesh`` back, and non-primary ranks get ``None``.
-    Global rank 0 then spawns TorchStore volumes on that mesh and broadcasts the
-    controller handle through the same ``TCPStore``.
+    :meth:`monarch.job.spmd.StoreJob.from_store` collectively. Global rank 0
+    configures and connects the job, spawns TorchStore volumes on its host mesh,
+    and broadcasts the controller handle through the same ``TCPStore``.
 
     ``transport`` selects the worker listen scheme. ``"ipc"`` (default)
     uses a per-worker Unix socket and is limited to single-host
@@ -289,6 +311,9 @@ async def initialize(
             ``"metatls-hostname"``.
         monarch_port: Port the worker binds on for TCP/metatls transports;
             ignored for ``"ipc"``.
+        configure_job: Optional callback that configures the rank 0
+            :class:`monarch.job.spmd.StoreJob` before it connects. Use this to
+            enable Job API components such as telemetry or remote mounts.
     """
 
     strategy = _validate_strategy(strategy)
@@ -314,20 +339,25 @@ async def initialize(
         is_master=(env.rank == 0),
         timeout=rendezvous_timeout,
     )
-    host_mesh = host_mesh_from_store(
+    mesh_name = f"torchstore_{store_name}"
+    job = StoreJob.from_store(
         rendezvous,
         monarch_port=monarch_port,
-        name=f"torchstore_{store_name}",
+        name=mesh_name,
         transport=transport,
         rank=env.rank,
         local_rank=env.local_rank,
         world_size=env.world_size,
         local_world_size=env.local_world_size,
     )
+    host_mesh = None
 
     try:
         controller_key = _spmd_key(store_name, "controller")
-        if host_mesh is not None:
+        if job is not None:
+            if configure_job is not None:
+                configure_job(job)
+            host_mesh = getattr(job.state(), mesh_name)
             storage_mesh = _storage_mesh(
                 strategy,
                 host_mesh,
@@ -353,12 +383,13 @@ async def initialize(
             rendezvous=rendezvous,
             controller=controller,
             store_name=store_name,
+            job=job,
             host_mesh=host_mesh,
             is_primary=(env.rank == 0),
         )
         _api._spmd_state_map[store_name] = session
     except Exception:
-        await _best_effort_cleanup(host_mesh)
+        await _best_effort_cleanup(job, host_mesh)
         raise
 
 
