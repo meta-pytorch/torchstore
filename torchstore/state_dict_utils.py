@@ -40,12 +40,18 @@ def _state_dict_storage_metadata(
     *,
     transfer_dtype: torch.dtype | None = None,
     preserve_dtype_keys: frozenset[str] = frozenset(),
-) -> tuple[dict[str, TensorSlice], dict[str, int], dict[str, tuple[str | int, ...]]]:
+) -> tuple[
+    dict[str, TensorSlice],
+    dict[str, int],
+    dict[str, torch.dtype],
+    dict[str, tuple[str | int, ...]],
+]:
     """Describe state-dict tensors using their normal TorchStore storage keys.
 
     Returns:
         slices: storage key -> the one slice this rank holds of it
         element_sizes: storage key -> bytes per element as transferred.
+        dtypes: storage key -> dtype used on the wire.
         mapping: flat key -> path in the nested state dict.
     """
     # Imported here for the same reason as create_direct_transport below:
@@ -55,6 +61,7 @@ def _state_dict_storage_metadata(
     flattened, mapping = flatten_state_dict(dict(state_dict))
     slices = {}
     element_sizes = {}
+    dtypes = {}
     for flat_key, value in flattened.items():
         storage_key = _state_dict_storage_key(key, flat_key)
         try:
@@ -73,8 +80,9 @@ def _state_dict_storage_metadata(
             and request.tensor_val.is_floating_point()
         ):
             dtype = transfer_dtype
+        dtypes[storage_key] = dtype
         element_sizes[storage_key] = torch.empty((), dtype=dtype).element_size()
-    return slices, element_sizes, mapping
+    return slices, element_sizes, dtypes, mapping
 
 
 @dataclass
