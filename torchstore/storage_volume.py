@@ -164,6 +164,13 @@ class InMemoryStore(StorageImpl):
         Looks up the key in kv storage and extracts the tensor if it exists.
         Only asserts on type mismatches between existing data and incoming request.
 
+        Self-heals on shape mismatch: if a stale entry has a different shape
+        than the incoming PUT (e.g. a prior delete was lost / silently dropped),
+        evict the stale entry so a fresh allocation runs. Without this, the
+        downstream client `shm_tensor.copy_(new_tensor)` crashes with
+        "size of tensor a (X) must match tensor b (Y) at dim N" because the
+        handshake hands back a descriptor sized for the OLD tensor.
+
         Args:
             request: The incoming put request
 
@@ -183,6 +190,29 @@ class InMemoryStore(StorageImpl):
             assert (
                 request.tensor_slice is None
             ), "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
+            # Self-heal on shape mismatch: drop stale entry, return None so
+            # caller allocates fresh. Uses request.tensor_meta (set by
+            # meta_only() when the original request had a tensor_val); if
+            # tensor_meta is missing, fall back to tensor_val. Skip check
+            # when neither is available (e.g. GET-only path).
+            incoming_shape: torch.Size | None = None
+            if request.tensor_meta is not None:
+                incoming_shape = request.tensor_meta[0]
+            elif isinstance(request.tensor_val, torch.Tensor):
+                incoming_shape = request.tensor_val.shape
+            if (
+                incoming_shape is not None
+                and current_object.shape != incoming_shape
+            ):
+                logger.warning(
+                    "InMemoryStore: evicting stale kv entry for key=%s "
+                    "(existing shape=%s, new shape=%s)",
+                    request.key,
+                    tuple(current_object.shape),
+                    tuple(incoming_shape),
+                )
+                del self.kv[request.key]
+                return None
             return current_object
 
         if isinstance(current_object, dict):

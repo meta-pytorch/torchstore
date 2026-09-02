@@ -104,6 +104,12 @@ class Request:
     tensor_slice: TensorSlice | None = None
     objects: Any | None = None
     is_object: bool = False
+    # Shape/dtype of the local tensor for this request, propagated through
+    # meta_only() so the storage volume can validate the incoming PUT against
+    # any existing kv entry without needing the full tensor data. Set
+    # automatically by meta_only() when tensor_val is present; callers should
+    # not set this directly.
+    tensor_meta: tuple[torch.Size, torch.dtype] | None = None
 
     @classmethod
     def from_any(
@@ -208,11 +214,21 @@ class Request:
         return cls(key=key, tensor_slice=copy.deepcopy(tensor_slice))
 
     def meta_only(self) -> "Request":
-        """Returns a copy of this request with tensor_val set to None."""
+        """Returns a copy of this request with tensor_val set to None.
+
+        Shape/dtype of the original tensor (if any) is preserved in
+        tensor_meta so server-side handlers can compare against existing
+        kv entries (e.g. detect stale-shape mismatches that would otherwise
+        crash the client during in-place SHM copy).
+        """
+        tensor_meta: tuple[torch.Size, torch.dtype] | None = self.tensor_meta
+        if tensor_meta is None and self.tensor_val is not None:
+            tensor_meta = (self.tensor_val.shape, self.tensor_val.dtype)
         return Request(
             key=self.key,
             tensor_val=None,
             tensor_slice=self.tensor_slice,
             objects=self.objects,
             is_object=self.is_object,
+            tensor_meta=tensor_meta,
         )
