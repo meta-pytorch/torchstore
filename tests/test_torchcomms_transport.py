@@ -419,6 +419,10 @@ class TestTorchCommsSelection:
     def test_torchcomms_rdma_alias_preserves_existing_callers(self) -> None:
         assert TransportType["TorchCommsRDMA"] is TransportType.TorchComms
 
+    def test_new_transport_preserves_existing_enum_values(self) -> None:
+        assert TransportType.SharedMemory.value == 6
+        assert TransportType.NIXL.value == 7
+
     def test_get_available_transport_prefers_shared_memory(self, monkeypatch) -> None:
         monkeypatch.setattr(transport_module, "SHM_ENABLED", True)
         monkeypatch.setattr(transport_module, "is_local_to_volume", lambda _ref: True)
