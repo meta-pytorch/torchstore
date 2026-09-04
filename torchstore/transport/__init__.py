@@ -15,6 +15,7 @@ from torchstore.transport.monarch_rdma import (
     MonarchRDMATransportBuffer,
 )
 from torchstore.transport.monarch_rpc import MonarchRPCTransportBuffer
+from torchstore.transport.nixl import nixl_available, NixlTransportBuffer
 from torchstore.transport.shared_memory import (
     is_local_to_volume,
     SharedMemoryTransportBuffer,
@@ -43,18 +44,23 @@ class TransportType(Enum):
     TorchComms = auto()
     TorchCommsRDMA = TorchComms  # Backward compatible alias
     Gloo = auto()
+    NIXL = auto()
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
 
 
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
-    Prefers SharedMemory for same-host transfers, then TorchComms (Uniflow RDMA/NVLink),
-    then MonarchRDMA, then Gloo, otherwise falls back to MonarchRPC.
+    Prefers SharedMemory for same-host transfers, then an explicitly enabled
+    NIXL transport, TorchComms, MonarchRDMA, and Gloo, before falling back to
+    MonarchRPC.
     """
     # Prefer SharedMemory for same-host transfers
     if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
         return TransportType.SharedMemory
+
+    if nixl_available():
+        return TransportType.NIXL
 
     # Fall back to RDMA if available (prefer TorchComms over Monarch RDMA)
     if torchcomms_uniflow_available() or torchcomms_rdma_available():
@@ -71,8 +77,9 @@ def _log_transport_resolution(
     storage_volume_ref: "StorageVolumeRef", transport_type: TransportType
 ) -> None:
     logger.info(
-        "[ts-transport] resolved=%s (uniflow=%s, tc_rdma=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
+        "[ts-transport] resolved=%s (nixl=%s, uniflow=%s, tc_rdma=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
         transport_type.name,
+        nixl_available(),
         torchcomms_uniflow_available(),
         torchcomms_rdma_available(),
         monarch_rdma_transport_available(),
@@ -98,10 +105,17 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
             return TorchCommsRdmaTransportBuffer(storage_volume_ref)
         raise RuntimeError("TorchComms transport is not available.")
 
+    if transport_type == TransportType.NIXL and not nixl_available():
+        raise RuntimeError(
+            "NIXL transport is not available. Install nixl and set "
+            "TORCHSTORE_NIXL_ENABLED=1."
+        )
+
     transport_map = {
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
         TransportType.Gloo: GlooTransportBuffer,
+        TransportType.NIXL: NixlTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
 
