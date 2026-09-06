@@ -89,6 +89,18 @@ def _gloo_factory(
         pg._register_backend(
             torch.device("cuda"), ProcessGroup.BackendType.GLOO, backend_class
         )
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        # Gloo can move bytes regardless of device; register XPU so callers
+        # don't have to manually `.cpu()` tensors before pg ops.
+        try:
+            pg._register_backend(
+                torch.device("xpu"), ProcessGroup.BackendType.GLOO, backend_class
+            )
+        except RuntimeError:
+            # Older torch builds may reject unknown device types here.
+            # Falling back to CPU/CUDA registration is fine — callers will
+            # implicitly stage through CPU.
+            pass
     return pg
 
 
