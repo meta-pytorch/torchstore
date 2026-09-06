@@ -161,8 +161,10 @@ class InMemoryStore(StorageImpl):
     def _extract_existing(self, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
 
-        Looks up the key in kv storage and extracts the tensor if it exists.
-        Only asserts on type mismatches between existing data and incoming request.
+        Looks up the key in kv storage and returns a tensor only when its allocation
+        is compatible with the incoming request. Returning None makes the transport
+        allocate replacement storage while preserving the current value until the
+        transfer succeeds.
 
         Args:
             request: The incoming put request
@@ -183,6 +185,8 @@ class InMemoryStore(StorageImpl):
             assert (
                 request.tensor_slice is None
             ), "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
+            if not self._is_compatible_tensor(current_object, request):
+                return None
             return current_object
 
         if isinstance(current_object, dict):
@@ -200,11 +204,22 @@ class InMemoryStore(StorageImpl):
             # Look up by coordinates
             shard = current_object.get(request.tensor_slice.coordinates)
             if shard is not None and "tensor" in shard:
-                return shard["tensor"]
+                tensor = shard["tensor"]
+                if not self._is_compatible_tensor(tensor, request):
+                    return None
+                return tensor
             # Coordinates don't match - new shard, return None to allocate new
             return None
 
         raise AssertionError(f"Unexpected current_object type: {type(current_object)}")
+
+    @staticmethod
+    def _is_compatible_tensor(tensor: torch.Tensor, request: "Request") -> bool:
+        if request.tensor_meta is None:
+            return True
+
+        shape, dtype = request.tensor_meta
+        return tensor.shape == shape and tensor.dtype == dtype
 
     def _handle_dtensor(
         self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
