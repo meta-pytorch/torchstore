@@ -4,20 +4,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Minimal scheduler-neutral metadata contract for a TCPStore proof of concept."""
+"""Scheduler-neutral metadata contract and TCPStore control-plane proof."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
+from enum import Enum
+from threading import Lock
+from types import TracebackType
 from typing import cast, NoReturn, TypeAlias
+
+from torch.distributed import PrefixStore, Store, TCPStore
 
 
 SCHEMA_VERSION = 1
 MAX_DOCUMENT_BYTES = 1024 * 1024
 MAX_ENDPOINT_BYTES = 4096
+MAX_HEAD_BYTES = 512
 MAX_OBJECTS = 4096
 MAX_CONSUMERS = 4096
 MAX_GENERATIONS_PER_SESSION = 16
@@ -25,6 +33,10 @@ MAX_INTEGER = (1 << 63) - 1
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _CHECKSUM_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _JsonObject: TypeAlias = dict[str, object]
+_CAS_CAPABILITY_KEY = "capability/compare-set"
+_CAS_CAPABILITY_VALUE = b"supported"
+_CONFIG_KEY = "config"
+_HEAD_KEY = "head"
 
 
 class ControlPlaneError(Exception):
@@ -39,8 +51,20 @@ class ConflictError(ControlPlaneError):
     """An immutable value conflicts with existing state."""
 
 
+class AmbiguousMutationError(ControlPlaneError):
+    """A Store mutation may have applied before its response failed."""
+
+
+class ConnectionUnusableError(ControlPlaneError):
+    """A Store connection must be replaced before another operation."""
+
+
 class NotReadyError(ControlPlaneError):
     """A lifecycle precondition has not been reached."""
+
+
+class UnsupportedStoreError(ControlPlaneError):
+    """The supplied c10d Store lacks a required atomic primitive."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +316,336 @@ class GenerationManifest:
         )
 
 
+class PublishDisposition(str, Enum):
+    COMMITTED_CURRENT = "committed_current"
+
+
+@dataclass(frozen=True, slots=True)
+class PublishResult:
+    manifest: GenerationManifest
+    disposition: PublishDisposition
+
+
+@dataclass(frozen=True, slots=True)
+class _GenerationHead:
+    run_id: str
+    generation: int
+    manifest_digest: str
+
+    def __post_init__(self) -> None:
+        _validate_identifier(self.run_id, "run_id")
+        _validate_integer(
+            self.generation,
+            "generation",
+            minimum=1,
+            maximum=MAX_GENERATIONS_PER_SESSION,
+        )
+        if (
+            not isinstance(self.manifest_digest, str)
+            or _CHECKSUM_PATTERN.fullmatch(self.manifest_digest) is None
+        ):
+            raise ValidationError("manifest_digest must be a lowercase SHA-256 digest")
+
+    def to_bytes(self) -> bytes:
+        return _encode_document(
+            {
+                "generation": self.generation,
+                "manifest_digest": self.manifest_digest,
+                "run_id": self.run_id,
+                "schema_version": SCHEMA_VERSION,
+            },
+            "generation head",
+            MAX_HEAD_BYTES,
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> _GenerationHead:
+        document = _decode_document(data, "generation head", MAX_HEAD_BYTES)
+        _require_fields(
+            document,
+            {"generation", "manifest_digest", "run_id", "schema_version"},
+            "generation head",
+        )
+        _require_schema_version(document)
+        return cls(
+            run_id=_expect_string(document["run_id"], "run_id"),
+            generation=_expect_integer(document["generation"], "generation"),
+            manifest_digest=_expect_string(
+                document["manifest_digest"], "manifest_digest"
+            ),
+        )
+
+
+class C10dGenerationCoordinator:
+    """Fixed-membership publication requiring Store compare-set semantics.
+
+    Each instance must exclusively own its injected Store connection.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        config: SessionConfig,
+        participant_id: str,
+    ) -> None:
+        if not isinstance(store, Store):
+            raise ValidationError("store must implement torch.distributed.Store")
+        if not isinstance(config, SessionConfig):
+            raise ValidationError("config must be a SessionConfig")
+        _validate_identifier(participant_id, "participant_id")
+        members = {config.publisher_id, *config.consumer_ids}
+        if participant_id not in members:
+            raise ValidationError("participant_id is not in fixed membership")
+        self._store: Store | None = PrefixStore(config.run_id, store)
+        self._config = config
+        self._participant_id = participant_id
+        self._opened = False
+        self._poisoned = False
+        self._closed = False
+        self._io_lock = Lock()
+
+    def __enter__(self) -> C10dGenerationCoordinator:
+        self._require_usable()
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Make this handle terminal and release its Store reference."""
+        with self._io_lock:
+            self._opened = False
+            self._closed = True
+            self._store = None
+
+    def create_session(self) -> SessionConfig:
+        """Create the immutable session configuration as the publisher."""
+        self._require_publisher()
+        self._require_compare_set()
+        self._put_immutable(_CONFIG_KEY, self._config.to_bytes())
+        self._opened = True
+        return self._config
+
+    def attach(self) -> SessionConfig:
+        """Attach only when the stored configuration matches exactly."""
+        encoded = self._read(_CONFIG_KEY)
+        if encoded is None:
+            raise NotReadyError("control-plane session does not exist")
+        stored = SessionConfig.from_bytes(encoded)
+        if encoded != stored.to_bytes():
+            raise ConflictError("session configuration is not canonical")
+        if stored != self._config:
+            raise ConflictError("session configuration does not match")
+        self._require_compare_set()
+        self._opened = True
+        return stored
+
+    def publish(
+        self,
+        generation: int,
+        application_version: int,
+        objects: Sequence[ObjectRef],
+    ) -> PublishResult:
+        """Publish one complete manifest, then atomically advance the head."""
+        self._require_open()
+        self._require_publisher()
+        if not isinstance(objects, Sequence) or isinstance(
+            objects, (str, bytes, bytearray)
+        ):
+            raise ValidationError("objects must be a bounded sequence")
+        if not objects or len(objects) > MAX_OBJECTS:
+            raise ValidationError("objects must be a bounded nonempty sequence")
+        manifest = GenerationManifest(
+            self._config.run_id,
+            generation,
+            application_version,
+            tuple(objects),
+        )
+        desired = manifest.to_bytes()
+        manifest_key = _manifest_key(generation)
+        stored = self._read(manifest_key)
+        if stored is not None and stored != desired:
+            raise ConflictError("generation manifest is immutable")
+        committed_head = self._read_committed_head()
+        current_head = None
+        committed = None
+        if committed_head is not None:
+            current_head, committed = committed_head
+            if committed == manifest:
+                return PublishResult(manifest, PublishDisposition.COMMITTED_CURRENT)
+        self._validate_first_generation(committed, generation)
+        self._put_immutable(manifest_key, desired)
+        desired_head = _GenerationHead(
+            run_id=self._config.run_id,
+            generation=generation,
+            manifest_digest=manifest.digest,
+        ).to_bytes()
+        reply = self._compare_set(_HEAD_KEY, current_head or b"", desired_head)
+        if reply == desired_head:
+            return PublishResult(manifest, PublishDisposition.COMMITTED_CURRENT)
+        observed = self._read_committed_head()
+        if observed is not None and observed[0] == desired_head:
+            return PublishResult(manifest, PublishDisposition.COMMITTED_CURRENT)
+        raise ConflictError("generation head changed concurrently")
+
+    def discover(self, *, after_generation: int = 0) -> GenerationManifest | None:
+        """Return the committed head without exposing unpublished manifests."""
+        self._require_open()
+        _validate_integer(
+            after_generation,
+            "after_generation",
+            minimum=0,
+            maximum=MAX_INTEGER,
+        )
+        committed_head = self._read_committed_head()
+        if committed_head is None:
+            return None
+        _, manifest = committed_head
+        if manifest.generation <= after_generation:
+            return None
+        return manifest
+
+    def _validate_first_generation(
+        self, current: GenerationManifest | None, generation: int
+    ) -> None:
+        if current is not None:
+            raise ConflictError("completion is required before another generation")
+        if generation != 1:
+            raise ConflictError("the first generation must be one")
+
+    def _read_committed_head(
+        self,
+    ) -> tuple[bytes, GenerationManifest] | None:
+        encoded = self._read(_HEAD_KEY)
+        if encoded is None:
+            return None
+        head = _GenerationHead.from_bytes(encoded)
+        if head.run_id != self._config.run_id:
+            raise ConflictError("generation head belongs to another session")
+        manifest_data = self._read(_manifest_key(head.generation))
+        if manifest_data is None:
+            raise ConflictError("committed generation manifest is missing")
+        manifest = GenerationManifest.from_bytes(manifest_data)
+        self._require_session(manifest)
+        if manifest_data != manifest.to_bytes():
+            raise ConflictError("committed generation manifest is not canonical")
+        if (
+            manifest.generation != head.generation
+            or manifest.digest != head.manifest_digest
+        ):
+            raise ConflictError("generation head does not match immutable manifest")
+        return encoded, manifest
+
+    def _require_session(self, manifest: GenerationManifest) -> None:
+        if not isinstance(manifest, GenerationManifest):
+            raise ValidationError("manifest must be a GenerationManifest")
+        if manifest.run_id != self._config.run_id:
+            raise ConflictError("manifest belongs to another session")
+
+    def _require_publisher(self) -> None:
+        if self._participant_id != self._config.publisher_id:
+            raise ValidationError("only the fixed publisher may perform this operation")
+
+    def _require_open(self) -> None:
+        self._require_usable()
+        if not self._opened:
+            raise NotReadyError("create or attach the session first")
+
+    def _read(self, key: str) -> bytes | None:
+        with self._io_lock:
+            self._require_usable()
+            store = self._store
+            if store is None:
+                raise ConnectionUnusableError("control-plane handle is closed")
+            try:
+                if not store.check([key]):
+                    return None
+                value = store.get(key)
+            except (OSError, RuntimeError) as error:
+                self._poisoned = True
+                raise ConnectionUnusableError(
+                    "TCPStore read failed; reconnect before retrying"
+                ) from error
+        if not isinstance(value, bytes) or not value:
+            raise ConflictError("TCPStore returned invalid metadata")
+        return value
+
+    def _put_immutable(self, key: str, value: bytes) -> None:
+        reply = self._compare_set(key, b"", value)
+        if reply != value:
+            raise ConflictError(f"immutable metadata conflict at {key}")
+
+    def _require_compare_set(self) -> None:
+        reply = self._compare_set(_CAS_CAPABILITY_KEY, b"", _CAS_CAPABILITY_VALUE)
+        if reply != _CAS_CAPABILITY_VALUE:
+            raise ConflictError("compare-set capability marker conflicts")
+
+    def _compare_set(self, key: str, expected: bytes, desired: bytes) -> bytes:
+        with self._io_lock:
+            self._require_usable()
+            store = self._store
+            if store is None:
+                raise ConnectionUnusableError("control-plane handle is closed")
+            compare_set = cast(Callable[[str, bytes, bytes], bytes], store.compare_set)
+            try:
+                reply = compare_set(key, expected, desired)
+            except NotImplementedError as error:
+                raise UnsupportedStoreError(
+                    "c10d Store does not implement compare_set"
+                ) from error
+            except (OSError, RuntimeError) as error:
+                self._poisoned = True
+                raise AmbiguousMutationError(
+                    f"TCPStore mutation outcome is unknown at {key}"
+                ) from error
+        if not isinstance(reply, bytes) or not reply:
+            raise ConflictError("TCPStore compare_set returned invalid metadata")
+        return reply
+
+    def _require_usable(self) -> None:
+        if self._closed:
+            raise ConnectionUnusableError("control-plane handle is closed")
+        if self._poisoned:
+            raise ConnectionUnusableError(
+                "TCPStore connection is ambiguous; reconnect before retrying"
+            )
+
+
+def connect_tcpstore_generation_coordinator(
+    endpoint: TCPStoreEndpoint,
+    config: SessionConfig,
+    participant_id: str,
+) -> C10dGenerationCoordinator:
+    """Connect one participant using scheduler-distributed endpoint data."""
+    if not isinstance(endpoint, TCPStoreEndpoint):
+        raise ValidationError("endpoint must be a TCPStoreEndpoint")
+    if not isinstance(config, SessionConfig):
+        raise ValidationError("config must be a SessionConfig")
+    _validate_identifier(participant_id, "participant_id")
+    if participant_id not in {config.publisher_id, *config.consumer_ids}:
+        raise ValidationError("participant_id is not in fixed membership")
+    if endpoint.namespace != config.run_id:
+        raise ValidationError("endpoint namespace must match the session run_id")
+    store = TCPStore(
+        host_name=endpoint.host,
+        port=endpoint.port,
+        world_size=None,
+        is_master=False,
+        timeout=timedelta(milliseconds=endpoint.timeout_milliseconds),
+        wait_for_workers=False,
+    )
+    return C10dGenerationCoordinator(store, config, participant_id)
+
+
+def _manifest_key(generation: int) -> str:
+    return f"manifest/{generation:020d}"
+
+
 def _encode_document(document: _JsonObject, label: str, maximum_bytes: int) -> bytes:
     try:
         encoded = json.dumps(
@@ -398,12 +752,19 @@ def _validate_integer(value: int, name: str, *, minimum: int, maximum: int) -> N
 
 
 __all__ = [
+    "AmbiguousMutationError",
+    "C10dGenerationCoordinator",
+    "ConnectionUnusableError",
     "ConflictError",
     "ControlPlaneError",
+    "connect_tcpstore_generation_coordinator",
     "GenerationManifest",
     "NotReadyError",
     "ObjectRef",
+    "PublishDisposition",
+    "PublishResult",
     "SessionConfig",
     "TCPStoreEndpoint",
+    "UnsupportedStoreError",
     "ValidationError",
 ]
