@@ -318,6 +318,7 @@ class GenerationManifest:
 
 class PublishDisposition(str, Enum):
     COMMITTED_CURRENT = "committed_current"
+    ALREADY_COMMITTED_HISTORICAL = "already_committed_historical"
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,7 +378,7 @@ class _GenerationHead:
 
 
 class C10dGenerationCoordinator:
-    """Fixed-membership publication requiring Store compare-set semantics.
+    """Fixed-membership lifecycle requiring TCPStore compare-set semantics.
 
     Each instance must exclusively own its injected Store connection.
     """
@@ -478,7 +479,12 @@ class C10dGenerationCoordinator:
             current_head, committed = committed_head
             if committed == manifest:
                 return PublishResult(manifest, PublishDisposition.COMMITTED_CURRENT)
-        self._validate_first_generation(committed, generation)
+            if generation < committed.generation and stored == desired:
+                return PublishResult(
+                    manifest,
+                    PublishDisposition.ALREADY_COMMITTED_HISTORICAL,
+                )
+        self._validate_next_generation(committed, generation)
         self._put_immutable(manifest_key, desired)
         desired_head = _GenerationHead(
             run_id=self._config.run_id,
@@ -491,6 +497,11 @@ class C10dGenerationCoordinator:
         observed = self._read_committed_head()
         if observed is not None and observed[0] == desired_head:
             return PublishResult(manifest, PublishDisposition.COMMITTED_CURRENT)
+        if observed is not None and observed[1].generation > generation:
+            return PublishResult(
+                manifest,
+                PublishDisposition.ALREADY_COMMITTED_HISTORICAL,
+            )
         raise ConflictError("generation head changed concurrently")
 
     def discover(self, *, after_generation: int = 0) -> GenerationManifest | None:
@@ -510,13 +521,82 @@ class C10dGenerationCoordinator:
             return None
         return manifest
 
-    def _validate_first_generation(
+    def acknowledge_applied(self, manifest: GenerationManifest) -> None:
+        """Record one fixed consumer's application of the exact head."""
+        self._require_open()
+        if self._participant_id not in self._config.consumer_ids:
+            raise ValidationError("only a fixed consumer may acknowledge")
+        self._require_session(manifest)
+        key = _ack_key(manifest.generation, self._participant_id)
+        expected = manifest.digest.encode("ascii")
+        existing = self._read(key)
+        if existing == expected:
+            self._require_immutable_manifest(manifest)
+            return
+        if existing is not None:
+            raise ConflictError("consumer acknowledgement is immutable")
+        try:
+            self._require_current(manifest)
+        except ConflictError:
+            existing = self._read(key)
+            if existing == expected:
+                self._require_immutable_manifest(manifest)
+                return
+            if existing is not None:
+                raise ConflictError("consumer acknowledgement is immutable") from None
+            raise
+        self._put_immutable(key, expected)
+
+    def retire(self, manifest: GenerationManifest) -> None:
+        """Retire only after every fixed consumer applied the exact manifest."""
+        self._require_open()
+        self._require_publisher()
+        if self.is_retired(manifest):
+            return
+        try:
+            self._require_current(manifest)
+        except ConflictError:
+            if self.is_retired(manifest):
+                return
+            raise
+        expected = manifest.digest.encode("ascii")
+        for consumer_id in self._config.consumer_ids:
+            acknowledgement = self._read(_ack_key(manifest.generation, consumer_id))
+            if acknowledgement is None:
+                raise NotReadyError("not every fixed consumer has acknowledged")
+            if acknowledgement != expected:
+                raise ConflictError("consumer acknowledgement conflicts")
+        self._put_immutable(_retired_key(manifest.generation), expected)
+
+    def is_retired(self, manifest: GenerationManifest) -> bool:
+        """Return whether the exact generation has a retirement marker."""
+        self._require_open()
+        self._require_session(manifest)
+        self._require_immutable_manifest(manifest)
+        stored = self._read(_retired_key(manifest.generation))
+        if stored is None:
+            return False
+        if stored != manifest.digest.encode("ascii"):
+            raise ConflictError("generation retirement marker conflicts")
+        return True
+
+    def _validate_next_generation(
         self, current: GenerationManifest | None, generation: int
     ) -> None:
-        if current is not None:
-            raise ConflictError("completion is required before another generation")
-        if generation != 1:
-            raise ConflictError("the first generation must be one")
+        if current is None:
+            if generation != 1:
+                raise ConflictError("the first generation must be one")
+            return
+        if generation != current.generation + 1:
+            raise ConflictError("generation must advance by exactly one")
+        if not self.is_retired(current):
+            raise NotReadyError("the current generation is not retired")
+
+    def _require_current(self, manifest: GenerationManifest) -> None:
+        self._require_session(manifest)
+        committed_head = self._read_committed_head()
+        if committed_head is None or committed_head[1] != manifest:
+            raise ConflictError("manifest is not the exact committed head")
 
     def _read_committed_head(
         self,
@@ -525,6 +605,8 @@ class C10dGenerationCoordinator:
         if encoded is None:
             return None
         head = _GenerationHead.from_bytes(encoded)
+        if encoded != head.to_bytes():
+            raise ConflictError("generation head is not canonical")
         if head.run_id != self._config.run_id:
             raise ConflictError("generation head belongs to another session")
         manifest_data = self._read(_manifest_key(head.generation))
@@ -540,6 +622,12 @@ class C10dGenerationCoordinator:
         ):
             raise ConflictError("generation head does not match immutable manifest")
         return encoded, manifest
+
+    def _require_immutable_manifest(self, manifest: GenerationManifest) -> None:
+        self._require_session(manifest)
+        stored = self._read(_manifest_key(manifest.generation))
+        if stored != manifest.to_bytes():
+            raise ConflictError("generation manifest does not match immutable data")
 
     def _require_session(self, manifest: GenerationManifest) -> None:
         if not isinstance(manifest, GenerationManifest):
@@ -644,6 +732,14 @@ def connect_tcpstore_generation_coordinator(
 
 def _manifest_key(generation: int) -> str:
     return f"manifest/{generation:020d}"
+
+
+def _ack_key(generation: int, consumer_id: str) -> str:
+    return f"ack/{generation:020d}/{consumer_id}"
+
+
+def _retired_key(generation: int) -> str:
+    return f"retired/{generation:020d}"
 
 
 def _encode_document(document: _JsonObject, label: str, maximum_bytes: int) -> bytes:
