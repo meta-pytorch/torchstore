@@ -305,3 +305,31 @@ def get_slice_intersection(
         local_shape=tuple(new_local_shape),
         mesh_shape=tensor_slice.mesh_shape,  # Keep original mesh shape
     )
+
+
+def same_slice_geometry(first: "TensorSlice", second: "TensorSlice") -> bool:
+    """Return whether two slices describe the same bytes, ignoring placement."""
+    return (
+        tuple(first.global_shape) == tuple(second.global_shape)
+        and tuple(first.offsets) == tuple(second.offsets)
+        and tuple(first.local_shape) == tuple(second.local_shape)
+    )
+
+
+def get_slice_ends(tensor_slice: "TensorSlice") -> "tuple[int, ...]":
+    """Return the exclusive end offset in each tensor dimension."""
+    return tuple(
+        int(offset) + int(size)
+        for offset, size in zip(tensor_slice.offsets, tensor_slice.local_shape)
+    )
+
+
+def get_slice_numel(tensor_slice: "TensorSlice") -> int:
+    """Return the number of elements in a tensor slice."""
+    return math.prod(int(size) for size in tensor_slice.local_shape)
+
+
+def slice_covers(container: "TensorSlice", contained: "TensorSlice") -> bool:
+    """Return whether container completely covers contained in global space."""
+    intersection = get_slice_intersection(container, contained)
+    return intersection is not None and same_slice_geometry(intersection, contained)
