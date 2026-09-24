@@ -8,7 +8,15 @@ from logging import getLogger
 
 import pytest
 import torch
-from torchstore.utils import assemble_tensor, get_local_tensor
+from torchstore.transport.types import TensorSlice
+from torchstore.utils import (
+    assemble_tensor,
+    get_local_tensor,
+    get_slice_ends,
+    get_slice_numel,
+    same_slice_geometry,
+    slice_covers,
+)
 
 logger = getLogger(__name__)
 
@@ -199,3 +207,67 @@ def test_assemble_tensor_perfect_fit():
     result = assemble_tensor(local_tensors, global_offsets)
     expected = torch.tensor([[1, 2], [3, 4]])
     assert torch.equal(result, expected)
+
+
+def test_same_slice_geometry_ignores_mesh_placement() -> None:
+    """Treat equal global regions as equal despite different mesh placement."""
+    first = TensorSlice(
+        offsets=(1, 2),
+        coordinates=(0, 1),
+        global_shape=(8, 8),
+        local_shape=(3, 4),
+        mesh_shape=(2, 2),
+    )
+    second = TensorSlice(
+        offsets=(1, 2),
+        coordinates=(7,),
+        global_shape=(8, 8),
+        local_shape=(3, 4),
+        mesh_shape=(8,),
+    )
+
+    assert same_slice_geometry(first, second)
+
+
+@pytest.mark.parametrize(
+    ("offsets", "shape", "expected_ends", "expected_numel"),
+    [
+        ((2,), (4,), (6,), 4),
+        ((1, 3), (2, 5), (3, 8), 10),
+        ((4, 0), (0, 8), (4, 8), 0),
+        ((), (), (), 1),
+    ],
+)
+def test_slice_extent_helpers(offsets, shape, expected_ends, expected_numel) -> None:
+    """Compute slice bounds and element counts, including scalar and empty cases."""
+    item = TensorSlice(
+        offsets=offsets,
+        coordinates=(),
+        global_shape=expected_ends,
+        local_shape=shape,
+        mesh_shape=(),
+    )
+
+    assert get_slice_ends(item) == expected_ends
+    assert get_slice_numel(item) == expected_numel
+
+
+def test_slice_covers_uses_global_geometry() -> None:
+    """Recognize directional containment between two global tensor regions."""
+    outer = TensorSlice(
+        offsets=(1, 2),
+        coordinates=(),
+        global_shape=(8, 8),
+        local_shape=(4, 5),
+        mesh_shape=(),
+    )
+    inner = TensorSlice(
+        offsets=(2, 3),
+        coordinates=(),
+        global_shape=(8, 8),
+        local_shape=(2, 2),
+        mesh_shape=(),
+    )
+
+    assert slice_covers(outer, inner)
+    assert not slice_covers(inner, outer)
