@@ -1,0 +1,97 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Internal metadata and local actions for precomputed tensor routes."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from enum import Enum
+
+from torchstore.transport.types import TensorSlice
+
+__all__ = [
+    "DestinationRoute",
+    "KeyPlan",
+    "LocalRouteTable",
+    "KeyRegistration",
+    "Registrations",
+    "RankRole",
+    "RouteEntry",
+    "Transfer",
+]
+
+
+class RankRole(str, Enum):
+    PUBLISHER = "publisher"
+    REQUESTER = "requester"
+
+
+@dataclass(frozen=True)
+class KeyRegistration:
+    """What one rank holds for one storage key"""
+
+    tensor_slice: TensorSlice
+    # Bytes per element of the transferred dtype
+    element_size: int
+
+
+# rank -> storage key -> what that rank holds for it
+Registrations = dict[str, Mapping[str, KeyRegistration]]
+
+
+@dataclass(frozen=True)
+class Transfer:
+    """One fixed read from a source volume in global tensor coordinates."""
+
+    source: str
+    source_volume_id: str
+    segment: TensorSlice
+    nbytes: int
+
+
+@dataclass(frozen=True)
+class DestinationRoute:
+    """Reads that fill one local requester slice."""
+
+    destination_slice: TensorSlice
+    transfers: tuple[Transfer, ...]
+
+
+RouteEntry = tuple[DestinationRoute, ...]
+
+
+@dataclass(frozen=True)
+class KeyPlan:
+    """The slice one rank holds for a storage key, and the routes that fill it"""
+
+    tensor_slice: TensorSlice
+    # A publisher's slice is served to others, so its `routes` stay empty.
+    routes: RouteEntry = ()
+
+
+@dataclass(frozen=True)
+class LocalRouteTable:
+    """One rank's immutable route table, installed when layouts are exchanged."""
+
+    rank: str
+    volume_id: str
+    role: RankRole
+    keys: Mapping[str, KeyPlan] = field(default_factory=dict)
+
+    def is_planned_tensor(self, key: str) -> bool:
+        """Whether this rank has a planned slice for the key."""
+        return key in self.keys
+
+    def plan(self, key: str) -> KeyPlan:
+        planned = self.keys.get(key)
+        if planned is None:
+            raise KeyError(f"rank {self.rank!r} has no metadata for key {key!r}")
+        return planned
+
+    def lookup(self, key: str) -> RouteEntry:
+        return self.plan(key).routes
