@@ -325,6 +325,16 @@ strategy = ts.LocalRankStrategy(default_transport_type=TransportType.Gloo)
 await ts.initialize(num_storage_volumes=N, strategy=strategy)
 ```
 
+### Opt-in transports
+
+Two transports are never selected automatically, because each applies only to specific
+hardware and must be requested by name:
+
+| Transport | When to ask for it |
+|-----------|--------------------|
+| **NIXL** | nixl installed and `TORCHSTORE_NIXL_ENABLED=1` |
+| **NeuronEFA** | The storage volume is a vLLM-Neuron generator on Trainium, so the destination is its HBM rather than torch storage — see [docs/neuron_efa_transport.md](docs/neuron_efa_transport.md) |
+
 ## Testing
 
 Pytest is used for testing.

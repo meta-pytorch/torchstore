@@ -21,6 +21,7 @@ from torchstore.transport.shared_memory import (
     SharedMemoryTransportBuffer,
     SHM_ENABLED,
 )
+from torchstore.transport.neuron_efa import NeuronEFATransportBuffer
 from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 from torchstore.transport.torchcomms.cache import (
     torchcomms_rdma_available,
@@ -46,6 +47,17 @@ class TransportType(Enum):
     Gloo = auto()
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
     NIXL = auto()
+    # Trainium: RDMA into a vLLM-Neuron generator's HBM regions over EFA.
+    #
+    # Needed because the usual contract -- hand me a state_dict, I populate those tensors in
+    # place -- has no effect on that receiver. vLLM-Neuron's compile path inlines model weights
+    # as HLO constants, so writing nn.Parameter.data does not reach the running compiled NEFF.
+    # The destination is therefore HBM regions described by a manifest the generator publishes,
+    # not torch storage, and the generator itself acts as the StorageVolume.
+    #
+    # Never selected by get_available_transport: it is not a general-purpose transport and only
+    # applies when the storage volume is a Neuron generator. Ask for it explicitly.
+    NeuronEFA = auto()
 
 
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
@@ -117,6 +129,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
         TransportType.Gloo: GlooTransportBuffer,
         TransportType.NIXL: NixlTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
+        TransportType.NeuronEFA: NeuronEFATransportBuffer,
     }
 
     return transport_map[transport_type](storage_volume_ref)
