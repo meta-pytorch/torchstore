@@ -263,6 +263,10 @@ class LocalClient:
                 and request.tensor_val.is_contiguous()
             )
 
+            # Under dp_replicate the same region is offered by every replica's
+            # volume, so fetch each one exactly once.
+            claimed_regions: set[tuple] = set()
+
             for volume_id, storage_info in volume_map.items():
                 if storage_info.object_type == ObjectType.OBJECT:
                     volume_requests[volume_id].append(
@@ -275,9 +279,13 @@ class LocalClient:
                     whole_keys.add(request.key)
                     break
                 else:
-                    volume_requests[volume_id].extend(
-                        self._expand_tensor_slices(request, storage_info, use_inplace)
+                    sub_requests = self._expand_tensor_slices(
+                        request, storage_info, use_inplace, claimed_regions
                     )
+                    # volume_requests is a defaultdict: extend([]) would still
+                    # create the key and contact the volume with nothing to do.
+                    if sub_requests:
+                        volume_requests[volume_id].extend(sub_requests)
 
         return dict(volume_requests), whole_keys
 
@@ -286,18 +294,31 @@ class LocalClient:
         request: Request,
         storage_info,
         use_inplace: bool,
+        claimed_regions: set[tuple],
     ) -> list[Request]:
-        """Expand a single key's tensor slices into sub-requests."""
+        """Expand a single key's tensor slices into sub-requests.
+
+        ``claimed_regions`` accumulates (offsets, local_shape) across the
+        volumes of one key so a replicated region is fetched only once. Safe
+        because replicas hold identical data and assembly keys off offsets and
+        shapes, not mesh coordinates.
+        """
         sub_requests = []
         for stored_slice in storage_info.tensor_slices:
             fetch_slice = stored_slice
             if request.tensor_slice is not None:
-                # TODO: we should also continue if we have already fetched this region in a previous call
-                # and also return completely if we've already fetched all regions. This is extra inneficient
-                # in the case of DP, where we fetch all Replicate shards unnecessarily
+                # TODO: return early once every requested region is claimed.
                 fetch_slice = get_slice_intersection(stored_slice, request.tensor_slice)
                 if fetch_slice is None:
                     continue
+
+            region = (
+                tuple(fetch_slice.offsets),
+                tuple(fetch_slice.local_shape),
+            )
+            if region in claimed_regions:
+                continue
+            claimed_regions.add(region)
 
             slice_request = Request.from_tensor_slice(request.key, fetch_slice)
 

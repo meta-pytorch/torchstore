@@ -643,5 +643,60 @@ async def test_fully_local_dtensor_put_get():
             await ts.shutdown()
 
 
+def test_replicated_regions_fetched_once():
+    """A region stored on several volumes must be requested from only one.
+
+    Under dp_replicate every shard is stored once per replica, so each region
+    is offered by `dp_replicate` volumes with identical content. Fetching it
+    from all of them multiplies wire bytes and the number of concurrent
+    per-volume transfers by the replicate degree.
+    """
+    from torchstore.client import LocalClient
+    from torchstore.controller import ObjectType, StorageInfo
+    from torchstore.transport.types import Request
+
+    global_shape = (8, 6)
+    mesh_shape = (2, 2)  # (dp_replicate, dp_shard)
+
+    # Shard(0) over dp_shard=2, replicated over dp_replicate=2 -> 4 volumes,
+    # each of the 2 distinct regions stored twice.
+    volume_map = {}
+    for replica in range(mesh_shape[0]):
+        for shard in range(mesh_shape[1]):
+            volume_map[f"r{replica}s{shard}"] = StorageInfo(
+                object_type=ObjectType.TENSOR_SLICE,
+                tensor_slices={
+                    TensorSlice(
+                        offsets=(shard * 4, 0),
+                        coordinates=(replica, shard),
+                        global_shape=global_shape,
+                        local_shape=(4, 6),
+                        mesh_shape=mesh_shape,
+                    )
+                },
+            )
+
+    class _Buffer:
+        supports_inplace_resharding = False
+
+    client = LocalClient.__new__(LocalClient)
+    request = Request(key="k")  # whole-tensor get, no tensor_slice
+    volume_requests, _ = client._build_volume_requests(
+        [request],
+        {"k": volume_map},
+        {volume_id: _Buffer() for volume_id in volume_map},
+    )
+
+    regions = [
+        (tuple(r.tensor_slice.offsets), tuple(r.tensor_slice.local_shape))
+        for reqs in volume_requests.values()
+        for r in reqs
+    ]
+    # Both distinct regions must be covered, with no duplicates, so exactly
+    # dp_shard volumes are contacted rather than dp_replicate * dp_shard.
+    assert sorted(regions) == [((0, 0), (4, 6)), ((4, 0), (4, 6))]
+    assert len(volume_requests) == mesh_shape[1]
+
+
 if __name__ == "__main__":
     main(__file__)
