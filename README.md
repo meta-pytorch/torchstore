@@ -325,6 +325,21 @@ strategy = ts.LocalRankStrategy(default_transport_type=TransportType.Gloo)
 await ts.initialize(num_storage_volumes=N, strategy=strategy)
 ```
 
+### Gloo Transport Configuration
+
+The Gloo transport reads these environment variables at import time:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `TORCHSTORE_GLOO_ENABLED` | `1` | Set to `0` to exclude Gloo from automatic transport selection. |
+| `TORCHSTORE_GLOO_INIT_TIMEOUT` | `120` | Timeout in seconds for the TCPStore and the Gloo process group of each connection (see below). |
+
+Despite its name, `TORCHSTORE_GLOO_INIT_TIMEOUT` is not only a setup timeout.
+The process group timeout bounds every operation on the group, including the
+send/recv that moves the tensor data, so a transfer that takes longer than the
+timeout fails even though the connection is healthy. Size it for the largest
+tensor you move over Gloo, not for connection setup.
+
 ## Testing
 
 Pytest is used for testing.

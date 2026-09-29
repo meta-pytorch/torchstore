@@ -34,6 +34,10 @@ _store_addrs: dict[
 
 
 TORCHSTORE_GLOO_ENABLED = os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1"
+# Timeout in seconds for the TCPStore and the gloo ProcessGroup of each
+# connection. Despite the name, the ProcessGroup timeout bounds every operation
+# on that group, including each tensor send/recv, so it must cover the longest
+# single transfer, not only connection setup.
 TORCHSTORE_GLOO_INIT_TIMEOUT = int(
     os.environ.get("TORCHSTORE_GLOO_INIT_TIMEOUT", "120")
 )
@@ -463,7 +467,7 @@ class GlooTransportBuffer(TransportBuffer):
             f"from rank {remote_rank} (my_rank={my_rank}, store_key={self.store_key})"
         )
 
-        # Run recv in thread and wait for completion
+        # Run recv in thread; work.wait() raises after TORCHSTORE_GLOO_INIT_TIMEOUT
         def do_recv():
             work = pg.recv([tensor], srcRank=remote_rank, tag=0)
             work.wait()
@@ -503,7 +507,7 @@ class GlooTransportBuffer(TransportBuffer):
             f"to rank {remote_rank} (my_rank={my_rank}, store_key={self.store_key})"
         )
 
-        # Run send in thread and wait for completion
+        # Run send in thread; work.wait() raises after TORCHSTORE_GLOO_INIT_TIMEOUT
         def do_send():
             work = pg.send([tensor], dstRank=remote_rank, tag=0)
             work.wait()
