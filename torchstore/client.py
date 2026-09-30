@@ -6,6 +6,8 @@
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Mapping
+from enum import Enum
 from logging import getLogger
 from typing import Any
 
@@ -27,6 +29,13 @@ from torchstore.utils import (
 logger = getLogger(__name__)
 
 
+class ClientType(str, Enum):
+    """Client implementation selected when initializing a store."""
+
+    STANDARD = "standard"
+    ROUTING = "routing"
+
+
 class LocalClient:
     """Client-side interface for TorchStore operations.
 
@@ -45,6 +54,23 @@ class LocalClient:
         self._directory = directory
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
+
+    async def register_layout(
+        self,
+        state_dict: Mapping[str, Any],
+        key: str,
+        *,
+        transfer_dtype: torch.dtype | None = None,
+        preserve_dtype_keys: frozenset[str] = frozenset(),
+    ) -> None:
+        """Hook for clients that require state-dict publisher registration."""
+
+    async def get_layouts(
+        self,
+        state_dict: Mapping[str, Any] | None,
+        key: str,
+    ) -> None:
+        """Hook for clients that require state-dict requester registration."""
 
     @torch.no_grad
     async def put(self, key: str, value: torch.Tensor | Any):

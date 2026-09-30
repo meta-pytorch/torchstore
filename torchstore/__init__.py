@@ -24,6 +24,7 @@ from torchstore.api import (
     reset_client,
     shutdown,
 )
+from torchstore.client import ClientType
 from torchstore.logging import init_logging
 from torchstore.strategy import (
     ControllerStorageVolumes,
@@ -57,6 +58,7 @@ __all__ = [
     "keys",
     "exists",
     "client",
+    "ClientType",
     "shutdown",
     "TorchStoreStrategy",
     "LocalRankStrategy",
