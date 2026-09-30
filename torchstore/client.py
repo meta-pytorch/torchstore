@@ -54,6 +54,7 @@ class LocalClient:
         self._directory = directory
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
+        self.last_get_transport_metrics: dict[str, float] = {}
 
     async def register_layout(
         self,
@@ -255,6 +256,99 @@ class LocalClient:
 
         # fetch (request, volume_result) pairs from all volumes in parallel
         fetch_pairs = await self._fetch_results(volume_requests, transport_buffer_map)
+        profiled_buffers = [
+            transport_buffer_map[volume_id]
+            for volume_id in volume_requests
+            if hasattr(
+                transport_buffer_map[volume_id],
+                "_profile_client_prepare_seconds",
+            )
+            and transport_buffer_map[volume_id]._profile_transfer_bytes > 0
+        ]
+
+        def elapsed_seconds(transport_buffer, start: str, end: str) -> float:
+            timeline = transport_buffer._profile_timeline_ns
+            return (timeline[end] - timeline[start]) / 1e9
+
+        def max_elapsed(start: str, end: str) -> float:
+            return max(
+                (
+                    elapsed_seconds(transport_buffer, start, end)
+                    for transport_buffer in profiled_buffers
+                    if start in transport_buffer._profile_timeline_ns
+                    and end in transport_buffer._profile_timeline_ns
+                ),
+                default=0.0,
+            )
+
+        self.last_get_transport_metrics = (
+            {
+                "nixl_prepare_seconds": max(
+                    transport_buffer._profile_client_prepare_seconds
+                    + transport_buffer._profile_server_prepare_seconds
+                    for transport_buffer in profiled_buffers
+                ),
+                "nixl_client_prepare_seconds": max(
+                    transport_buffer._profile_client_prepare_seconds
+                    for transport_buffer in profiled_buffers
+                ),
+                "nixl_server_prepare_seconds": max(
+                    transport_buffer._profile_server_prepare_seconds
+                    for transport_buffer in profiled_buffers
+                ),
+                "nixl_completion_wait_seconds": max(
+                    transport_buffer._profile_completion_wait_seconds
+                    for transport_buffer in profiled_buffers
+                ),
+                "torchstore_request_delivery_seconds": max_elapsed(
+                    "client_request_sent",
+                    "server_request_received",
+                ),
+                "torchstore_server_lookup_seconds": max_elapsed(
+                    "server_request_received",
+                    "server_data_ready",
+                ),
+                "torchstore_server_return_seconds": max_elapsed(
+                    "server_transfer_completed",
+                    "server_response_sent",
+                ),
+                "torchstore_response_delivery_seconds": max_elapsed(
+                    "server_response_sent",
+                    "client_response_received",
+                ),
+                "torchstore_rpc_roundtrip_seconds": max_elapsed(
+                    "client_request_sent",
+                    "client_response_received",
+                ),
+                "torchstore_rpc_nonserver_seconds": max(
+                    (
+                        elapsed_seconds(
+                            transport_buffer,
+                            "client_request_sent",
+                            "client_response_received",
+                        )
+                        - elapsed_seconds(
+                            transport_buffer,
+                            "server_request_received",
+                            "server_response_sent",
+                        )
+                        for transport_buffer in profiled_buffers
+                        if all(
+                            event in transport_buffer._profile_timeline_ns
+                            for event in (
+                                "client_request_sent",
+                                "client_response_received",
+                                "server_request_received",
+                                "server_response_sent",
+                            )
+                        )
+                    ),
+                    default=0.0,
+                ),
+            }
+            if profiled_buffers
+            else {}
+        )
 
         # assemble final results
         return self._assemble_results(requests, fetch_pairs, whole_keys)

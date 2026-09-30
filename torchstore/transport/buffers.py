@@ -180,6 +180,10 @@ class TransportBuffer:
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
 
+    def _profile_event(self, event: str, **metadata: Any) -> None:
+        """Record an optional transport-specific profiling event."""
+        return
+
     def requires_handshake(self, requests: list[Request]) -> bool:
         """Determine if a handshake is needed before the operation.
 
@@ -241,9 +245,11 @@ class TransportBuffer:
             await self._pre_get_hook(requests)
             l.track_step("_pre_get_hook")
 
+            self._profile_event("client_request_sent")
             transport_buffer = await self.storage_volume_ref.volume.get.call_one(
                 self, self._storage_volume_requests(meta_requests)
             )
+            self._profile_event("client_response_received")
             response = await self._handle_storage_volume_response(
                 requests, transport_buffer
             )

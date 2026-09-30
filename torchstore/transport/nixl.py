@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
+import threading
 import time
 import uuid
 import weakref
@@ -19,6 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import cache
 from importlib.util import find_spec
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -36,6 +39,211 @@ logger = logging.getLogger(__name__)
 ENV_TORCHSTORE_NIXL_BACKEND = os.environ.get("TORCHSTORE_NIXL_BACKEND", "UCX")
 ENV_TORCHSTORE_NIXL_ENABLED = os.environ.get("TORCHSTORE_NIXL_ENABLED", "0") == "1"
 ENV_TORCHSTORE_NIXL_TIMEOUT_S = int(os.environ.get("TORCHSTORE_NIXL_TIMEOUT_S", "60"))
+
+
+@dataclass(frozen=True)
+class _NicCounterSnapshot:
+    timestamp_ns: int
+    counters: dict[str, int]
+
+
+@cache
+def _nic_counter_paths() -> dict[str, tuple[Path, int]]:
+    """Resolve the IB counters for the UCX net device used by this process."""
+    device_spec = os.environ.get("UCX_NET_DEVICES", "").split(",", 1)[0]
+    if not device_spec:
+        return {}
+    net_device, _, port = device_spec.partition(":")
+    infiniband_dir = Path("/sys/class/net") / net_device / "device/infiniband"
+    try:
+        ib_device = next(infiniband_dir.iterdir())
+    except (FileNotFoundError, StopIteration):
+        return {}
+
+    port_dir = ib_device / "ports" / (port or "1")
+    paths: dict[str, tuple[Path, int]] = {}
+    # The standard IB byte counters count four-byte words.
+    standard = {
+        "tx_bytes": ("port_xmit_data", 4),
+        "rx_bytes": ("port_rcv_data", 4),
+        "tx_packets": ("port_xmit_packets", 1),
+        "rx_packets": ("port_rcv_packets", 1),
+        "tx_wait": ("port_xmit_wait", 1),
+        "tx_discards": ("port_xmit_discards", 1),
+        "rx_errors": ("port_rcv_errors", 1),
+    }
+    for name, (filename, scale) in standard.items():
+        path = port_dir / "counters" / filename
+        if path.is_file():
+            paths[name] = (path, scale)
+
+    hardware = {
+        "cnp_sent": "np_cnp_sent",
+        "cnp_handled": "rp_cnp_handled",
+        "cnp_ignored": "rp_cnp_ignored",
+        "packet_seq_err": "packet_seq_err",
+        "retry_exceeded": "retry_exceeded",
+        "out_of_buffer": "out_of_buffer",
+        "req_cqe_error": "req_cqe_error",
+        "resp_cqe_error": "resp_cqe_error",
+    }
+    for name, filename in hardware.items():
+        path = port_dir / "hw_counters" / filename
+        if path.is_file():
+            paths[name] = (path, 1)
+    return paths
+
+
+class _NicCounterSampler:
+    """Sample shared node-level NIC counters while traced transfers are active."""
+
+    _INTERVAL_SECONDS = 0.1
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._active: dict[tuple[str, str], int] = {}
+        self._samples: list[_NicCounterSnapshot] = []
+        self._thread: threading.Thread | None = None
+
+    def _read(self) -> _NicCounterSnapshot | None:
+        paths = _nic_counter_paths()
+        if not paths:
+            return None
+        counters: dict[str, int] = {}
+        try:
+            for name, (path, scale) in paths.items():
+                counters[name] = int(path.read_text()) * scale
+        except (OSError, ValueError):
+            return None
+        return _NicCounterSnapshot(time.time_ns(), counters)
+
+    def _append_sample(self) -> _NicCounterSnapshot | None:
+        sample = self._read()
+        if sample is not None:
+            with self._lock:
+                self._samples.append(sample)
+        return sample
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait()
+            while True:
+                with self._lock:
+                    active = bool(self._active)
+                    if not active:
+                        self._wake.clear()
+                        break
+                self._append_sample()
+                time.sleep(self._INTERVAL_SECONDS)
+
+    def begin(self, request_id: str, role: str) -> bool:
+        if not _nic_counter_paths():
+            return False
+        key = (request_id, role)
+        sample = self._read()
+        if sample is None:
+            return False
+        with self._lock:
+            self._active[key] = sample.timestamp_ns
+            self._samples.append(sample)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="torchstore-nic-counters",
+                    daemon=True,
+                )
+                self._thread.start()
+            self._wake.set()
+        return True
+
+    def mark(self) -> _NicCounterSnapshot | None:
+        return self._append_sample()
+
+    def end(
+        self,
+        request_id: str,
+        role: str,
+        baseline: _NicCounterSnapshot | None = None,
+    ) -> dict[str, int]:
+        key = (request_id, role)
+        completion = self._read()
+        with self._lock:
+            started_ns = self._active.pop(key, None)
+            if started_ns is None or completion is None:
+                return {}
+            self._samples.append(completion)
+            start = baseline
+            if start is None:
+                start = next(
+                    (
+                        sample
+                        for sample in self._samples
+                        if sample.timestamp_ns >= started_ns
+                    ),
+                    completion,
+                )
+            samples = [
+                sample
+                for sample in self._samples
+                if start.timestamp_ns <= sample.timestamp_ns <= completion.timestamp_ns
+            ]
+            if not self._active:
+                self._samples.clear()
+
+        def delta(name: str) -> int:
+            return max(
+                0,
+                completion.counters.get(name, 0) - start.counters.get(name, 0),
+            )
+
+        def activity_ns(counter: str) -> tuple[int, int, int]:
+            previous = start.counters.get(counter, 0)
+            first = 0
+            last = 0
+            for sample in samples:
+                current = sample.counters.get(counter, previous)
+                if current > previous:
+                    first = first or sample.timestamp_ns
+                    last = sample.timestamp_ns
+                previous = current
+            if not first:
+                return -1, -1, -1
+            return (
+                first - start.timestamp_ns,
+                max(0, last - first),
+                max(0, completion.timestamp_ns - last),
+            )
+
+        tx_first, tx_active, tx_tail = activity_ns("tx_bytes")
+        rx_first, rx_active, rx_tail = activity_ns("rx_bytes")
+        return {
+            "window_ns": completion.timestamp_ns - start.timestamp_ns,
+            "tx_bytes": delta("tx_bytes"),
+            "rx_bytes": delta("rx_bytes"),
+            "tx_packets": delta("tx_packets"),
+            "rx_packets": delta("rx_packets"),
+            "tx_first_ns": tx_first,
+            "tx_active_ns": tx_active,
+            "tx_tail_ns": tx_tail,
+            "rx_first_ns": rx_first,
+            "rx_active_ns": rx_active,
+            "rx_tail_ns": rx_tail,
+            "tx_wait": delta("tx_wait"),
+            "cnp_sent": delta("cnp_sent"),
+            "cnp_handled": delta("cnp_handled"),
+            "cnp_ignored": delta("cnp_ignored"),
+            "packet_seq_err": delta("packet_seq_err"),
+            "retry_exceeded": delta("retry_exceeded"),
+            "tx_discards": delta("tx_discards"),
+            "rx_errors": delta("rx_errors"),
+            "out_of_buffer": delta("out_of_buffer"),
+            "req_cqe_error": delta("req_cqe_error"),
+            "resp_cqe_error": delta("resp_cqe_error"),
+        }
+
+
+_NIC_COUNTER_SAMPLER = _NicCounterSampler()
 
 
 class _NixlTransferStatus(str, Enum):
@@ -115,6 +323,7 @@ class NixlAgentCache(TransportCache):
             enable_prog_thread=True,
             enable_listen_thread=False,
             backends=[self.backend],
+            capture_telemetry=True,
         )
         self.agent = nixl_agent(name, config)
         self._registrations: dict[tuple[int, int], _Registration] = {}
@@ -438,13 +647,61 @@ class NixlTransportBuffer(TransportBuffer):
         self._descriptor_cache_miss = False
         self._descriptor_request_compact = False
         self._server_request_received = False
+        self._profile_prepared_layout_reused = False
+        self._profile_client_prepare_seconds = 0.0
+        self._profile_server_prepare_seconds = 0.0
+        self._profile_completion_wait_seconds = 0.0
+        self._profile_request_id = uuid.uuid4().hex[:12]
+        self._profile_client_host = socket.gethostname()
+        self._profile_server_host = ""
+        self._profile_volume_id = ""
+        self._profile_transfer_bytes = 0
+        self._profile_timeline_ns: dict[str, int] = {}
+        self._profile_request_pickle_ns = 0
+        self._profile_request_unpickle_ns = 0
+        self._profile_request_frame_bytes = 0
+        self._profile_response_unpickle_ns = 0
+        self._profile_response_frame_bytes = 0
+        self._profile_requester_nic: dict[str, int] = {}
+        self._profile_publisher_nic: dict[str, int] = {}
+        self._profile_nixl_telemetry: list[dict[str, int | str]] = []
+
+    @override
+    def _profile_event(self, event: str, **metadata: Any) -> None:
+        self._profile_timeline_ns[event] = time.time_ns()
+        self._profile_server_host = metadata.get(
+            "server_host", self._profile_server_host
+        )
+        self._profile_volume_id = metadata.get("volume_id", self._profile_volume_id)
+        if event == "client_request_sent":
+            _NIC_COUNTER_SAMPLER.begin(self._profile_request_id, "requester")
+        elif event == "client_response_received":
+            self._profile_requester_nic = _NIC_COUNTER_SAMPLER.end(
+                self._profile_request_id,
+                "requester",
+            )
 
     def __getstate__(self) -> dict[str, Any]:
+        event = (
+            "server_response_pickle_started"
+            if "server_request_received" in self._profile_timeline_ns
+            else "client_request_pickle_started"
+        )
+        self._profile_event(event)
         state = self.__dict__.copy()
         state["storage_volume_ref"] = None
         if self._descriptor_request_compact and not self._server_request_received:
             state["_contexts"] = []
         return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        event = (
+            "client_response_unpickle_finished"
+            if "server_request_received" in self._profile_timeline_ns
+            else "server_request_unpickle_finished"
+        )
+        self._profile_event(event)
 
     def _client_cache(self) -> NixlAgentCache:
         return self.storage_volume_ref.transport_context.get(NixlAgentCache)
@@ -566,6 +823,8 @@ class NixlTransportBuffer(TransportBuffer):
     @override
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Fetch metadata if needed and allocate RDMA buffers."""
+        self._profile_event("client_prepare_started")
+        started = time.perf_counter()
         # 1. fetch metadata in a single batch, preserving order
         meta_requests = [req.meta_only() for req in requests if req.tensor_val is None]
         meta_results = (
@@ -602,6 +861,8 @@ class NixlTransportBuffer(TransportBuffer):
             )
         self._configure_get_descriptor_layout(requests)
         self._publish_client_metadata()
+        self._profile_client_prepare_seconds = time.perf_counter() - started
+        self._profile_event("client_prepare_finished")
 
     async def _transfer(
         self,
@@ -613,6 +874,9 @@ class NixlTransportBuffer(TransportBuffer):
         if not transfers:
             return True
 
+        self._profile_event("server_transfer_prepare_started")
+        self._profile_transfer_bytes = sum(tensor.nbytes for _, tensor, _ in transfers)
+        started = time.perf_counter()
         cache = ctx.get(NixlAgentCache)
         remote_agent = self._connect_client(cache)
         local_signature = tuple(
@@ -628,6 +892,7 @@ class NixlTransportBuffer(TransportBuffer):
             if self._descriptor_layout_id is not None
             else None
         )
+        self._profile_prepared_layout_reused = prepared_layout is not None
         if prepared_layout is None and any(
             remote_descriptors is None for _, _, remote_descriptors in transfers
         ):
@@ -637,6 +902,9 @@ class NixlTransportBuffer(TransportBuffer):
         persistent_handles: list[tuple[_PreparedTransferGroup, Any]] = []
         temporary_handles = []
         dispatch_error: Exception | None = None
+        completion_started = started
+        nic_active = _NIC_COUNTER_SAMPLER.begin(self._profile_request_id, "publisher")
+        nic_baseline: _NicCounterSnapshot | None = None
         try:
             if prepared_layout is None:
                 transfer_groups: dict[tuple[Any, Any], tuple[Any, Any]] = {}
@@ -722,6 +990,8 @@ class NixlTransportBuffer(TransportBuffer):
                         prepared_layout,
                     )
             try:
+                if nic_active:
+                    nic_baseline = _NIC_COUNTER_SAMPLER.mark()
                 if prepared_layout is not None:
                     for group in prepared_layout.groups:
                         handle = group.xfer_handles.get(operation)
@@ -761,6 +1031,9 @@ class NixlTransportBuffer(TransportBuffer):
                         )
                         handles.append(handle)
                         cache.agent.transfer(handle)
+                completion_started = time.perf_counter()
+                self._profile_server_prepare_seconds = completion_started - started
+                self._profile_event("server_transfer_submitted")
             except Exception as error:
                 # Earlier handles may already be active. Drain them below before
                 # propagating the dispatch error.
@@ -798,6 +1071,27 @@ class NixlTransportBuffer(TransportBuffer):
                         cancelled = True
                 if status != _NixlTransferStatus.DONE:
                     failed = True
+            self._profile_completion_wait_seconds = (
+                time.perf_counter() - completion_started
+            )
+            self._profile_event("server_transfer_completed")
+            self._profile_nixl_telemetry = []
+            for handle in handles:
+                try:
+                    telemetry = cache.agent.get_xfer_telemetry(handle)
+                    self._profile_nixl_telemetry.append(
+                        {
+                            "backend": cache.agent.query_xfer_backend(handle),
+                            "start_time_us": int(telemetry.startTime),
+                            "post_duration_us": int(telemetry.postDuration),
+                            "xfer_duration_us": int(telemetry.xferDuration),
+                            "total_bytes": int(telemetry.totalBytes),
+                            "desc_count": int(telemetry.descCount),
+                        }
+                    )
+                except Exception:
+                    # Older NIXL builds and test doubles may not expose telemetry.
+                    pass
 
             if cancelled:
                 raise asyncio.CancelledError
@@ -816,6 +1110,12 @@ class NixlTransportBuffer(TransportBuffer):
                 f"{[request.key for request, _, _ in transfers]!r}"
             ) from error
         finally:
+            if nic_active:
+                self._profile_publisher_nic = _NIC_COUNTER_SAMPLER.end(
+                    self._profile_request_id,
+                    "publisher",
+                    nic_baseline,
+                )
             for group, _ in persistent_handles:
                 group.operations_in_use.discard(operation)
             # Concurrent uses get request-local handles. Cached handles remain
@@ -943,11 +1243,93 @@ class NixlTransportBuffer(TransportBuffer):
             self._descriptor_request_compact = False
             self._restore_client_descriptors()
             self._publish_client_metadata()
+            self._profile_event("client_request_sent")
             transport_buffer = await self.storage_volume_ref.volume.get.call_one(
                 self, [request.meta_only() for request in requests]
             )
+            self._profile_event("client_response_received")
             if transport_buffer._descriptor_cache_miss:
                 raise RuntimeError("NIXL descriptor cache refill failed")
+        client_response_received = self._profile_timeline_ns.get(
+            "client_response_received"
+        )
+        self._profile_timeline_ns.update(transport_buffer._profile_timeline_ns)
+        if client_response_received is not None:
+            self._profile_timeline_ns["client_response_received"] = (
+                client_response_received
+            )
+        self._profile_server_host = transport_buffer._profile_server_host
+        self._profile_volume_id = transport_buffer._profile_volume_id
+        self._profile_transfer_bytes = transport_buffer._profile_transfer_bytes
+        self._profile_server_prepare_seconds = (
+            transport_buffer._profile_server_prepare_seconds
+        )
+        self._profile_completion_wait_seconds = (
+            transport_buffer._profile_completion_wait_seconds
+        )
+        self._profile_request_unpickle_ns = (
+            transport_buffer._profile_request_unpickle_ns
+        )
+        self._profile_response_unpickle_ns = (
+            transport_buffer._profile_response_unpickle_ns
+        )
+        self._profile_response_frame_bytes = (
+            transport_buffer._profile_response_frame_bytes
+        )
+        self._profile_publisher_nic = transport_buffer._profile_publisher_nic
+        self._profile_nixl_telemetry = transport_buffer._profile_nixl_telemetry
+        self._profile_prepared_layout_reused = (
+            transport_buffer._profile_prepared_layout_reused
+        )
+        timeline = self._profile_timeline_ns
+        logging.info(
+            "NIXL_GET_TIMELINE request_id=%s volume_id=%s bytes=%d "
+            "layout_id=%s compact_request=%d prepared_layout_reused=%d "
+            "client_host=%s server_host=%s client_prepare_started_ns=%d "
+            "client_prepare_finished_ns=%d client_request_sent_ns=%d "
+            "client_request_pickle_started_ns=%d "
+            "server_request_unpickle_finished_ns=%d "
+            "server_request_received_ns=%d server_data_ready_ns=%d "
+            "server_transfer_prepare_started_ns=%d "
+            "server_transfer_submitted_ns=%d server_transfer_completed_ns=%d "
+            "server_response_sent_ns=%d server_response_pickle_started_ns=%d "
+            "client_response_unpickle_finished_ns=%d "
+            "client_response_received_ns=%d "
+            "monarch_request_pickle_ns=%d monarch_request_unpickle_ns=%d "
+            "monarch_request_frame_bytes=%d "
+            "monarch_response_unpickle_ns=%d monarch_response_frame_bytes=%d "
+            "requester_nic=%s publisher_nic=%s nixl_telemetry=%s",
+            self._profile_request_id,
+            self._profile_volume_id,
+            self._profile_transfer_bytes,
+            self._descriptor_layout_id or "-",
+            self._descriptor_request_compact,
+            self._profile_prepared_layout_reused,
+            self._profile_client_host,
+            self._profile_server_host,
+            timeline.get("client_prepare_started", 0),
+            timeline.get("client_prepare_finished", 0),
+            timeline.get("client_request_sent", 0),
+            timeline.get("client_request_pickle_started", 0),
+            timeline.get("server_request_unpickle_finished", 0),
+            timeline.get("server_request_received", 0),
+            timeline.get("server_data_ready", 0),
+            timeline.get("server_transfer_prepare_started", 0),
+            timeline.get("server_transfer_submitted", 0),
+            timeline.get("server_transfer_completed", 0),
+            timeline.get("server_response_sent", 0),
+            timeline.get("server_response_pickle_started", 0),
+            timeline.get("client_response_unpickle_finished", 0),
+            timeline.get("client_response_received", 0),
+            self._profile_request_pickle_ns,
+            self._profile_request_unpickle_ns,
+            self._profile_request_frame_bytes,
+            self._profile_response_unpickle_ns,
+            self._profile_response_frame_bytes,
+            json.dumps(self._profile_requester_nic, separators=(",", ":")),
+            json.dumps(self._profile_publisher_nic, separators=(",", ":")),
+            json.dumps(self._profile_nixl_telemetry, separators=(",", ":")),
+        )
         results: list[Any] = []
         for client_context, volume_context in zip(
             self._contexts, transport_buffer._contexts, strict=True
@@ -970,3 +1352,98 @@ class NixlTransportBuffer(TransportBuffer):
         self._client_metadata = None
         self._contexts = []
         self._descriptor_layout_id = None
+
+
+def _find_profiled_buffer(value: Any, depth: int = 0) -> NixlTransportBuffer | None:
+    if isinstance(value, NixlTransportBuffer):
+        return value
+    if depth >= 4:
+        return None
+    if isinstance(value, dict):
+        children = value.values()
+    elif isinstance(value, (list, tuple)):
+        children = value
+    else:
+        return None
+    for child in children:
+        buffer = _find_profiled_buffer(child, depth + 1)
+        if buffer is not None:
+            return buffer
+    return None
+
+
+def _monarch_rpc_direction(buffer: NixlTransportBuffer) -> str | None:
+    timeline = buffer._profile_timeline_ns
+    if "server_response_sent" in timeline:
+        return "response"
+    if "client_request_sent" in timeline:
+        return "request"
+    return None
+
+
+def _install_monarch_rpc_profiling() -> None:
+    """Measure Monarch codec work and exact serialized frame sizes."""
+    try:
+        from monarch._src.actor import actor_mesh
+    except ImportError:
+        return
+    if getattr(actor_mesh, "_torchstore_rpc_profiling", False):
+        return
+
+    original_pickle = actor_mesh.pickle
+    original_pickling_state = actor_mesh.PicklingState
+
+    def profiled_pickle(value: Any, *args: Any, **kwargs: Any) -> Any:
+        buffer = _find_profiled_buffer(value)
+        direction = _monarch_rpc_direction(buffer) if buffer is not None else None
+        started = time.perf_counter_ns()
+        state = original_pickle(value, *args, **kwargs)
+        finished = time.perf_counter_ns()
+        if buffer is not None and direction is not None:
+            duration_ns = finished - started
+            frame_bytes = len(state.buffer())
+            if direction == "request":
+                buffer._profile_request_pickle_ns = duration_ns
+                buffer._profile_request_frame_bytes = frame_bytes
+            elif buffer._profile_transfer_bytes >= 1_000_000_000:
+                # Response serialization finishes after its serialized snapshot
+                # is fixed, so this value cannot ride back in that response.
+                # Restrict the extra log record to the payload-bearing requests
+                # used by the critical-path analysis.
+                logging.info(
+                    "MONARCH_RESPONSE_PICKLE request_id=%s duration_ns=%d "
+                    "frame_bytes=%d",
+                    buffer._profile_request_id,
+                    duration_ns,
+                    frame_bytes,
+                )
+        return state
+
+    class ProfiledPicklingState:
+        def __init__(self, message: Any, *args: Any, **kwargs: Any) -> None:
+            self._state = original_pickling_state(message, *args, **kwargs)
+            self._frame_bytes = len(message)
+
+        def unpickle(self) -> Any:
+            started = time.perf_counter_ns()
+            value = self._state.unpickle()
+            finished = time.perf_counter_ns()
+            buffer = _find_profiled_buffer(value)
+            direction = _monarch_rpc_direction(buffer) if buffer is not None else None
+            if buffer is not None and direction is not None:
+                if direction == "request":
+                    buffer._profile_request_unpickle_ns = finished - started
+                else:
+                    buffer._profile_response_unpickle_ns = finished - started
+                    buffer._profile_response_frame_bytes = self._frame_bytes
+            return value
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._state, name)
+
+    actor_mesh.pickle = profiled_pickle
+    actor_mesh.PicklingState = ProfiledPicklingState
+    actor_mesh._torchstore_rpc_profiling = True
+
+
+_install_monarch_rpc_profiling()
