@@ -29,8 +29,7 @@ class TransportCache(ABC):
         return
 
     @abstractmethod
-    def clear(self) -> None:
-        ...
+    def clear(self) -> None: ...
 
 
 T = TypeVar("T", bound=TransportCache)
@@ -242,9 +241,11 @@ class TransportBuffer:
             await self._pre_get_hook(requests)
             l.track_step("_pre_get_hook")
 
+            transport_buffer = await self.storage_volume_ref.volume.get.call_one(
+                self, self._storage_volume_requests(meta_requests)
+            )
             response = await self._handle_storage_volume_response(
-                requests,
-                await self.storage_volume_ref.volume.get.call_one(self, meta_requests),
+                requests, transport_buffer
             )
             l.track_step("volume.get.call")
 
@@ -314,6 +315,18 @@ class TransportBuffer:
 
     async def _pre_get_hook(self, requests: list[Request]):
         pass
+
+    def _storage_volume_requests(self, requests: list[Request]) -> list[Request]:
+        """Return request metadata to include in the storage-volume RPC."""
+        return requests
+
+    def resolve_get_requests(
+        self,
+        ctx: "TransportContext",
+        requests: list[Request],
+    ) -> list[Request] | None:
+        """Resolve protocol-cached request metadata on the storage volume."""
+        return requests
 
     async def _handle_storage_volume_response(
         self, requests: list[Request], transport_buffer: "TransportBuffer"

@@ -12,7 +12,7 @@ import pickle
 import weakref
 from types import SimpleNamespace
 from typing import NamedTuple
-from unittest.mock import AsyncMock, call, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 import torch
@@ -20,10 +20,10 @@ import torch
 import torchstore.transport.nixl as nixl_transport
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.nixl import (
-    _NixlTransferOperation,
-    _NixlTransferStatus,
     NixlAgentCache,
     NixlTransportBuffer,
+    _NixlTransferOperation,
+    _NixlTransferStatus,
 )
 from torchstore.transport.types import Request
 
@@ -61,6 +61,16 @@ class FakeXferHandle(NamedTuple):
     remote_agent: str
 
 
+class FakePreppedDListHandle:
+    def __init__(self, agent_name, descriptors) -> None:
+        self.agent_name = agent_name
+        self.descriptors = list(descriptors)
+        self.released = False
+
+    def release(self):
+        self.released = True
+
+
 class FakeNixlAgent:
     # Shared fake backend state.
     # The registry lets client and server agents resolve the same descriptors;
@@ -85,6 +95,7 @@ class FakeNixlAgent:
         self.name = name
         self.config = config
         self.initialized = []
+        self.prepared = []
         self._check_errors_raised: set[int] = set()
         self.calls = Mock()
         for method_name in ("transfer", "check_xfer_state", "release_xfer_handle"):
@@ -94,6 +105,12 @@ class FakeNixlAgent:
         for method_name in (
             "register_memory",
             "deregister_memory",
+            "get_xfer_descs",
+            "get_serialized_descs",
+            "deserialize_descs",
+            "prep_xfer_dlist",
+            "make_prepped_xfer",
+            "release_dlist_handle",
             "add_remote_agent",
             "remove_remote_agent",
         ):
@@ -111,6 +128,8 @@ class FakeNixlAgent:
             self.tensors.pop(descriptor, None)
 
     def get_xfer_descs(self, tensor):
+        if isinstance(tensor, FakeXferDList):
+            return FakeXferDList(tensor.descriptors, tensor.memory_type)
         assert tensor.numel() > 0
         return FakeXferDList([id(tensor)], self.memory_types.get(id(tensor), "DRAM"))
 
@@ -144,6 +163,38 @@ class FakeNixlAgent:
         )
         self.initialized.append(handle)
         return handle
+
+    def prep_xfer_dlist(self, agent_name, descriptors, *, backends):
+        handle = FakePreppedDListHandle(agent_name, descriptors.descriptors)
+        self.prepared.append(handle)
+        return handle
+
+    def make_prepped_xfer(
+        self,
+        operation,
+        local_handle,
+        local_indices,
+        remote_handle,
+        remote_indices,
+        *,
+        backends,
+    ):
+        handle = FakeXferHandle(
+            handle_id=len(self.initialized),
+            operation=_NixlTransferOperation(operation),
+            local_descriptors=[
+                local_handle.descriptors[index] for index in local_indices
+            ],
+            remote_descriptors=[
+                remote_handle.descriptors[index] for index in remote_indices
+            ],
+            remote_agent=remote_handle.agent_name,
+        )
+        self.initialized.append(handle)
+        return handle
+
+    def release_dlist_handle(self, handle):
+        handle.release()
 
     def transfer(self, handle):
         if self.transfer_error_handle_id == handle.handle_id:
@@ -316,9 +367,211 @@ async def test_get_writes_storage_tensor_into_client_destination(ref, ctx):
     assert torch.equal(destination, stored)
     agent = FakeNixlAgent.instances[-1]
     assert agent.initialized[0].operation == _NixlTransferOperation.WRITE
-    assert agent.release_xfer_handle.call_args_list == _expected_handle_calls(
-        agent.initialized
+    agent.release_xfer_handle.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_reuses_descriptors_without_mutating_cached_lists(ref, ctx):
+    destinations = [torch.zeros(8) for _ in range(3)]
+    requests = [
+        Request.from_tensor(f"weight-{index}", destination)
+        for index, destination in enumerate(destinations)
+    ]
+    stored = [torch.arange(8, dtype=torch.float32) + index for index in range(3)]
+
+    first_client_buffer = NixlTransportBuffer(ref)
+    await first_client_buffer._pre_get_hook(requests)
+    assert all(
+        context.remote_descriptors is not None
+        for context in first_client_buffer._contexts
     )
+    assert len(
+        first_client_buffer._storage_volume_requests(
+            [request.meta_only() for request in requests]
+        )
+    ) == len(requests)
+    first_wire = pickle.dumps(first_client_buffer)
+    first_storage_volume_buffer = pickle.loads(first_wire)
+    await first_storage_volume_buffer.handle_get_request(
+        ctx,
+        list(zip((request.meta_only() for request in requests), stored)),
+    )
+    first_results = await first_client_buffer._handle_storage_volume_response(
+        requests, first_storage_volume_buffer
+    )
+    await first_client_buffer._post_request_success()
+
+    server_cache = ctx.get(NixlAgentCache)
+    server_agent = FakeNixlAgent.instances[-1]
+    assert server_agent.register_memory.call_count == len(stored)
+    unrelated = torch.zeros(1)
+    server_cache.register(unrelated)
+    server_agent.register_memory.reset_mock()
+    del unrelated
+    gc.collect()
+    assert len(server_cache._prepared_transfer_layouts) == 1
+
+    second_client_buffer = NixlTransportBuffer(ref)
+    await second_client_buffer._pre_get_hook(requests)
+    assert second_client_buffer._client_metadata is None
+    assert all(
+        context.remote_descriptors is None for context in second_client_buffer._contexts
+    )
+    assert (
+        second_client_buffer._storage_volume_requests(
+            [request.meta_only() for request in requests]
+        )
+        == []
+    )
+    second_wire = pickle.dumps(second_client_buffer)
+    second_storage_volume_buffer = pickle.loads(second_wire)
+    cached_requests = second_storage_volume_buffer.resolve_get_requests(ctx, [])
+    assert cached_requests is not None
+    await second_storage_volume_buffer.handle_get_request(
+        ctx,
+        list(zip(cached_requests, stored, strict=True)),
+    )
+    second_storage_volume_buffer = _storage_volume_copy(second_storage_volume_buffer)
+    second_results = await second_client_buffer._handle_storage_volume_response(
+        requests, second_storage_volume_buffer
+    )
+
+    for results in (first_results, second_results):
+        assert all(
+            result is destination
+            for result, destination in zip(results, destinations, strict=True)
+        )
+
+    assert len(second_wire) < len(first_wire)
+    client_agent, server_agent = FakeNixlAgent.instances
+    assert client_agent.get_xfer_descs.call_count == len(destinations)
+    assert client_agent.get_serialized_descs.call_count == len(destinations)
+    assert server_agent.prep_xfer_dlist.call_count == 2
+    assert server_agent.make_prepped_xfer.call_count == 1
+    assert len(server_agent.initialized) == 1
+    assert server_agent.transfer.call_count == 2
+    staging_tensors = [
+        entry[1] for entry in server_cache._publisher_staging_tensors.values()
+    ]
+    assert server_agent.initialized[0].local_descriptors == [
+        id(tensor) for tensor in staging_tensors
+    ]
+    server_agent.release_xfer_handle.assert_not_called()
+    assert all(not handle.released for handle in server_agent.prepared)
+
+
+@pytest.mark.asyncio
+async def test_get_reuses_prepared_layout_for_noncontiguous_source(ref, ctx):
+    destination = torch.zeros(4, 2)
+    request = Request.from_tensor("weight", destination)
+    stored_base = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    stored = stored_base[:, ::2]
+    assert not stored.is_contiguous()
+
+    first_client_buffer = NixlTransportBuffer(ref)
+    await first_client_buffer._pre_get_hook([request])
+    first_storage_volume_buffer = _storage_volume_copy(first_client_buffer)
+    await first_storage_volume_buffer.handle_get_request(
+        ctx, [(request.meta_only(), stored)]
+    )
+    await first_client_buffer._handle_storage_volume_response(
+        [request], first_storage_volume_buffer
+    )
+    await first_client_buffer._post_request_success()
+    assert torch.equal(destination, stored)
+
+    destination.zero_()
+    stored_base.add_(100)
+    second_client_buffer = NixlTransportBuffer(ref)
+    await second_client_buffer._pre_get_hook([request])
+    assert second_client_buffer._storage_volume_requests([request.meta_only()]) == []
+    second_storage_volume_buffer = _storage_volume_copy(second_client_buffer)
+    cached_requests = second_storage_volume_buffer.resolve_get_requests(ctx, [])
+    assert cached_requests is not None
+    await second_storage_volume_buffer.handle_get_request(
+        ctx, [(cached_requests[0], stored)]
+    )
+    await second_client_buffer._handle_storage_volume_response(
+        [request], second_storage_volume_buffer
+    )
+
+    assert torch.equal(destination, stored)
+    server_agent = FakeNixlAgent.instances[-1]
+    assert server_agent.prep_xfer_dlist.call_count == 2
+    assert server_agent.make_prepped_xfer.call_count == 1
+    assert server_agent.transfer.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_reuses_first_destination_for_equivalent_layout(ref):
+    first_destination = torch.zeros(8)
+    first_request = Request.from_tensor("weight", first_destination)
+    first_buffer = NixlTransportBuffer(ref)
+    await first_buffer._pre_get_hook([first_request])
+    first_layout_id = first_buffer._descriptor_layout_id
+    await first_buffer._post_request_success()
+
+    replacement_destination = torch.ones(8)
+    replacement_request = Request.from_tensor("weight", replacement_destination)
+    second_buffer = NixlTransportBuffer(ref)
+    await second_buffer._pre_get_hook([replacement_request])
+
+    assert second_buffer._descriptor_layout_id == first_layout_id
+    assert second_buffer._contexts[0].tensor is first_destination
+    assert second_buffer._contexts[0].remote_descriptors is None
+    assert (
+        second_buffer._storage_volume_requests([replacement_request.meta_only()]) == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_reports_missing_publisher_descriptor_layout(ref, ctx):
+    destination = torch.zeros(8)
+    request = Request.from_tensor("weight", destination)
+    client_buffer = NixlTransportBuffer(ref)
+    await client_buffer._pre_get_hook([request])
+    await client_buffer._post_request_success()
+
+    cached_client_buffer = NixlTransportBuffer(ref)
+    await cached_client_buffer._pre_get_hook([request])
+    assert cached_client_buffer._contexts[0].remote_descriptors is None
+    storage_volume_buffer = _storage_volume_copy(cached_client_buffer)
+
+    cached_requests = storage_volume_buffer.resolve_get_requests(ctx, [])
+
+    assert cached_requests is None
+    assert storage_volume_buffer._descriptor_cache_miss
+
+
+@pytest.mark.asyncio
+async def test_get_refills_missing_publisher_descriptor_layout(ref, ctx):
+    destination = torch.zeros(8)
+    request = Request.from_tensor("weight", destination)
+    stored = torch.arange(8, dtype=torch.float32)
+    client_buffer = NixlTransportBuffer(ref)
+    await client_buffer._pre_get_hook([request])
+    await client_buffer._post_request_success()
+
+    cached_client_buffer = NixlTransportBuffer(ref)
+    await cached_client_buffer._pre_get_hook([request])
+    missing_buffer = _storage_volume_copy(cached_client_buffer)
+    assert missing_buffer.resolve_get_requests(ctx, []) is None
+    assert missing_buffer._descriptor_cache_miss
+
+    async def refill(buffer, meta_requests):
+        assert buffer._contexts[0].remote_descriptors is not None
+        refilled_buffer = _storage_volume_copy(buffer)
+        await refilled_buffer.handle_get_request(ctx, [(meta_requests[0], stored)])
+        return refilled_buffer
+
+    ref.volume.get = SimpleNamespace(call_one=AsyncMock(side_effect=refill))
+    results = await cached_client_buffer._handle_storage_volume_response(
+        [request], missing_buffer
+    )
+
+    assert results == [destination]
+    assert torch.equal(destination, stored)
+    ref.volume.get.call_one.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -643,9 +896,7 @@ async def test_get_mixed_batch_preserves_empty_and_object_entries(ref, ctx):
     agent = FakeNixlAgent.instances[-1]
     assert len(agent.initialized) == 1
     assert len(agent.initialized[0].local_descriptors) == 2
-    assert agent.release_xfer_handle.call_args_list == _expected_handle_calls(
-        agent.initialized
-    )
+    agent.release_xfer_handle.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -671,6 +922,29 @@ def test_memory_registration_is_reused_for_same_tensor(agent_cache):
 
     assert first is second
     assert agent_cache.agent.register_memory.call_count == 1
+
+
+def test_transfer_descriptors_are_reused_for_same_tensor(agent_cache):
+    tensor = torch.zeros(16)
+
+    first = agent_cache.get_xfer_descriptors(tensor)
+    second = agent_cache.get_xfer_descriptors(tensor)
+
+    assert first is second
+    assert agent_cache.agent.register_memory.call_count == 1
+    assert agent_cache.agent.get_xfer_descs.call_count == 1
+
+
+def test_serialized_transfer_descriptors_are_reused_for_same_tensor(agent_cache):
+    tensor = torch.zeros(16)
+
+    first = agent_cache.get_serialized_xfer_descriptors(tensor)
+    second = agent_cache.get_serialized_xfer_descriptors(tensor)
+
+    assert first is second
+    assert agent_cache.agent.register_memory.call_count == 1
+    assert agent_cache.agent.get_xfer_descs.call_count == 1
+    assert agent_cache.agent.get_serialized_descs.call_count == 1
 
 
 def test_memory_registration_is_evicted_with_tensor_storage(agent_cache):

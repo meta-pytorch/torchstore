@@ -10,7 +10,7 @@ from logging import getLogger
 from typing import Any
 
 import torch
-from monarch.actor import Actor, endpoint
+from monarch.actor import Actor, concurrent_endpoint, endpoint
 
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.types import Request, TensorSlice
@@ -69,12 +69,17 @@ class StorageVolume(Actor):
     ) -> None:
         await self.store.put(transport_buffer, requests)
 
-    @endpoint
+    @concurrent_endpoint
     async def get(
         self,
         transport_buffer: TransportBuffer,
         requests: list[Request],
     ) -> TransportBuffer:
+        requests = transport_buffer.resolve_get_requests(
+            self.store.transport_context, requests
+        )
+        if requests is None:
+            return transport_buffer
         return await self.store.get(transport_buffer, requests)
 
     @endpoint
@@ -180,23 +185,23 @@ class InMemoryStore(StorageImpl):
 
         if isinstance(current_object, torch.Tensor):
             # Regular tensor - request must also be a regular tensor (no tensor_slice)
-            assert (
-                request.tensor_slice is None
-            ), "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
+            assert request.tensor_slice is None, (
+                "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
+            )
             return current_object
 
         if isinstance(current_object, dict):
             if "obj" in current_object:
                 # Object dict - request must also be an object
-                assert (
-                    request.is_object
-                ), "Existing data is an object but request.is_object is False"
+                assert request.is_object, (
+                    "Existing data is an object but request.is_object is False"
+                )
                 return None
 
             # DTensor shard dict - incoming request must also be a DTensor
-            assert (
-                request.tensor_slice is not None
-            ), "Existing data is DTensor shards but incoming request has no tensor_slice"
+            assert request.tensor_slice is not None, (
+                "Existing data is DTensor shards but incoming request has no tensor_slice"
+            )
             # Look up by coordinates
             shard = current_object.get(request.tensor_slice.coordinates)
             if shard is not None and "tensor" in shard:

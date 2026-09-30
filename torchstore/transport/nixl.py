@@ -15,11 +15,11 @@ import socket
 import time
 import uuid
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import cache
 from importlib.util import find_spec
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from typing_extensions import override
@@ -74,6 +74,30 @@ class _Registration:
 
     descriptors: Any
     storage_ref: weakref.ReferenceType[Any]
+    xfer_descriptors: Any | None = None
+    serialized_xfer_descriptors: bytes | None = None
+
+
+@dataclass
+class _PreparedTransferGroup:
+    """Reusable NIXL preparation for one local/remote memory-type pair."""
+
+    local_handle: Any
+    remote_handle: Any
+    indices: list[int]
+    xfer_handles: dict[_NixlTransferOperation, Any] = field(default_factory=dict)
+    operations_in_use: set[_NixlTransferOperation] = field(default_factory=set)
+
+
+@dataclass
+class _PreparedTransferLayout:
+    """Publisher-side prepared handles for one stable client tensor layout."""
+
+    local_signature: tuple[tuple[str, int, int], ...]
+    groups: tuple[_PreparedTransferGroup, ...]
+    requests: tuple[Request, ...]
+    contexts: tuple[NixlRequestContext, ...]
+    invalidated: bool = False
 
 
 class NixlAgentCache(TransportCache):
@@ -95,6 +119,17 @@ class NixlAgentCache(TransportCache):
         self.agent = nixl_agent(name, config)
         self._registrations: dict[tuple[int, int], _Registration] = {}
         self._remote_agents: dict[str, bytes] = {}
+        self._client_layout_ids: dict[tuple[Any, ...], str] = {}
+        self._published_client_layouts: set[tuple[str, str]] = set()
+        self._client_transfer_tensors: dict[
+            tuple[str, int, tuple[Any, ...]], tuple[str, torch.Tensor]
+        ] = {}
+        self._prepared_transfer_layouts: dict[
+            tuple[str, str], _PreparedTransferLayout
+        ] = {}
+        self._publisher_staging_tensors: dict[
+            tuple[str, str, int], tuple[str, torch.Tensor]
+        ] = {}
 
     def register(self, tensor: torch.Tensor) -> Any:
         """Register a contiguous tensor once for the lifetime of its storage."""
@@ -110,10 +145,193 @@ class NixlAgentCache(TransportCache):
         self._registrations[key] = _Registration(descriptors, storage_ref)
         return descriptors
 
+    def get_xfer_descriptors(self, tensor: torch.Tensor) -> Any:
+        """Return transfer descriptors cached with the tensor registration."""
+        key = (tensor.data_ptr(), tensor.nbytes)
+        self.register(tensor)
+        registration = self._registrations[key]
+        if registration.xfer_descriptors is None:
+            registration.xfer_descriptors = self.agent.get_xfer_descs(tensor)
+        return registration.xfer_descriptors
+
+    def get_serialized_xfer_descriptors(self, tensor: torch.Tensor) -> bytes:
+        """Return a cached wire representation of a tensor's descriptors."""
+        key = (tensor.data_ptr(), tensor.nbytes)
+        descriptors = self.get_xfer_descriptors(tensor)
+        registration = self._registrations[key]
+        if registration.serialized_xfer_descriptors is None:
+            registration.serialized_xfer_descriptors = self.agent.get_serialized_descs(
+                descriptors
+            )
+        return registration.serialized_xfer_descriptors
+
+    def copy_xfer_descriptors(self, tensor: torch.Tensor) -> Any:
+        """Return a mutable request-local copy of cached tensor descriptors."""
+        return self.agent.deserialize_descs(
+            self.get_serialized_xfer_descriptors(tensor)
+        )
+
+    def get_client_layout_id(self, layout_key: tuple[Any, ...]) -> str:
+        """Return a process-local stable ID for a client tensor layout."""
+        layout_id = self._client_layout_ids.get(layout_key)
+        if layout_id is None:
+            layout_id = uuid.uuid4().hex
+            self._client_layout_ids[layout_key] = layout_id
+        return layout_id
+
+    def get_client_transfer_tensor(
+        self,
+        volume_id: str,
+        index: int,
+        request: Request,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep the first destination for a logical request layout alive."""
+        tensor_signature = (
+            request.key,
+            tuple(tensor.shape),
+            str(tensor.dtype),
+            str(tensor.device),
+            request.tensor_slice,
+        )
+        cache_key = (volume_id, index, tensor_signature)
+        cached = self._client_transfer_tensors.get(cache_key)
+        if cached is None:
+            self._client_transfer_tensors[cache_key] = (request.key, tensor)
+            return tensor
+        return cached[1]
+
+    def client_layout_is_published(self, volume_id: str, layout_id: str) -> bool:
+        return (volume_id, layout_id) in self._published_client_layouts
+
+    def mark_client_layout_published(self, volume_id: str, layout_id: str) -> None:
+        self._published_client_layouts.add((volume_id, layout_id))
+
+    def mark_client_layout_missing(self, volume_id: str, layout_id: str) -> None:
+        self._published_client_layouts.discard((volume_id, layout_id))
+
+    def has_remote_agent(self, name: str) -> bool:
+        return name in self._remote_agents
+
+    def stage_publisher_tensor(
+        self,
+        remote_agent: str,
+        layout_id: str,
+        index: int,
+        request_key: str,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Copy a source into a stable, reusable publisher-side NIXL buffer."""
+        cache_key = (remote_agent, layout_id, index)
+        cached = self._publisher_staging_tensors.get(cache_key)
+        staging = cached[1] if cached is not None else None
+        if (
+            staging is None
+            or staging.shape != tensor.shape
+            or staging.dtype != tensor.dtype
+            or staging.device != tensor.device
+        ):
+            staging = torch.empty_like(tensor, memory_format=torch.contiguous_format)
+            self._publisher_staging_tensors[cache_key] = (request_key, staging)
+        staging.copy_(tensor)
+        return staging
+
+    def get_prepared_transfer_layout(
+        self,
+        remote_agent: str,
+        layout_id: str,
+        local_signature: tuple[tuple[str, int, int], ...],
+    ) -> _PreparedTransferLayout | None:
+        layout = self._prepared_transfer_layouts.get((remote_agent, layout_id))
+        if (
+            layout is None
+            or layout.invalidated
+            or layout.local_signature != local_signature
+        ):
+            return None
+        return layout
+
+    def get_prepared_transfer_requests(
+        self, remote_agent: str, layout_id: str
+    ) -> tuple[list[Request], list[NixlRequestContext]] | None:
+        layout = self._prepared_transfer_layouts.get((remote_agent, layout_id))
+        if layout is None or layout.invalidated:
+            return None
+        contexts = [
+            NixlRequestContext(
+                shape=context.shape,
+                dtype=context.dtype,
+                is_object=context.is_object,
+            )
+            for context in layout.contexts
+        ]
+        return list(layout.requests), contexts
+
+    def set_prepared_transfer_layout(
+        self,
+        remote_agent: str,
+        layout_id: str,
+        layout: _PreparedTransferLayout,
+    ) -> None:
+        key = (remote_agent, layout_id)
+        previous = self._prepared_transfer_layouts.pop(key, None)
+        if previous is not None:
+            if any(group.operations_in_use for group in previous.groups):
+                self._prepared_transfer_layouts[key] = previous
+                raise RuntimeError("cannot replace an active NIXL descriptor layout")
+            self._release_prepared_transfer_layout(previous)
+        self._prepared_transfer_layouts[key] = layout
+
+    def release_invalidated_transfer_layout(
+        self,
+        remote_agent: str,
+        layout_id: str,
+        layout: _PreparedTransferLayout,
+    ) -> None:
+        key = (remote_agent, layout_id)
+        if (
+            layout.invalidated
+            and not any(group.operations_in_use for group in layout.groups)
+            and self._prepared_transfer_layouts.get(key) is layout
+        ):
+            self._prepared_transfer_layouts.pop(key)
+            self._release_prepared_transfer_layout(layout)
+
+    def _release_prepared_transfer_layout(
+        self, layout: _PreparedTransferLayout
+    ) -> None:
+        for group in layout.groups:
+            for handle in group.xfer_handles.values():
+                self.agent.release_xfer_handle(handle)
+            self.agent.release_dlist_handle(group.local_handle)
+            self.agent.release_dlist_handle(group.remote_handle)
+
+    def _clear_prepared_transfer_layouts(self, remote_agent: str | None = None) -> None:
+        for key, layout in list(self._prepared_transfer_layouts.items()):
+            if remote_agent is None or key[0] == remote_agent:
+                self._release_prepared_transfer_layout(layout)
+                self._prepared_transfer_layouts.pop(key, None)
+
+    def _invalidate_prepared_transfer_layouts(
+        self, registration_key: tuple[int, int]
+    ) -> None:
+        for cache_key, layout in list(self._prepared_transfer_layouts.items()):
+            if not any(
+                (data_ptr, nbytes) == registration_key
+                for _, data_ptr, nbytes in layout.local_signature
+            ):
+                continue
+            if any(group.operations_in_use for group in layout.groups):
+                layout.invalidated = True
+            else:
+                self._prepared_transfer_layouts.pop(cache_key)
+                self._release_prepared_transfer_layout(layout)
+
     def _evict(self, key: tuple[int, int]) -> None:
         registration = self._registrations.get(key)
         if registration is None:
             return
+        self._invalidate_prepared_transfer_layouts(key)
         self.agent.deregister_memory(registration.descriptors)
         self._registrations.pop(key, None)
 
@@ -123,6 +341,7 @@ class NixlAgentCache(TransportCache):
         if previous_metadata == metadata:
             return name
         if previous_metadata is not None:
+            self._clear_prepared_transfer_layouts(name)
             self.agent.remove_remote_agent(name)
         remote_name = self.agent.add_remote_agent(metadata)
         if isinstance(remote_name, bytes):
@@ -135,7 +354,44 @@ class NixlAgentCache(TransportCache):
         return remote_name
 
     @override
+    def delete(self, keys: set[str]) -> None:
+        stale_layout_ids = {
+            layout_id
+            for layout_key, layout_id in self._client_layout_ids.items()
+            if any(entry[0] in keys for entry in layout_key[1])
+        }
+        self._client_layout_ids = {
+            layout_key: layout_id
+            for layout_key, layout_id in self._client_layout_ids.items()
+            if layout_id not in stale_layout_ids
+        }
+        self._published_client_layouts = {
+            published
+            for published in self._published_client_layouts
+            if published[1] not in stale_layout_ids
+        }
+        self._client_transfer_tensors = {
+            cache_key: entry
+            for cache_key, entry in self._client_transfer_tensors.items()
+            if entry[0] not in keys
+        }
+        for cache_key, layout in list(self._prepared_transfer_layouts.items()):
+            if any(key in keys for key, _, _ in layout.local_signature):
+                self._release_prepared_transfer_layout(layout)
+                self._prepared_transfer_layouts.pop(cache_key, None)
+        self._publisher_staging_tensors = {
+            cache_key: entry
+            for cache_key, entry in self._publisher_staging_tensors.items()
+            if entry[0] not in keys
+        }
+
+    @override
     def clear(self) -> None:
+        self._clear_prepared_transfer_layouts()
+        self._client_transfer_tensors.clear()
+        self._client_layout_ids.clear()
+        self._published_client_layouts.clear()
+        self._publisher_staging_tensors.clear()
         for key in list(self._registrations):
             self._evict(key)
         for remote_name in list(self._remote_agents):
@@ -178,16 +434,24 @@ class NixlTransportBuffer(TransportBuffer):
         self._client_metadata: bytes | None = None
         self._client_agent_name: str | None = None
         self._contexts: list[NixlRequestContext] = []
+        self._descriptor_layout_id: str | None = None
+        self._descriptor_cache_miss = False
+        self._descriptor_request_compact = False
+        self._server_request_received = False
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["storage_volume_ref"] = None
+        if self._descriptor_request_compact and not self._server_request_received:
+            state["_contexts"] = []
         return state
 
     def _client_cache(self) -> NixlAgentCache:
         return self.storage_volume_ref.transport_context.get(NixlAgentCache)
 
-    def _register_client_tensor(self, tensor: torch.Tensor) -> NixlRequestContext:
+    def _register_client_tensor(
+        self, tensor: torch.Tensor, *, include_descriptors: bool = True
+    ) -> NixlRequestContext:
         assert tensor.is_contiguous()
         context = NixlRequestContext(
             tensor=tensor,
@@ -195,20 +459,86 @@ class NixlTransportBuffer(TransportBuffer):
             dtype=tensor.dtype,
         )
         # NIXL cannot create transfer descriptors for zero-byte tensors.
-        if tensor.numel() == 0:
+        if tensor.numel() == 0 or not include_descriptors:
             return context
 
         cache = self._client_cache()
-        cache.register(tensor)
-        descriptors = cache.agent.get_xfer_descs(tensor)
-        context.remote_descriptors = cache.agent.get_serialized_descs(descriptors)
+        context.remote_descriptors = cache.get_serialized_xfer_descriptors(tensor)
         return context
 
     def _publish_client_metadata(self) -> None:
-        if any(context.remote_descriptors is not None for context in self._contexts):
+        if self._descriptor_layout_id is not None or any(
+            context.remote_descriptors is not None for context in self._contexts
+        ):
             cache = self._client_cache()
             self._client_agent_name = cache.agent.name
-            self._client_metadata = cache.agent.get_agent_metadata()
+            if (
+                self._descriptor_layout_id is None
+                or not cache.client_layout_is_published(
+                    self.storage_volume_ref.volume_id, self._descriptor_layout_id
+                )
+            ):
+                self._client_metadata = cache.agent.get_agent_metadata()
+
+    def _configure_get_descriptor_layout(self, requests: list[Request]) -> None:
+        tensor_layout = tuple(
+            (
+                request.key,
+                tuple(context.tensor.shape),
+                str(context.tensor.dtype),
+                str(context.tensor.device),
+                request.tensor_slice,
+            )
+            for request, context in zip(requests, self._contexts, strict=True)
+            if context.tensor is not None and context.tensor.numel() != 0
+        )
+        if not tensor_layout:
+            return
+
+        cache = self._client_cache()
+        self._descriptor_layout_id = cache.get_client_layout_id(("GET", tensor_layout))
+        if not cache.client_layout_is_published(
+            self.storage_volume_ref.volume_id, self._descriptor_layout_id
+        ):
+            self._restore_client_descriptors()
+
+    def _restore_client_descriptors(self) -> None:
+        for context in self._contexts:
+            tensor = context.tensor
+            if tensor is not None and tensor.numel() != 0:
+                context.remote_descriptors = (
+                    self._client_cache().get_serialized_xfer_descriptors(tensor)
+                )
+
+    @override
+    def _storage_volume_requests(self, requests: list[Request]) -> list[Request]:
+        if self._descriptor_layout_id is not None and all(
+            context.remote_descriptors is None for context in self._contexts
+        ):
+            self._descriptor_request_compact = True
+            return []
+        return requests
+
+    @override
+    def resolve_get_requests(
+        self,
+        ctx: TransportContext,
+        requests: list[Request],
+    ) -> list[Request] | None:
+        self._server_request_received = True
+        if requests or self._descriptor_layout_id is None:
+            return requests
+        if self._client_agent_name is None:
+            self._descriptor_cache_miss = True
+            return None
+        cached = ctx.get(NixlAgentCache).get_prepared_transfer_requests(
+            self._client_agent_name, self._descriptor_layout_id
+        )
+        if cached is None:
+            self._descriptor_cache_miss = True
+            return None
+        requests, self._contexts = cached
+        return requests
 
     @override
     async def _pre_put_hook(self, requests: list[Request]) -> None:
@@ -247,7 +577,7 @@ class NixlTransportBuffer(TransportBuffer):
 
         # 2. build contexts
         self._contexts = []
-        for request in requests:
+        for index, request in enumerate(requests):
             tensor = request.tensor_val
             if tensor is None:
                 meta = next(meta_iterator)
@@ -259,61 +589,178 @@ class NixlTransportBuffer(TransportBuffer):
                     shape = request.tensor_slice.local_shape
                 tensor = torch.empty(shape, dtype=dtype, device="cpu")
 
-            self._contexts.append(self._register_client_tensor(tensor))
+            if tensor.numel() != 0:
+                tensor = self._client_cache().get_client_transfer_tensor(
+                    self.storage_volume_ref.volume_id,
+                    index,
+                    request,
+                    tensor,
+                )
+
+            self._contexts.append(
+                self._register_client_tensor(tensor, include_descriptors=False)
+            )
+        self._configure_get_descriptor_layout(requests)
         self._publish_client_metadata()
 
     async def _transfer(
         self,
         ctx: TransportContext,
         operation: _NixlTransferOperation,
-        transfers: list[tuple[Request, torch.Tensor, bytes]],
-    ) -> None:
+        transfers: list[tuple[Request, torch.Tensor, bytes | None]],
+        request_layout: list[Request] | None = None,
+    ) -> bool:
         if not transfers:
-            return
+            return True
 
         cache = ctx.get(NixlAgentCache)
         remote_agent = self._connect_client(cache)
-        transfer_groups: dict[tuple[Any, Any], tuple[Any, Any]] = {}
+        local_signature = tuple(
+            (request.key, tensor.data_ptr(), tensor.nbytes)
+            for request, tensor, _ in transfers
+        )
+        prepared_layout = (
+            cache.get_prepared_transfer_layout(
+                remote_agent,
+                self._descriptor_layout_id,
+                local_signature,
+            )
+            if self._descriptor_layout_id is not None
+            else None
+        )
+        if prepared_layout is None and any(
+            remote_descriptors is None for _, _, remote_descriptors in transfers
+        ):
+            return False
+
         handles = []
+        persistent_handles: list[tuple[_PreparedTransferGroup, Any]] = []
+        temporary_handles = []
         dispatch_error: Exception | None = None
         try:
-            for _, tensor, serialized_remote_descs in transfers:
-                cache.register(tensor)
-                tensor_local_descs = cache.agent.get_xfer_descs(tensor)
-                tensor_remote_descs = cache.agent.deserialize_descs(
-                    serialized_remote_descs
-                )
-
-                # Each NIXL descriptor list must have one memory type per side.
-                # Split mixed CPU/GPU batches while preserving cross-device pairs.
-                group_key = (
-                    tensor_local_descs.getType(),
-                    tensor_remote_descs.getType(),
-                )
-                group = transfer_groups.get(group_key)
-                if group is None:
-                    transfer_groups[group_key] = (
-                        tensor_local_descs,
-                        tensor_remote_descs,
+            if prepared_layout is None:
+                transfer_groups: dict[tuple[Any, Any], tuple[Any, Any]] = {}
+                for _, tensor, serialized_remote_descs in transfers:
+                    assert serialized_remote_descs is not None
+                    tensor_local_descs = cache.get_xfer_descriptors(tensor)
+                    tensor_remote_descs = cache.agent.deserialize_descs(
+                        serialized_remote_descs
                     )
-                else:
-                    local_descs, remote_descs = group
-                    for index in range(tensor_local_descs.descCount()):
-                        local_descs.append(tensor_local_descs[index])
-                    for index in range(tensor_remote_descs.descCount()):
-                        remote_descs.append(tensor_remote_descs[index])
+                    # Each NIXL descriptor list must have one memory type per side.
+                    # Split mixed CPU/GPU batches while preserving cross-device pairs.
+                    group_key = (
+                        tensor_local_descs.getType(),
+                        tensor_remote_descs.getType(),
+                    )
+                    group = transfer_groups.get(group_key)
+                    if group is None:
+                        # The aggregate is mutated below, so clone the cached local
+                        # descriptor list before using it as the accumulator.
+                        transfer_groups[group_key] = (
+                            cache.copy_xfer_descriptors(tensor),
+                            tensor_remote_descs,
+                        )
+                    else:
+                        local_descs, remote_descs = group
+                        for index in range(tensor_local_descs.descCount()):
+                            local_descs.append(tensor_local_descs[index])
+                        for index in range(tensor_remote_descs.descCount()):
+                            remote_descs.append(tensor_remote_descs[index])
 
-            try:
-                for local_descs, remote_descs in transfer_groups.values():
-                    handle = cache.agent.initialize_xfer(
-                        operation.value,
-                        local_descs,
-                        remote_descs,
+                if self._descriptor_layout_id is not None:
+                    prepared_groups = []
+                    try:
+                        for local_descs, remote_descs in transfer_groups.values():
+                            if local_descs.descCount() != remote_descs.descCount():
+                                raise RuntimeError(
+                                    "NIXL local and remote descriptor counts differ"
+                                )
+                            local_handle = cache.agent.prep_xfer_dlist(
+                                "NIXL_INIT_AGENT",
+                                local_descs,
+                                backends=[cache.backend],
+                            )
+                            try:
+                                remote_handle = cache.agent.prep_xfer_dlist(
+                                    remote_agent,
+                                    remote_descs,
+                                    backends=[cache.backend],
+                                )
+                            except Exception:
+                                cache.agent.release_dlist_handle(local_handle)
+                                raise
+                            prepared_groups.append(
+                                _PreparedTransferGroup(
+                                    local_handle,
+                                    remote_handle,
+                                    list(range(local_descs.descCount())),
+                                )
+                            )
+                    except Exception:
+                        for group in prepared_groups:
+                            cache.agent.release_dlist_handle(group.local_handle)
+                            cache.agent.release_dlist_handle(group.remote_handle)
+                        raise
+                    prepared_layout = _PreparedTransferLayout(
+                        local_signature,
+                        tuple(prepared_groups),
+                        tuple(
+                            request_layout or (request for request, _, _ in transfers)
+                        ),
+                        tuple(
+                            NixlRequestContext(
+                                shape=context.shape,
+                                dtype=context.dtype,
+                                is_object=context.is_object,
+                            )
+                            for context in self._contexts
+                        ),
+                    )
+                    cache.set_prepared_transfer_layout(
                         remote_agent,
-                        backends=[cache.backend],
+                        self._descriptor_layout_id,
+                        prepared_layout,
                     )
-                    handles.append(handle)
-                    cache.agent.transfer(handle)
+            try:
+                if prepared_layout is not None:
+                    for group in prepared_layout.groups:
+                        handle = group.xfer_handles.get(operation)
+                        if handle is None:
+                            handle = cache.agent.make_prepped_xfer(
+                                operation.value,
+                                group.local_handle,
+                                group.indices,
+                                group.remote_handle,
+                                group.indices,
+                                backends=[cache.backend],
+                            )
+                            group.xfer_handles[operation] = handle
+                        if operation in group.operations_in_use:
+                            handle = cache.agent.make_prepped_xfer(
+                                operation.value,
+                                group.local_handle,
+                                group.indices,
+                                group.remote_handle,
+                                group.indices,
+                                backends=[cache.backend],
+                            )
+                            temporary_handles.append(handle)
+                        else:
+                            group.operations_in_use.add(operation)
+                            persistent_handles.append((group, handle))
+                        handles.append(handle)
+                        cache.agent.transfer(handle)
+                else:
+                    for local_descs, remote_descs in transfer_groups.values():
+                        handle = cache.agent.initialize_xfer(
+                            operation.value,
+                            local_descs,
+                            remote_descs,
+                            remote_agent,
+                            backends=[cache.backend],
+                        )
+                        handles.append(handle)
+                        cache.agent.transfer(handle)
             except Exception as error:
                 # Earlier handles may already be active. Drain them below before
                 # propagating the dispatch error.
@@ -362,20 +809,37 @@ class NixlTransportBuffer(TransportBuffer):
                 raise RuntimeError("NIXL transfer failed")
             if timed_out:
                 raise TimeoutError("NIXL transfer timed out")
+            return True
         except Exception as error:
             raise RuntimeError(
                 f"NIXL {operation.value} failed for keys="
                 f"{[request.key for request, _, _ in transfers]!r}"
             ) from error
         finally:
-            # Handles are released only after their transfers reach a terminal
-            # state; NIXL release is assumed safe at that point.
-            for handle in handles:
+            for group, _ in persistent_handles:
+                group.operations_in_use.discard(operation)
+            # Concurrent uses get request-local handles. Cached handles remain
+            # prepared and are reposted after each completed transfer.
+            for handle in temporary_handles:
                 cache.agent.release_xfer_handle(handle)
+            if prepared_layout is None:
+                # Legacy requests do not have a reusable layout.
+                for handle in handles:
+                    cache.agent.release_xfer_handle(handle)
+            elif self._descriptor_layout_id is not None:
+                cache.release_invalidated_transfer_layout(
+                    remote_agent,
+                    self._descriptor_layout_id,
+                    prepared_layout,
+                )
 
     def _connect_client(self, cache: NixlAgentCache) -> str:
-        if self._client_agent_name is None or self._client_metadata is None:
-            raise RuntimeError("NIXL request is missing client agent metadata")
+        if self._client_agent_name is None:
+            raise RuntimeError("NIXL request is missing the client agent name")
+        if self._client_metadata is None:
+            if cache.has_remote_agent(self._client_agent_name):
+                return self._client_agent_name
+            raise RuntimeError("NIXL request is missing uncached client agent metadata")
         return cache.add_remote_agent(self._client_agent_name, self._client_metadata)
 
     @override
@@ -419,10 +883,10 @@ class NixlTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
-        transfers: list[tuple[Request, torch.Tensor, bytes]] = []
+        transfers: list[tuple[Request, torch.Tensor, bytes | None]] = []
 
-        for (request, data), request_context in zip(
-            entries, self._contexts, strict=True
+        for index, ((request, data), request_context) in enumerate(
+            zip(entries, self._contexts, strict=True)
         ):
             if not isinstance(data, torch.Tensor):
                 request_context.is_object = True
@@ -435,12 +899,32 @@ class NixlTransportBuffer(TransportBuffer):
                 request_context.shape,
                 must_be_contiguous=False,
             )
-            source = data if data.is_contiguous() else data.contiguous()
+            if (
+                self._client_agent_name is not None
+                and self._descriptor_layout_id is not None
+            ):
+                source = ctx.get(NixlAgentCache).stage_publisher_tensor(
+                    self._client_agent_name,
+                    self._descriptor_layout_id,
+                    index,
+                    request.key,
+                    data,
+                )
+            else:
+                source = data if data.is_contiguous() else data.contiguous()
             # Empty tensors have no bytes to move or NIXL descriptors to transfer.
             if source.numel() != 0:
-                assert request_context.remote_descriptors is not None
                 transfers.append((request, source, request_context.remote_descriptors))
-        await self._transfer(ctx, _NixlTransferOperation.WRITE, transfers)
+        self._descriptor_cache_miss = not await self._transfer(
+            ctx,
+            _NixlTransferOperation.WRITE,
+            transfers,
+            [request for request, _ in entries],
+        )
+        # Descriptor bytes are request-only data and need not be echoed back in
+        # the response after the publisher has cached the prepared layout.
+        for context in self._contexts:
+            context.remote_descriptors = None
 
     @override
     async def _handle_storage_volume_response(
@@ -449,6 +933,21 @@ class NixlTransportBuffer(TransportBuffer):
         transport_buffer: TransportBuffer,
     ) -> list[Any]:
         assert isinstance(transport_buffer, NixlTransportBuffer)
+        if transport_buffer._descriptor_cache_miss:
+            if self._descriptor_layout_id is None:
+                raise RuntimeError("NIXL descriptor cache miss without a layout ID")
+            cache = self._client_cache()
+            cache.mark_client_layout_missing(
+                self.storage_volume_ref.volume_id, self._descriptor_layout_id
+            )
+            self._descriptor_request_compact = False
+            self._restore_client_descriptors()
+            self._publish_client_metadata()
+            transport_buffer = await self.storage_volume_ref.volume.get.call_one(
+                self, [request.meta_only() for request in requests]
+            )
+            if transport_buffer._descriptor_cache_miss:
+                raise RuntimeError("NIXL descriptor cache refill failed")
         results: list[Any] = []
         for client_context, volume_context in zip(
             self._contexts, transport_buffer._contexts, strict=True
@@ -460,6 +959,14 @@ class NixlTransportBuffer(TransportBuffer):
             )
         return results
 
+    @override
+    async def _post_request_success(self) -> None:
+        if self._descriptor_layout_id is not None:
+            self._client_cache().mark_client_layout_published(
+                self.storage_volume_ref.volume_id, self._descriptor_layout_id
+            )
+
     async def drop(self) -> None:
         self._client_metadata = None
         self._contexts = []
+        self._descriptor_layout_id = None
