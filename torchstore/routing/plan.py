@@ -9,9 +9,10 @@
 from __future__ import annotations
 
 import zlib
-from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections import Counter, defaultdict
+from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
+from typing import TypeVar
 
 import torch
 
@@ -29,6 +30,7 @@ from ._model import (
 
 __all__ = ["Balance", "KeyRegistration", "RoutingPlan"]
 
+_Candidate = TypeVar("_Candidate")
 _GeometryKey = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
 # One replication set: its geometry and the ranks reporting it.
 _Group = tuple[_GeometryKey, list[tuple[str, TensorSlice]]]
@@ -43,10 +45,44 @@ def _geometry_key(tensor_slice: TensorSlice) -> _GeometryKey:
 
 
 class Balance(str, Enum):
-    """How to choose between ranks holding byte-identical data."""
+    """How to choose between ranks holding or wanting byte-identical data."""
 
-    # A pure function of the key, so every local planner makes the same choice.
+    # Based on knowledge of global load
+    LEAST_LOADED = "least_loaded"
+    # Pure function of the key
     ROTATE = "rotate"
+
+    @property
+    def sequential(self) -> bool:
+        """Whether a choice depends on the choices made before it."""
+        return self is Balance.LEAST_LOADED
+
+
+def _itself(candidate: str) -> str:
+    """Name of a candidate that is already just a rank."""
+    return candidate
+
+
+class _LeastLoaded:
+    """Hands each choice to whichever candidate has been given the fewest bytes."""
+
+    def __init__(self) -> None:
+        self._assigned: Counter[str] = Counter()
+
+    def choose(
+        self,
+        key: str,
+        index: int,
+        candidates: Sequence[_Candidate],
+        nbytes: int,
+        name: Callable[[_Candidate], str] = _itself,
+    ) -> _Candidate:
+        chosen = min(
+            candidates,
+            key=lambda candidate: (self._assigned[name(candidate)], name(candidate)),
+        )
+        self._assigned[name(chosen)] += nbytes
+        return chosen
 
 
 class _Rotate:
@@ -56,12 +92,14 @@ class _Rotate:
         self,
         key: str,
         index: int,
-        candidates: Sequence[str],
-    ) -> str:
+        candidates: Sequence[_Candidate],
+        nbytes: int,
+        name: Callable[[_Candidate], str] = _itself,
+    ) -> _Candidate:
         return candidates[(zlib.crc32(key.encode()) + index) % len(candidates)]
 
 
-_BALANCERS = {Balance.ROTATE: _Rotate}
+_BALANCERS = {Balance.LEAST_LOADED: _LeastLoaded, Balance.ROTATE: _Rotate}
 
 
 def _geometry_slice(geometry: _GeometryKey) -> TensorSlice:
@@ -117,11 +155,13 @@ class _Builder:
         rank: str,
         registrations: Mapping[str, KeyRegistration],
         publishers: Registrations,
+        requesters: Registrations | None,
         balance: Balance,
     ) -> None:
         self.rank = rank
         self.registrations = registrations
         self.publishers = publishers
+        self.requesters = {**(requesters or {}), rank: registrations}
         self.balance = _BALANCERS[balance]()
         # storage_key -> wire dtype
         self.dtypes: dict[str, torch.dtype] = {}
@@ -151,14 +191,19 @@ class _Builder:
         published_keys = {
             key for registrations in self.publishers.values() for key in registrations
         }
-        requested_keys = set(self.registrations)
+        requested_keys = {
+            key for registrations in self.requesters.values() for key in registrations
+        }
         unpublished = requested_keys - published_keys
         if unpublished:
             raise KeyError(f"requester keys have no publisher: {sorted(unpublished)}")
 
         key_shapes: dict[str, tuple[int, ...]] = {}
         key_dtypes: dict[str, torch.dtype] = {}
-        registrations_by_rank = [*self.publishers.values(), self.registrations]
+        registrations_by_rank = [
+            *self.publishers.values(),
+            *self.requesters.values(),
+        ]
         for registrations in registrations_by_rank:
             for key, item in registrations.items():
                 global_shape = item.tensor_slice.global_shape
@@ -185,7 +230,7 @@ class _Builder:
             numel = get_slice_numel(piece)
             covered += numel
             nbytes = numel * element_size
-            rank = self.balance.choose(key, index, ranks)
+            rank = self.balance.choose(key, index, ranks, nbytes)
             transfers.append(
                 Transfer(
                     source=rank,
@@ -231,25 +276,75 @@ class _Builder:
         #   publishers                 requesters
         #   P0 [rows 0-3] --+
         #                   +--pull--> R0
-        #   P1 [rows 4-7] --+
+        #   P1 [rows 4-7] --+           |
+        #                               +--relay--> R1 (waits, then pulls)
         #
         #   R0: DestinationRoute(dest=rows0-7,
-        #                        transfers=[P0->rows0-3, P1->rows4-7])
-        keys = {}
-        for storage_key, registration in sorted(self.registrations.items()):
-            target_slice = self._slice(_geometry_key(registration.tensor_slice))
-            keys[storage_key] = KeyPlan(
-                registration.tensor_slice,
-                DestinationRoute(
-                    destination_slice=registration.tensor_slice,
-                    transfers=self._publisher_transfers(storage_key, target_slice),
-                ),
-            )
+        #                        transfers=[P0->rows0-3, P1->rows4-7],
+        #                        notify_relay_id="weights#0", notify_peers=("R1",))
+        #   R1: DestinationRoute(dest=rows0-7, transfers=[R0->rows0-7],
+        #                        wait_for_relay_id="weights#0")
+        routes: dict[str, DestinationRoute] = {}
+
+        for storage_key, groups in _group_by_geometry(self.requesters).items():
+            for relay_index, (geometry, members) in enumerate(groups):
+                local_slice = next(
+                    (
+                        member_slice
+                        for member, member_slice in members
+                        if member == self.rank
+                    ),
+                    None,
+                )
+                if local_slice is None:
+                    continue
+
+                target_slice = self._slice(geometry)
+                target_bytes = get_slice_numel(target_slice) * self._element_size(
+                    storage_key
+                )
+                # The ingress rank serves every peer, and how many peers there
+                # are does not depend on which member is chosen.
+                ingress_rank, ingress_slice = self.balance.choose(
+                    storage_key,
+                    relay_index,
+                    members,
+                    target_bytes * (len(members) - 1),
+                    name=lambda member: member[0],
+                )
+                peers = tuple(member for member in members if member[0] != ingress_rank)
+
+                relay_id = f"{storage_key}#{relay_index}" if peers else None
+
+                if ingress_rank == self.rank:
+                    routes[storage_key] = DestinationRoute(
+                        destination_slice=ingress_slice,
+                        transfers=self._publisher_transfers(storage_key, target_slice),
+                        notify_relay_id=relay_id,
+                        notify_peers=tuple(peer for peer, _slice in peers),
+                    )
+                else:
+                    routes[storage_key] = DestinationRoute(
+                        destination_slice=local_slice,
+                        transfers=(
+                            Transfer(
+                                source=ingress_rank,
+                                source_volume_id=ingress_rank,
+                                segment=target_slice,
+                                nbytes=target_bytes,
+                            ),
+                        ),
+                        wait_for_relay_id=relay_id,
+                    )
+
         return LocalRouteTable(
             rank=self.rank,
             volume_id=self.rank,
             role=RankRole.REQUESTER,
-            keys=keys,
+            keys={
+                storage_key: KeyPlan(item.tensor_slice, routes.get(storage_key))
+                for storage_key, item in sorted(self.registrations.items())
+            },
         )
 
 
@@ -288,13 +383,21 @@ class RoutingPlan:
         registrations: Mapping[str, KeyRegistration],
         publishers: Registrations,
         balance: Balance = Balance.ROTATE,
+        *,
+        requesters: Registrations | None = None,
     ) -> RoutingPlan:
         """Build one requester plan from its layout and every publisher's."""
+        if balance.sequential:
+            raise ValueError(
+                f"{balance.value!r} balances against a running total, so ranks "
+                "only agree when one planner builds them all"
+            )
         return cls(
             _Builder(
                 rank,
                 registrations,
                 publishers,
+                requesters,
                 balance,
             ).build()
         )

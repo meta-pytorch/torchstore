@@ -16,7 +16,9 @@ from torchstore.client import ClientType
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import RoutingCoordinator
+from torchstore.routing.service import RoutingService, RoutingServiceGroup
 from torchstore.storage_volume import StorageVolume
+from torchstore.strategy import MultiMeshStrategy
 
 
 def test_routing_namespaces_distinguish_participant_meshes(monkeypatch) -> None:
@@ -45,18 +47,22 @@ def test_routing_namespaces_distinguish_participant_meshes(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("mesh", "strategy"),
+    ("mesh", "relay_meshes", "strategy", "message"),
     [
-        (None, object()),
-        (object(), None),
+        (None, [object()], object(), "both mesh and strategy"),
+        (object(), [object()], None, "both mesh and strategy"),
+        (object(), [], object(), "at least one relay mesh"),
     ],
 )
-def test_routing_initialization_validates_required_arguments(mesh, strategy) -> None:
+def test_routing_initialization_validates_required_arguments(
+    mesh, relay_meshes, strategy, message: str
+) -> None:
     """Reject incomplete routing-mode initialization before spawning actors."""
-    with pytest.raises(RuntimeError, match="both mesh and strategy"):
+    with pytest.raises(RuntimeError, match=message):
         asyncio.run(
             store_api.initialize(
                 mesh=mesh,
+                relay_meshes=relay_meshes,
                 strategy=strategy,
                 client_type=ClientType.ROUTING,
                 store_name="routing-test",
@@ -64,7 +70,7 @@ def test_routing_initialization_validates_required_arguments(mesh, strategy) -> 
         )
 
 
-def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
+def test_routing_initialization_spawns_volumes_services_and_coordinator(
     monkeypatch,
 ) -> None:
     """Initialize publisher storage and register every participating rank."""
@@ -78,40 +84,70 @@ def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
         def size(self) -> int:
             return self._size
 
-    strategy = SimpleNamespace(set_storage_volumes=AsyncMock())
+    strategy = MultiMeshStrategy()
+    strategy.set_storage_volumes = AsyncMock()
     coordinator = SimpleNamespace(init=SimpleNamespace(call_one=AsyncMock()))
     volumes = object()
+    services = object()
     spawn_volumes = AsyncMock(return_value=volumes)
+    spawn_services = AsyncMock(return_value=services)
+    set_services = AsyncMock()
     spawn_coordinator = AsyncMock(return_value=coordinator)
 
     monkeypatch.setattr(StorageVolume, "spawn", spawn_volumes)
+    monkeypatch.setattr(RoutingService, "spawn", spawn_services)
+    monkeypatch.setattr(RoutingServiceGroup, "set_services", set_services)
     monkeypatch.setattr(store_api, "get_or_spawn_controller", spawn_coordinator)
     monkeypatch.setattr(store_api, "current_rank", lambda: SimpleNamespace(rank=0))
     publisher = Mesh("publisher-mesh", 2)
-    # 2. Initialize the publisher mesh.
+    requester_0 = Mesh("requester-mesh-0", 1)
+    requester_1 = Mesh("requester-mesh-1", 2)
+
+    # 2. Initialize one publisher mesh and two requester meshes.
     asyncio.run(
         store_api.initialize(
             mesh=publisher,
+            relay_meshes=[requester_0, requester_1],
             strategy=strategy,
             client_type=ClientType.ROUTING,
             store_name="routing-test",
         )
     )
 
-    # 3. Verify the publisher volume and publisher roster.
-    spawn_volumes.assert_awaited_once()
-    args, kwargs = spawn_volumes.await_args
-    assert args == (1, publisher)
-    assert kwargs["id_func"]() == "publisher/0"
-    strategy.set_storage_volumes.assert_awaited_once_with(volumes)
+    # 3. Verify participant volumes, services, and the complete roster.
+    assert [call.args[:2] for call in spawn_volumes.await_args_list] == [
+        (1, publisher),
+        (1, requester_0),
+        (1, requester_1),
+    ]
+    assert [call.kwargs["id_func"]() for call in spawn_volumes.await_args_list] == [
+        "publisher/0",
+        "requester/0/0",
+        "requester/1/0",
+    ]
+    strategy.set_storage_volumes.assert_awaited_once_with(volumes, volumes, volumes)
+    assert [call.args[0] for call in spawn_services.await_args_list] == [
+        publisher,
+        requester_0,
+        requester_1,
+    ]
+    set_services.assert_awaited_once_with(services, services, services)
     spawn_coordinator.assert_awaited_once_with("routing-test", RoutingCoordinator)
+    init_call = coordinator.init.call_one.await_args
     coordinator.init.call_one.assert_awaited_once_with(
         publishers={
             "publisher/0",
             "publisher/1",
         },
+        requesters={
+            "requester/0/0",
+            "requester/1/0",
+            "requester/1/1",
+        },
+        services=init_call.kwargs["services"],
         strategy=strategy,
     )
+    assert isinstance(init_call.kwargs["services"], RoutingServiceGroup)
 
 
 def test_client_constructs_and_caches_a_routing_client(monkeypatch) -> None:

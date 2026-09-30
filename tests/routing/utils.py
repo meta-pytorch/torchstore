@@ -44,10 +44,12 @@ async def routing_clients(
 ) -> dict[str, RoutingClient]:
     """Spawn routing infrastructure without registering state-dict layouts."""
     publisher_mesh = this_host().spawn_procs(per_host={"procs": len(publishers)})
+    requester_mesh = this_host().spawn_procs(per_host={"procs": len(requesters)})
     store_name = f"routing-test-{uuid.uuid4()}"
-    strategy = ts.LocalRankStrategy(TransportType.MonarchRPC)
+    strategy = ts.MultiMeshStrategy(TransportType.MonarchRPC)
     await ts.initialize(
         mesh=publisher_mesh,
+        relay_meshes=[requester_mesh],
         strategy=strategy,
         client_type=ts.ClientType.ROUTING,
         store_name=store_name,

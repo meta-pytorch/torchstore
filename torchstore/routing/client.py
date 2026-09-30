@@ -16,7 +16,12 @@ from torch.distributed.tensor import DTensor
 
 from torchstore.client import LocalClient
 from torchstore.logging import LatencyTracker
-from torchstore.state_dict_utils import _state_dict_storage_metadata, DELIM, MAPPING
+from torchstore.state_dict_utils import (
+    _state_dict_mapping_key,
+    _state_dict_storage_metadata,
+    DELIM,
+    MAPPING,
+)
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
@@ -95,17 +100,53 @@ class RoutingClient(LocalClient):
                 "user_state_dict is required for the first routed get_state_dict"
             )
 
-        slices, dtypes, _mapping = _state_dict_storage_metadata(state_dict, key)
+        slices, dtypes, mapping = _state_dict_storage_metadata(state_dict, key)
         registrations = {
             name: KeyRegistration(tensor_slice, dtype=dtypes[name])
             for name, tensor_slice in slices.items()
         }
         rank = self._routing_directory.rank
-        publishers = await self._coordinator.get_layouts.call_one(key=key)
-        self._routing_directory.install(
-            RoutingPlan.for_requester(rank, registrations, publishers)
+        (
+            publishers,
+            requesters,
+            services,
+        ) = await self._coordinator.register_requester_layout.call_one(
+            rank=rank,
+            key=key,
+            registrations=registrations,
         )
+        self._routing_directory.install(
+            RoutingPlan.for_requester(
+                rank,
+                registrations,
+                publishers,
+                requesters=requesters,
+            ),
+            services,
+        )
+        await self._publish_mapping(key, mapping)
         self._registered_layouts.add(key)
+
+    async def _publish_mapping(self, key: str, mapping: Mapping[str, Any]) -> None:
+        """Publish this ingress's mapping entries once during registration."""
+        if self._role != RankRole.REQUESTER:
+            return
+        prefix = f"{key}/"
+        direct_keys = {
+            storage_key.removeprefix(prefix)
+            for storage_key, entry in self._routing_directory.routes.keys.items()
+            if storage_key.startswith(prefix)
+            and entry.route is not None
+            and entry.route.wait_for_relay_id is None
+        }
+        if direct_keys:
+            await self.put_batch(
+                {
+                    _state_dict_mapping_key(key): {
+                        flat_key: mapping[flat_key] for flat_key in direct_keys
+                    }
+                }
+            )
 
     @torch.no_grad()
     async def put_batch(self, entries: dict[str, torch.Tensor | Any]) -> None:
@@ -158,7 +199,7 @@ class RoutingClient(LocalClient):
             )
 
     async def _fetch(self, requests: list[Request]) -> dict[str, Any]:
-        """Read objects, then routed slices directly from publishers.
+        """Read objects, then routed slices, relaying between peers as planned.
 
         Args:
             requests: Pre-built Request per key (may include tensor_slice).
@@ -185,22 +226,33 @@ class RoutingClient(LocalClient):
             tracker.track_e2e()
             return objects
 
-        self._resolve_destinations(tensor_requests)
+        resolved = self._resolve_destinations(tensor_requests)
         tracker.track_step("resolve")
 
-        published = await super()._fetch(tensor_requests)
+        by_key = {request.key: request for request in tensor_requests}
+        direct = [by_key[key] for key in resolved.keys_for(relay=False)]
+        published = await super()._fetch(direct) if direct else {}
         tracker.track_step("publisher")
 
-        tracker.track_e2e()
-        return published
+        await self._relay(resolved, direct, published)
+        tracker.track_step("relay_publish")
 
-    def _resolve_destinations(self, requests: list[Request]) -> None:
+        peer = [by_key[key] for key in resolved.keys_for(relay=True)]
+        if peer:
+            await self._routing_directory.wait_ready(resolved.relay_ids)
+        relayed = await super()._fetch(peer) if peer else {}
+        tracker.track_step("relay")
+
+        tracker.track_e2e()
+        return published | relayed
+
+    def _resolve_destinations(self, requests: list[Request]) -> Any:
         """Look up each request's planned route, checking the caller's buffer."""
-        targets = self._routing_directory.resolve_get_batch(
+        resolved = self._routing_directory.resolve_get_batch(
             [request.meta_only() for request in requests]
         )
         for request in requests:
-            target = targets[request.key]
+            target = resolved.targets[request.key]
             if request.tensor_val is not None and tuple(
                 request.tensor_val.shape
             ) != tuple(target.local_shape):
@@ -208,6 +260,22 @@ class RoutingClient(LocalClient):
                     f"destination for {request.key!r} has shape "
                     f"{tuple(request.tensor_val.shape)}, expected {target.local_shape}"
                 )
+        return resolved
+
+    async def _relay(
+        self, resolved: Any, direct: list[Request], published: dict[str, Any]
+    ) -> None:
+        """Store what this rank just read so its peers can read it from here."""
+        if not resolved.notifications:
+            return
+        await self.put_batch(
+            {
+                request.key: published[request.key]
+                for request in direct
+                if request.key in published
+            }
+        )
+        await self._routing_directory.notify_ready(resolved.notifications)
 
     async def _fetch_object(self, key: str) -> Any:
         """Merge a state-dict mapping and retain this requester's planned keys."""

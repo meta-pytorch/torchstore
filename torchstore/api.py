@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
+from collections.abc import Sequence
 from functools import partial
 from typing import Any, overload, TYPE_CHECKING
 
@@ -17,8 +19,13 @@ from torchstore.controller import Controller, ControllerDirectory
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import RoutingCoordinator
+from torchstore.routing.service import RoutingService, RoutingServiceGroup
 from torchstore.storage_volume import StorageVolume
-from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
+from torchstore.strategy import (
+    ControllerStorageVolumes,
+    MultiMeshStrategy,
+    TorchStoreStrategy,
+)
 from torchstore.transport.types import TensorSlice
 
 if TYPE_CHECKING:
@@ -47,7 +54,7 @@ def _routing_namespace(role: RankRole, group: int | None) -> str:
             raise ValueError("publishers are a single mesh and take no group")
         return role.value
     if group is None:
-        raise ValueError("requesters must pass the index of their requester mesh")
+        raise ValueError("requesters must pass the index of their relay mesh")
     return f"{role.value}/{group}"
 
 
@@ -57,6 +64,7 @@ async def initialize(
     store_name: str = DEFAULT_TORCHSTORE_NAME,
     mesh: ProcMesh | None = None,
     client_type: ClientType = ClientType.STANDARD,
+    relay_meshes: Sequence[ProcMesh] | None = None,
 ) -> None:
     """Initialize the TorchStore distributed storage system.
 
@@ -70,6 +78,8 @@ async def initialize(
         mesh (ProcMesh, optional): Monarch ProcMesh on which to spawn StorageVolumes
         client_type: Client implementation to initialize. Routing clients lazily
             exchange state-dict layouts and construct routes.
+        relay_meshes: Requester ProcMeshes used by routing clients to relay
+            tensors between ranks with identical destination slices.
 
     Raises:
         RuntimeError: If num_storage_volumes > 1 but no strategy is provided.
@@ -82,7 +92,7 @@ async def initialize(
     if client_type == ClientType.ROUTING:
         if strategy is None or mesh is None:
             raise RuntimeError("routing mode requires both mesh and strategy")
-        await _initialize_routing(mesh, strategy, store_name)
+        await _initialize_routing(mesh, relay_meshes, strategy, store_name)
         return
 
     if num_storage_volumes == 1 and strategy is None:
@@ -117,23 +127,57 @@ async def initialize(
 
 async def _initialize_routing(
     mesh: ProcMesh,
+    relay_meshes: Sequence[ProcMesh] | None,
     strategy: TorchStoreStrategy,
     store_name: str,
 ) -> None:
-    """Spawn trainer volumes and the coordinator that routing mode needs."""
-    namespace = _routing_namespace(RankRole.PUBLISHER, None)
-    volumes = await StorageVolume.spawn(
-        1,
-        mesh,
-        id_func=partial(_routing_volume_id, namespace),
-    )
-    await strategy.set_storage_volumes(volumes)
+    """Spawn the volumes, services and coordinator that routing mode needs."""
+    if not relay_meshes:
+        raise RuntimeError("routing mode requires at least one relay mesh")
+    if not isinstance(strategy, MultiMeshStrategy):
+        raise RuntimeError(
+            "routing mode needs a MultiMeshStrategy: publisher and relay "
+            f"volumes span several ProcMeshes, which {type(strategy).__name__} "
+            "cannot index"
+        )
 
-    publishers = {f"{namespace}/{rank}" for rank in range(mesh.size())}
+    namespaces = [_routing_namespace(RankRole.PUBLISHER, None)] + [
+        _routing_namespace(RankRole.REQUESTER, group)
+        for group in range(len(relay_meshes))
+    ]
+    meshes = [mesh, *relay_meshes]
+    volumes = await asyncio.gather(
+        *(
+            StorageVolume.spawn(1, m, id_func=partial(_routing_volume_id, namespace))
+            for m, namespace in zip(meshes, namespaces, strict=True)
+        )
+    )
+    await strategy.set_storage_volumes(*volumes)
+
+    publishers = {f"{namespaces[0]}/{rank}" for rank in range(mesh.size())}
+    requesters = {
+        f"{namespace}/{rank}"
+        for participant_mesh, namespace in zip(
+            relay_meshes, namespaces[1:], strict=True
+        )
+        for rank in range(participant_mesh.size())
+    }
+
+    services = RoutingServiceGroup()
+    await services.set_services(
+        *await asyncio.gather(
+            *(
+                RoutingService.spawn(m, id_func=partial(_routing_volume_id, namespace))
+                for m, namespace in zip(meshes, namespaces, strict=True)
+            )
+        )
+    )
 
     coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
     await coordinator.init.call_one(
         publishers=publishers,
+        requesters=requesters,
+        services=services,
         strategy=strategy,
     )
 

@@ -66,8 +66,8 @@ def test_resolve_get_batch_validates_request_metadata() -> None:
     directory.install(_routing_plan())
     wrong = tensor_slice((1,), (3,), global_shape=(4,))
 
-    targets = directory.resolve_get_batch([Request(key="model/w")])
-    assert targets == {"model/w": tensor_slice((0,), (4,), global_shape=(4,))}
+    resolved = directory.resolve_get_batch([Request(key="model/w")])
+    assert resolved.targets == {"model/w": tensor_slice((0,), (4,), global_shape=(4,))}
 
     with pytest.raises(ValueError, match="does not match the plan"):
         directory.resolve_get_batch([Request(key="model/w", tensor_slice=wrong)])

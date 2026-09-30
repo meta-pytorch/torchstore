@@ -30,6 +30,7 @@ from torchstore.strategy import (
     ControllerStorageVolumes,
     HostStrategy,
     LocalRankStrategy,
+    MultiMeshStrategy,
     TorchStoreStrategy,
 )
 
@@ -62,6 +63,7 @@ __all__ = [
     "shutdown",
     "TorchStoreStrategy",
     "LocalRankStrategy",
+    "MultiMeshStrategy",
     "HostStrategy",
     "ControllerStorageVolumes",
     "put_state_dict",
