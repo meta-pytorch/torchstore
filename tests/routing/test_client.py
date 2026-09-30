@@ -36,7 +36,7 @@ async def test_requester_rejects_a_wrong_destination_shape() -> None:
     requester = (await _publisher_and_requester_clients())["requester/0/0"]
 
     with pytest.raises(ValueError, match="destination .* has shape .* expected"):
-        await requester.get("model/w", torch.empty(3))
+        await requester.get("model/w", torch.empty(3, dtype=torch.int64))
 
 
 @pytest.mark.asyncio
