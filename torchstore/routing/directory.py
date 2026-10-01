@@ -13,16 +13,16 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from torchstore.controller import ObjectType, StorageInfo
+from torchstore.directory import VolumeDirectory
 from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import same_slice_geometry
-
 from ._model import LocalRouteTable, RankRole
 
 if TYPE_CHECKING:
     from .plan import RoutingPlan
 
 
-class RoutingDirectory:
+class RoutingDirectory(VolumeDirectory):
     """Rank-local route metadata."""
 
     def __init__(self, rank: str) -> None:
@@ -43,7 +43,11 @@ class RoutingDirectory:
         Storage keys carry their namespace, so tables for different state dicts
         merge without collision.
         """
-        table = plan._local(self.rank)
+        table = plan.routes
+        if table.rank != self.rank:
+            raise ValueError(
+                f"cannot install rank {table.rank!r} routes for rank {self.rank!r}"
+            )
         if self._routes is None:
             self._routes = table
             return
@@ -82,11 +86,17 @@ class RoutingDirectory:
             targets[request.key] = self._target_slice(request)
         return targets
 
-    def locate_volumes(
+    async def locate_volumes(
         self,
         keys: list[str],
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
     ) -> dict[str, dict[str, StorageInfo]]:
-        """Volumes holding each key, and the form it is stored in."""
+        """Volumes holding each key, and the form it is stored in.
+
+        Routing plans already require complete publisher coverage. Routing does
+        not expose the mutable-store operations that use ``missing_ok``.
+        """
         return {key: self._locate(key) for key in keys}
 
     def _locate(self, key: str) -> dict[str, StorageInfo]:

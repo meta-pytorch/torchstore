@@ -10,7 +10,6 @@ from dataclasses import replace
 
 import pytest
 import torch
-
 from torchstore.routing._model import KeyRegistration
 from torchstore.routing.directory import RoutingDirectory
 from torchstore.routing.plan import RoutingPlan
@@ -19,17 +18,14 @@ from torchstore.transport.types import Request
 from .utils import tensor_slice
 
 
-def _routing_plan(namespace: str = "model") -> RoutingPlan:
+def _routing_plan(namespace: str = "model", rank: str = "requester") -> RoutingPlan:
     whole = tensor_slice((0,), (4,), global_shape=(4,))
     key = f"{namespace}/w"
     publishers = {"publisher": {key: KeyRegistration(whole, dtype=torch.float32)}}
-    requesters = {"requester": {key: KeyRegistration(whole, dtype=torch.float32)}}
-    return RoutingPlan(
-        {
-            rank: RoutingPlan.build_for(rank, publishers, requesters)._local(rank)
-            for rank in ("publisher", "requester")
-        }
-    )
+    registrations = {key: KeyRegistration(whole, dtype=torch.float32)}
+    if rank == "publisher":
+        return RoutingPlan.for_publisher(rank, registrations)
+    return RoutingPlan.for_requester(rank, registrations, publishers)
 
 
 def test_routes_are_unavailable_until_a_plan_is_installed() -> None:
@@ -55,10 +51,10 @@ def test_install_rejects_a_changed_volume() -> None:
     original = _routing_plan()
     directory.install(original)
     changed_table = replace(
-        original._local("requester"),
+        original.routes,
         volume_id="other-volume",
     )
-    changed = RoutingPlan({"requester": changed_table})
+    changed = RoutingPlan(changed_table)
 
     with pytest.raises(ValueError, match="cannot change volume or role"):
         directory.install(changed)
@@ -82,7 +78,7 @@ def test_resolve_get_batch_validates_request_metadata() -> None:
 def test_only_requesters_can_resolve_gets() -> None:
     """Prevent publisher-local tables from executing requester reads."""
     directory = RoutingDirectory("publisher")
-    directory.install(_routing_plan())
+    directory.install(_routing_plan(rank="publisher"))
 
     with pytest.raises(RuntimeError, match="only requester clients"):
         directory.resolve_get_batch([Request(key="model/w")])
