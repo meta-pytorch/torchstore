@@ -9,9 +9,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from itertools import product
+from typing import Any
 
 from monarch.actor import Actor, endpoint
 
+from torchstore.directory import VolumeDirectory
 from torchstore.storage_utils.trie import Trie
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
@@ -45,6 +47,28 @@ class StorageInfo:
         ), "Particularly dangerous to change storage type of an existing key, are you sure? Raise an issue if so."
 
         self.tensor_slices.update(other_storage_info.tensor_slices)
+
+
+class ControllerDirectory(VolumeDirectory):
+    """Adapts a remote controller to the shared directory interface."""
+
+    def __init__(self, controller: Any) -> None:
+        self._controller = controller
+
+    async def locate_volumes(
+        self,
+        keys: list[str],
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
+    ) -> dict[str, dict[str, StorageInfo]]:
+        try:
+            return await self._controller.locate_volumes.call_one(
+                keys,
+                missing_ok=missing_ok,
+                require_fully_committed=require_fully_committed,
+            )
+        except Exception as error:
+            raise KeyError(str(error)) from error
 
 
 class Controller(Actor):

@@ -12,7 +12,7 @@ from torch.distributed.tensor import DTensor
 
 import torchstore.state_dict_utils
 from torchstore.client import LocalClient
-from torchstore.controller import Controller
+from torchstore.controller import Controller, ControllerDirectory
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
@@ -145,8 +145,9 @@ async def client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> LocalClient:
     controller_strategy = await controller.get_controller_strategy.call_one()
 
     local_client = LocalClient(
-        controller=controller,
+        directory=ControllerDirectory(controller),
         strategy=controller_strategy,
+        controller=controller,
     )
     _local_clent_map[store_name] = local_client
 

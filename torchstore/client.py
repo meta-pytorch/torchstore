@@ -13,6 +13,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
+from torchstore.directory import VolumeDirectory
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer, Request, TensorSlice
@@ -36,18 +37,14 @@ class LocalClient:
 
     def __init__(
         self,
-        controller,
+        directory: VolumeDirectory,
         strategy,
+        *,
+        controller=None,
     ):
+        self._directory = directory
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
-
-    async def _locate_volumes(self, keys: list[str]):
-        """Helper method to call locate_volumes and convert any error to KeyError for missing keys."""
-        try:
-            return await self._controller.locate_volumes.call_one(keys)
-        except Exception as e:
-            raise KeyError(str(e)) from e
 
     @torch.no_grad
     async def put(self, key: str, value: torch.Tensor | Any):
@@ -214,7 +211,7 @@ class LocalClient:
             dict mapping each key to its raw fetched data (before inplace copy-back).
         """
         keys = [r.key for r in requests]
-        volume_maps = await self._locate_volumes(keys)
+        volume_maps = await self._directory.locate_volumes(keys)
         all_volume_ids: set[str] = {vid for vm in volume_maps.values() for vid in vm}
 
         # eagerly make transport buffers for all volumes
