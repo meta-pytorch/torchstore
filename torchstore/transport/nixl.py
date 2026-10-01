@@ -97,16 +97,24 @@ class NixlAgentCache(TransportCache):
         self._remote_agents: dict[str, bytes] = {}
 
     def register(self, tensor: torch.Tensor) -> Any:
-        """Register a contiguous tensor once for the lifetime of its storage."""
-        key = (tensor.data_ptr(), tensor.nbytes)
+        """Register a tensor's whole storage once for the lifetime of that storage.
+
+        Transfers build descriptors from the tensor itself, and NIXL accepts any
+        descriptor inside a registered region, so one registration covers every
+        view into the storage. Resharded gets write many views into one
+        destination parameter (5.6k views over 1.5k parameters for Qwen3.5-27B
+        pulled from FSDP4), and each registration costs ~1.8 ms over UCX/RoCE.
+        """
+        storage = tensor.untyped_storage()
+        key = (storage.data_ptr(), storage.nbytes())
         existing = self._registrations.get(key)
         if existing is not None:
             return existing.descriptors
 
-        descriptors = self.agent.register_memory(tensor, backends=[self.backend])
-        storage_ref = weakref.ref(
-            tensor.untyped_storage(), lambda _ref, _key=key: self._evict(_key)
-        )
+        # Not kept: a tensor over the storage would keep the storage alive.
+        region = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(storage)
+        descriptors = self.agent.register_memory(region, backends=[self.backend])
+        storage_ref = weakref.ref(storage, lambda _ref, _key=key: self._evict(_key))
         self._registrations[key] = _Registration(descriptors, storage_ref)
         return descriptors
 
