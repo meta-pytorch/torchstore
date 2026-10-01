@@ -6,6 +6,7 @@
 
 import logging
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -17,11 +18,65 @@ from torch.distributed.checkpoint._nested_dict import (
 )
 
 from torchstore.logging import LatencyTracker
+from torchstore.transport.types import Request, TensorSlice
 
 DELIM = "/"
 MAPPING = "MAPPING"
 
 logger = logging.getLogger(__name__)
+
+
+def _state_dict_storage_key(key: str, flat_key: str) -> str:
+    return f"{key}{DELIM}{flat_key}"
+
+
+def _state_dict_mapping_key(key: str) -> str:
+    return _state_dict_storage_key(key, MAPPING)
+
+
+def _state_dict_storage_metadata(
+    state_dict: Mapping[str, object],
+    key: str,
+    *,
+    transfer_dtype: torch.dtype | None = None,
+    preserve_dtype_keys: frozenset[str] = frozenset(),
+) -> tuple[
+    dict[str, TensorSlice],
+    dict[str, torch.dtype],
+    dict[str, tuple[str | int, ...]],
+]:
+    """Describe state-dict tensors using their normal TorchStore storage keys.
+
+    Returns:
+        slices: storage key -> the one slice this rank holds of it
+        dtypes: storage key -> dtype used on the wire.
+        mapping: flat key -> path in the nested state dict.
+    """
+    from torchstore.direct_weight_sync import _request_to_slice
+
+    flattened, mapping = flatten_state_dict(dict(state_dict))
+    slices = {}
+    dtypes = {}
+    for flat_key, value in flattened.items():
+        storage_key = _state_dict_storage_key(key, flat_key)
+        try:
+            request = Request.from_any(storage_key, value)
+        except TypeError as error:
+            raise TypeError(
+                f"state dict metadata only supports tensor values; "
+                f"{flat_key!r} has type {type(value)}"
+            ) from error
+        assert request.tensor_val is not None
+        slices[storage_key] = _request_to_slice(request, request.tensor_val)
+        dtype = request.tensor_val.dtype
+        if (
+            transfer_dtype is not None
+            and flat_key not in preserve_dtype_keys
+            and request.tensor_val.is_floating_point()
+        ):
+            dtype = transfer_dtype
+        dtypes[storage_key] = dtype
+    return slices, dtypes, mapping
 
 
 @dataclass
@@ -97,10 +152,13 @@ async def put_state_dict(
 
     # Batch all tensor entries, then put the mapping separately.
     # The mapping is stored last so it acts as a commit marker for the state dict.
-    entries = {f"{key}{DELIM}{k}": v for k, v in flattened_state_dict.items()}
+    entries = {
+        _state_dict_storage_key(key, flat_key): value
+        for flat_key, value in flattened_state_dict.items()
+    }
     await store.put_batch(entries)
     tracker.track_step("put_batch", nbytes=nbytes)
-    await store.put(f"{key}{DELIM}{MAPPING}", mapping)
+    await store.put(_state_dict_mapping_key(key), mapping)
     tracker.track_step("put_mapping")
     tracker.track_e2e(nbytes=nbytes)
 
@@ -136,7 +194,7 @@ async def get_state_dict(
 
     try:
         # Since the mapping is the last thing we write out, it also gaurantees the state dict is not pending
-        fetched_mapping = await store.get(f"{key}{DELIM}{MAPPING}")
+        fetched_mapping = await store.get(_state_dict_mapping_key(key))
     except Exception as e:
         raise RuntimeError(
             f"Mapping is missing from the store. This most likely means there is no matching 'push' call for this key: {key=}"
@@ -149,9 +207,11 @@ async def get_state_dict(
         else ({}, None)
     )
     if strict and user_mapping is not None:
-        assert user_mapping == fetched_mapping
+        assert user_mapping == fetched_mapping, (
+            "the stored state dict does not match this one; routing does not "
+            "support strict=True, since a rank reads only the keys it registered"
+        )
 
-    get_id = lambda fk: f"{key}{DELIM}{fk}"
     flattened_keys = list(fetched_mapping.keys())
 
     get_batch_dict = {}
@@ -161,12 +221,14 @@ async def get_state_dict(
         if t is not None and not isinstance(t, torch.Tensor):
             t = None
             logger.warning(f"non-tensor value found for in-place: {fk}")
-        get_batch_dict[get_id(fk)] = t
+        get_batch_dict[_state_dict_storage_key(key, fk)] = t
 
     results = await store.get_batch(get_batch_dict)
     nbytes = _flattened_nbytes(results)
     tracker.track_step("get_batch", nbytes=nbytes)
-    fetched_state_dict = {fk: results[get_id(fk)] for fk in flattened_keys}
+    fetched_state_dict = {
+        fk: results[_state_dict_storage_key(key, fk)] for fk in flattened_keys
+    }
 
     out = unflatten_state_dict(fetched_state_dict, fetched_mapping)
     tracker.track_step("unflatten")
