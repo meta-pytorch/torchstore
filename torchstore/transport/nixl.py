@@ -353,7 +353,7 @@ class NixlTransportBuffer(TransportBuffer):
                         break
                     timed_out |= time.monotonic() >= deadline
                     try:
-                        await asyncio.sleep(0)
+                        await asyncio.sleep(0.001)
                     except asyncio.CancelledError:
                         # Keep polling so the RPC retains both sides' tensor storage.
                         cancelled = True
