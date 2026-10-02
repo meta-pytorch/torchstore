@@ -13,6 +13,7 @@ spawn_procs to create proper multi-process actor meshes.
 Skipped when XPU hardware is not available.
 """
 
+import asyncio
 import os
 
 import pytest
@@ -270,5 +271,55 @@ async def test_xccl_state_dict():
         assert set(src.keys()) == set(got.keys())
         for k in src:
             assert abs(got[k] - src[k]) < 1e-3, f"{k}: {src[k]} != {got[k]}"
+    finally:
+        await ts.shutdown()
+
+
+@requires_xpu
+@pytest.mark.asyncio
+@pytest.mark.timeout(300)
+async def test_xccl_concurrent_gets_from_many_volumes():
+    """Two clients each fetch from four volumes at once, all communicators cold.
+
+    This is the shape of an RL weight pull: every generator gathers over every
+    storage volume, so each process creates several oneCCL communicators
+    concurrently, then transfers from all of them. oneCCL serializes both behind
+    process-global state while each call blocks on its peer, so without one
+    exchange at a time per client this formed a cross-process cycle and hung.
+    """
+    num_volumes = 4
+
+    class Writer(Actor):
+        def __init__(self):
+            os.environ["LOCAL_RANK"] = str(current_rank().rank)
+
+        @endpoint
+        async def put(self) -> tuple[str, float]:
+            rank = current_rank().rank
+            t = torch.full((1024, 1024), float(rank + 1), device="xpu")
+            await ts.put(f"concurrent_{rank}", t)
+            return f"concurrent_{rank}", float(t.sum().item())
+
+    class Reader(Actor):
+        def __init__(self):
+            os.environ["LOCAL_RANK"] = str(current_rank().rank)
+
+        @endpoint
+        async def get_all(self, keys: list[str]) -> dict[str, float]:
+            tensors = await asyncio.gather(*(ts.get(k) for k in keys))
+            return {k: float(t.sum().item()) for k, t in zip(keys, tensors)}
+
+    await ts.initialize(
+        num_storage_volumes=num_volumes,
+        strategy=ts.LocalRankStrategy(TransportType.XCCL),
+    )
+
+    writers = await spawn_actors(num_volumes, Writer, "writers")
+    readers = await spawn_actors(2, Reader, "readers")
+
+    try:
+        expected = dict(v for _, v in await writers.put.call())
+        for _, got in await readers.get_all.call(sorted(expected)):
+            assert got == expected
     finally:
         await ts.shutdown()

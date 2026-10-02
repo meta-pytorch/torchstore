@@ -11,9 +11,12 @@ avoiding the two device-host copies that gloo would incur.
 """
 
 import asyncio
+import contextlib
 import os
 import socket
+import threading
 import uuid
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from logging import getLogger
 from typing import Any, TYPE_CHECKING
@@ -34,6 +37,9 @@ if TYPE_CHECKING:
 logger = getLogger(__name__)
 
 _store_addrs: dict[str, tuple[str, int, str]] = {}
+# Admits one client-side XCCL exchange with a volume at a time per process;
+# see _exclusive_xccl_exchange.
+_exchange_lock = threading.Lock()
 
 TORCHSTORE_XCCL_ENABLED = os.environ.get("TORCHSTORE_XCCL_ENABLED", "1") == "1"
 TORCHSTORE_XCCL_INIT_TIMEOUT = int(
@@ -62,6 +68,48 @@ def _wait_with_timeout(work: Any, what: str, store_key: str | None) -> None:
             "Raise TORCHSTORE_XCCL_TRANSFER_TIMEOUT if the transfer is merely "
             "slow, or set it to 0 to wait indefinitely."
         ) from e
+
+
+def _warm_up_communicator(
+    pg: ProcessGroup, device: torch.device, group_name: str
+) -> None:
+    """Create the PG's oneCCL communicator now, with a 1-byte broadcast.
+
+    ProcessGroupXCCL creates its communicator lazily on the first collective.
+    Both sides call this during the handshake, so the communicator exists
+    before the bulk transfer that follows; see _exclusive_xccl_exchange for
+    why a client runs one such exchange at a time.
+    """
+    tiny = torch.zeros(1, dtype=torch.uint8, device=device)
+    opts = dist.BroadcastOptions()
+    opts.rootRank = 0
+    opts.rootTensor = 0
+    _wait_with_timeout(pg.broadcast([tiny], opts), "warm-up broadcast", group_name)
+    torch.xpu.synchronize(device)
+
+
+@contextlib.asynccontextmanager
+async def _exclusive_xccl_exchange() -> AsyncIterator[None]:
+    """Run one client exchange with a volume (handshake + transfer) at a time.
+
+    oneCCL serializes a process's communicator creation behind a global lock,
+    and with CCL_OP_SYNC its collectives too, while each one blocks on its
+    peer. A client exchanging with several volumes at once can then deadlock
+    across processes: it waits on volume V1 while V1 waits on a second client,
+    which waits on V2, which waits on the first client. A volume only starts
+    a transfer when a client asks for it, so with one exchange in flight per
+    client, every operation a volume is running belongs to a client that is
+    already in the matching call, and it completes. Volumes need no lock.
+
+    The lock is polled rather than acquired in a worker thread, so a
+    cancelled caller can never leave it held.
+    """
+    while not _exchange_lock.acquire(blocking=False):
+        await asyncio.sleep(0.01)
+    try:
+        yield
+    finally:
+        _exchange_lock.release()
 
 
 def xccl_available() -> bool:
@@ -193,6 +241,14 @@ class XcclTransportBuffer(TransportBuffer):
             return False
         return True
 
+    async def _put_requests(self, requests: list[Request]) -> None:
+        async with _exclusive_xccl_exchange():
+            await super()._put_requests(requests)
+
+    async def _get_requests(self, requests: list[Request]) -> list[Any]:
+        async with _exclusive_xccl_exchange():
+            return await super()._get_requests(requests)
+
     async def _pre_handshake(self) -> None:
         volume_id = self.storage_volume_ref.volume_id
         self.store_key = f"torchstore_xccl_{str(uuid.uuid4())[:8]}"
@@ -218,7 +274,7 @@ class XcclTransportBuffer(TransportBuffer):
         group_name = self.store_key
 
         def create_pg():
-            return _xccl_factory(
+            pg = _xccl_factory(
                 store=tcp_store,
                 rank=0,
                 world_size=2,
@@ -226,6 +282,11 @@ class XcclTransportBuffer(TransportBuffer):
                 device=device,
                 group_name=group_name,
             )
+            # Runs while the handshake RPC is in flight: the volume warms up
+            # its side before replying, so waiting for the reply first would
+            # deadlock.
+            _warm_up_communicator(pg, device, group_name)
+            return pg
 
         self._pg_task = asyncio.create_task(asyncio.to_thread(create_pg))
 
@@ -263,7 +324,7 @@ class XcclTransportBuffer(TransportBuffer):
                 is_master=False,
                 timeout=timedelta(seconds=TORCHSTORE_XCCL_INIT_TIMEOUT),
             )
-            return _xccl_factory(
+            pg = _xccl_factory(
                 store=tcp_store,
                 rank=1,
                 world_size=2,
@@ -271,6 +332,8 @@ class XcclTransportBuffer(TransportBuffer):
                 device=device,
                 group_name=group_name,
             )
+            _warm_up_communicator(pg, device, group_name)
+            return pg
 
         pg = await asyncio.to_thread(create_pg)
         ctx.get(XcclProcessGroupCache).put(self.store_key, pg)
