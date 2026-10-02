@@ -86,6 +86,9 @@ class FakeNixlAgent:
         self.config = config
         self.initialized = []
         self._check_errors_raised: set[int] = set()
+        # Registered address ranges by descriptor; like NIXL, a transfer
+        # descriptor must fall inside one of them.
+        self.regions: dict[int, tuple[int, int]] = {}
         self.calls = Mock()
         for method_name in ("transfer", "check_xfer_state", "release_xfer_handle"):
             method = Mock(wraps=getattr(self, method_name))
@@ -103,15 +106,23 @@ class FakeNixlAgent:
     def register_memory(self, tensor, *, backends):
         assert tensor.numel() > 0
         descriptor = id(tensor)
-        self.tensors[descriptor] = weakref.ref(tensor)
+        self.regions[descriptor] = (
+            tensor.data_ptr(),
+            tensor.data_ptr() + tensor.nbytes,
+        )
         return [descriptor]
 
     def deregister_memory(self, descriptors):
         for descriptor in descriptors:
-            self.tensors.pop(descriptor, None)
+            self.regions.pop(descriptor, None)
 
     def get_xfer_descs(self, tensor):
         assert tensor.numel() > 0
+        start, end = tensor.data_ptr(), tensor.data_ptr() + tensor.nbytes
+        assert any(
+            lo <= start and end <= hi for lo, hi in self.regions.values()
+        ), "transfer descriptor outside registered memory"
+        self.tensors[id(tensor)] = weakref.ref(tensor)
         return FakeXferDList([id(tensor)], self.memory_types.get(id(tensor), "DRAM"))
 
     def get_serialized_descs(self, descriptors):
@@ -673,13 +684,25 @@ def test_memory_registration_is_reused_for_same_tensor(agent_cache):
     assert agent_cache.agent.register_memory.call_count == 1
 
 
+def test_memory_registration_covers_all_views_of_a_storage(agent_cache):
+    tensor = torch.zeros(4, 16)
+
+    first = agent_cache.register(tensor[0])
+    second = agent_cache.register(tensor[1:3])
+
+    assert first is second
+    assert agent_cache.agent.register_memory.call_count == 1
+    (region,) = agent_cache.agent.register_memory.call_args.args
+    assert region.data_ptr() == tensor.data_ptr()
+    assert region.nbytes == tensor.nbytes
+
+
 def test_memory_registration_is_evicted_with_tensor_storage(agent_cache):
     tensor = torch.zeros(16)
     key = (tensor.data_ptr(), tensor.nbytes)
-    descriptor = id(tensor)
     agent = agent_cache.agent
 
-    agent_cache.register(tensor)
+    (descriptor,) = agent_cache.register(tensor)
     assert key in agent_cache._registrations
 
     # Mock call history retains arguments; clear it so it does not own the tensor.
