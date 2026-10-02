@@ -10,7 +10,6 @@ import asyncio
 
 import pytest
 import torch
-
 from torchstore.state_dict_utils import _state_dict_storage_metadata, get_state_dict
 
 
@@ -47,6 +46,9 @@ def test_strict_state_dict_mismatch() -> None:
     """Explain that strict reads cannot use a rank-local routed layout."""
 
     class Client:
+        async def get_layouts(self, state_dict, key):
+            pass
+
         async def get(self, key):
             return {"weight": ("weight",)}
 
