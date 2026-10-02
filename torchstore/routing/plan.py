@@ -12,13 +12,11 @@ import zlib
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from enum import Enum
-from typing import DefaultDict
 
 import torch
 
 from torchstore.transport.types import TensorSlice
 from torchstore.utils import get_slice_intersection, get_slice_numel
-
 from ._model import (
     DestinationRoute,
     KeyPlan,
@@ -95,8 +93,8 @@ def _group_by_geometry(registrations: Registrations) -> dict[str, list[_Group]]:
     On the publisher side they are interchangeable sources, so a tensor
     replicated across trainer DP collapses to one group.
     """
-    grouped: DefaultDict[
-        str, DefaultDict[_GeometryKey, list[tuple[str, TensorSlice]]]
+    grouped: defaultdict[
+        str, defaultdict[_GeometryKey, list[tuple[str, TensorSlice]]]
     ] = defaultdict(lambda: defaultdict(list))
     for rank, items in registrations.items():
         for storage_key, item in items.items():
@@ -112,16 +110,18 @@ def _group_by_geometry(registrations: Registrations) -> dict[str, list[_Group]]:
 
 
 class _Builder:
-    """Turns every rank's reported layout into per-rank route tables."""
+    """Builds one requester's routes from its layout and all publishers."""
 
     def __init__(
         self,
+        rank: str,
+        registrations: Mapping[str, KeyRegistration],
         publishers: Registrations,
-        requesters: Registrations,
         balance: Balance,
     ) -> None:
+        self.rank = rank
+        self.registrations = registrations
         self.publishers = publishers
-        self.requesters = requesters
         self.balance = _BALANCERS[balance]()
         # storage_key -> wire dtype
         self.dtypes: dict[str, torch.dtype] = {}
@@ -143,36 +143,29 @@ class _Builder:
         """Derive byte width from the validated wire dtype for ``key``."""
         return self.dtypes[key].itemsize
 
-    def _validate(self, rank: str) -> None:
+    def _validate(self) -> None:
         """Check everything the ranks must agree on before any route is built."""
         if not self.publishers:
             raise ValueError("routing requires at least one publisher rank")
-        if not self.requesters:
-            raise ValueError("routing requires at least one requester rank")
-
-        if rank not in self.publishers and rank not in self.requesters:
-            raise KeyError(f"rank did not register a layout: {rank!r}")
 
         published_keys = {
             key for registrations in self.publishers.values() for key in registrations
         }
-        requested_keys = {
-            key for registrations in self.requesters.values() for key in registrations
-        }
+        requested_keys = set(self.registrations)
         unpublished = requested_keys - published_keys
         if unpublished:
             raise KeyError(f"requester keys have no publisher: {sorted(unpublished)}")
 
         key_shapes: dict[str, tuple[int, ...]] = {}
         key_dtypes: dict[str, torch.dtype] = {}
-        for registrations_by_rank in (self.publishers, self.requesters):
-            for registrations in registrations_by_rank.values():
-                for key, item in registrations.items():
-                    global_shape = item.tensor_slice.global_shape
-                    if key_shapes.setdefault(key, global_shape) != global_shape:
-                        raise ValueError(f"inconsistent global shape for key {key!r}")
-                    if key_dtypes.setdefault(key, item.dtype) != item.dtype:
-                        raise ValueError(f"inconsistent dtype for key {key!r}")
+        registrations_by_rank = [*self.publishers.values(), self.registrations]
+        for registrations in registrations_by_rank:
+            for key, item in registrations.items():
+                global_shape = item.tensor_slice.global_shape
+                if key_shapes.setdefault(key, global_shape) != global_shape:
+                    raise ValueError(f"inconsistent global shape for key {key!r}")
+                if key_dtypes.setdefault(key, item.dtype) != item.dtype:
+                    raise ValueError(f"inconsistent dtype for key {key!r}")
 
     def _publisher_transfers(
         self,
@@ -217,20 +210,9 @@ class _Builder:
             )
         return tuple(transfers)
 
-    def build(self, rank: str) -> LocalRouteTable:
-        """Build one rank's route table from real TorchStore slice metadata."""
-        self._validate(rank)
-
-        if rank in self.publishers:
-            return LocalRouteTable(
-                rank=rank,
-                volume_id=rank,
-                role=RankRole.PUBLISHER,
-                keys={
-                    storage_key: KeyPlan(item.tensor_slice)
-                    for storage_key, item in sorted(self.publishers[rank].items())
-                },
-            )
+    def build(self) -> LocalRouteTable:
+        """Build the requester's route table from real slice metadata."""
+        self._validate()
 
         for registrations in self.publishers.values():
             for storage_key, item in registrations.items():
@@ -254,7 +236,7 @@ class _Builder:
         #   R0: DestinationRoute(dest=rows0-7,
         #                        transfers=[P0->rows0-3, P1->rows4-7])
         keys = {}
-        for storage_key, registration in sorted(self.requesters[rank].items()):
+        for storage_key, registration in sorted(self.registrations.items()):
             target_slice = self._slice(_geometry_key(registration.tensor_slice))
             keys[storage_key] = KeyPlan(
                 registration.tensor_slice,
@@ -264,41 +246,55 @@ class _Builder:
                 ),
             )
         return LocalRouteTable(
-            rank=rank,
-            volume_id=rank,
+            rank=self.rank,
+            volume_id=self.rank,
             role=RankRole.REQUESTER,
             keys=keys,
         )
 
 
 class RoutingPlan:
-    """Immutable per-rank routes produced once from global slice metadata."""
+    """Immutable local routes produced once from global slice metadata."""
 
     def __init__(
         self,
-        routes: Mapping[str, LocalRouteTable],
+        routes: LocalRouteTable,
     ) -> None:
-        self._routes = dict(routes)
+        self.routes = routes
 
     @classmethod
-    def build_for(
+    def for_publisher(
         cls,
         rank: str,
+        registrations: Mapping[str, KeyRegistration],
+    ) -> RoutingPlan:
+        """Build a publisher plan using only that rank's local registrations."""
+        return cls(
+            LocalRouteTable(
+                rank=rank,
+                volume_id=rank,
+                role=RankRole.PUBLISHER,
+                keys={
+                    storage_key: KeyPlan(item.tensor_slice)
+                    for storage_key, item in sorted(registrations.items())
+                },
+            )
+        )
+
+    @classmethod
+    def for_requester(
+        cls,
+        rank: str,
+        registrations: Mapping[str, KeyRegistration],
         publishers: Registrations,
-        requesters: Registrations,
         balance: Balance = Balance.ROTATE,
     ) -> RoutingPlan:
-        """Reconcile every rank's reported layout into ``rank``'s own plan."""
-        return cls({rank: _Builder(publishers, requesters, balance).build(rank)})
-
-    @property
-    def ranks(self) -> tuple[str, ...]:
-        """Ranks with a local table in this plan."""
-        return tuple(sorted(self._routes))
-
-    def lookup(self, rank: str, key: str) -> DestinationRoute | None:
-        """Return the immutable local actions for ``rank`` and ``key``."""
-        return self._routes[rank].lookup(key)
-
-    def _local(self, rank: str) -> LocalRouteTable:
-        return self._routes[rank]
+        """Build one requester plan from its layout and every publisher's."""
+        return cls(
+            _Builder(
+                rank,
+                registrations,
+                publishers,
+                balance,
+            ).build()
+        )
