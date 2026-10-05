@@ -9,15 +9,13 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Mapping
-from functools import partial
 from typing import Any
 
-from monarch.actor import current_rank, get_or_spawn_controller, this_host
+import torchstore as ts
+from monarch.actor import get_or_spawn_controller, this_host
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import RoutingCoordinator
-from torchstore.storage_volume import StorageVolume
-from torchstore.strategy import LocalRankStrategy
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 
@@ -40,10 +38,6 @@ def tensor_slice(
     )
 
 
-def _routing_volume_id(namespace: str) -> str:
-    return f"{namespace}/{current_rank().rank}"
-
-
 async def routing_clients(
     publishers: Mapping[str, Mapping[str, Any]],
     requesters: Mapping[str, Mapping[str, Any]],
@@ -51,18 +45,14 @@ async def routing_clients(
     """Spawn routing infrastructure without registering state-dict layouts."""
     publisher_mesh = this_host().spawn_procs(per_host={"procs": len(publishers)})
     store_name = f"routing-test-{uuid.uuid4()}"
-    strategy = LocalRankStrategy(TransportType.MonarchRPC)
-    volumes = await StorageVolume.spawn(
-        1,
-        publisher_mesh,
-        id_func=partial(_routing_volume_id, RankRole.PUBLISHER.value),
-    )
-    await strategy.set_storage_volumes(volumes)
-    coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
-    await coordinator.init.call_one(
-        publishers=set(publishers),
+    strategy = ts.LocalRankStrategy(TransportType.MonarchRPC)
+    await ts.initialize(
+        mesh=publisher_mesh,
         strategy=strategy,
+        client_type=ts.ClientType.ROUTING,
+        store_name=store_name,
     )
+    coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
     roles = {
         **{rank: RankRole.PUBLISHER for rank in publishers},
         **{rank: RankRole.REQUESTER for rank in requesters},

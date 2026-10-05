@@ -7,6 +7,7 @@
 import asyncio
 from collections import defaultdict
 from collections.abc import Mapping
+from enum import Enum
 from logging import getLogger
 from typing import Any
 
@@ -26,6 +27,13 @@ from torchstore.utils import (
 )
 
 logger = getLogger(__name__)
+
+
+class ClientType(str, Enum):
+    """Client implementation selected when initializing a store."""
+
+    STANDARD = "standard"
+    ROUTING = "routing"
 
 
 class LocalClient:
