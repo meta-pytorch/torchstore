@@ -139,6 +139,12 @@ async def put_state_dict(
         tracker.track_e2e()
         return
 
+    await store.register_layout(
+        state_dict,
+        key,
+        transfer_dtype=transfer_dtype,
+    )
+
     flattened_state_dict, mapping = flatten_state_dict(state_dict)
     tracker.track_step("flatten")
     # TODO: when transfer_dtype actually casts (source dtype != transfer_dtype),
@@ -192,6 +198,8 @@ async def get_state_dict(
         tracker.track_e2e(nbytes=_state_dict_nbytes(user_state_dict))
         return user_state_dict
 
+    await store.get_layouts(user_state_dict, key)
+
     try:
         # Since the mapping is the last thing we write out, it also gaurantees the state dict is not pending
         fetched_mapping = await store.get(_state_dict_mapping_key(key))
@@ -240,13 +248,15 @@ def _cast_floating_tensors(flattened_state_dict, dtype):
     if dtype is None:
         return flattened_state_dict
     return {
-        key: value.to(dtype)
-        if (
-            isinstance(value, torch.Tensor)
-            and value.is_floating_point()
-            and value.dtype != dtype
+        key: (
+            value.to(dtype)
+            if (
+                isinstance(value, torch.Tensor)
+                and value.is_floating_point()
+                and value.dtype != dtype
+            )
+            else value
         )
-        else value
         for key, value in flattened_state_dict.items()
     }
 
