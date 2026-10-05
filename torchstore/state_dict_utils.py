@@ -198,7 +198,7 @@ async def get_state_dict(
         tracker.track_e2e(nbytes=_state_dict_nbytes(user_state_dict))
         return user_state_dict
 
-    await store.get_layouts(user_state_dict, key)
+    await store.get_layouts(user_state_dict, key, strict=strict)
 
     try:
         # Since the mapping is the last thing we write out, it also gaurantees the state dict is not pending

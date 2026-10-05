@@ -46,7 +46,7 @@ def test_strict_state_dict_mismatch() -> None:
     """Explain that strict reads cannot use a rank-local routed layout."""
 
     class Client:
-        async def get_layouts(self, state_dict, key):
+        async def get_layouts(self, state_dict, key, *, strict=True):
             pass
 
         async def get(self, key):
