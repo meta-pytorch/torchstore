@@ -84,6 +84,8 @@ class RoutingClient(LocalClient):
         self,
         state_dict: Mapping[str, Any] | None,
         key: str,
+        *,
+        strict: bool = True,
     ) -> None:
         """Fetch publisher layouts and install one requester plan."""
         if key in self._registered_layouts:
@@ -95,13 +97,25 @@ class RoutingClient(LocalClient):
                 "user_state_dict is required for the first routed get_state_dict"
             )
 
+        publishers = await self._coordinator.get_layouts.call_one(key=key)
         slices, dtypes, _mapping = _state_dict_storage_metadata(state_dict, key)
+        if not strict:
+            published_keys = {
+                name
+                for publisher_registrations in publishers.values()
+                for name in publisher_registrations
+            }
+            slices = {
+                name: tensor_slice
+                for name, tensor_slice in slices.items()
+                if name in published_keys
+            }
+            dtypes = {name: dtype for name, dtype in dtypes.items() if name in slices}
         registrations = {
             name: KeyRegistration(tensor_slice, dtype=dtypes[name])
             for name, tensor_slice in slices.items()
         }
         rank = self._routing_directory.rank
-        publishers = await self._coordinator.get_layouts.call_one(key=key)
         self._routing_directory.install(
             RoutingPlan.for_requester(rank, registrations, publishers)
         )

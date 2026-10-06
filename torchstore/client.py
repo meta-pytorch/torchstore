@@ -69,6 +69,8 @@ class LocalClient:
         self,
         state_dict: Mapping[str, Any] | None,
         key: str,
+        *,
+        strict: bool = True,
     ) -> None:
         """Hook for clients that require state-dict requester registration."""
 

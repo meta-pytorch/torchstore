@@ -185,3 +185,30 @@ async def test_source_only_mapping_entry_is_not_requested() -> None:
 
     assert set(result) == {"first"}
     torch.testing.assert_close(result["first"], first)
+
+
+@pytest.mark.asyncio
+async def test_destination_only_entry_is_ignored_by_non_strict_read() -> None:
+    """Keep requester-local tensors that have no corresponding publisher key."""
+    source = torch.arange(2)
+    local_only = torch.full((2,), -1)
+    destination = {
+        "weight": torch.zeros_like(source),
+        "local_only": local_only,
+    }
+    clients = await routing_clients(
+        publishers={"publisher/0": {"weight": source}},
+        requesters={"requester/0/0": destination},
+    )
+
+    await put_state_dict(clients["publisher/0"], {"weight": source}, "model")
+    result = await get_state_dict(
+        clients["requester/0/0"],
+        "model",
+        destination,
+        strict=False,
+    )
+
+    assert set(result) == {"weight"}
+    torch.testing.assert_close(result["weight"], source)
+    torch.testing.assert_close(destination["local_only"], local_only)
