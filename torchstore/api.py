@@ -192,9 +192,9 @@ async def client(
     Args:
         store_name (str): Name of the store to get a client for. Defaults to DEFAULT_TORCHSTORE_NAME.
         role: Set on a rank of a routing store to get a routing client:
-            ``"publisher"`` for ranks on the publisher mesh and ``"requester"``
-            for ranks on a requester mesh. State-dict put/get operations register
-            its layout lazily.
+            ``RankRole.PUBLISHER`` for ranks on the publisher mesh and
+            ``RankRole.REQUESTER`` for ranks on a requester mesh. State-dict
+            put/get operations register its layout lazily.
         group: Requester-mesh index used to namespace requester ranks. Required
             for requesters, rejected for publishers.
 

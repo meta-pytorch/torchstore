@@ -26,6 +26,7 @@ from torchstore.api import (
 )
 from torchstore.client import ClientType
 from torchstore.logging import init_logging
+from torchstore.routing._model import RankRole
 from torchstore.strategy import (
     ControllerStorageVolumes,
     HostStrategy,
@@ -59,6 +60,7 @@ __all__ = [
     "exists",
     "client",
     "ClientType",
+    "RankRole",
     "shutdown",
     "TorchStoreStrategy",
     "LocalRankStrategy",

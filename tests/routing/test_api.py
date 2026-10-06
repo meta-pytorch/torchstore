@@ -12,8 +12,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 import torchstore.api as store_api
+from torchstore import RankRole
 from torchstore.client import ClientType
-from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import RoutingCoordinator
 from torchstore.storage_volume import StorageVolume
