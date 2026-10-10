@@ -93,6 +93,8 @@ class Request:
         key (str): The storage key for this request.
         tensor_val (Optional[torch.Tensor]): The actual tensor data to store/retrieve.
             For DTensors, this contains the local tensor shard.
+        tensor_meta (Optional[tuple[torch.Size, torch.dtype]]): Shape and dtype of
+            tensor_val, retained when constructing metadata-only PUT requests.
         tensor_slice (Optional[TensorSlice]): Metadata about distributed tensor sharding,
             including offsets, coordinates, and shape information.
         objects (Optional[Any]): Arbitrary Python objects that must be pickleable.
@@ -101,6 +103,7 @@ class Request:
 
     key: str = ""
     tensor_val: torch.Tensor | None = None
+    tensor_meta: tuple[torch.Size, torch.dtype] | None = None
     tensor_slice: TensorSlice | None = None
     objects: Any | None = None
     is_object: bool = False
@@ -209,9 +212,14 @@ class Request:
 
     def meta_only(self) -> "Request":
         """Returns a copy of this request with tensor_val set to None."""
+        tensor_meta = self.tensor_meta
+        if self.tensor_val is not None:
+            tensor_meta = (self.tensor_val.shape, self.tensor_val.dtype)
+
         return Request(
             key=self.key,
             tensor_val=None,
+            tensor_meta=tensor_meta,
             tensor_slice=self.tensor_slice,
             objects=self.objects,
             is_object=self.is_object,

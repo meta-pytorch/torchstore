@@ -13,10 +13,13 @@ in shared memory, allowing:
 - Persistence - stored tensor remains in shared memory for O(1) subsequent access
 """
 
+import asyncio
 import functools
 import logging
 import os
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -241,6 +244,12 @@ class SharedMemoryEntry:
         return torch.as_strided(base, d.shape, d.resolved_stride(), d.storage_offset)
 
 
+@dataclass
+class _KeyLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
 class SharedMemoryCache(TransportCache):
     """Client-side cache for shared memory segments.
 
@@ -250,6 +259,72 @@ class SharedMemoryCache(TransportCache):
 
     def __init__(self):
         self._storages: dict[tuple[str, bytes], torch.UntypedStorage] = {}
+        self._key_locks: dict[str, _KeyLock] = {}
+
+    @asynccontextmanager
+    async def lock_keys(self, keys: Iterable[str]) -> AsyncIterator[None]:
+        """Serialize operations that may mutate the same cached keys."""
+        locks: list[tuple[str, _KeyLock]] = []
+        for key in sorted(set(keys)):
+            key_lock = self._key_locks.setdefault(key, _KeyLock())
+            key_lock.users += 1
+            locks.append((key, key_lock))
+
+        acquired: list[_KeyLock] = []
+        try:
+            for _, key_lock in locks:
+                await key_lock.lock.acquire()
+                acquired.append(key_lock)
+            yield
+        finally:
+            for key_lock in reversed(acquired):
+                key_lock.lock.release()
+            for key, key_lock in locks:
+                key_lock.users -= 1
+                if key_lock.users == 0 and self._key_locks.get(key) is key_lock:
+                    del self._key_locks[key]
+
+    def _evict(self, cache_keys: list[tuple[str, bytes]]) -> None:
+        """Remove cached mappings and unpin their storage."""
+        for cache_key in cache_keys:
+            storage = self._storages.pop(cache_key, None)
+            if storage is not None:
+                unpin_memory(storage)
+
+    def _attach(
+        self,
+        key: str,
+        descriptor: SharedMemoryDescriptor,
+        *,
+        evict_stale: bool,
+    ) -> SharedMemoryEntry:
+        """Attach a descriptor, optionally evicting stale handles for its key."""
+        cache_key = (key, descriptor.storage_handle)
+        storage = self._storages.get(cache_key)
+
+        if storage is not None and storage.nbytes() == descriptor.size:
+            if evict_stale:
+                self._evict(
+                    [
+                        candidate
+                        for candidate in self._storages
+                        if candidate[0] == key and candidate != cache_key
+                    ]
+                )
+            return SharedMemoryEntry(storage=storage, descriptor=descriptor)
+
+        entry = descriptor.attach()
+        pin_memory(entry.storage)
+
+        stale_keys = [
+            candidate
+            for candidate in self._storages
+            if candidate == cache_key
+            or (evict_stale and candidate[0] == key)
+        ]
+        self._evict(stale_keys)
+        self._storages[cache_key] = entry.storage
+        return entry
 
     def allocate(
         self,
@@ -261,34 +336,38 @@ class SharedMemoryCache(TransportCache):
         new_tensor = allocate_shared_tensor(shape, dtype)
         descriptor = SharedMemoryDescriptor.from_tensor(new_tensor)
         assert descriptor is not None
-        entry = self.attach(key, descriptor)
+        entry = self._attach(key, descriptor, evict_stale=False)
         return entry, descriptor
 
     def attach(self, key: str, descriptor: SharedMemoryDescriptor) -> SharedMemoryEntry:
         """Attach to shared memory segment, caching the storage."""
-        cache_key = (key, descriptor.storage_handle)
+        return self._attach(key, descriptor, evict_stale=True)
 
+    def promote(self, key: str, storage_handle: bytes) -> None:
+        """Retain a committed allocation and evict older handles for its key."""
+        cache_key = (key, storage_handle)
         if cache_key not in self._storages:
-            entry = descriptor.attach()
-            pin_memory(entry.storage)
-            self._storages[cache_key] = entry.storage
-
-        return SharedMemoryEntry(
-            storage=self._storages[cache_key], descriptor=descriptor
+            return
+        self._evict(
+            [
+                candidate
+                for candidate in self._storages
+                if candidate[0] == key and candidate != cache_key
+            ]
         )
+
+    def discard(self, key: str, storage_handle: bytes) -> None:
+        """Discard an allocation whose request did not commit."""
+        self._evict([(key, storage_handle)])
 
     def clear(self) -> None:
         """Clear all entries."""
-        for storage in self._storages.values():
-            unpin_memory(storage)
-        self._storages.clear()
+        self._evict(list(self._storages))
 
     def delete(self, keys: set[str]) -> None:
         """Clear cached shared-memory mappings for deleted TorchStore keys."""
         cache_keys = [cache_key for cache_key in self._storages if cache_key[0] in keys]
-        for cache_key in cache_keys:
-            storage = self._storages.pop(cache_key)
-            unpin_memory(storage)
+        self._evict(cache_keys)
 
     def __del__(self):
         self.clear()
@@ -329,13 +408,21 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         # Batch state – one context per processed entry
         self._contexts: list[ShmContext] = []
+        self._pending_allocations: list[tuple[str, bytes]] = []
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         return self._needs_handshake
 
     async def put_to_storage_volume(self, requests: list[Request]) -> None:
-        self._needs_handshake = True
-        await super().put_to_storage_volume(requests)
+        shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
+        async with shm_cache.lock_keys(request.key for request in requests):
+            self._needs_handshake = True
+            await super().put_to_storage_volume(requests)
+
+    async def get_from_storage_volume(self, requests: list[Request]) -> list[Any]:
+        shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
+        async with shm_cache.lock_keys(request.key for request in requests):
+            return await super().get_from_storage_volume(requests)
 
     async def recv_handshake(
         self,
@@ -398,6 +485,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                 client_entry, descriptor = shm_cache.allocate(
                     key, tensor.shape, tensor.dtype
                 )
+                self._pending_allocations.append((key, descriptor.storage_handle))
 
             self._contexts.append(ShmContext(descriptor=descriptor))
 
@@ -519,5 +607,22 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
         return results
 
+    async def _post_request_success(self) -> None:
+        if not self._pending_allocations:
+            return
+
+        shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
+        committed_handles: dict[str, bytes] = {}
+        for key, storage_handle in self._pending_allocations:
+            committed_handles[key] = storage_handle
+        for key, storage_handle in committed_handles.items():
+            shm_cache.promote(key, storage_handle)
+        self._pending_allocations.clear()
+
     async def drop(self) -> None:
+        if self._pending_allocations:
+            shm_cache = self.storage_volume_ref.transport_context.get(SharedMemoryCache)
+            for key, storage_handle in self._pending_allocations:
+                shm_cache.discard(key, storage_handle)
+            self._pending_allocations.clear()
         self._contexts = []
