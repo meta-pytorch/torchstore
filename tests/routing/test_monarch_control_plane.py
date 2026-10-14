@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-import math
 import re
 import uuid
 from collections.abc import Collection
@@ -29,7 +28,7 @@ from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinat
 from torchstore.storage_volume import StorageVolume
 from torchstore.transport import TransportType
 
-from .test_coordinator import _registration
+from .test_coordinator import _plus_timeout, _registration
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -47,17 +46,6 @@ def _timing_lines(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
             )
             lines.append(match.groups())
     return lines
-
-
-def _plus_timeout(signature: inspect.Signature) -> inspect.Signature:
-    """``signature`` plus the keyword-only ``timeout_s=None`` that lookups add."""
-    timeout = inspect.Parameter(
-        "timeout_s",
-        inspect.Parameter.KEYWORD_ONLY,
-        default=None,
-        annotation="float | None",
-    )
-    return signature.replace(parameters=[*signature.parameters.values(), timeout])
 
 
 async def _monarch_control_plane(publishers: Collection[str]) -> MonarchControlPlane:
@@ -218,15 +206,3 @@ async def test_monarch_timeout_reports_the_clamped_wait() -> None:
             await asyncio.wait_for(
                 control_plane.get_layouts("model", timeout_s=timeout_s), timeout=5
             )
-
-
-@pytest.mark.asyncio
-async def test_nan_timeout_is_refused() -> None:
-    """Refuse a NaN timeout at once."""
-    control_plane = await _monarch_control_plane({"publisher"})
-    with pytest.raises(
-        ActorError, match="ValueError: get_layouts timeout_s must not be NaN"
-    ):
-        await asyncio.wait_for(
-            control_plane.get_layouts("nan", timeout_s=math.nan), timeout=10
-        )

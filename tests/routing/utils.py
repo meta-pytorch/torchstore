@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -18,6 +19,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
+from torchstore.routing.control_plane import ControlPlane
 from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
@@ -60,9 +62,14 @@ def shard(tensor: torch.Tensor, dim: int, rank: int, num_ranks: int) -> DTensor:
 async def routing_clients(
     publishers: Mapping[str, Mapping[str, Any]],
     requesters: Mapping[str, Mapping[str, Any]],
+    *,
+    wrap_control_plane: Callable[[ControlPlane], ControlPlane] | None = None,
+    exit_stack: contextlib.AsyncExitStack | None = None,
 ) -> dict[str, RoutingClient]:
     """Spawn routing infrastructure without registering state-dict layouts."""
     publisher_mesh = this_host().spawn_procs(per_host={"procs": len(publishers)})
+    if exit_stack is not None:
+        exit_stack.push_async_callback(publisher_mesh.stop)
     store_name = f"routing-test-{uuid.uuid4()}"
     strategy = ts.LocalRankStrategy(TransportType.MonarchRPC)
     await ts.initialize(
@@ -72,7 +79,9 @@ async def routing_clients(
         store_name=store_name,
     )
     coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
-    control_plane = MonarchControlPlane(coordinator)
+    control_plane: ControlPlane = MonarchControlPlane(coordinator)
+    if wrap_control_plane is not None:
+        control_plane = wrap_control_plane(control_plane)
     roles = {
         **{rank: RankRole.PUBLISHER for rank in publishers},
         **{rank: RankRole.REQUESTER for rank in requesters},
