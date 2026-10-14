@@ -447,12 +447,6 @@ class SharedMemoryTransportBuffer(TransportBuffer):
                     results.append(shm_entry.get_tensor())
         return results
 
-    def __getstate__(self) -> dict[str, Any]:
-        """Exclude non-serializable objects when sending buffer to storage volume."""
-        state = self.__dict__.copy()
-        state["storage_volume_ref"] = None
-        return state
-
     async def handle_get_request(
         self,
         ctx: "TransportContext",
