@@ -698,5 +698,80 @@ def test_replicated_regions_fetched_once():
     assert len(volume_requests) == mesh_shape[1]
 
 
+def test_replica_scan_rotates_per_client():
+    """Clients with different ordinals must claim regions from different replicas.
+
+    Without a rotation every client scans the volumes in the same order and
+    claims every region from the first replica, so that replica's volumes serve
+    the whole job: one cached communicator and the full fetch volume per client
+    (128 of each at 32 nodes). Rotating by the client ordinal spreads the
+    clients evenly over the replicas.
+    """
+    from collections import Counter
+
+    from torchstore.client import _client_ordinal, LocalClient
+    from torchstore.controller import ObjectType, StorageInfo
+    from torchstore.transport.types import Request
+
+    global_shape = (8, 6)
+    mesh_shape = (2, 2)  # (dp_replicate, dp_shard)
+
+    # Volume ids are trainer ranks, rank = replica * dp_shard + shard, so
+    # numeric order is replica-major -- what the rotation assumes.
+    volume_map = {}
+    for replica in range(mesh_shape[0]):
+        for shard in range(mesh_shape[1]):
+            volume_map[str(replica * mesh_shape[1] + shard)] = StorageInfo(
+                object_type=ObjectType.TENSOR_SLICE,
+                tensor_slices={
+                    TensorSlice(
+                        offsets=(shard * 4, 0),
+                        coordinates=(replica, shard),
+                        global_shape=global_shape,
+                        local_shape=(4, 6),
+                        mesh_shape=mesh_shape,
+                    )
+                },
+            )
+
+    class _Buffer:
+        supports_inplace_resharding = False
+
+    client = LocalClient.__new__(LocalClient)
+    num_clients = mesh_shape[0] * mesh_shape[1]
+    previous = os.environ.get("TORCHSTORE_CLIENT_ORDINAL")
+    contacted: list[set[str]] = []
+    try:
+        for ordinal in range(num_clients):
+            os.environ["TORCHSTORE_CLIENT_ORDINAL"] = str(ordinal)
+            _client_ordinal.cache_clear()
+            volume_requests, _ = client._build_volume_requests(
+                [Request(key="k")],
+                {"k": volume_map},
+                {volume_id: _Buffer() for volume_id in volume_map},
+            )
+            regions = [
+                (tuple(r.tensor_slice.offsets), tuple(r.tensor_slice.local_shape))
+                for reqs in volume_requests.values()
+                for r in reqs
+            ]
+            # Rotating must not change what is fetched, only where from.
+            assert sorted(regions) == [((0, 0), (4, 6)), ((4, 0), (4, 6))]
+            assert len(volume_requests) == mesh_shape[1]
+            contacted.append(set(volume_requests))
+    finally:
+        _client_ordinal.cache_clear()
+        if previous is None:
+            os.environ.pop("TORCHSTORE_CLIENT_ORDINAL", None)
+        else:
+            os.environ["TORCHSTORE_CLIENT_ORDINAL"] = previous
+
+    # Every volume serves the same number of clients: dp_shard volumes per
+    # client * num_clients / num_volumes.
+    counts = Counter(volume_id for volumes in contacted for volume_id in volumes)
+    assert set(counts) == set(volume_map)
+    assert set(counts.values()) == {mesh_shape[1] * num_clients // len(volume_map)}
+
+
 if __name__ == "__main__":
     main(__file__)
