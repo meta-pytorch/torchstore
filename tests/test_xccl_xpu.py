@@ -15,6 +15,7 @@ Skipped when XPU hardware is not available.
 
 import asyncio
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -323,3 +324,31 @@ async def test_xccl_concurrent_gets_from_many_volumes():
             assert got == expected
     finally:
         await ts.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_handshake_store_binds_an_os_assigned_port(monkeypatch):
+    """The handshake's TCPStore binds port 0 and advertises the port it got."""
+    from torchstore.transport import xccl
+
+    requested = []
+    real_store = xccl.TCPStore
+
+    def recording_store(*args, **kwargs):
+        requested.append(kwargs["port"])
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(xccl, "TCPStore", recording_store)
+    monkeypatch.setattr(xccl, "_xpu_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(xccl, "_xccl_factory", lambda **kwargs: object())
+    monkeypatch.setattr(xccl, "_warm_up_communicator", lambda *args: None)
+    buffers = [
+        xccl.XcclTransportBuffer(SimpleNamespace(volume_id=f"volume_{i}"))
+        for i in range(8)
+    ]
+    await asyncio.gather(*(b._pre_handshake() for b in buffers))
+    await asyncio.gather(*(b._pg_task for b in buffers))
+    assert requested == [0] * len(buffers)
+    ports = [b.master_port for b in buffers]
+    assert ports == [b._tcp_store.port for b in buffers]
+    assert len(set(ports)) == len(ports) and min(ports) > 0

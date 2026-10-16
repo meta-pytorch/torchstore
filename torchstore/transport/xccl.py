@@ -21,7 +21,6 @@ from datetime import timedelta
 from logging import getLogger
 from typing import Any, TYPE_CHECKING
 
-import portpicker
 import torch
 import torch.distributed as dist
 from torch.distributed import PrefixStore, ProcessGroup, Store, TCPStore
@@ -253,20 +252,20 @@ class XcclTransportBuffer(TransportBuffer):
         volume_id = self.storage_volume_ref.volume_id
         self.store_key = f"torchstore_xccl_{str(uuid.uuid4())[:8]}"
         self.master_addr = _get_hostname()
-        self.master_port = portpicker.pick_unused_port()
-
-        logger.info(
-            f"[pid={os.getpid()}] xccl handshake with StorageVolume:[{volume_id}] "
-            f"TCPStore at {self.master_addr}:{self.master_port}"
-        )
-
+        # Port 0: the OS picks a free port at bind time (picking one first races: EADDRINUSE).
         self._tcp_store = TCPStore(
             host_name=self.master_addr,
-            port=self.master_port,
+            port=0,
             world_size=2,
             is_master=True,
             timeout=timedelta(seconds=TORCHSTORE_XCCL_INIT_TIMEOUT),
             wait_for_workers=False,
+        )
+        self.master_port = self._tcp_store.port
+
+        logger.info(
+            f"[pid={os.getpid()}] xccl handshake with StorageVolume:[{volume_id}] "
+            f"TCPStore at {self.master_addr}:{self.master_port}"
         )
 
         tcp_store = self._tcp_store
