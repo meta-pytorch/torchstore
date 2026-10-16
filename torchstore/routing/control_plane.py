@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ._model import KeyRegistration, Registrations
@@ -17,15 +18,15 @@ from ._model import KeyRegistration, Registrations
 if TYPE_CHECKING:
     from torchstore.strategy import TorchStoreStrategy
 
-__all__ = ["ControlPlane"]
+__all__ = ["ControlPlane", "ControlPlaneAddress"]
 
 
 class ControlPlane(ABC):
     """Rank coordination that happens before any tensor moves.
 
     Errors are not normalized (Monarch raises its own, such as ``ActorError``), so
-    callers match them by message. Implementations that own resources add ``close``.
-    Calls may come from any thread or event loop, so hold no loop-bound state.
+    callers match them by message. Implementations that own resources add an async
+    ``close``. Calls may come from any thread or event loop: hold no loop-bound state.
     """
 
     @abstractmethod
@@ -66,4 +67,30 @@ class ControlPlane(ABC):
     @abstractmethod
     async def strategy(self) -> TorchStoreStrategy:
         """Return a strategy that resolves the registered publishers' volumes."""
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class ControlPlaneAddress(ABC):
+    """Where every rank connects to one routing store's control plane.
+
+    The driver hands it to each rank, so subclasses are frozen dataclasses: they
+    pickle and compare by value.
+    """
+
+    store_name: str
+
+    @abstractmethod
+    async def connect(self) -> ControlPlane:
+        """Return a new control plane connected to this address on each call.
+
+        TorchStore closes it, if it has ``close``, once a shutdown or a new selection drops
+        its record, or the ``ts.client`` call that dialed it fails or finds the address
+        recorded. The close is a task on the caller's event loop, cancelled if that loop ends.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def __str__(self) -> str:
+        """Name the address for log lines without whitespace, such as ``host:port``."""
         raise NotImplementedError

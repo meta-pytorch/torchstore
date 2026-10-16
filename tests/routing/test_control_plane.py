@@ -7,12 +7,16 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
+import pickle
 from abc import ABC
 from collections.abc import Iterable
 
+import pytest
+import torchstore as ts
 import torchstore.routing.control_plane as control_plane_module
-from torchstore.routing.control_plane import ControlPlane
+from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
 
 # The design doc's ControlPlane sketch.
 _DESIGN = {
@@ -21,6 +25,17 @@ _DESIGN = {
     "get_layouts": "(self, key: 'str') -> 'Registrations'",
     "strategy": "(self) -> 'TorchStoreStrategy'",
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class _Address(ControlPlaneAddress):
+    port: int
+
+    async def connect(self) -> ControlPlane:
+        raise NotImplementedError
+
+    def __str__(self) -> str:
+        return f"host:{self.port}"
 
 
 def _imported(nodes: Iterable[ast.AST]) -> set[str]:
@@ -55,7 +70,14 @@ def test_control_plane_imports_no_backend() -> None:
         if isinstance(node, ast.If) and ast.unparse(node.test) == "TYPE_CHECKING"
         for statement in node.body
     ]
-    on_load = {"__future__", "abc", "collections.abc", "typing", "._model"}
+    on_load = {
+        "__future__",
+        "abc",
+        "collections.abc",
+        "dataclasses",
+        "typing",
+        "._model",
+    }
     assert _imported(tree.body) == on_load
     assert _imported(type_checking) == {"torchstore.strategy"}
     assert _imported(ast.walk(tree)) == on_load | {"torchstore.strategy"}
@@ -64,3 +86,32 @@ def test_control_plane_imports_no_backend() -> None:
         inspect.iscoroutinefunction(getattr(ControlPlane, name))
         for name in ControlPlane.__abstractmethods__
     )
+
+
+def test_address_is_an_abstract_frozen_dataclass() -> None:
+    """Name a store, connect asynchronously, and pickle and compare by value."""
+    assert ts.ControlPlaneAddress is ControlPlaneAddress
+    assert ts.ControlPlane is ControlPlane
+    assert ControlPlaneAddress.__abstractmethods__ == {"connect", "__str__"}
+    assert inspect.iscoroutinefunction(ControlPlaneAddress.connect)
+    assert [field.name for field in dataclasses.fields(ControlPlaneAddress)] == [
+        "store_name"
+    ]
+    with pytest.raises(TypeError, match="abstract"):
+        ControlPlaneAddress("store")
+
+    # A dataclass's str() is its repr, whose spaces would split the log line's field.
+    @dataclasses.dataclass(frozen=True)
+    class Unnamed(ControlPlaneAddress):
+        async def connect(self) -> ControlPlane:
+            raise NotImplementedError
+
+    with pytest.raises(TypeError, match="abstract"):
+        Unnamed("store")
+
+    address = _Address("store", 1)
+    assert pickle.loads(pickle.dumps(address)) == address
+    assert hash(address) == hash(_Address("store", 1))
+    assert address not in (_Address("store", 2), _Address("other", 1))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        address.port = 2
