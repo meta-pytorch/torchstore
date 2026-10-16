@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import inspect
 import math
@@ -14,19 +15,33 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
-from types import SimpleNamespace
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Mapping,
+)
 from typing import Any, Protocol
+from unittest.mock import ANY, create_autospec
 
 import pytest
 import pytest_asyncio
 import torch
 import torchstore as ts
 import torchstore.routing.coordinator as coordinator_module
-from monarch.actor import ActorError, get_or_spawn_controller
+import torchstore.routing.layout_registry as layout_registry_module
+from monarch.actor import (
+    ActorError,
+    concurrent_endpoint,
+    endpoint,
+    get_or_spawn_controller,
+)
 from torchstore.routing._model import KeyRegistration, Registrations
 from torchstore.routing.control_plane import ControlPlane
 from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
+from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.transport import TransportType
 
 from ..volume_meshes import VolumeMesh
@@ -81,12 +96,83 @@ async def _coordinator(publishers=None, strategy=None):
     return coordinator
 
 
+class _HostedRegistry(ControlPlane):
+    """Runs each call as a task on the registry's loop, like a concurrent endpoint."""
+
+    def __init__(
+        self, registry: LayoutRegistry, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        self._registry = registry
+        self._loop = loop
+
+    async def _on_host(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
+        return await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        )
+
+    async def init(
+        self, publishers: Collection[str], strategy: ts.TorchStoreStrategy
+    ) -> None:
+        await self._on_host(self._registry.init(publishers, strategy))
+
+    async def strategy(self) -> ts.TorchStoreStrategy:
+        return await self._on_host(self._registry.strategy())
+
+    async def register_layout(
+        self, rank: str, key: str, registrations: Mapping[str, KeyRegistration]
+    ) -> None:
+        await self._on_host(self._registry.register_layout(rank, key, registrations))
+
+    async def get_layouts(
+        self, key: str, *, timeout_s: float | None = None
+    ) -> Registrations:
+        layouts = await self._on_host(
+            self._registry.get_layouts(key, timeout_s=timeout_s)
+        )
+        # Callers own their layouts, as with Monarch's pickled replies.
+        return {rank: dict(registrations) for rank, registrations in layouts.items()}
+
+
+@contextlib.asynccontextmanager
+async def _registry_store(
+    stop_timeout_s: float = 10,
+) -> AsyncIterator[Callable[[], Awaitable[_HostedRegistry]]]:
+    """Host one ``LayoutRegistry`` on a thread's own event loop, without Monarch.
+
+    Exit fails if the host loop has not stopped within ``stop_timeout_s``.
+    """
+    hosting: concurrent.futures.Future = concurrent.futures.Future()
+
+    async def host() -> None:
+        stop = asyncio.Event()
+        hosting.set_result((asyncio.get_running_loop(), stop))
+        await stop.wait()
+
+    thread = threading.Thread(target=asyncio.run, args=(host(),), daemon=True)
+    thread.start()
+    loop, stop = await asyncio.wrap_future(hosting)
+    registry = LayoutRegistry()
+
+    async def connect() -> _HostedRegistry:
+        return _HostedRegistry(registry, loop)
+
+    try:
+        yield connect
+    finally:
+        # ``asyncio.run`` cancels any call still running on the host loop.
+        loop.call_soon_threadsafe(stop.set)
+        await asyncio.to_thread(thread.join, stop_timeout_s)
+        assert not thread.is_alive(), "the registry's host loop did not stop"
+
+
+# The coordinator actor runs in this process, so both stores read this patched default.
+_LOOKUP_DEFAULT = (layout_registry_module, "_LAYOUT_REGISTRATION_TIMEOUT_S")
+
+
 @pytest_asyncio.fixture(
     params=[
-        pytest.param(
-            (_monarch_store, coordinator_module, "_LAYOUT_REGISTRATION_TIMEOUT_S"),
-            id="monarch",
-        )
+        pytest.param((_monarch_store, *_LOOKUP_DEFAULT), id="monarch"),
+        pytest.param((_registry_store, *_LOOKUP_DEFAULT), id="registry"),
     ]
 )
 async def make_control_plane(
@@ -354,13 +440,15 @@ async def test_a_timeout_ends_only_its_own_lookup(make_control_plane) -> None:
     patient = asyncio.ensure_future(patient_handle.get_layouts("model", timeout_s=30))
     expiring = asyncio.ensure_future(impatient_handle.get_layouts("model", timeout_s=4))
     await _assert_still_pending(patient, expiring)
-    # A check of the still-empty key while both lookups wait.
-    with pytest.raises(
-        Exception, match=r"missing publishers: \['publisher/0', 'publisher/1'\]"
-    ):
-        await asyncio.wait_for(
-            impatient_handle.get_layouts("model", timeout_s=0), timeout=1
-        )
+    # A check and a short wait of the still-empty key time out while both lookups wait.
+    for timeout_s, guard_s in ((0, 1), (0.1, 5)):
+        with pytest.raises(
+            Exception, match=r"missing publishers: \['publisher/0', 'publisher/1'\]"
+        ):
+            await asyncio.wait_for(
+                impatient_handle.get_layouts("model", timeout_s=timeout_s),
+                timeout=guard_s,
+            )
     await _assert_still_pending(patient, expiring)
     loop = asyncio.get_running_loop()
     registering = loop.time()
@@ -426,9 +514,12 @@ async def test_state_dict_namespaces_have_independent_layouts(
 async def test_every_waiting_requester_gets_layouts_from_other_handles(
     make_control_plane,
 ) -> None:
-    """Release every requester's lookup once publishers register on other handles."""
+    """Release every requester's lookup once publishers register on other handles.
+
+    More requesters wait than publishers register, and each owns the layouts it gets.
+    """
     first, second, *requesters = await make_control_plane(
-        {"publisher/0", "publisher/1"}, handles=4
+        {"publisher/0", "publisher/1"}, handles=5
     )
 
     await asyncio.wait_for(
@@ -441,13 +532,18 @@ async def test_every_waiting_requester_gets_layouts_from_other_handles(
         second.register_layout("publisher/1", "model", _registration("model/second")),
         timeout=1,
     )
-    results = await asyncio.wait_for(asyncio.gather(*lookups), timeout=5)
+    results = list(await asyncio.wait_for(asyncio.gather(*lookups), timeout=5))
 
     expected = {
         "publisher/0": _registration("model/first"),
         "publisher/1": _registration("model/second"),
     }
-    assert results == [expected, expected]
+    assert results == [expected] * len(requesters)
+    # A requester's edits reach neither another requester's layouts nor later lookups.
+    assert results[0]["publisher/0"] is not results[2]["publisher/0"]
+    results[0].pop("publisher/1")
+    results[1]["publisher/0"] = {}
+    assert results[2] == expected
     # Serving the waiting lookups leaves the layouts for later ones.
     for requester in requesters:
         layouts = await asyncio.wait_for(
@@ -702,9 +798,101 @@ async def test_control_plane_mirrors_the_coordinator_endpoints() -> None:
     assert layouts == {"publisher": _registration()}
 
 
-def test_monarch_default_timeout_is_300_seconds() -> None:
-    """Keep the coordinator's five-minute wait for lookups without a timeout."""
-    assert coordinator_module._LAYOUT_REGISTRATION_TIMEOUT_S == 300
+def test_coordinator_keeps_its_endpoint_kinds() -> None:
+    """Keep ``init`` and ``strategy`` as endpoints, and the layout calls concurrent."""
+
+    async def serial_body(self) -> None:
+        pass
+
+    async def concurrent_body(self) -> None:
+        pass
+
+    serial = type(endpoint(serial_body))
+    concurrent = type(concurrent_endpoint(concurrent_body))
+    assert serial is not concurrent
+    kinds = {
+        name: type(RoutingCoordinator.__dict__[name])
+        for name in ControlPlane.__abstractmethods__
+    }
+    assert kinds == {
+        "init": serial,
+        "strategy": serial,
+        "register_layout": concurrent,
+        "get_layouts": concurrent,
+    }
+
+
+@pytest.mark.asyncio
+async def test_coordinator_delegates_each_endpoint_to_its_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forward each endpoint's arguments, result and error through one registry."""
+    registry_class = create_autospec(LayoutRegistry)
+    registry = registry_class.return_value
+    # The coordinator actor runs in this process and builds its registry by this name.
+    monkeypatch.setattr(coordinator_module, "LayoutRegistry", registry_class)
+    coordinator = await _coordinator()
+    strategy = ts.TorchStoreStrategy(TransportType.MonarchRPC)
+    layouts = {"publisher": _registration()}
+    registry.strategy.return_value = strategy
+    registry.get_layouts.return_value = layouts
+    calls = {
+        "init": (({"publisher"}, strategy), {}),
+        "strategy": ((), {}),
+        "register_layout": (("publisher", "model", _registration()), {}),
+        "get_layouts": (("model",), {"timeout_s": 7}),
+    }
+
+    results = {
+        name: await asyncio.wait_for(
+            getattr(coordinator, name).call_one(*args, **kwargs), timeout=5
+        )
+        for name, (args, kwargs) in calls.items()
+    }
+    # Arguments and results cross the actor as copies, so strategies match by value.
+    registry.init.assert_awaited_once_with({"publisher"}, ANY)
+    for copy in (registry.init.await_args.args[1], results["strategy"]):
+        assert type(copy) is ts.TorchStoreStrategy
+        assert copy.default_transport_type == TransportType.MonarchRPC
+    registry.strategy.assert_awaited_once_with()
+    registry.register_layout.assert_awaited_once_with(
+        "publisher", "model", _registration()
+    )
+    registry.get_layouts.assert_awaited_once_with("model", timeout_s=7)
+    assert (results["init"], results["register_layout"]) == (None, None)
+    assert results["get_layouts"] == layouts
+    # Without a timeout, the registry applies its own default.
+    await asyncio.wait_for(coordinator.get_layouts.call_one("model"), timeout=5)
+    registry.get_layouts.assert_awaited_with("model", timeout_s=None)
+
+    for name, (args, kwargs) in calls.items():
+        error = RuntimeError(f"{name} failed")
+        getattr(registry, name).side_effect = error
+        with pytest.raises(ActorError) as raised:
+            await asyncio.wait_for(
+                getattr(coordinator, name).call_one(*args, **kwargs), timeout=5
+            )
+        # The registry's own error crosses as a copy, not wrapped in another.
+        assert repr(raised.value.exception) == repr(error)
+    # Both init calls reset the coordinator's one registry in place.
+    registry_class.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_registry_store_exit_fails_when_its_loop_does_not_stop() -> None:
+    """Fail the registry store's exit at its time limit when the host loop is stuck."""
+    release = threading.Event()
+    # Without the limit, exit waits for this timer to free the loop, then passes.
+    unblock = threading.Timer(5, release.set)
+    unblock.start()
+    try:
+        with pytest.raises(AssertionError, match="host loop did not stop"):
+            async with _registry_store(stop_timeout_s=0.2) as connect:
+                handle = await connect()
+                handle._loop.call_soon_threadsafe(release.wait)
+    finally:
+        release.set()
+        unblock.cancel()
 
 
 @pytest.mark.asyncio
@@ -762,94 +950,3 @@ async def test_monarch_second_init_replaces_publishers_and_clears_layouts() -> N
             await asyncio.wait_for(first.get_layouts("model", timeout_s=0), timeout=1)
         strategy = await asyncio.wait_for(first.strategy(), timeout=1)
         assert strategy.default_transport_type == TransportType.Gloo
-
-
-@pytest.mark.asyncio
-async def test_lookup_waits_exactly_its_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Wait out a lookup's whole timeout, 300 s by default. Zero or less never waits.
-
-    Complete layouts return without starting a wait.
-    """
-    coordinator = await _coordinator({"publisher"})
-    deadlines: list[float] = []
-
-    async def wait_for(wait, timeout):
-        deadlines.append(timeout)
-        wait.close()  # the deadline fires before the wait starts
-        raise asyncio.TimeoutError
-
-    # Only the coordinator module sees the fake, not the rest of the process.
-    monkeypatch.setattr(
-        coordinator_module,
-        "asyncio",
-        SimpleNamespace(wait_for=wait_for, TimeoutError=asyncio.TimeoutError),
-    )
-    for timeout_s, waits_s in ((None, 300), (120, 120), (0, 0), (-1, 0)):
-        with pytest.raises(ActorError, match=f"timed out after {waits_s} seconds"):
-            await asyncio.wait_for(
-                coordinator.get_layouts.call_one("model", timeout_s=timeout_s),
-                timeout=5,
-            )
-    assert deadlines == [300, 120, 0, 0]
-    await coordinator.register_layout.call_one("publisher", "model", _registration())
-    layouts = await asyncio.wait_for(
-        coordinator.get_layouts.call_one("model"), timeout=5
-    )
-    assert layouts == {"publisher": _registration()}
-    assert deadlines == [300, 120, 0, 0], "complete layouts started a wait"
-
-
-@pytest.mark.timeout(60)
-@pytest.mark.parametrize(
-    ("registered", "racing", "missing"),
-    [
-        (("publisher/0",), ("publisher/1",), []),
-        ((), ("publisher/0",), ["publisher/1"]),
-    ],
-    ids=("completes-layouts", "leaves-one-missing"),
-)
-@pytest.mark.asyncio
-async def test_timeout_racing_a_registration(
-    monkeypatch,
-    registered: tuple[str, ...],
-    racing: tuple[str, ...],
-    missing: list[str],
-) -> None:
-    """Return layouts that a registration racing the timeout completes, else name who is missing."""
-    publishers = {"publisher/0", "publisher/1"}
-    coordinator = await _coordinator(publishers)
-    for rank in registered:
-        await coordinator.register_layout.call_one(rank, "model", _registration(rank))
-    deadlines: list[float] = []
-
-    async def wait_for(wait, timeout):
-        # Step the real wait by hand so it stays parked while the racing ranks register.
-        wait.send(None)
-        for rank in racing:
-            await coordinator.register_layout.call_one(
-                rank, "model", _registration(rank)
-            )
-        deadlines.append(timeout)
-        try:
-            wait.throw(asyncio.CancelledError())  # the deadline fires before it resumes
-        except asyncio.CancelledError:
-            raise asyncio.TimeoutError from None
-        raise AssertionError("the wait outlived its deadline")
-
-    # Only the coordinator module sees the fake, not the rest of the process.
-    monkeypatch.setattr(
-        coordinator_module,
-        "asyncio",
-        SimpleNamespace(wait_for=wait_for, TimeoutError=asyncio.TimeoutError),
-    )
-    lookup = asyncio.wait_for(coordinator.get_layouts.call_one("model"), timeout=5)
-    if missing:
-        with pytest.raises(
-            ActorError, match=re.escape(f"missing publishers: {missing}")
-        ):
-            await lookup
-    else:
-        assert await lookup == {rank: _registration(rank) for rank in publishers}
-    assert deadlines == [coordinator_module._LAYOUT_REGISTRATION_TIMEOUT_S]
