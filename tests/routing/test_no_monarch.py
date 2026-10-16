@@ -49,6 +49,7 @@ _MONARCH_FREE = [
     "torchstore.direct_weight_sync",
     "torchstore.transport.monarch_rdma",
     "torchstore.storage",
+    "torchstore.volume_host",
 ]
 _ACTOR_MODULES = [
     "torchstore.controller",

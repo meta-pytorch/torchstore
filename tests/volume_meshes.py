@@ -12,18 +12,32 @@ from __future__ import annotations
 class _GetId:
     """A mesh's ``get_id``, answering for one volume per rank as Monarch's ``call`` does."""
 
-    def __init__(self, volumes: list[tuple[str, str]]) -> None:
+    def __init__(
+        self, volumes: list[tuple[str, str]], coords: list[dict[str, int]]
+    ) -> None:
         self._volumes = volumes
+        self._coords = coords
 
     async def call(self) -> list[tuple[dict[str, int], tuple[str, str]]]:
-        return [({"procs": rank}, volume) for rank, volume in enumerate(self._volumes)]
+        return [
+            (dict(coord), volume) for coord, volume in zip(self._coords, self._volumes)
+        ]
 
 
 class VolumeMesh:
-    """A stand-in volume mesh that pickles with its strategy. Slices name their coordinates."""
+    """A stand-in volume mesh that pickles with its strategy. Slices name their coordinates.
 
-    def __init__(self, volumes: list[tuple[str, str]]) -> None:
-        self.get_id = _GetId(volumes)
+    Volume ``i`` sits at ``coords[i]``, by default ``{"procs": i}``.
+    """
+
+    def __init__(
+        self,
+        volumes: list[tuple[str, str]],
+        coords: list[dict[str, int]] | None = None,
+    ) -> None:
+        if coords is None:
+            coords = [{"procs": rank} for rank in range(len(volumes))]
+        self.get_id = _GetId(volumes, coords)
 
     def slice(self, **coord: int) -> tuple[str, dict[str, int]]:
         return ("slice", coord)

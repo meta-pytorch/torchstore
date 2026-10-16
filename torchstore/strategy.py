@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
 from torchstore.utils import get_local_hostname
+from torchstore.volume_host import MonarchVolumeHost, VolumeHost
 
 if TYPE_CHECKING:
     from torchstore.storage_volume import StorageVolume
@@ -64,15 +65,12 @@ class TorchStoreStrategy:
         self.default_transport_type = default_transport_type
         logger.info(f"Initializing TorchStoreStrategy with {default_transport_type=}")
 
-        self.storage_volumes = None
-        self.volume_id_to_coord = {}
-        self.volume_id_to_hostname = {}
+        self._volume_host: VolumeHost | None = None
         self.transport_context = TransportContext()
 
     def __str__(self) -> str:
-        storage_vol_len = (
-            len(self.storage_volumes) if self.storage_volumes is not None else 0
-        )
+        host = self.volume_host
+        storage_vol_len = len(host.volume_ids()) if host is not None else 0
         return f"{self.__class__.__name__}(storage_volume_len={storage_vol_len})"
 
     @classmethod
@@ -94,17 +92,20 @@ class TorchStoreStrategy:
         raise NotImplementedError(f"{cls.__name__} must implement 'get_client_id'")
 
     async def set_storage_volumes(self, storage_volumes):
-        """Configure the storage volumes and build ID-to-coordinate mapping.
+        """Configure the storage volumes and build the host that resolves their IDs.
 
         Args:
             storage_volumes: Actor mesh of storage volume actors.
         """
-        self.storage_volumes = storage_volumes
-        self.volume_id_to_coord = {}
-        self.volume_id_to_hostname = {}
-        for coord, (volume_id, hostname) in await self.storage_volumes.get_id.call():
-            self.volume_id_to_coord[volume_id] = coord
-            self.volume_id_to_hostname[volume_id] = hostname
+        self._volume_host = await MonarchVolumeHost.from_mesh(storage_volumes)
+
+    @property
+    def volume_host(self) -> VolumeHost | None:
+        """The host that resolves volume IDs, or None if this strategy has none.
+
+        None before volumes are set, and ControllerStorageVolumes never builds one.
+        """
+        return self._volume_host
 
     def select_storage_volume(self) -> StorageVolumeRef:
         """Select the storage volume for the current client process.
@@ -114,30 +115,37 @@ class TorchStoreStrategy:
         """
         # client_id == volume_id for this strategy
         client_id = self.get_client_id()
-        if client_id not in self.volume_id_to_coord:
+        host = self.volume_host
+        volume_ids = host.volume_ids() if host is not None else ()
+        if client_id not in volume_ids:
             raise KeyError(
-                f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
+                f"No corresponding storage volume found for {client_id} volume_ids={list(volume_ids)}"
             )
 
         return self.get_storage_volume(client_id)
 
     def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
-        """Retrieves storage volume actor for a given volume ID.
+        """Resolve a volume ID to a reference through the volume host.
 
         Args:
             volume_id (str): The volume ID to look up.
 
         Returns:
-            StorageVolumeRef: Reference to the storage volume actor.
+            StorageVolumeRef: Reference to that volume's handle.
+
+        Raises:
+            KeyError: If no storage volume has this ID.
         """
-        volume_coord = self.volume_id_to_coord[volume_id]
+        host = self.volume_host
+        if host is None:
+            raise KeyError(volume_id)
 
         return StorageVolumeRef(
-            self.storage_volumes.slice(**volume_coord),
+            host.endpoints(volume_id),
             volume_id,
             self.transport_context,
             self.default_transport_type,
-            volume_hostname=self.volume_id_to_hostname.get(volume_id),
+            volume_hostname=host.hostname(volume_id),
         )
 
 
@@ -192,6 +200,12 @@ class ControllerStorageVolumes(TorchStoreStrategy):
     """Strategy that creates a singleton controller as the storage volume. This is a workaround
     for lack of support for actor -> actor comms in monarch when using remote allocations.
     """
+
+    def __init__(self, default_transport_type: TransportType = TransportType.Unset):
+        super().__init__(default_transport_type)
+        self.storage_volumes = None
+        self.volume_id_to_coord = {}
+        self.volume_id_to_hostname = {}
 
     def __str__(self) -> str:
         storage_vol_len = (
