@@ -10,11 +10,18 @@ import asyncio
 import contextlib
 import inspect
 import math
+import os
 import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
+from pathlib import Path
 from typing import Any, Protocol
 from unittest.mock import ANY, create_autospec
 
@@ -37,12 +44,17 @@ from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.transport import TransportType
 
 from ..volume_meshes import VolumeMesh
+from . import file_store_control_plane
+from .file_store_control_plane import FileStoreControlPlane
 from .utils import registry_store, tensor_slice
 
 pytestmark = pytest.mark.timeout(60)
 
 # A lookup that does not wait returns well within this. A correct one cannot.
 _STILL_PENDING_S = 0.5
+# A timeout fires at most a timer's slack early, and on a loaded host within _LATE_S
+# of its deadline.
+_EARLY_S, _LATE_S = 0.01, 1.5
 
 
 class TimedControlPlane(Protocol):
@@ -88,7 +100,25 @@ async def _coordinator(publishers=None, strategy=None):
     return coordinator
 
 
-# The coordinator actor runs in this process, so both stores read this patched default.
+@contextlib.asynccontextmanager
+async def _file_store() -> AsyncIterator[Callable[[], Awaitable[TimedControlPlane]]]:
+    """Open handles on one ``FileStoreControlPlane`` store, and close each at exit."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "control_plane")
+        handles: list[FileStoreControlPlane] = []
+
+        async def connect() -> TimedControlPlane:
+            handles.append(FileStoreControlPlane(path))
+            return handles[-1]
+
+        try:
+            yield connect
+        finally:
+            await asyncio.gather(*(handle.close() for handle in handles))
+
+
+# The coordinator actor runs in this process, so the Monarch and registry stores
+# both read this patched default.
 _LOOKUP_DEFAULT = (layout_registry_module, "_LAYOUT_REGISTRATION_TIMEOUT_S")
 
 
@@ -96,6 +126,10 @@ _LOOKUP_DEFAULT = (layout_registry_module, "_LAYOUT_REGISTRATION_TIMEOUT_S")
     params=[
         pytest.param((_monarch_store, *_LOOKUP_DEFAULT), id="monarch"),
         pytest.param((registry_store, *_LOOKUP_DEFAULT), id="registry"),
+        pytest.param(
+            (_file_store, file_store_control_plane, "_LAYOUT_REGISTRATION_TIMEOUT_S"),
+            id="filestore",
+        ),
     ]
 )
 async def make_control_plane(
@@ -319,7 +353,9 @@ async def test_timeout_preserves_layout_for_retry(make_control_plane) -> None:
                 control_plane.get_layouts("model", timeout_s=timeout_s),
                 timeout=guard_s,
             )
-        assert loop.time() - started >= timeout_s / 2, "a positive timeout must wait"
+        elapsed = loop.time() - started
+        assert elapsed >= timeout_s - _EARLY_S, "a positive timeout must wait"
+        assert elapsed < max(timeout_s, 0) + _LATE_S, "a timeout must fire on time"
 
     retry = asyncio.ensure_future(control_plane.get_layouts("model", timeout_s=30))
     await _assert_still_pending(retry)
@@ -347,7 +383,9 @@ async def test_default_timeout_names_missing_publishers(make_control_plane) -> N
     started = loop.time()
     with pytest.raises(Exception, match=re.escape(message)):
         await asyncio.wait_for(control_plane.get_layouts("model"), timeout=5)
-    assert loop.time() - started >= 0.1, "the default timeout must wait"
+    elapsed = loop.time() - started
+    assert elapsed >= 0.2 - _EARLY_S, "the default timeout must wait"
+    assert elapsed < 0.2 + _LATE_S, "the default timeout must fire on time"
 
 
 @pytest.mark.asyncio
@@ -873,3 +911,218 @@ async def test_monarch_second_init_replaces_publishers_and_clears_layouts() -> N
             await asyncio.wait_for(first.get_layouts("model", timeout_s=0), timeout=1)
         strategy = await asyncio.wait_for(first.strategy(), timeout=1)
         assert strategy.default_transport_type == TransportType.Gloo
+
+
+def test_file_store_default_timeout_is_300_seconds() -> None:
+    """Keep the interface's five-minute wait for lookups without a timeout."""
+    assert file_store_control_plane._LAYOUT_REGISTRATION_TIMEOUT_S == 300
+
+
+@pytest.mark.asyncio
+async def test_file_store_second_init_refuses_the_directory() -> None:
+    """Refuse a second init from any handle, keeping the first publishers and strategy.
+
+    The first init makes the directory with mode 0o700.
+    """
+    async with _file_store() as connect:
+        first, second = await connect(), await connect()
+        await first.init(
+            {"publisher/0", "publisher/1"},
+            ts.TorchStoreStrategy(TransportType.MonarchRPC),
+        )
+        assert stat.S_IMODE(os.stat(first._path).st_mode) == 0o700
+        await first.register_layout("publisher/0", "model", _registration())
+        with pytest.raises(FileExistsError):
+            await second.init(
+                {"publisher/1", "publisher/2"},
+                ts.TorchStoreStrategy(TransportType.Gloo),
+            )
+        with pytest.raises(
+            TimeoutError, match=r"missing publishers: \['publisher/1'\]"
+        ):
+            await asyncio.wait_for(second.get_layouts("model", timeout_s=0), timeout=1)
+        strategy = await asyncio.wait_for(second.strategy(), timeout=1)
+        assert strategy.default_transport_type == TransportType.MonarchRPC
+
+
+@pytest.mark.asyncio
+async def test_file_store_close_refuses_later_calls() -> None:
+    """Refuse every call on a closed handle, leaving other handles on it serving."""
+    async with _file_store() as connect:
+        closed, other = await connect(), await connect()
+        strategy = ts.TorchStoreStrategy(TransportType.MonarchRPC)
+        await closed.init({"publisher"}, strategy)
+        # A handle that already served a call refuses it once closed.
+        await asyncio.wait_for(closed.strategy(), timeout=1)
+        await closed.close()
+        calls = (
+            lambda: closed.init({"publisher"}, strategy),
+            closed.strategy,
+            lambda: closed.register_layout("publisher", "model", _registration()),
+            lambda: closed.get_layouts("model", timeout_s=0),
+        )
+        for make_call in calls:
+            with pytest.raises(RuntimeError, match="is closed"):
+                await asyncio.wait_for(make_call(), timeout=1)
+        served = await asyncio.wait_for(other.strategy(), timeout=1)
+        assert served.default_transport_type == TransportType.MonarchRPC
+
+
+@pytest.mark.asyncio
+async def test_file_store_init_failing_before_ready_leaves_it_uninitialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail fast with "init has not run" on every handle until init writes ready."""
+    write_once = FileStoreControlPlane._write_once
+
+    def failing_write_once(self: FileStoreControlPlane, key: str, value: bytes) -> None:
+        if key == file_store_control_plane._STRATEGY:
+            raise OSError("disk full")
+        write_once(self, key, value)
+
+    monkeypatch.setattr(FileStoreControlPlane, "_write_once", failing_write_once)
+    async with _file_store() as connect:
+        writer, reader = await connect(), await connect()
+        with pytest.raises(OSError, match="disk full"):
+            await writer.init(
+                {"publisher"}, ts.TorchStoreStrategy(TransportType.MonarchRPC)
+            )
+        calls = (
+            reader.strategy,
+            lambda: reader.register_layout("publisher", "model", _registration()),
+            lambda: reader.get_layouts("model", timeout_s=0),
+        )
+        for make_call in calls:
+            with pytest.raises(Exception, match="init has not run"):
+                await asyncio.wait_for(make_call(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_file_store_calls_run_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run every file call on a worker thread, so slow files never block the loop."""
+    loop_thread = threading.get_ident()
+    on_loop: list[str] = []
+    directory = FileStoreControlPlane._directory
+
+    def recording_directory(self: FileStoreControlPlane) -> str:
+        if threading.get_ident() == loop_thread:
+            on_loop.append(inspect.stack(context=0)[1].function)
+        return directory(self)
+
+    monkeypatch.setattr(FileStoreControlPlane, "_directory", recording_directory)
+    async with _file_store() as connect:
+        publisher, requester = await connect(), await connect()
+        await publisher.init(
+            {"publisher"}, ts.TorchStoreStrategy(TransportType.MonarchRPC)
+        )
+        await requester.strategy()
+        lookup = asyncio.ensure_future(requester.get_layouts("model"))
+        await _assert_still_pending(lookup)
+        await publisher.register_layout("publisher", "model", _registration())
+        layouts = await asyncio.wait_for(lookup, timeout=5)
+        assert layouts == {"publisher": _registration()}
+    assert on_loop == []
+
+
+@pytest.mark.asyncio
+async def test_file_store_fails_fast_without_its_parent_directory(
+    tmp_path: Path,
+) -> None:
+    """Fail at once on a path whose parent directory is missing."""
+    plane = FileStoreControlPlane(str(tmp_path / "missing" / "control_plane"))
+    with pytest.raises(FileNotFoundError):
+        await asyncio.wait_for(
+            plane.init({"publisher"}, ts.TorchStoreStrategy(TransportType.MonarchRPC)),
+            timeout=1,
+        )
+    with pytest.raises(RuntimeError, match="init has not run"):
+        await asyncio.wait_for(plane.strategy(), timeout=1)
+    assert not (tmp_path / "missing").exists()
+
+
+# The repository root, so a child process imports this directory's helper.
+_ROOT = str(Path(__file__).resolve().parents[2])
+_FILE_STORE_CHILD = """
+import asyncio, os, resource, signal, sys
+
+sys.path.insert(0, sys.argv[1])
+from tests.routing.file_store_control_plane import FileStoreControlPlane
+
+path, mode = sys.argv[2:]
+
+
+async def main():
+    plane = FileStoreControlPlane(path)
+    # The handle serves a call first, as a rank's has when it dies or fills the disk.
+    await plane.strategy()
+    if mode == "killed":
+        # Die after writing the value, before linking it into place.
+        os.link = lambda *args: os.kill(os.getpid(), signal.SIGKILL)
+    else:
+        # A full disk: a file holds one byte, so a write lands partly, then fails.
+        _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1, hard))
+    try:
+        await plane.register_layout("publisher/0", "model", {})
+    except OSError as error:
+        print("write failed:", error.strerror)
+    await plane.close()
+    print("closed")
+
+
+asyncio.run(main())
+"""
+
+
+def _run_file_store_child(path: str, mode: str) -> subprocess.CompletedProcess[str]:
+    """Register a layout on ``path`` from a child process that ``mode`` breaks."""
+    return subprocess.run(
+        [sys.executable, "-c", _FILE_STORE_CHILD, _ROOT, path, mode],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.asyncio
+async def test_file_store_ignores_a_writer_killed_mid_write() -> None:
+    """Leave no partial value when a writer dies before linking its value into place."""
+    async with _file_store() as connect:
+        driver, requester = await connect(), await connect()
+        await driver.init(
+            {"publisher/0"}, ts.TorchStoreStrategy(TransportType.MonarchRPC)
+        )
+        child = await asyncio.to_thread(_run_file_store_child, driver._path, "killed")
+        assert child.returncode == -signal.SIGKILL, child.stdout + child.stderr
+        # Its value stays in a temporary file that no call reads.
+        assert len(os.listdir(driver._path)) == 4
+        with pytest.raises(
+            TimeoutError, match=r"missing publishers: \['publisher/0'\]"
+        ):
+            await asyncio.wait_for(
+                requester.get_layouts("model", timeout_s=0.1), timeout=5
+            )
+        publisher = await connect()
+        await publisher.register_layout("publisher/0", "model", _registration())
+        layouts = await asyncio.wait_for(requester.get_layouts("model"), timeout=5)
+        assert layouts == {"publisher/0": _registration()}
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.asyncio
+async def test_file_store_write_errors_raise_and_leave_nothing() -> None:
+    """Raise a full disk's error from the write, leave no file, and close cleanly."""
+    async with _file_store() as connect:
+        driver = await connect()
+        await driver.init(
+            {"publisher/0"}, ts.TorchStoreStrategy(TransportType.MonarchRPC)
+        )
+        written = sorted(os.listdir(driver._path))
+        child = await asyncio.to_thread(_run_file_store_child, driver._path, "full")
+        assert child.returncode == 0, child.stdout + child.stderr
+        assert child.stdout.splitlines() == ["write failed: File too large", "closed"]
+        assert sorted(os.listdir(driver._path)) == written

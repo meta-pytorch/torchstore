@@ -16,7 +16,11 @@ from collections.abc import Iterable
 import pytest
 import torchstore as ts
 import torchstore.routing.control_plane as control_plane_module
+from torchstore.routing._model import KeyRegistration, RankRole, Registrations
 from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
+from torchstore.strategy import TorchStoreStrategy
+
+from . import file_store_control_plane
 
 # The design doc's ControlPlane sketch.
 _DESIGN = {
@@ -115,3 +119,68 @@ def test_address_is_an_abstract_frozen_dataclass() -> None:
     assert address not in (_Address("store", 2), _Address("other", 1))
     with pytest.raises(dataclasses.FrozenInstanceError):
         address.port = 2
+
+
+def test_control_plane_types_are_public() -> None:
+    """Export the interface, its address, the TorchStore types it names and the role enum."""
+    public = {
+        "ControlPlane": ControlPlane,
+        "ControlPlaneAddress": ControlPlaneAddress,
+        "KeyRegistration": KeyRegistration,
+        "Registrations": Registrations,
+        "TorchStoreStrategy": TorchStoreStrategy,
+        "RankRole": RankRole,
+    }
+    for name, value in public.items():
+        assert name in ts.__all__ and getattr(ts, name) is value, name
+
+
+def test_file_store_control_plane_uses_only_public_names() -> None:
+    """Build the test's own control plane from ``ts.__all__`` and the standard library.
+
+    Private names appear only on the plane itself, never on what TorchStore hands it.
+    """
+    tree = ast.parse(inspect.getsource(file_store_control_plane))
+    # Only what the helper needs, so no import machinery or introspection module.
+    allowed = {"__future__", "asyncio", "collections", "json", "math", "os"}
+    allowed |= {"pickle", "tempfile", "torchstore", "urllib"}
+    public = set(ts.__all__)
+    aliases, imported = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name.split(".")[0] in allowed, alias.name
+                if alias.name.split(".")[0] == "torchstore":
+                    assert alias.name == "torchstore", alias.name
+                    aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            package = (node.module or "").split(".")[0]
+            assert node.level == 0 and package in allowed, ast.unparse(node)
+            if package == "torchstore":
+                names = {alias.name for alias in node.names}
+                assert node.module == "torchstore", ast.unparse(node)
+                assert names <= public, ast.unparse(node)
+                imported |= names
+    # The package appears only as ``ts.<public name>``, so ``getattr(ts, ...)`` fails too.
+    attributes = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute)]
+    used = {
+        node.attr
+        for node in attributes
+        if isinstance(node.value, ast.Name) and node.value.id in aliases
+    }
+    bases = {id(node.value) for node in attributes}
+    # Dunders such as __builtins__, and these builtins, reach names no import shows.
+    banned = {"compile", "eval", "exec", "getattr", "globals", "locals", "vars"}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            name = node.id if isinstance(node, ast.Name) else node.attr
+            assert not name.startswith("__"), f"line {node.lineno}"
+            assert name not in banned, f"line {node.lineno}"
+        if isinstance(node, ast.Name):
+            assert node.id not in aliases or id(node) in bases, f"line {node.lineno}"
+    for node in attributes:
+        if node.attr.startswith("_"):
+            on_self = isinstance(node.value, ast.Name) and node.value.id == "self"
+            assert on_self, f"line {node.lineno}"
+    assert (used or imported) and used <= public, used
+    assert issubclass(file_store_control_plane.FileStoreControlPlane, ts.ControlPlane)
