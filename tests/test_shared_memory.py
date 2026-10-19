@@ -65,7 +65,7 @@ class TestHelperFunctions:
         assert len(hostname) > 0
 
         # With env var override
-        monkeypatch.setenv("HOSTNAME", "test-hostname")
+        monkeypatch.setenv("TORCHSTORE_HOSTNAME", "test-hostname")
         assert get_local_hostname() == "test-hostname"
 
     def test_is_local_to_volume_same_host(self):

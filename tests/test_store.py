@@ -43,7 +43,7 @@ async def test_basic(strategy_params, transport_type):
             # required by LocalRankStrategy
             os.environ["LOCAL_RANK"] = str(self.rank)
             # required by HostStrategy
-            os.environ["HOSTNAME"] = socket.gethostname()
+            os.environ["TORCHSTORE_HOSTNAME"] = socket.gethostname()
 
         @endpoint
         async def put(self):
@@ -316,7 +316,7 @@ async def test_delete_batch(strategy_params):
             self.world_size = world_size
             self.rank = current_rank().rank
             os.environ["LOCAL_RANK"] = str(self.rank)
-            os.environ["HOSTNAME"] = socket.gethostname()
+            os.environ["TORCHSTORE_HOSTNAME"] = socket.gethostname()
 
         @endpoint
         async def put_rank_values(self):
@@ -415,7 +415,7 @@ async def test_shm_cache_reuse_on_same_key_puts(strategy_params):
             init_logging()
             self.rank = current_rank().rank
             os.environ["LOCAL_RANK"] = str(self.rank)
-            os.environ["HOSTNAME"] = socket.gethostname()
+            os.environ["TORCHSTORE_HOSTNAME"] = socket.gethostname()
 
         @endpoint
         async def put_twice_and_check_cache(self, key: str):
@@ -475,7 +475,7 @@ async def test_batch_basic(strategy_params, transport_type):
             self.world_size = world_size
             self.rank = current_rank().rank
             os.environ["LOCAL_RANK"] = str(self.rank)
-            os.environ["HOSTNAME"] = socket.gethostname()
+            os.environ["TORCHSTORE_HOSTNAME"] = socket.gethostname()
 
         def _make_batch(self, prefix: str, offset: int, device: str) -> dict:
             """Build a batch with tensors, an object, and a cross-device tensor if CUDA."""
@@ -562,7 +562,7 @@ async def test_noncontiguous_put(strategy_params, transport_type):
             self.world_size = world_size
             self.rank = current_rank().rank
             os.environ["LOCAL_RANK"] = str(self.rank)
-            os.environ["HOSTNAME"] = socket.gethostname()
+            os.environ["TORCHSTORE_HOSTNAME"] = socket.gethostname()
 
         @endpoint
         async def put(self):

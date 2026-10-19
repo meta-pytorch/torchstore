@@ -120,9 +120,17 @@ def tensors_overlap_in_memory(
     return all(base_start <= t.data_ptr() < base_end for t, _ in tensors)
 
 
+# Overrides the hostname torchstore uses to identify the local machine.
+TORCHSTORE_HOSTNAME_ENV = "TORCHSTORE_HOSTNAME"
+
+
 def get_local_hostname() -> str:
-    """Get the current machine's hostname."""
-    return os.environ.get("HOSTNAME", socket.gethostname())
+    """Get the current machine's hostname.
+
+    Honors the ``TORCHSTORE_HOSTNAME`` environment variable if set, otherwise
+    falls back to ``socket.gethostname()``.
+    """
+    return os.environ.get(TORCHSTORE_HOSTNAME_ENV, socket.gethostname())
 
 
 async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):

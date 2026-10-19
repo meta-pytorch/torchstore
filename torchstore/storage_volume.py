@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
-import socket
 from logging import getLogger
 from typing import Any
 
@@ -14,7 +12,7 @@ from monarch.actor import Actor, endpoint
 
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.types import Request, TensorSlice
-from torchstore.utils import get_slice_intersection, spawn_actors
+from torchstore.utils import get_local_hostname, get_slice_intersection, spawn_actors
 
 logger = getLogger(__name__)
 
@@ -50,8 +48,7 @@ class StorageVolume(Actor):
 
     @endpoint
     async def get_id(self) -> tuple[str, str]:
-        hostname = os.environ.get("HOSTNAME", socket.gethostname())
-        return (self.volume_id, hostname)
+        return (self.volume_id, get_local_hostname())
 
     @endpoint
     async def handshake(
