@@ -333,6 +333,125 @@ async def test_get_writes_storage_tensor_into_client_destination(ref, ctx):
 
 
 @pytest.mark.asyncio
+async def test_get_batches_noncontiguous_staging_within_byte_limit(
+    monkeypatch, ref, ctx
+):
+    # Each view is 4 * 3 * 8 = 96 bytes, so two fit in each 192-byte batch.
+    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_GET_STAGING_BYTES", 192)
+    stored_bases = [
+        torch.arange(index * 24, (index + 1) * 24).reshape(4, 6) for index in range(3)
+    ]
+    stored = [base[:, ::2] for base in stored_bases]
+    destinations = [torch.zeros(4, 3, dtype=torch.int64) for _ in stored]
+    requests = [
+        Request.from_tensor(f"weight-{index}", destination)
+        for index, destination in enumerate(destinations)
+    ]
+    client_buffer = NixlTransportBuffer(ref)
+
+    await client_buffer._pre_get_hook(requests)
+    storage_volume_buffer = _storage_volume_copy(client_buffer)
+    await storage_volume_buffer.handle_get_request(
+        ctx,
+        [
+            (request.meta_only(), value)
+            for request, value in zip(requests, stored, strict=True)
+        ],
+    )
+
+    assert all(
+        torch.equal(destination, value)
+        for destination, value in zip(destinations, stored, strict=True)
+    )
+    agent = ctx.get(NixlAgentCache).agent
+    assert [len(handle.local_descriptors) for handle in agent.initialized] == [2, 1]
+
+
+@pytest.mark.asyncio
+async def test_get_allows_oversized_tensor_as_single_staging_batch(
+    monkeypatch, ref, ctx
+):
+    # The transport does not split tensors: each 96-byte view travels alone.
+    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_GET_STAGING_BYTES", 64)
+    stored_bases = [torch.arange(24).reshape(4, 6) for _ in range(2)]
+    stored = [base[:, ::2] for base in stored_bases]
+    destinations = [torch.zeros(4, 3, dtype=torch.int64) for _ in stored]
+    requests = [
+        Request.from_tensor(f"weight-{index}", destination)
+        for index, destination in enumerate(destinations)
+    ]
+    client_buffer = NixlTransportBuffer(ref)
+
+    await client_buffer._pre_get_hook(requests)
+    storage_volume_buffer = _storage_volume_copy(client_buffer)
+    await storage_volume_buffer.handle_get_request(
+        ctx,
+        [
+            (request.meta_only(), value)
+            for request, value in zip(requests, stored, strict=True)
+        ],
+    )
+
+    agent = ctx.get(NixlAgentCache).agent
+    assert [len(handle.local_descriptors) for handle in agent.initialized] == [1, 1]
+    assert all(
+        torch.equal(destination, value)
+        for destination, value in zip(destinations, stored, strict=True)
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_staging_limit_is_shared_by_concurrent_requests(
+    monkeypatch, ref, ctx
+):
+    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_GET_STAGING_BYTES", 96)
+    destinations = [torch.zeros(4, 3, dtype=torch.int64) for _ in range(2)]
+    requests = [
+        Request.from_tensor(f"weight-{index}", destination)
+        for index, destination in enumerate(destinations)
+    ]
+    client_buffers = [NixlTransportBuffer(ref) for _ in requests]
+    for client_buffer, request in zip(client_buffers, requests, strict=True):
+        await client_buffer._pre_get_hook([request])
+    storage_volume_buffers = [
+        _storage_volume_copy(client_buffer) for client_buffer in client_buffers
+    ]
+    stored_bases = [torch.arange(24).reshape(4, 6) for _ in requests]
+    stored = [base[:, ::2] for base in stored_bases]
+    agent = ctx.get(NixlAgentCache).agent
+
+    FakeNixlAgent.force_processing = True
+    first_task = asyncio.create_task(
+        storage_volume_buffers[0].handle_get_request(
+            ctx, [(requests[0].meta_only(), stored[0])]
+        )
+    )
+    while not agent.check_xfer_state.called:
+        await asyncio.sleep(0)
+
+    second_task = asyncio.create_task(
+        storage_volume_buffers[1].handle_get_request(
+            ctx, [(requests[1].meta_only(), stored[1])]
+        )
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    # The second request cannot create its staging copy or NIXL transfer while
+    # the first request owns the storage volume's entire byte budget.
+    assert len(agent.initialized) == 1
+
+    FakeNixlAgent.force_processing = False
+    await asyncio.gather(first_task, second_task)
+
+    assert len(agent.initialized) == 2
+    assert all(
+        torch.equal(destination, value)
+        for destination, value in zip(destinations, stored, strict=True)
+    )
+
+
+@pytest.mark.asyncio
 async def test_put_batches_multiple_tensors_in_one_transfer(ref, ctx):
     client_buffer = NixlTransportBuffer(ref)
     sources = [torch.arange(4), torch.arange(4, 8)]
