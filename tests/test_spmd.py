@@ -49,7 +49,7 @@ def _reserve_free_port() -> int:
 
 
 def _configure_spmd_env(rank: int, master_port: int) -> None:
-    os.environ["HOSTNAME"] = socket.gethostname()
+    os.environ["TORCHSTORE_HOSTNAME"] = socket.gethostname()
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["LOCAL_WORLD_SIZE"] = str(_WORLD_SIZE)
     os.environ["MASTER_ADDR"] = _MASTER_ADDR

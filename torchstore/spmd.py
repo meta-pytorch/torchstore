@@ -37,6 +37,7 @@ except ImportError as e:
 import torchstore.api as _api
 from torchstore.controller import Controller
 from torchstore.strategy import HostStrategy, LocalRankStrategy, TorchStoreStrategy
+from torchstore.utils import TORCHSTORE_HOSTNAME_ENV
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -330,7 +331,7 @@ async def initialize(
         env.num_hosts if isinstance(strategy, HostStrategy) else env.world_size
     )
 
-    os.environ.setdefault("HOSTNAME", socket.gethostname())
+    os.environ.setdefault(TORCHSTORE_HOSTNAME_ENV, socket.gethostname())
 
     rendezvous = TCPStore(
         env.master_addr,

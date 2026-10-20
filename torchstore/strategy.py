@@ -12,13 +12,13 @@ multiple storage volumes. Strategies map client processes to storage volumes.
 
 import logging
 import os
-import socket
 from typing import TYPE_CHECKING
 
 from monarch.actor import current_rank
 
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
+from torchstore.utils import get_local_hostname
 
 if TYPE_CHECKING:
     from torchstore.storage_volume import StorageVolume
@@ -146,19 +146,19 @@ class TorchStoreStrategy:
 class HostStrategy(TorchStoreStrategy):
     """Assumes one storage volume per host.
 
-    Each process uses 'HOSTNAME' to determine which storage volume to connect to.
-    This strategy requires the HOSTNAME environment variable to be set and assumes
-    one storage volume per local rank.
+    Each process uses its hostname to determine which storage volume to connect to.
+    The hostname is read from the TORCHSTORE_HOSTNAME environment variable if set,
+    otherwise from ``socket.gethostname()``.
     """
 
     @classmethod
     def get_volume_id(cls):
         # Note: this should only called at spawn, which makes this safe.
-        return os.environ.get("HOSTNAME", socket.gethostname())
+        return get_local_hostname()
 
     @classmethod
     def get_client_id(cls):
-        return os.environ["HOSTNAME"]
+        return get_local_hostname()
 
 
 class LocalRankStrategy(TorchStoreStrategy):
