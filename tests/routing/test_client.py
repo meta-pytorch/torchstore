@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 from collections import Counter
 from collections.abc import Collection, Mapping
 from typing import Any
@@ -16,13 +17,19 @@ import monarch.actor as monarch_actor
 import pytest
 import torch
 import torchstore as ts
+from torchstore.routing import _gc
 from torchstore.routing._model import KeyRegistration, RankRole, Registrations
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.control_plane import ControlPlane
-from torchstore.state_dict_utils import get_state_dict, put_state_dict
+from torchstore.routing.plan import RoutingPlan
+from torchstore.state_dict_utils import (
+    _state_dict_storage_metadata,
+    get_state_dict,
+    put_state_dict,
+)
 from torchstore.transport import TransportType
 
-from .utils import registered_clients, routing_clients
+from .utils import registered_clients, routing_clients, tensor_slice
 
 # One deadline covers the whole sync and leaves the marker's other 60 s for cleanup.
 _DEADLINE_S = 60.0
@@ -73,6 +80,35 @@ def _in_memory_clients() -> tuple[_InMemoryControlPlane, RoutingClient, RoutingC
         RoutingClient("publisher/0", RankRole.PUBLISHER, control_plane, strategy),
         RoutingClient("requester/0/0", RankRole.REQUESTER, control_plane, strategy),
     )
+
+
+def _fsdp_layouts(world: int) -> Registrations:
+    """Each publisher's slices under 1-D FSDP, unevenly chunked, plus a buffer every rank holds whole."""
+    sharded = {
+        "model/embed": ((15, 4), 0),
+        "model/wqkv": ((24, 6), 0),
+        "model/wo": ((6, 15), 1),
+    }
+    layouts = {}
+    for rank in range(world):
+        placement = {"coordinates": (rank,), "mesh_shape": (world,)}
+        layout = {}
+        for key, (shape, dim) in sharded.items():
+            chunk = -(-shape[dim] // world)
+            start = min(rank * chunk, shape[dim])
+            offsets = tuple(start if d == dim else 0 for d in range(len(shape)))
+            local = list(shape)
+            local[dim] = min(chunk, shape[dim] - start)
+            layout[key] = KeyRegistration(
+                tensor_slice(offsets, tuple(local), global_shape=shape, **placement),
+                dtype=torch.bfloat16,
+            )
+        layout["model/freqs"] = KeyRegistration(
+            tensor_slice((0, 0), (4, 2), global_shape=(4, 2), **placement),
+            dtype=torch.float32,
+        )
+        layouts[f"publisher/{rank}"] = layout
+    return layouts
 
 
 class _CountingControlPlane(ControlPlane):
@@ -243,6 +279,125 @@ async def test_a_failed_layout_exchange_is_retried_on_the_next_sync() -> None:
     assert route is not None
     [transfer] = route.transfers
     assert transfer.source == "publisher/0"
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "disabled"])
+@pytest.mark.parametrize("requested", ["w", "other"], ids=["plans", "planning_raises"])
+@pytest.mark.asyncio
+async def test_a_requester_pauses_collection_only_while_it_plans(
+    monkeypatch: pytest.MonkeyPatch, requested: str, enabled: bool
+) -> None:
+    """Pause collection only while a requester plans its routes, then leave it as it was, also on a raise.
+
+    The control plane's lookup, which can wait for minutes, and every other step run
+    with collection as the caller left it.
+    """
+    assert gc.isenabled() and _gc._windows == 0
+    control_plane, publisher, requester = _in_memory_clients()
+    await publisher.register_layout({"w": torch.empty(4, dtype=torch.int64)}, "model")
+    seen: list[tuple[str, bool]] = []
+
+    def recorded(step: str, call: Any) -> Any:
+        def record(*args: Any, **kwargs: Any) -> Any:
+            seen.append((step, gc.isenabled()))
+            return call(*args, **kwargs)
+
+        return record
+
+    get_layouts = control_plane.get_layouts
+
+    async def lookup(key: str) -> Registrations:
+        # Recorded as the lookup runs, not when the requester creates its coroutine.
+        seen.append(("lookup", gc.isenabled()))
+        return await get_layouts(key)
+
+    directory = requester._routing_directory
+    monkeypatch.setattr(control_plane, "get_layouts", lookup)
+    monkeypatch.setattr(
+        "torchstore.routing.client._state_dict_storage_metadata",
+        recorded("metadata", _state_dict_storage_metadata),
+    )
+    monkeypatch.setattr(
+        RoutingPlan, "for_requester", recorded("plan", RoutingPlan.for_requester)
+    )
+    monkeypatch.setattr(directory, "install", recorded("install", directory.install))
+    state_dict = {requested: torch.empty(4, dtype=torch.int64)}
+    if not enabled:
+        gc.disable()
+    try:
+        if requested == "w":
+            await requester.get_layouts(state_dict, "model")
+            after, windows = gc.isenabled(), _gc._windows
+        else:
+            with pytest.raises(
+                KeyError, match="requester keys have no publisher"
+            ) as raised:
+                await requester.get_layouts(state_dict, "model")
+            # Read before dropping the error, so only the requester's own close passes.
+            after, windows = gc.isenabled(), _gc._windows
+            del raised
+    finally:
+        gc.enable()
+    steps = [("lookup", enabled), ("metadata", enabled), ("plan", False)]
+    if requested == "w":
+        steps.append(("install", enabled))
+        assert directory.routes.lookup("model/w")
+    assert seen == steps
+    assert after is enabled and windows == 0
+
+
+@pytest.mark.asyncio
+async def test_a_paused_plan_matches_one_built_with_collection_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Install, from 8 synthetic FSDP layouts, the routes that planning with frequent collections builds."""
+    assert gc.isenabled() and _gc._windows == 0
+    enabled: list[bool] = []
+    for_requester = RoutingPlan.for_requester
+
+    def planned(*args: Any, **kwargs: Any) -> RoutingPlan:
+        enabled.append(gc.isenabled())
+        return for_requester(*args, **kwargs)
+
+    monkeypatch.setattr(RoutingPlan, "for_requester", planned)
+    layouts = _fsdp_layouts(8)
+    control_plane = _InMemoryControlPlane()
+    control_plane._layouts["model"] = layouts
+    strategy = ts.TorchStoreStrategy(TransportType.MonarchRPC)
+    requester = RoutingClient(
+        "requester/0/0", RankRole.REQUESTER, control_plane, strategy
+    )
+    state_dict = {
+        "embed": torch.empty(15, 4, dtype=torch.bfloat16),
+        "wqkv": torch.empty(24, 6, dtype=torch.bfloat16),
+        "wo": torch.empty(6, 15, dtype=torch.bfloat16),
+        "freqs": torch.empty(4, 2),
+    }
+    await requester.get_layouts(state_dict, "model")
+
+    slices, dtypes, _mapping = _state_dict_storage_metadata(state_dict, "model")
+    registrations = {
+        key: KeyRegistration(local_slice, dtype=dtypes[key])
+        for key, local_slice in slices.items()
+    }
+    assert gc.isenabled()
+    # Collect after every allocation, so a plan that depended on collection would differ.
+    threshold = gc.get_threshold()
+    collections = gc.get_stats()[0]["collections"]
+    gc.set_threshold(1)
+    try:
+        expected = for_requester("requester/0/0", registrations, layouts).routes
+    finally:
+        gc.set_threshold(*threshold)
+    assert gc.get_stats()[0]["collections"] > collections
+    assert enabled == [False]
+    assert requester._routing_directory.routes == expected
+    transfers: list[int] = []
+    for plan in expected.keys.values():
+        assert plan.route is not None
+        transfers.append(len(plan.route.transfers))
+    # Sorted keys: embed, freqs, wo and wqkv. The buffer is read from one of its 8 holders.
+    assert transfers == [8, 1, 8, 8]
 
 
 @pytest.mark.timeout(120)
