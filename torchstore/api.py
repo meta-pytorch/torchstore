@@ -56,8 +56,9 @@ _control_plane_map: dict[str, _SelectedControlPlane] = {}
 # (store, instance) for each initialize still running on a caller's control plane.
 _initializing: list[tuple[str, ControlPlane]] = []
 
-# Guards each check-and-swap of the record, _initializing and the client cache. Never
-# held across an await: a dialed connection closes after it is released.
+# Guards each check-and-swap of the record, _initializing, the client cache and the
+# pending frame-length warning. Never held across an await: a dialed connection closes
+# after it is released.
 _selection_lock = threading.Lock()
 
 # Stores whose record ts.shutdown released here, until a selection takes the name back,
@@ -77,11 +78,29 @@ _closing: set["asyncio.Task[None]"] = set()
 
 _TActor = TypeVar("_TActor", bound="Actor")
 
+# Set by the package init when it exports Monarch's frame-length default, until the
+# first Monarch path logs that.
+_frame_length_warning_pending: bool = False
+
+
+def _log_frame_length_export() -> None:
+    """Log the package init's frame-length export once, from a path that loaded Monarch."""
+    global _frame_length_warning_pending
+    with _selection_lock:
+        pending = _frame_length_warning_pending
+        _frame_length_warning_pending = False
+    if pending:
+        logger.warning(
+            "Warning: setting HYPERACTOR_CODEC_MAX_FRAME_LENGTH since this needs to be set"
+            " to enable large RPC calls via Monarch"
+        )
+
 
 def current_rank() -> "Point":
     """Monarch's ``current_rank``, imported when first called."""
     from monarch.actor import current_rank as monarch_current_rank
 
+    _log_frame_length_export()
     return monarch_current_rank()
 
 
@@ -91,6 +110,7 @@ def get_or_spawn_controller(
     """Monarch's ``get_or_spawn_controller``, imported when first called."""
     from monarch.actor import get_or_spawn_controller as monarch_get_or_spawn_controller
 
+    _log_frame_length_export()
     return monarch_get_or_spawn_controller(name, Class, *args, **kwargs)
 
 
@@ -312,6 +332,8 @@ async def initialize(
 
     from torchstore.storage_volume import StorageVolume
 
+    # Before the volume spawn, so a first initialize that fails there still logs it.
+    _log_frame_length_export()
     # TODO: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
     # ideally this is done in the controller.init
     if isinstance(strategy, ControllerStorageVolumes):
@@ -347,6 +369,8 @@ async def _initialize_routing(
     """Spawn trainer volumes, then initialize the given control plane or Monarch's."""
     from torchstore.storage_volume import StorageVolume
 
+    # Volumes are Monarch actors, also under a caller's own control plane.
+    _log_frame_length_export()
     claim: tuple[str, ControlPlane] | None = None
     if control_plane is not None:
         # Until its record lands, the claim keeps other stores off the instance.
@@ -472,8 +496,10 @@ def _after_fork_in_child() -> None:
 
     The parent's connections stay the parent's, so the child dials its own.
     """
-    global _selection_lock
+    global _frame_length_warning_pending, _selection_lock
     _selection_lock = threading.Lock()
+    # The variable is inherited here, not exported by this process's import.
+    _frame_length_warning_pending = False
     for store_name, selected in list(_control_plane_map.items()):
         if selected.address is not None:
             del _control_plane_map[store_name]

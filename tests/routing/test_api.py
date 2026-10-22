@@ -56,6 +56,8 @@ def _fresh_process_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(store_api, "_initializing", [])
     monkeypatch.setattr(store_api, "_released_stores", set())
     monkeypatch.setattr(store_api, "_forked_stores", {})
+    # Keep the import's frame-length warning out of the first test to reach Monarch.
+    monkeypatch.setattr(store_api, "_frame_length_warning_pending", False)
 
 
 def test_routing_namespaces_distinguish_participant_meshes(monkeypatch) -> None:
@@ -2108,7 +2110,7 @@ print("parent", asyncio.run(client()))
 def test_a_forked_child_dials_its_own_connection() -> None:
     """Leave the parent's connection to the parent: a forked child dials its own."""
     store_name = _store_name()
-    # A set variable keeps Monarch, and its threads, out of the child until used.
+    # A set variable skips TorchStore's logging setup, so its INFO lines stay off stdout.
     env = {**os.environ, "HYPERACTOR_CODEC_MAX_FRAME_LENGTH": "910737418240"}
     with subprocess.Popen(
         [sys.executable, "-c", _FORK_CHILD, _ROOT, store_name],
