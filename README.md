@@ -315,6 +315,14 @@ configuration is needed — the selection happens at runtime:
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
 
+Setting `TORCHSTORE_TORCH_TRANSPORT_BACKEND` to a backend listed by
+`torch.distributed._transport.available_transports()` (e.g. `nixl`) enables the
+torch.distributed transport, preferred after shared memory. Requires a PyTorch
+build with `torch.distributed._transport`. `TORCHSTORE_TORCH_TRANSPORT_TIMEOUT_S`
+(default 60) bounds how long the storage volume waits for a request's transfers.
+Transfers cannot be cancelled, so a failed request may take up to 3x this
+timeout to release its memory, or leak it if they never finish.
+
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:
 
