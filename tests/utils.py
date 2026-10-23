@@ -101,7 +101,11 @@ class DTensorActor(Actor):
         os.environ["LOCAL_RANK"] = str(self.rank)
 
         # this is only necessary for nccl, but we're not using it in this test.
-        os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+        # A run that hides every GPU, with an empty mask or one whose first index is
+        # negative such as -1, keeps them hidden here too.
+        inherited = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if inherited is None or not (inherited == "" or inherited.startswith("-")):
+            os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
 
     def rlog(self, msg):
         logger.info(f"rank: {self.rank} {msg}")
