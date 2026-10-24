@@ -21,8 +21,8 @@ _PUBLISHER_RANKS = 2
 _REQUESTER_RANKS = 2
 # Each push gets a fresh loop, so client state tied to an earlier loop fails one.
 _ROUNDS = 2
-# A hung step fails at its own line, before the timeout marker fires.
-_STEP_TIMEOUT_S = 60.0
+# One deadline covers the whole sync and leaves the marker's other 60 s for cleanup.
+_DEADLINE_S = 60.0
 
 
 def _layer(rank: int, round_: int) -> torch.Tensor:
@@ -36,6 +36,13 @@ def _weights(round_: int) -> dict[str, torch.Tensor]:
         f"layers.{rank}.weight": _layer(rank, round_)
         for rank in range(_PUBLISHER_RANKS)
     }
+
+
+def _raise_first(results: list[object]) -> None:
+    """Raise the first exception that a gather with ``return_exceptions`` returned."""
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
 
 
 class _Publisher(Actor):
@@ -83,54 +90,53 @@ class _Requester(Actor):
 
 @pytest.mark.timeout(120)
 @pytest.mark.asyncio
-async def test_routed_weight_sync_across_actor_meshes() -> None:
+async def test_routed_weight_sync_across_actor_meshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Sync publishers that push from worker threads into a requester mesh."""
-    # Monarch's default fault hook interrupts the whole session; recording faults
-    # lets a dead or stalled peer fail its step instead. A failed run keeps this
-    # hook, since its stopped meshes can still report faults after it ends.
+    # Monarch's default fault hook interrupts the whole session, so record this
+    # test's mesh faults instead. monkeypatch restores the hook after any outcome.
     faults: list[monarch_actor.MeshFailure] = []
-    default_fault_hook = monarch_actor.unhandled_fault_hook
-    monarch_actor.unhandled_fault_hook = faults.append
+    monkeypatch.setattr(monarch_actor, "unhandled_fault_hook", faults.append)
     store_name = f"routed-sync-test-{uuid.uuid4()}"
     publisher_mesh = this_host().spawn_procs(per_host={"procs": _PUBLISHER_RANKS})
     requester_mesh = this_host().spawn_procs(per_host={"procs": _REQUESTER_RANKS})
-    try:
-        await asyncio.wait_for(
-            ts.initialize(
-                mesh=publisher_mesh,
-                strategy=ts.TorchStoreStrategy(TransportType.MonarchRPC),
-                client_type=ts.ClientType.ROUTING,
-                store_name=store_name,
-            ),
-            _STEP_TIMEOUT_S,
+
+    async def sync() -> None:
+        await ts.initialize(
+            mesh=publisher_mesh,
+            strategy=ts.TorchStoreStrategy(TransportType.MonarchRPC),
+            client_type=ts.ClientType.ROUTING,
+            store_name=store_name,
         )
         publishers = publisher_mesh.spawn("publisher", _Publisher, store_name)
         requesters = requester_mesh.spawn("requester", _Requester, store_name)
-        # Let every call settle first: stopping a mesh mid-lookup can break Monarch's
-        # controller lookups for the rest of the session.
-        results = await asyncio.wait_for(
-            asyncio.gather(
+        # Let every lookup settle before raising a failed one, since stopping a mesh
+        # mid-lookup can break Monarch's controller lookups for the session. A hang
+        # still reaches the deadline with lookups in flight.
+        _raise_first(
+            await asyncio.gather(
                 publishers.initialize_client.call(),
                 requesters.initialize_client.call(),
                 return_exceptions=True,
-            ),
-            _STEP_TIMEOUT_S,
+            )
         )
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-
         for round_ in range(_ROUNDS):
             # Each read follows the push, as one that starts first can miss the mapping.
-            await asyncio.wait_for(publishers.push.call(round_), _STEP_TIMEOUT_S)
-            pulled = await asyncio.wait_for(requesters.pull.call(), _STEP_TIMEOUT_S)
+            await publishers.push.call(round_)
+            pulled = await requesters.pull.call()
             torch.testing.assert_close(
                 {(round_, point.rank): values for point, values in pulled.items()},
                 {(round_, rank): _weights(round_) for rank in range(_REQUESTER_RANKS)},
                 rtol=0,
                 atol=0,
             )
+
+    try:
+        await asyncio.wait_for(sync(), _DEADLINE_S)
     finally:
-        await asyncio.gather(requester_mesh.stop(), publisher_mesh.stop())
+        stopped = await asyncio.gather(
+            requester_mesh.stop(), publisher_mesh.stop(), return_exceptions=True
+        )
     assert not faults, [fault.report() for fault in faults]
-    monarch_actor.unhandled_fault_hook = default_fault_hook
+    _raise_first(stopped)
