@@ -315,6 +315,13 @@ configuration is needed — the selection happens at runtime:
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
 
+Setting `TORCHSTORE_TORCH_TRANSPORT_BACKEND` to a backend listed by
+`torch.distributed._transport.available_transports()` (e.g. `nixl`) enables the
+torch.distributed transport, preferred after shared memory and over NIXL. Requires
+a PyTorch build with `torch.distributed._transport`. The variable is read at import
+time. This transport registers every tensor per request, so large state dicts are
+slower than with NIXL until registrations are cached.
+
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:
 
