@@ -7,18 +7,15 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import re
 import uuid
-from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import torch
 import torchstore.routing.coordinator as coordinator_module
 from monarch.actor import ActorError, get_or_spawn_controller
-from torchstore.routing._model import KeyRegistration, Registrations
+from torchstore.routing._model import KeyRegistration
 from torchstore.routing.coordinator import RoutingCoordinator
 
 from .utils import tensor_slice
@@ -40,20 +37,6 @@ def _registration(key: str = "model/w") -> dict[str, KeyRegistration]:
             dtype=torch.float32,
         )
     }
-
-
-class _ManualClockLoop(asyncio.SelectorEventLoop):
-    """Fires timers only once a test moves ``now`` past them."""
-
-    now = 0.0
-
-    def time(self) -> float:
-        return self.now
-
-
-def _endpoint_body(name: str) -> Callable[..., Any]:
-    """The undecorated ``RoutingCoordinator`` method, callable without an actor."""
-    return inspect.unwrap(RoutingCoordinator.__dict__[name]._method)
 
 
 @pytest.mark.asyncio
@@ -177,84 +160,54 @@ async def test_state_dict_namespaces_have_independent_layouts() -> None:
 
 
 @pytest.mark.timeout(60)
-def test_timeout_racing_the_last_registration_returns_layouts(monkeypatch) -> None:
-    """Return the layouts only when the last one lands as the wait times out."""
-    monkeypatch.setattr(coordinator_module, "_LAYOUT_REGISTRATION_TIMEOUT_S", 1)
-    init, get_layouts, register_layout = map(
-        _endpoint_body, ("init", "get_layouts", "register_layout")
-    )
-    timeouts: list[tuple[asyncio.AbstractEventLoop, float]] = []
-    wait_for = asyncio.wait_for
-
-    async def recording_wait_for(fut, timeout):
-        try:
-            return await wait_for(fut, timeout)
-        except asyncio.TimeoutError:
-            timeouts.append((asyncio.get_running_loop(), timeout))
-            raise
-
-    # Without this record, a registration that wakes the read first also passes.
-    monkeypatch.setattr(asyncio, "wait_for", recording_wait_for)
-
-    def time_out(
-        publishers: set[str],
-        *,
-        registered: tuple[str, ...] = (),
-        racing: tuple[str, ...] = (),
-    ) -> Registrations:
-        """Park a read after ``registered`` ranks, then expire it as ``racing`` register."""
-        actor = SimpleNamespace(_publishers=None, _strategy=None, _layouts={})
-        loop = _ManualClockLoop()
-        registrations: list[asyncio.Future[None]] = []
-
-        def register() -> None:
-            for rank in racing:
-                registrations.append(
-                    asyncio.ensure_future(
-                        register_layout(actor, rank, "model", _registration(rank))
-                    )
-                )
-
-        async def race() -> Registrations:
-            await init(actor, publishers, None)
-            for rank in registered:
-                await register_layout(actor, rank, "model", _registration(rank))
-            waiter = asyncio.ensure_future(get_layouts(actor, "model"))
-            for _ in range(10):
-                await asyncio.sleep(0)
-                if waiter.done():
-                    waiter.result()  # raises the read's own error first
-                    raise AssertionError("get_layouts returned without waiting")
-                layouts = actor._layouts.get("model")
-                if layouts is not None and not layouts.condition.locked():
-                    break  # the read is parked on the condition
-            else:
-                waiter.cancel()
-                raise AssertionError("get_layouts never waited")
-            # Both timers come due at once, and the earlier one (the registration)
-            # runs first, so the last layout lands as the read's deadline expires.
-            loop.call_at(0.5, register)
-            loop.now = 2.0
-            try:
-                await asyncio.wait({waiter})
-            finally:
-                await asyncio.gather(*registrations)
-            expired = [timeout for seen, timeout in timeouts if seen is loop]
-            assert expired == [1], "the read's deadline must expire"
-            return waiter.result()
-
-        try:
-            return loop.run_until_complete(race())
-        finally:
-            loop.close()
-
+@pytest.mark.parametrize(
+    ("registered", "racing", "missing"),
+    [
+        (("publisher/0",), ("publisher/1",), []),
+        ((), ("publisher/0",), ["publisher/1"]),
+    ],
+    ids=("completes-layouts", "leaves-one-missing"),
+)
+@pytest.mark.asyncio
+async def test_timeout_racing_a_registration(
+    monkeypatch,
+    registered: tuple[str, ...],
+    racing: tuple[str, ...],
+    missing: list[str],
+) -> None:
+    """Return layouts that a registration racing the timeout completes, else name who is missing."""
     publishers = {"publisher/0", "publisher/1"}
-    # The last registration lands as the read's deadline expires.
-    assert time_out(
-        publishers, registered=("publisher/0",), racing=("publisher/1",)
-    ) == {rank: _registration(rank) for rank in publishers}
-    # A registration that leaves another publisher missing still names it.
-    with pytest.raises(
-        TimeoutError, match=re.escape("missing publishers: ['publisher/1']")
-    ):
-        time_out(publishers, racing=("publisher/0",))
+    coordinator = await _coordinator(publishers)
+    for rank in registered:
+        await coordinator.register_layout.call_one(rank, "model", _registration(rank))
+    deadlines: list[float] = []
+
+    async def wait_for(wait, timeout):
+        # Step the real wait by hand so it stays parked while the racing ranks register.
+        wait.send(None)
+        for rank in racing:
+            await coordinator.register_layout.call_one(
+                rank, "model", _registration(rank)
+            )
+        deadlines.append(timeout)
+        try:
+            wait.throw(asyncio.CancelledError())  # the deadline fires before it resumes
+        except asyncio.CancelledError:
+            raise asyncio.TimeoutError from None
+        raise AssertionError("the wait outlived its deadline")
+
+    # Only the coordinator module sees the fake, not the rest of the process.
+    monkeypatch.setattr(
+        coordinator_module,
+        "asyncio",
+        SimpleNamespace(wait_for=wait_for, TimeoutError=asyncio.TimeoutError),
+    )
+    lookup = asyncio.wait_for(coordinator.get_layouts.call_one("model"), timeout=5)
+    if missing:
+        with pytest.raises(
+            ActorError, match=re.escape(f"missing publishers: {missing}")
+        ):
+            await lookup
+    else:
+        assert await lookup == {rank: _registration(rank) for rank in publishers}
+    assert deadlines == [coordinator_module._LAYOUT_REGISTRATION_TIMEOUT_S]
