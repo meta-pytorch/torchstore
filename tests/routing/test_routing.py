@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor
 from torchstore.state_dict_utils import get_state_dict, put_state_dict
 
-from .utils import registered_clients, routing_clients
+from .utils import registered_clients, routing_clients, shard
 
 
 @pytest.mark.asyncio
@@ -20,19 +19,9 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors()
     None
 ):
     """Assemble two publisher shards for allocated and caller-owned outputs."""
-    # 1. Represent each publisher's local rows as a DTensor shard. Fake meshes
-    # avoid process-group setup while retaining real global-offset metadata.
-    local_tensors = [torch.arange(8).view(2, 4), torch.arange(8, 16).view(2, 4)]
+    # 1. Represent each publisher's local rows as a DTensor shard.
     publisher_tensors = [
-        DTensor.from_local(
-            local_tensor,
-            DeviceMesh("cpu", torch.arange(2), _init_backend=False, _rank=rank),
-            [Shard(0)],
-            run_check=False,
-            shape=torch.Size((4, 4)),
-            stride=(4, 1),
-        )
-        for rank, local_tensor in enumerate(local_tensors)
+        shard(torch.arange(16).view(4, 4), 0, rank, 2) for rank in range(2)
     ]
     destination = torch.full((4, 4), -1)
     clients = await registered_clients(
@@ -99,18 +88,7 @@ async def test_split_publisher_state_dict() -> None:
 @pytest.mark.asyncio
 async def test_identical_mapping_entries_from_dtensor_shards_are_merged() -> None:
     """Accept the same FQN-to-path entry from every shard of one DTensor."""
-    local_tensors = [torch.arange(2), torch.arange(2, 4)]
-    publisher_tensors = [
-        DTensor.from_local(
-            local_tensor,
-            DeviceMesh("cpu", torch.arange(2), _init_backend=False, _rank=rank),
-            [Shard(0)],
-            run_check=False,
-            shape=torch.Size((4,)),
-            stride=(1,),
-        )
-        for rank, local_tensor in enumerate(local_tensors)
-    ]
+    publisher_tensors = [shard(torch.arange(4), 0, rank, 2) for rank in range(2)]
     destination = {"w": torch.full((4,), -1)}
     clients = await routing_clients(
         publishers={
@@ -191,10 +169,9 @@ async def test_source_only_mapping_entry_is_not_requested() -> None:
 async def test_destination_only_entry_is_ignored_by_non_strict_read() -> None:
     """Keep requester-local tensors that have no corresponding publisher key."""
     source = torch.arange(2)
-    local_only = torch.full((2,), -1)
     destination = {
         "weight": torch.zeros_like(source),
-        "local_only": local_only,
+        "local_only": torch.full((2,), -1),
     }
     clients = await routing_clients(
         publishers={"publisher/0": {"weight": source}},
@@ -211,4 +188,90 @@ async def test_destination_only_entry_is_ignored_by_non_strict_read() -> None:
 
     assert set(result) == {"weight"}
     torch.testing.assert_close(result["weight"], source)
-    torch.testing.assert_close(destination["local_only"], local_only)
+    torch.testing.assert_close(destination["local_only"], torch.full((2,), -1))
+
+
+# Shard dim of each tensor on two publishers, or None for a whole copy on each.
+# Column shards of out.weight are strided in every requester's buffer, so reads
+# copy them in rather than writing in place.
+_PUBLISHER_DIMS = {"proj.weight": 0, "norm.weight": None, "out.weight": 1}
+
+
+def _weights(round_: int) -> dict[str, torch.Tensor]:
+    """Whole tensors published in one round, with every value new each round."""
+    proj = torch.arange(24, dtype=torch.float32).view(4, 6) / 7 + round_
+    return {
+        "proj.weight": proj.to(torch.bfloat16),
+        "norm.weight": torch.arange(6, dtype=torch.float32) / 3 - round_,
+        "out.weight": torch.arange(24, dtype=torch.float32).view(4, 6) / 5 + 2 * round_,
+    }
+
+
+def _place(
+    tensors: dict[str, torch.Tensor],
+    dims: dict[str, int | None],
+    rank: int,
+    num_ranks: int,
+) -> dict[str, torch.Tensor]:
+    """Hold each tensor as one rank of a mesh would."""
+    return {
+        name: (
+            tensor.clone()
+            if dims[name] is None
+            else shard(tensor, dims[name], rank, num_ranks)
+        )
+        for name, tensor in tensors.items()
+    }
+
+
+def _locals(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The rank-local part of each tensor."""
+    return {
+        name: tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        for name, tensor in state_dict.items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("num_ranks", "dims"),
+    [
+        (1, {"proj.weight": None, "norm.weight": None, "out.weight": None}),
+        (2, {"proj.weight": 1, "norm.weight": 0, "out.weight": 0}),
+    ],
+    ids=["whole", "resharded"],
+)
+@pytest.mark.asyncio
+async def test_reads_refill_requester_buffers_every_round(
+    num_ranks: int, dims: dict[str, int | None]
+) -> None:
+    """Refill caller-owned buffers each round, sharded unlike the publishers."""
+    published = [
+        {
+            f"publisher/{rank}": _place(_weights(round_), _PUBLISHER_DIMS, rank, 2)
+            for rank in range(2)
+        }
+        for round_ in range(2)
+    ]
+    zeros = {name: torch.zeros_like(tensor) for name, tensor in _weights(0).items()}
+    destinations = {
+        f"requester/0/{rank}": _place(zeros, dims, rank, num_ranks)
+        for rank in range(num_ranks)
+    }
+    clients = await routing_clients(publishers=published[0], requesters=destinations)
+
+    for round_, state_dicts in enumerate(published):
+        for publisher, state_dict in state_dicts.items():
+            await put_state_dict(clients[publisher], state_dict, "model")
+        for requester, destination in destinations.items():
+            await get_state_dict(clients[requester], "model", destination)
+        torch.testing.assert_close(
+            {name: _locals(destination) for name, destination in destinations.items()},
+            {
+                f"requester/0/{rank}": _locals(
+                    _place(_weights(round_), dims, rank, num_ranks)
+                )
+                for rank in range(num_ranks)
+            },
+            rtol=0,
+            atol=0,
+        )
