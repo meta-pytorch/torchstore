@@ -201,12 +201,8 @@ def test_timeout_racing_the_last_registration_returns_layouts(monkeypatch) -> No
         *,
         registered: tuple[str, ...] = (),
         racing: tuple[str, ...] = (),
-        reinit: set[str] | None = None,
     ) -> Registrations:
-        """Park a read, then expire its deadline as the ``racing`` ranks register.
-
-        ``registered`` ranks register first; ``reinit`` re-runs init while it waits.
-        """
+        """Park a read after ``registered`` ranks, then expire it as ``racing`` register."""
         actor = SimpleNamespace(_publishers=None, _strategy=None, _layouts={})
         loop = _ManualClockLoop()
         registrations: list[asyncio.Future[None]] = []
@@ -235,8 +231,6 @@ def test_timeout_racing_the_last_registration_returns_layouts(monkeypatch) -> No
             else:
                 waiter.cancel()
                 raise AssertionError("get_layouts never waited")
-            if reinit is not None:
-                await init(actor, reinit, None)
             # Both timers come due at once, and the earlier one (the registration)
             # runs first, so the last layout lands as the read's deadline expires.
             loop.call_at(0.5, register)
@@ -264,13 +258,3 @@ def test_timeout_racing_the_last_registration_returns_layouts(monkeypatch) -> No
         TimeoutError, match=re.escape("missing publishers: ['publisher/1']")
     ):
         time_out(publishers, racing=("publisher/0",))
-    # A read parked across a second init raises instead of returning the layouts
-    # that init dropped, even once a new publisher registers.
-    for reinit in ({"publisher/0"}, publishers):
-        with pytest.raises(TimeoutError, match=re.escape("missing publishers: []")):
-            time_out(
-                publishers | {"publisher/2"},
-                registered=("publisher/0", "publisher/1"),
-                racing=("publisher/0",),
-                reinit=reinit,
-            )

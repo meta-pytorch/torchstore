@@ -103,8 +103,7 @@ class RoutingCoordinator(Actor):
             except asyncio.TimeoutError as error:
                 missing = self._publishers - layouts.publishers.keys()
                 # A registration can land while the timed-out wait reacquires the lock.
-                # Layouts that a later init dropped are never returned.
-                if not missing and self._layouts.get(key) is layouts:
+                if not missing:
                     return layouts.publishers
                 raise TimeoutError(
                     f"timed out after {_LAYOUT_REGISTRATION_TIMEOUT_S} seconds "
