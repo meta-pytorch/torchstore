@@ -11,8 +11,11 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
+import torch
 import torchstore as ts
 from monarch.actor import get_or_spawn_controller, this_host
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import RoutingCoordinator
@@ -35,6 +38,22 @@ def tensor_slice(
         global_shape=global_shape,
         local_shape=local_shape,
         mesh_shape=mesh_shape,
+    )
+
+
+def shard(tensor: torch.Tensor, dim: int, rank: int, num_ranks: int) -> DTensor:
+    """Hold one rank's chunk of ``tensor`` along ``dim`` as a DTensor shard.
+
+    Fake meshes give real global offsets without a process group.
+    """
+    mesh = DeviceMesh("cpu", torch.arange(num_ranks), _init_backend=False, _rank=rank)
+    return DTensor.from_local(
+        tensor.chunk(num_ranks, dim)[rank].clone(),
+        mesh,
+        [Shard(dim)],
+        run_check=False,
+        shape=tensor.shape,
+        stride=tensor.stride(),
     )
 
 
