@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import copy
 import math
 import os
@@ -15,7 +16,7 @@ import torch
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 import torchstore as ts
-from monarch.actor import Actor, current_rank, endpoint
+from monarch.actor import Actor, current_rank, endpoint, this_host
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -94,6 +95,8 @@ class DCPParityTest(Actor):
         self.rank = current_rank().rank
         # needed for LocalRankStrategy
         os.environ["LOCAL_RANK"] = str(self.rank)
+        # CPU-only ranks: hide GPUs so the optimizer step opens no CUDA context.
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     def rlog(self, msg):
         logger.info(f"rank: {self.rank} {msg}")
@@ -223,11 +226,20 @@ async def test_dcp_sharding_parity(transport_type):
         # put_state_dict from multiple clients to a single storage volume runs into same-key
         # race conditions (contains non sharded elements)
         strategy = ts.LocalRankStrategy
-        await ts.initialize(
-            num_storage_volumes=save_world_size,
-            strategy=strategy(transport_type),
-        )
-        try:
+        async with contextlib.AsyncExitStack() as cleanup:
+            # Every mesh is spawned here and stopped at the end, each even if another stop fails.
+            def spawn(num_procs: int):
+                procs = this_host().spawn_procs(per_host={"gpus": num_procs})
+                cleanup.push_async_callback(procs.stop)
+                return procs
+
+            await ts.initialize(
+                num_storage_volumes=save_world_size,
+                strategy=strategy(transport_type),
+                mesh=spawn(save_world_size),
+            )
+            cleanup.push_async_callback(ts.shutdown)
+            save_procs, get_procs = spawn(save_world_size), spawn(get_world_size)
             with tempfile.TemporaryDirectory() as tmpdir:
                 dcp_checkpoint_fn = os.path.join(tmpdir, "dcp_checkpoint.pt")
 
@@ -235,6 +247,7 @@ async def test_dcp_sharding_parity(transport_type):
                     save_world_size,
                     DCPParityTest,
                     "save_world",
+                    mesh=save_procs,
                     mesh_shape=save_mesh_shape,
                     dcp_checkpoint_fn=dcp_checkpoint_fn,
                     file_store_name=os.path.join(tmpdir, "save_world"),
@@ -245,6 +258,7 @@ async def test_dcp_sharding_parity(transport_type):
                     get_world_size,
                     DCPParityTest,
                     "get_world",
+                    mesh=get_procs,
                     mesh_shape=get_mesh_shape,
                     dcp_checkpoint_fn=dcp_checkpoint_fn,
                     file_store_name=os.path.join(tmpdir, "get_world"),
@@ -258,11 +272,6 @@ async def test_dcp_sharding_parity(transport_type):
                         raise AssertionError(
                             f"Assertion failed on rank {coord.rank} ({save_mesh_shape=} {get_mesh_shape=}): {e}"
                         ) from e
-        finally:
-            # TODO: Investigate monarch bug with proc_mesh.stop()
-            # await save_world._proc_mesh.stop()
-            # await get_world._proc_mesh.stop()
-            await ts.shutdown()
 
 
 def _assert_equal_state_dict(state_dict1, state_dict2):
