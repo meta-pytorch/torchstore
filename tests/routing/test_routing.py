@@ -8,10 +8,27 @@ from __future__ import annotations
 
 import pytest
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 from torchstore.state_dict_utils import get_state_dict, put_state_dict
 
-from .utils import registered_clients, routing_clients, shard
+from .utils import registered_clients, routing_clients
+
+
+def shard(tensor: torch.Tensor, dim: int, rank: int, num_ranks: int) -> DTensor:
+    """Hold one rank's chunk of ``tensor`` along ``dim`` as a DTensor shard.
+
+    Fake meshes give real global offsets without a process group.
+    """
+    mesh = DeviceMesh("cpu", torch.arange(num_ranks), _init_backend=False, _rank=rank)
+    return DTensor.from_local(
+        tensor.chunk(num_ranks, dim)[rank].clone(),
+        mesh,
+        [Shard(dim)],
+        run_check=False,
+        shape=tensor.shape,
+        stride=tensor.stride(),
+    )
 
 
 @pytest.mark.asyncio
