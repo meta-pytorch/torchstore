@@ -643,5 +643,43 @@ async def test_fully_local_dtensor_put_get():
             await ts.shutdown()
 
 
+class _MaskActor(DTensorActor):
+    """Reports the CUDA mask that its constructor left."""
+
+    @endpoint
+    async def mask(self) -> str | None:
+        return os.environ.get("CUDA_VISIBLE_DEVICES")
+
+
+@pytest.mark.parametrize(
+    "inherited, expected",
+    [("", ""), ("-1", "-1"), ("3", "0,1")],
+    ids=["empty", "negative", "visible"],
+)
+@pytest.mark.asyncio
+async def test_dtensor_actor_keeps_a_mask_that_hides_every_gpu(
+    monkeypatch, inherited, expected
+) -> None:
+    """Keep a test run's mask that hides every GPU, and give others ``visible_devices``."""
+    # Monarch copies this process's environment into each process it spawns.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", inherited)
+    procs = this_host().spawn_procs(per_host={"gpus": 1})
+    try:
+        actor = await spawn_actors(
+            1,
+            _MaskActor,
+            "mask_actor",
+            mesh=procs,
+            mesh_shape=(1,),
+            original_tensor=torch.zeros(1),
+            placements=[Shard(0)],
+            file_store_name="unused",
+            visible_devices="0,1",
+        )
+        assert await actor.mask.call_one() == expected
+    finally:
+        await procs.stop()
+
+
 if __name__ == "__main__":
     main(__file__)
