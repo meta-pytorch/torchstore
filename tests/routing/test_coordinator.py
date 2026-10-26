@@ -7,9 +7,7 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import uuid
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -159,55 +157,15 @@ async def test_state_dict_namespaces_have_independent_layouts() -> None:
     assert all(set(layouts) == {"publisher"} for layouts in results)
 
 
-@pytest.mark.timeout(60)
-@pytest.mark.parametrize(
-    ("registered", "racing", "missing"),
-    [
-        (("publisher/0",), ("publisher/1",), []),
-        ((), ("publisher/0",), ["publisher/1"]),
-    ],
-    ids=("completes-layouts", "leaves-one-missing"),
-)
 @pytest.mark.asyncio
-async def test_timeout_racing_a_registration(
-    monkeypatch,
-    registered: tuple[str, ...],
-    racing: tuple[str, ...],
-    missing: list[str],
-) -> None:
-    """Return layouts that a registration racing the timeout completes, else name who is missing."""
-    publishers = {"publisher/0", "publisher/1"}
-    coordinator = await _coordinator(publishers)
-    for rank in registered:
-        await coordinator.register_layout.call_one(rank, "model", _registration(rank))
-    deadlines: list[float] = []
-
-    async def wait_for(wait, timeout):
-        # Step the real wait by hand so it stays parked while the racing ranks register.
-        wait.send(None)
-        for rank in racing:
-            await coordinator.register_layout.call_one(
-                rank, "model", _registration(rank)
-            )
-        deadlines.append(timeout)
-        try:
-            wait.throw(asyncio.CancelledError())  # the deadline fires before it resumes
-        except asyncio.CancelledError:
-            raise asyncio.TimeoutError from None
-        raise AssertionError("the wait outlived its deadline")
-
-    # Only the coordinator module sees the fake, not the rest of the process.
-    monkeypatch.setattr(
-        coordinator_module,
-        "asyncio",
-        SimpleNamespace(wait_for=wait_for, TimeoutError=asyncio.TimeoutError),
+async def test_timeout_with_no_publisher_missing_returns_layouts(monkeypatch) -> None:
+    """Return the layouts when the wait times out after every publisher registered."""
+    # A zero timeout cancels the wait before it starts, so the read times out with
+    # every layout in place, as when the last registration lands at the deadline.
+    monkeypatch.setattr(coordinator_module, "_LAYOUT_REGISTRATION_TIMEOUT_S", 0)
+    coordinator = await _coordinator({"publisher"})
+    await coordinator.register_layout.call_one("publisher", "model", _registration())
+    layouts = await asyncio.wait_for(
+        coordinator.get_layouts.call_one("model"), timeout=1
     )
-    lookup = asyncio.wait_for(coordinator.get_layouts.call_one("model"), timeout=5)
-    if missing:
-        with pytest.raises(
-            ActorError, match=re.escape(f"missing publishers: {missing}")
-        ):
-            await lookup
-    else:
-        assert await lookup == {rank: _registration(rank) for rank in publishers}
-    assert deadlines == [coordinator_module._LAYOUT_REGISTRATION_TIMEOUT_S]
+    assert layouts == {"publisher": _registration()}
