@@ -507,3 +507,12 @@ class DirectWeightSyncDest:
                 # op.recv_buffer[op.src_slices] extracts the overlap from the source
                 # op.dest_tensor[op.dest_slices] targets where it goes in the dest
                 op.dest_tensor[op.dest_slices].copy_(op.recv_buffer[op.src_slices])
+
+        # Callers may consume the destination from other streams or threads,
+        # which the copies above are not ordered with.
+        for device in {
+            op.dest_tensor.device
+            for op in plan
+            if op.dest_tensor is not None and op.dest_tensor.device.type == "cuda"
+        }:
+            torch.cuda.current_stream(device).synchronize()
