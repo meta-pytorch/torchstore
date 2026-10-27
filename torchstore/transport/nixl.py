@@ -74,6 +74,7 @@ class _Registration:
 
     descriptors: Any
     storage_ref: weakref.ReferenceType[Any]
+    storage_id: int
 
 
 class NixlAgentCache(TransportCache):
@@ -94,10 +95,13 @@ class NixlAgentCache(TransportCache):
         )
         self.agent = nixl_agent(name, config)
         self._registrations: dict[tuple[int, int], _Registration] = {}
+        # id(storage) -> its registration key, to find registrations whose
+        # storage has since moved.
+        self._keys_by_storage: dict[int, tuple[int, int]] = {}
         self._remote_agents: dict[str, bytes] = {}
 
     def register(self, tensor: torch.Tensor) -> Any:
-        """Register a tensor's whole storage once for the lifetime of that storage.
+        """Register a tensor's whole storage until it is freed or reallocated.
 
         Transfers build descriptors from the tensor itself, and NIXL accepts any
         descriptor inside a registered region, so one registration covers every
@@ -108,22 +112,42 @@ class NixlAgentCache(TransportCache):
         storage = tensor.untyped_storage()
         key = (storage.data_ptr(), storage.nbytes())
         existing = self._registrations.get(key)
-        if existing is not None:
+        if existing is not None and existing.storage_ref() is storage:
             return existing.descriptors
+
+        # The memory moved or was reused (e.g. FSDP freed and reallocated a
+        # parameter's storage): drop registrations over memory the caching
+        # allocator may hand out again.
+        if existing is not None:
+            self._evict(key)
+        stale_key = self._keys_by_storage.get(id(storage))
+        if stale_key is not None:
+            self._evict(stale_key)
 
         # Not kept: a tensor over the storage would keep the storage alive.
         region = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(storage)
         descriptors = self.agent.register_memory(region, backends=[self.backend])
-        storage_ref = weakref.ref(storage, lambda _ref, _key=key: self._evict(_key))
-        self._registrations[key] = _Registration(descriptors, storage_ref)
+        storage_ref = weakref.ref(storage, lambda ref, _key=key: self._evict(_key, ref))
+        self._registrations[key] = _Registration(descriptors, storage_ref, id(storage))
+        self._keys_by_storage[id(storage)] = key
         return descriptors
 
-    def _evict(self, key: tuple[int, int]) -> None:
+    def _evict(
+        self,
+        key: tuple[int, int],
+        storage_ref: weakref.ReferenceType[Any] | None = None,
+    ) -> None:
         registration = self._registrations.get(key)
         if registration is None:
             return
+        # A dead storage's callback must not evict a newer registration at its key.
+        if storage_ref is not None and registration.storage_ref is not storage_ref:
+            return
         self.agent.deregister_memory(registration.descriptors)
         self._registrations.pop(key, None)
+        storage_id = registration.storage_id
+        if self._keys_by_storage.get(storage_id) == key:
+            del self._keys_by_storage[storage_id]
 
     def add_remote_agent(self, name: str, metadata: bytes) -> str:
         """Load new remote metadata, replacing an older copy when needed."""
@@ -149,6 +173,111 @@ class NixlAgentCache(TransportCache):
         for remote_name in list(self._remote_agents):
             self.agent.remove_remote_agent(remote_name)
             self._remote_agents.pop(remote_name)
+
+
+async def _transfer_tensors(
+    cache: NixlAgentCache,
+    operation: _NixlTransferOperation,
+    remote_agent: str,
+    transfers: list[tuple[torch.Tensor, bytes]],
+) -> None:
+    """Transfer each local tensor to or from its serialized remote descriptors.
+
+    Waits until every started transfer reaches a terminal state before
+    returning or raising, so registered memory stays valid during DMA.
+    """
+    transfer_groups: dict[tuple[Any, Any], tuple[Any, Any]] = {}
+    handles = []
+    dispatch_error: Exception | None = None
+    try:
+        for tensor, serialized_remote_descs in transfers:
+            cache.register(tensor)
+            tensor_local_descs = cache.agent.get_xfer_descs(tensor)
+            tensor_remote_descs = cache.agent.deserialize_descs(serialized_remote_descs)
+
+            # Each NIXL descriptor list must have one memory type per side.
+            # Split mixed CPU/GPU batches while preserving cross-device pairs.
+            group_key = (
+                tensor_local_descs.getType(),
+                tensor_remote_descs.getType(),
+            )
+            group = transfer_groups.get(group_key)
+            if group is None:
+                transfer_groups[group_key] = (
+                    tensor_local_descs,
+                    tensor_remote_descs,
+                )
+            else:
+                local_descs, remote_descs = group
+                for index in range(tensor_local_descs.descCount()):
+                    local_descs.append(tensor_local_descs[index])
+                for index in range(tensor_remote_descs.descCount()):
+                    remote_descs.append(tensor_remote_descs[index])
+
+        try:
+            for local_descs, remote_descs in transfer_groups.values():
+                handle = cache.agent.initialize_xfer(
+                    operation.value,
+                    local_descs,
+                    remote_descs,
+                    remote_agent,
+                    backends=[cache.backend],
+                )
+                handles.append(handle)
+                cache.agent.transfer(handle)
+        except Exception as error:
+            # Earlier handles may already be active. Drain them below before
+            # propagating the dispatch error.
+            dispatch_error = error
+
+        deadline = time.monotonic() + ENV_TORCHSTORE_NIXL_TIMEOUT_S
+        timed_out = False
+        cancelled = False
+        failed = False
+        check_error: Exception | None = None
+
+        # All handles are already in flight, so waiting for them one at a time
+        # does not serialize the transfers. NIXL has no cancellation API, so a
+        # timeout is reported only after active operations reach a terminal
+        # state. Returning earlier could free registered tensor storage while
+        # DMA is still using it.
+        for handle in handles:
+            while True:
+                try:
+                    status = cache.agent.check_xfer_state(handle)
+                except Exception as error:
+                    # A status-query failure does not establish that the DMA has
+                    # stopped. Remember the error, but keep polling so registered
+                    # storage and the transfer handle remain alive until terminal.
+                    if check_error is None:
+                        check_error = error
+                    status = _NixlTransferStatus.PROCESSING
+                if status != _NixlTransferStatus.PROCESSING:
+                    break
+                timed_out |= time.monotonic() >= deadline
+                try:
+                    await asyncio.sleep(0.001)
+                except asyncio.CancelledError:
+                    # Keep polling so the RPC retains both sides' tensor storage.
+                    cancelled = True
+            if status != _NixlTransferStatus.DONE:
+                failed = True
+
+        if cancelled:
+            raise asyncio.CancelledError
+        if dispatch_error is not None:
+            raise dispatch_error
+        if check_error is not None:
+            raise check_error
+        if failed:
+            raise RuntimeError("NIXL transfer failed")
+        if timed_out:
+            raise TimeoutError("NIXL transfer timed out")
+    finally:
+        # Handles are released only after their transfers reach a terminal
+        # state; NIXL release is assumed safe at that point.
+        for handle in handles:
+            cache.agent.release_xfer_handle(handle)
 
 
 @dataclass
@@ -281,105 +410,18 @@ class NixlTransportBuffer(TransportBuffer):
 
         cache = ctx.get(NixlAgentCache)
         remote_agent = self._connect_client(cache)
-        transfer_groups: dict[tuple[Any, Any], tuple[Any, Any]] = {}
-        handles = []
-        dispatch_error: Exception | None = None
         try:
-            for _, tensor, serialized_remote_descs in transfers:
-                cache.register(tensor)
-                tensor_local_descs = cache.agent.get_xfer_descs(tensor)
-                tensor_remote_descs = cache.agent.deserialize_descs(
-                    serialized_remote_descs
-                )
-
-                # Each NIXL descriptor list must have one memory type per side.
-                # Split mixed CPU/GPU batches while preserving cross-device pairs.
-                group_key = (
-                    tensor_local_descs.getType(),
-                    tensor_remote_descs.getType(),
-                )
-                group = transfer_groups.get(group_key)
-                if group is None:
-                    transfer_groups[group_key] = (
-                        tensor_local_descs,
-                        tensor_remote_descs,
-                    )
-                else:
-                    local_descs, remote_descs = group
-                    for index in range(tensor_local_descs.descCount()):
-                        local_descs.append(tensor_local_descs[index])
-                    for index in range(tensor_remote_descs.descCount()):
-                        remote_descs.append(tensor_remote_descs[index])
-
-            try:
-                for local_descs, remote_descs in transfer_groups.values():
-                    handle = cache.agent.initialize_xfer(
-                        operation.value,
-                        local_descs,
-                        remote_descs,
-                        remote_agent,
-                        backends=[cache.backend],
-                    )
-                    handles.append(handle)
-                    cache.agent.transfer(handle)
-            except Exception as error:
-                # Earlier handles may already be active. Drain them below before
-                # propagating the dispatch error.
-                dispatch_error = error
-
-            deadline = time.monotonic() + ENV_TORCHSTORE_NIXL_TIMEOUT_S
-            timed_out = False
-            cancelled = False
-            failed = False
-            check_error: Exception | None = None
-
-            # All handles are already in flight, so waiting for them one at a time
-            # does not serialize the transfers. NIXL has no cancellation API, so a
-            # timeout is reported only after active operations reach a terminal
-            # state. Returning earlier could free registered tensor storage while
-            # DMA is still using it.
-            for handle in handles:
-                while True:
-                    try:
-                        status = cache.agent.check_xfer_state(handle)
-                    except Exception as error:
-                        # A status-query failure does not establish that the DMA has
-                        # stopped. Remember the error, but keep polling so registered
-                        # storage and the transfer handle remain alive until terminal.
-                        if check_error is None:
-                            check_error = error
-                        status = _NixlTransferStatus.PROCESSING
-                    if status != _NixlTransferStatus.PROCESSING:
-                        break
-                    timed_out |= time.monotonic() >= deadline
-                    try:
-                        await asyncio.sleep(0.001)
-                    except asyncio.CancelledError:
-                        # Keep polling so the RPC retains both sides' tensor storage.
-                        cancelled = True
-                if status != _NixlTransferStatus.DONE:
-                    failed = True
-
-            if cancelled:
-                raise asyncio.CancelledError
-            if dispatch_error is not None:
-                raise dispatch_error
-            if check_error is not None:
-                raise check_error
-            if failed:
-                raise RuntimeError("NIXL transfer failed")
-            if timed_out:
-                raise TimeoutError("NIXL transfer timed out")
+            await _transfer_tensors(
+                cache,
+                operation,
+                remote_agent,
+                [(tensor, descriptors) for _, tensor, descriptors in transfers],
+            )
         except Exception as error:
             raise RuntimeError(
                 f"NIXL {operation.value} failed for keys="
                 f"{[request.key for request, _, _ in transfers]!r}"
             ) from error
-        finally:
-            # Handles are released only after their transfers reach a terminal
-            # state; NIXL release is assumed safe at that point.
-            for handle in handles:
-                cache.agent.release_xfer_handle(handle)
 
     def _connect_client(self, cache: NixlAgentCache) -> str:
         if self._client_agent_name is None or self._client_metadata is None:

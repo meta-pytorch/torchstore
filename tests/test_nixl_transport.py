@@ -18,6 +18,12 @@ import pytest
 import torch
 
 import torchstore.transport.nixl as nixl_transport
+from torchstore.direct_weight_sync import (
+    DirectWeightSyncDest,
+    DirectWeightSyncSource,
+    group_handles,
+    NixlBuffer,
+)
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.nixl import (
     _NixlTransferOperation,
@@ -25,7 +31,7 @@ from torchstore.transport.nixl import (
     NixlAgentCache,
     NixlTransportBuffer,
 )
-from torchstore.transport.types import Request
+from torchstore.transport.types import Request, TensorSlice
 
 
 class FakeNixlConfig:
@@ -714,6 +720,20 @@ def test_memory_registration_is_evicted_with_tensor_storage(agent_cache):
     agent.deregister_memory.assert_called_once_with([descriptor])
 
 
+def test_memory_registration_is_replaced_when_storage_is_reallocated(agent_cache):
+    tensor = torch.zeros(16)
+    agent = agent_cache.agent
+    (descriptor,) = agent_cache.register(tensor)
+
+    # FSDP frees and reallocates parameter memory on the same storage object.
+    tensor.untyped_storage().resize_(2 * tensor.nbytes)
+    agent_cache.register(tensor)
+
+    agent.deregister_memory.assert_called_once_with([descriptor])
+    storage = tensor.untyped_storage()
+    assert list(agent_cache._registrations) == [(storage.data_ptr(), storage.nbytes())]
+
+
 def test_memory_deregistration_failure_propagates(agent_cache):
     tensor = torch.zeros(16)
     key = (tensor.data_ptr(), tensor.nbytes)
@@ -750,3 +770,61 @@ def test_remote_agent_removal_failure_propagates(agent_cache):
 
     assert "remote-agent" in agent_cache._remote_agents
     agent_cache.agent.remove_remote_agent.side_effect = None
+
+
+@pytest.mark.asyncio
+async def test_direct_weight_sync_reads_every_source_agent_in_one_transfer():
+    weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    bias = torch.arange(4, dtype=torch.float32)
+    sources = []
+    per_rank = []
+    for rank in range(2):
+        source = DirectWeightSyncSource()
+        handles = source.register(
+            {"weight": weight.chunk(2)[rank].clone(), "bias": bias.clone()},
+            rank=rank,
+        )
+        # Plain tensors register as full tensors; mark the weight rows each owns.
+        handles["weight"].tensor_slice = TensorSlice(
+            offsets=(4 * rank, 0),
+            coordinates=(rank,),
+            global_shape=(8, 4),
+            local_shape=(4, 4),
+            mesh_shape=(2,),
+        )
+        sources.append(source)
+        per_rank.append(pickle.loads(pickle.dumps(handles)))
+
+    rank_handles = per_rank[0]
+    assert isinstance(rank_handles["weight"].rdma_buffer, NixlBuffer)
+    # The rank's metadata is pickled once and shared by its handles.
+    assert (
+        rank_handles["weight"].rdma_buffer.agent
+        is rank_handles["bias"].rdma_buffer.agent
+    )
+
+    all_handles = group_handles(per_rank)
+    dest_state_dict = {"weight": torch.zeros(8, 4), "bias": torch.zeros(4)}
+    dest = DirectWeightSyncDest()
+    await dest.pull(all_handles, dest_state_dict)
+
+    assert torch.equal(dest_state_dict["weight"], weight)
+    assert torch.equal(dest_state_dict["bias"], bias)
+    agent = dest._nixl.agent
+    # One READ per source agent; the replicated bias is read from rank 0 only.
+    assert [handle.remote_agent for handle in agent.initialized] == [
+        source._nixl.agent.name for source in sources
+    ]
+    assert all(
+        handle.operation == _NixlTransferOperation.READ for handle in agent.initialized
+    )
+
+    # Later pulls reuse registrations and loaded remote metadata.
+    register_calls = agent.register_memory.call_count
+    await dest.pull(all_handles, dest_state_dict)
+    assert agent.register_memory.call_count == register_calls
+    assert agent.add_remote_agent.call_count == 2
+
+    for source in sources:
+        await source.cleanup()
+        assert source._nixl._registrations == {}

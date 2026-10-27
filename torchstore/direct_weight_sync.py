@@ -7,8 +7,9 @@
 """Direct RDMA weight sync — zero-copy weight transfer between actors.
 
 Instead of routing tensor data through a StorageVolume (two hops),
-this module lets the destination read directly from the source's GPU
-memory via one-sided RDMA reads (one hop).
+this module lets the destination read directly from the source's
+registered (GPU or pinned CPU) memory via one-sided RDMA reads (one hop).
+Reads use NIXL when ``TORCHSTORE_NIXL_ENABLED=1``, else Monarch RDMA.
 
 TorchStore is still used for metadata exchange (RDMA handle registration),
 but the actual weight data travels directly source → destination.
@@ -37,6 +38,12 @@ from dataclasses import dataclass
 
 import torch
 
+from torchstore.transport.nixl import (
+    _NixlTransferOperation,
+    _transfer_tensors,
+    nixl_available,
+    NixlAgentCache,
+)
 from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import get_slice_intersection, to_byte_view
 
@@ -45,17 +52,36 @@ logger = logging.getLogger(__name__)
 RDMA_KEY_PREFIX = "policy_rdma"
 
 
+@dataclass(frozen=True)
+class NixlSourceAgent:
+    """A source rank's NIXL agent.
+
+    One instance is shared by all of a rank's handles, so pickling the
+    rank's handle dict sends the metadata once.
+    """
+
+    name: str
+    metadata: bytes
+
+
+@dataclass(frozen=True)
+class NixlBuffer:
+    """Serialized NIXL descriptors of a registered source buffer."""
+
+    agent: NixlSourceAgent
+    descriptors: bytes
+
+
 @dataclass
 class RDMAWeightHandle:
     """Serializable handle for direct RDMA access to a weight shard.
 
-    The ``rdma_buffer`` field is a Monarch ``RDMABuffer`` which is
-    natively pickle-able across Monarch actors.  After deserialization
-    on the destination, calling ``rdma_buffer.read_into(byte_view)``
-    performs a one-sided RDMA read from the source's memory.
+    The ``rdma_buffer`` field is a :class:`NixlBuffer` or a Monarch
+    ``RDMABuffer``; both pickle across Monarch actors. The destination
+    reads from it with one-sided RDMA reads.
     """
 
-    rdma_buffer: object | None  # monarch.rdma.RDMABuffer
+    rdma_buffer: object | None  # NixlBuffer | monarch.rdma.RDMABuffer
     tensor_slice: TensorSlice  # shard position in the global tensor
     source_rank: int
 
@@ -108,6 +134,9 @@ class DirectWeightSyncSource:
         self._handles: dict[str, RDMAWeightHandle] = {}
         # name → (staging_buffer, source_local_tensor)
         self._staging: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._nixl: NixlAgentCache | None = None
+        # Registered views; NIXL descriptors don't keep their memory alive.
+        self._nixl_views: list[torch.Tensor] = []
 
     def register(
         self,
@@ -129,9 +158,15 @@ class DirectWeightSyncSource:
         Returns a dict of serializable :class:`RDMAWeightHandle` objects
         that can be stored in TorchStore or sent to the destination actor.
         """
-        from monarch.rdma import RDMABuffer
+        use_nixl = nixl_available()
+        if use_nixl:
+            if self._nixl is None:
+                self._nixl = NixlAgentCache()
+        else:
+            from monarch.rdma import RDMABuffer
 
         handles: dict[str, RDMAWeightHandle] = {}
+        nixl_views: dict[str, torch.Tensor] = {}
         num_staged = 0
 
         for name, param in state_dict.items():
@@ -152,17 +187,32 @@ class DirectWeightSyncSource:
                 ), f"Expected contiguous tensor for key={name}, strides={local_tensor.stride()}"
                 buf_tensor = local_tensor
 
-            rdma_buf = (
-                None
-                if buf_tensor.numel() == 0
-                else RDMABuffer(to_byte_view(buf_tensor))
-            )
+            rdma_buf = None
+            if buf_tensor.numel() > 0:
+                byte_view = to_byte_view(buf_tensor)
+                if use_nixl:
+                    self._nixl.register(byte_view)
+                    nixl_views[name] = byte_view
+                else:
+                    rdma_buf = RDMABuffer(byte_view)
 
             handles[name] = RDMAWeightHandle(
                 rdma_buffer=rdma_buf,
                 tensor_slice=tensor_slice,
                 source_rank=rank,
             )
+
+        if nixl_views:
+            # The metadata carries the registrations' remote keys, so export it
+            # only after registering every buffer.
+            agent = self._nixl.agent
+            source_agent = NixlSourceAgent(agent.name, agent.get_agent_metadata())
+            for name, byte_view in nixl_views.items():
+                handles[name].rdma_buffer = NixlBuffer(
+                    source_agent,
+                    agent.get_serialized_descs(agent.get_xfer_descs(byte_view)),
+                )
+            self._nixl_views.extend(nixl_views.values())
 
         self._handles = handles
         logger.info(
@@ -187,10 +237,15 @@ class DirectWeightSyncSource:
     async def cleanup(self) -> None:
         """Release all RDMA registrations."""
         for handle in self._handles.values():
-            if handle.rdma_buffer is not None:
+            if handle.rdma_buffer is not None and not isinstance(
+                handle.rdma_buffer, NixlBuffer
+            ):
                 await handle.rdma_buffer.drop()
+        if self._nixl is not None:
+            self._nixl.clear()
         self._handles.clear()
         self._staging.clear()
+        self._nixl_views.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +317,26 @@ class DirectWeightSyncDest:
         self._plan: list[_TransferOp] | None = None
         self._plan_handles: dict[str, list[RDMAWeightHandle]] | None = None
         self._plan_signature: tuple | None = None
+        self._nixl: NixlAgentCache | None = None
+
+    async def _read_nixl(
+        self,
+        source_agent: NixlSourceAgent,
+        transfers: list[tuple[torch.Tensor, bytes]],
+    ) -> None:
+        """Read every buffer of one source agent in a batched NIXL transfer.
+
+        Destination storages stay registered across pulls; the cache drops a
+        registration once its storage is freed or reallocated.
+        """
+        if self._nixl is None:
+            self._nixl = NixlAgentCache()
+        remote_agent = self._nixl.add_remote_agent(
+            source_agent.name, source_agent.metadata
+        )
+        await _transfer_tensors(
+            self._nixl, _NixlTransferOperation.READ, remote_agent, transfers
+        )
 
     def _build_plan(
         self,
@@ -403,9 +478,22 @@ class DirectWeightSyncDest:
         }:
             torch.cuda.synchronize(device)
 
-        # Issue all RDMA reads concurrently
+        # Issue all RDMA reads concurrently, one NIXL batch per source agent.
+        monarch_reads = []
+        nixl_reads: dict[str, tuple[NixlSourceAgent, list]] = {}
+        for op in plan:
+            if not isinstance(op.rdma_buffer, NixlBuffer):
+                monarch_reads.append(op.rdma_buffer.read_into(op.dest_byte_view))
+                continue
+            agent = op.rdma_buffer.agent
+            _, transfers = nixl_reads.setdefault(agent.name, (agent, []))
+            transfers.append((op.dest_byte_view, op.rdma_buffer.descriptors))
         await asyncio.gather(
-            *(op.rdma_buffer.read_into(op.dest_byte_view) for op in plan)
+            *monarch_reads,
+            *(
+                self._read_nixl(agent, transfers)
+                for agent, transfers in nixl_reads.values()
+            ),
         )
 
         # Post-read copies (only for resharded ops). no_grad: dests may be
