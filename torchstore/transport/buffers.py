@@ -28,6 +28,13 @@ class TransportCache(ABC):
         """
         return
 
+    def busy(self) -> bool:
+        """Whether unfinished transfers may still use the cache's resources.
+
+        TransportContext.clear retires busy caches instead of clearing them.
+        """
+        return False
+
     @abstractmethod
     def clear(self) -> None:
         ...
@@ -47,6 +54,8 @@ class TransportContext:
 
     def __init__(self) -> None:
         self._caches: dict[type[TransportCache], TransportCache] = {}
+        # Caches holding resources a transport cannot release, kept for good.
+        self._retired: list[TransportCache] = []
 
     def get(self, cache_type: type[T]) -> T:
         """Get or lazily create a cache by its type (calls cache_type() if new)."""
@@ -54,9 +63,23 @@ class TransportContext:
             self._caches[cache_type] = cache_type()
         return self._caches[cache_type]  # type: ignore[return-value]
 
+    def retire(self, cache: TransportCache) -> None:
+        """Keep a cache alive without clearing it; the next get creates a new one."""
+        if self._caches.get(type(cache)) is cache:
+            del self._caches[type(cache)]
+        if cache not in self._retired:
+            self._retired.append(cache)
+
+    def retired(self, cache_type: type[T]) -> list[T]:
+        """Return the retired caches of a type."""
+        return [cache for cache in self._retired if isinstance(cache, cache_type)]
+
     def clear(self) -> None:
-        """Clear all caches."""
-        for cache in self._caches.values():
+        """Clear all caches, retiring busy ones instead."""
+        for cache in list(self._caches.values()):
+            if cache.busy():
+                self.retire(cache)
+                continue
             cache.clear()
         self._caches.clear()
 
