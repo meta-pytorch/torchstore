@@ -31,6 +31,8 @@ Typical usage (RL trainer → generator weight sync):
 
 import asyncio
 import logging
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import torch
@@ -72,6 +74,17 @@ def _request_to_slice(req: Request, param: torch.Tensor) -> TensorSlice:
         local_shape=shape,
         mesh_shape=tuple(1 for _ in range(ndim)),
     )
+
+
+def group_handles(
+    per_rank: Iterable[Mapping[str, RDMAWeightHandle]],
+) -> dict[str, list[RDMAWeightHandle]]:
+    """Merge per-rank handle dicts into per-param lists of handles."""
+    all_handles: dict[str, list[RDMAWeightHandle]] = defaultdict(list)
+    for rank_handles in per_rank:
+        for name, handle in rank_handles.items():
+            all_handles[name].append(handle)
+    return all_handles
 
 
 # ---------------------------------------------------------------------------
@@ -210,24 +223,40 @@ class _TransferOp:
     dest_slices: tuple[slice, ...] | None = None
 
 
+def _plan_signature(dest_state_dict: dict[str, torch.Tensor]) -> tuple:
+    """Identify the destination memory a plan was built for."""
+    dests = []
+    for name, param in dest_state_dict.items():
+        local = Request.from_any(name, param).tensor_val
+        dests.append(
+            (name, local.data_ptr(), local.untyped_storage().nbytes(), local.dtype)
+        )
+    return tuple(dests)
+
+
 class DirectWeightSyncDest:
     """Pulls weights via direct RDMA reads from source handles.
 
     On the first :meth:`pull`, a transfer plan is computed and cached.
-    Subsequent pulls skip all metadata work and just execute RDMA reads
-    + post-read copies.  Receive buffers are allocated on GPU (same
-    device as dest) to avoid CPU-GPU copies.
+    Subsequent pulls into the same destination memory skip all metadata
+    work and just execute RDMA reads + post-read copies. The plan is
+    rebuilt when the handles or the destination tensors change, e.g. when
+    pulling a subset of the state dict or into reallocated storage.
+    Receive buffers are allocated on GPU (same device as dest) to avoid
+    CPU-GPU copies.
     """
 
     def __init__(self) -> None:
         self._plan: list[_TransferOp] | None = None
+        self._plan_handles: dict[str, list[RDMAWeightHandle]] | None = None
+        self._plan_signature: tuple | None = None
 
     def _build_plan(
         self,
         all_handles: dict[str, list[RDMAWeightHandle]],
         dest_state_dict: dict[str, torch.Tensor],
     ) -> list[_TransferOp]:
-        """Build the transfer plan (called once on first pull).
+        """Build the transfer plan.
 
         For each destination parameter, finds overlapping source shards
         and creates a _TransferOp describing how to read from each one.
@@ -333,7 +362,8 @@ class DirectWeightSyncDest:
     ) -> None:
         """Pull weights from source handles into *dest_state_dict*.
 
-        On the first call the transfer plan is built and cached.
+        The transfer plan is built on the first call and reused while the
+        handles and destination memory stay the same.
         All RDMA reads are issued concurrently for maximum throughput.
 
         Args:
@@ -341,8 +371,15 @@ class DirectWeightSyncDest:
             dest_state_dict: Destination model state dict to write into
                 (parameters are updated in-place).
         """
-        if self._plan is None:
+        signature = _plan_signature(dest_state_dict)
+        if (
+            self._plan is None
+            or all_handles is not self._plan_handles
+            or signature != self._plan_signature
+        ):
             self._plan = self._build_plan(all_handles, dest_state_dict)
+            self._plan_handles = all_handles
+            self._plan_signature = signature
 
         # Issue all RDMA reads concurrently
         await asyncio.gather(

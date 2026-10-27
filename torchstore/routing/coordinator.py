@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 from monarch.actor import (  # type: ignore[import-untyped]
     Actor,
@@ -27,15 +28,15 @@ _LAYOUT_REGISTRATION_TIMEOUT_S = 5 * 60
 
 
 @dataclass
-class _Layouts:
-    """Publisher registrations for one state-dict namespace."""
+class _PublisherTable:
+    """One value per publisher for one state-dict namespace."""
 
-    publishers: Registrations = field(default_factory=dict)
+    publishers: dict[str, Any] = field(default_factory=dict)
     # Coordinate idempotent publisher registration with requester reads:
-    # - The first call from a publisher stores its layout.
-    # - Later calls from that publisher leave the stored layout unchanged.
+    # - The first call from a publisher stores its value.
+    # - Later calls from that publisher leave the stored value unchanged.
     # - Once all publishers have registered, notify every requester; subsequent
-    #   requesters satisfy the condition immediately and receive the same layouts.
+    #   requesters satisfy the condition immediately and receive the same values.
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
 
 
@@ -45,7 +46,8 @@ class RoutingCoordinator(Actor):
     def __init__(self) -> None:
         self._publishers: frozenset[str] | None = None
         self._strategy: TorchStoreStrategy | None = None
-        self._layouts: dict[str, _Layouts] = {}
+        self._layouts: dict[str, _PublisherTable] = {}
+        self._rdma_handles: dict[str, _PublisherTable] = {}
 
     @endpoint
     async def init(
@@ -56,6 +58,7 @@ class RoutingCoordinator(Actor):
         self._publishers = frozenset(publishers)
         self._strategy = strategy
         self._layouts = {}
+        self._rdma_handles = {}
 
     @endpoint
     async def strategy(self) -> TorchStoreStrategy:
@@ -72,16 +75,7 @@ class RoutingCoordinator(Actor):
         registrations: Mapping[str, KeyRegistration],
     ) -> None:
         """Record one publisher's layout without waiting for other ranks."""
-        if self._publishers is None:
-            raise RuntimeError("RoutingCoordinator.init has not run")
-        if rank not in self._publishers:
-            raise KeyError(f"{rank!r} is not a publisher rank")
-        layouts = self._layouts.setdefault(key, _Layouts())
-        async with layouts.condition:
-            if rank not in layouts.publishers:
-                layouts.publishers[rank] = dict(registrations)
-                if layouts.publishers.keys() == self._publishers:
-                    layouts.condition.notify_all()
+        await self._register(self._layouts, rank, key, dict(registrations))
 
     @concurrent_endpoint
     async def get_layouts(
@@ -89,24 +83,66 @@ class RoutingCoordinator(Actor):
         key: str,
     ) -> Registrations:
         """Wait for and return every publisher layout for ``key``."""
+        return await self._wait_for_publishers(self._layouts, key, "layouts")
+
+    @concurrent_endpoint
+    async def register_rdma_handles(
+        self,
+        rank: str,
+        key: str,
+        handles: Mapping[str, Any],
+    ) -> None:
+        """Record one publisher's direct-RDMA handles without waiting."""
+        await self._register(self._rdma_handles, rank, key, dict(handles))
+
+    @concurrent_endpoint
+    async def get_rdma_handles(self, key: str) -> dict[str, Mapping[str, Any]]:
+        """Wait for and return every publisher's direct-RDMA handles for ``key``."""
+        return await self._wait_for_publishers(self._rdma_handles, key, "RDMA handles")
+
+    async def _register(
+        self,
+        tables: dict[str, _PublisherTable],
+        rank: str,
+        key: str,
+        value: Any,
+    ) -> None:
         if self._publishers is None:
             raise RuntimeError("RoutingCoordinator.init has not run")
-        layouts = self._layouts.setdefault(key, _Layouts())
-        async with layouts.condition:
+        if rank not in self._publishers:
+            raise KeyError(f"{rank!r} is not a publisher rank")
+        table = tables.setdefault(key, _PublisherTable())
+        async with table.condition:
+            if rank in table.publishers:
+                return
+            table.publishers[rank] = value
+            if table.publishers.keys() == self._publishers:
+                table.condition.notify_all()
+
+    async def _wait_for_publishers(
+        self,
+        tables: dict[str, _PublisherTable],
+        key: str,
+        what: str,
+    ) -> dict[str, Any]:
+        if self._publishers is None:
+            raise RuntimeError("RoutingCoordinator.init has not run")
+        table = tables.setdefault(key, _PublisherTable())
+        async with table.condition:
             try:
                 await asyncio.wait_for(
-                    layouts.condition.wait_for(
-                        lambda: layouts.publishers.keys() == self._publishers
+                    table.condition.wait_for(
+                        lambda: table.publishers.keys() == self._publishers
                     ),
                     timeout=_LAYOUT_REGISTRATION_TIMEOUT_S,
                 )
             except asyncio.TimeoutError as error:
-                missing = self._publishers - layouts.publishers.keys()
+                missing = self._publishers - table.publishers.keys()
                 # A registration can land while the timed-out wait reacquires the lock.
                 if missing:
                     raise TimeoutError(
                         f"timed out after {_LAYOUT_REGISTRATION_TIMEOUT_S} seconds "
-                        f"waiting for publisher layouts for {key!r}; "
+                        f"waiting for publisher {what} for {key!r}; "
                         f"missing publishers: {sorted(missing)}"
                     ) from error
-        return layouts.publishers
+        return table.publishers

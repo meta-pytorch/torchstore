@@ -15,6 +15,7 @@ import torch
 import torchstore as ts
 from monarch.actor import Actor, concurrent_endpoint, current_rank, this_host
 from torchstore.transport import TransportType
+from torchstore.transport.monarch_rdma import monarch_rdma_available
 
 _KEY = "model_state_dict"
 _PUBLISHER_RANKS = 2
@@ -48,9 +49,12 @@ def _raise_first(results: list[object]) -> None:
 class _Publisher(Actor):
     """A trainer rank that publishes the way TitanRL's trainer does."""
 
-    def __init__(self, store_name: str) -> None:
+    def __init__(self, store_name: str, direct_rdma: bool) -> None:
         self._store_name = store_name
+        self._direct_rdma = direct_rdma
         self._rank = current_rank().rank
+        # Direct RDMA registers this memory once, so pushes update it in place.
+        self._state_dict = {f"layers.{self._rank}.weight": _layer(self._rank, 0)}
 
     @concurrent_endpoint
     async def initialize_client(self) -> None:
@@ -58,11 +62,18 @@ class _Publisher(Actor):
 
     @concurrent_endpoint
     async def push(self, round_: int) -> None:
-        state_dict = {f"layers.{self._rank}.weight": _layer(self._rank, round_)}
+        self._state_dict[f"layers.{self._rank}.weight"].copy_(
+            _layer(self._rank, round_)
+        )
         # A worker thread with a fresh event loop per push, as in TitanRL's trainer.
         await asyncio.to_thread(
             lambda: asyncio.run(
-                ts.put_state_dict(state_dict, _KEY, store_name=self._store_name)
+                ts.put_state_dict(
+                    self._state_dict,
+                    _KEY,
+                    store_name=self._store_name,
+                    direct_rdma=self._direct_rdma,
+                )
             )
         )
 
@@ -70,8 +81,9 @@ class _Publisher(Actor):
 class _Requester(Actor):
     """A generator rank that reads into the same buffers every round."""
 
-    def __init__(self, store_name: str) -> None:
+    def __init__(self, store_name: str, direct_rdma: bool) -> None:
         self._store_name = store_name
+        self._direct_rdma = direct_rdma
         self._destination = {
             name: torch.zeros_like(tensor) for name, tensor in _weights(0).items()
         }
@@ -83,15 +95,31 @@ class _Requester(Actor):
     @concurrent_endpoint
     async def pull(self) -> dict[str, torch.Tensor]:
         await ts.get_state_dict(
-            _KEY, self._destination, strict=False, store_name=self._store_name
+            _KEY,
+            self._destination,
+            strict=False,
+            store_name=self._store_name,
+            direct_rdma=self._direct_rdma,
         )
         return self._destination
 
 
 @pytest.mark.timeout(120)
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "direct_rdma",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not monarch_rdma_available(), reason="RDMA is unavailable"
+            ),
+        ),
+    ],
+)
 async def test_routed_weight_sync_across_actor_meshes(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, direct_rdma: bool
 ) -> None:
     """Sync publishers that push from worker threads into a requester mesh."""
     # Monarch's default fault hook interrupts the whole session, so record this
@@ -109,8 +137,12 @@ async def test_routed_weight_sync_across_actor_meshes(
             client_type=ts.ClientType.ROUTING,
             store_name=store_name,
         )
-        publishers = publisher_mesh.spawn("publisher", _Publisher, store_name)
-        requesters = requester_mesh.spawn("requester", _Requester, store_name)
+        publishers = publisher_mesh.spawn(
+            "publisher", _Publisher, store_name, direct_rdma
+        )
+        requesters = requester_mesh.spawn(
+            "requester", _Requester, store_name, direct_rdma
+        )
         # Let every lookup settle before raising a failed one, since stopping a mesh
         # mid-lookup can break Monarch's controller lookups for the session. A hang
         # still reaches the deadline with lookups in flight.

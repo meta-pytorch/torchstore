@@ -169,3 +169,27 @@ async def test_timeout_with_no_publisher_missing_returns_layouts(monkeypatch) ->
         coordinator.get_layouts.call_one("model"), timeout=1
     )
     assert layouts == {"publisher": _registration()}
+
+
+@pytest.mark.asyncio
+async def test_rdma_handles_wait_for_every_publisher() -> None:
+    """Gate RDMA handle lookup on every publisher, keeping the first registration."""
+    coordinator = await _coordinator({"publisher/0", "publisher/1"}, strategy=object())
+
+    await coordinator.register_rdma_handles.call_one(
+        "publisher/0", "model", {"w": "first"}
+    )
+    lookup = asyncio.ensure_future(coordinator.get_rdma_handles.call_one("model"))
+    done, _ = await asyncio.wait([lookup], timeout=0.5)
+    assert not done, "get_rdma_handles returned before every publisher registered"
+    await coordinator.register_rdma_handles.call_one(
+        "publisher/0", "model", {"w": "ignored"}
+    )
+    await coordinator.register_rdma_handles.call_one(
+        "publisher/1", "model", {"w": "second"}
+    )
+
+    assert await asyncio.wait_for(lookup, timeout=5) == {
+        "publisher/0": {"w": "first"},
+        "publisher/1": {"w": "second"},
+    }

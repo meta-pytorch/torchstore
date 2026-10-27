@@ -12,9 +12,11 @@ from logging import getLogger
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
 from torchstore.controller import ObjectType
+from torchstore.direct_weight_sync import group_handles, RDMAWeightHandle
 from torchstore.directory import VolumeDirectory
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
@@ -73,6 +75,25 @@ class LocalClient:
         strict: bool = True,
     ) -> None:
         """Hook for clients that require state-dict requester registration."""
+
+    async def publish_rdma_handles(
+        self, key: str, handles: Mapping[str, RDMAWeightHandle]
+    ) -> None:
+        """Publish this rank's direct-RDMA handles for ``key``.
+
+        Requires ``torch.distributed`` to number the source ranks.
+        """
+        rank = dist.get_rank()
+        await self.put(f"{key}/rank_{rank}", dict(handles))
+        if rank == 0:
+            await self.put(f"{key}/num_ranks", dist.get_world_size())
+
+    async def get_rdma_handles(self, key: str) -> dict[str, list[RDMAWeightHandle]]:
+        """Fetch every source rank's direct-RDMA handles for ``key``."""
+        num_ranks = await self.get(f"{key}/num_ranks")
+        return group_handles(
+            [await self.get(f"{key}/rank_{r}") for r in range(num_ranks)]
+        )
 
     @torch.no_grad
     async def put(self, key: str, value: torch.Tensor | Any):

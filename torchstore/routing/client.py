@@ -15,6 +15,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from torchstore.client import LocalClient
+from torchstore.direct_weight_sync import group_handles, RDMAWeightHandle
 from torchstore.logging import LatencyTracker
 from torchstore.state_dict_utils import _state_dict_storage_metadata, DELIM, MAPPING
 from torchstore.strategy import TorchStoreStrategy
@@ -120,6 +121,25 @@ class RoutingClient(LocalClient):
             RoutingPlan.for_requester(rank, registrations, publishers)
         )
         self._registered_layouts.add(key)
+
+    async def publish_rdma_handles(
+        self, key: str, handles: Mapping[str, RDMAWeightHandle]
+    ) -> None:
+        """Register this publisher's direct-RDMA handles with the coordinator."""
+        if self._role != RankRole.PUBLISHER:
+            raise RuntimeError("only publisher clients publish RDMA handles")
+        await self._coordinator.register_rdma_handles.call_one(
+            rank=self._routing_directory.rank,
+            key=key,
+            handles=dict(handles),
+        )
+
+    async def get_rdma_handles(self, key: str) -> dict[str, list[RDMAWeightHandle]]:
+        """Wait for every publisher's direct-RDMA handles for ``key``."""
+        if self._role != RankRole.REQUESTER:
+            raise RuntimeError("only requester clients get RDMA handles")
+        publishers = await self._coordinator.get_rdma_handles.call_one(key=key)
+        return group_handles(publishers[rank] for rank in sorted(publishers))
 
     @torch.no_grad()
     async def put_batch(self, entries: dict[str, torch.Tensor | Any]) -> None:

@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -114,7 +113,8 @@ async def put_state_dict(
     subsequent calls only non-contiguous staging buffers are refreshed.
     ``state_dict`` may be ``None`` on subsequent calls to skip the
     (potentially expensive) ``model.state_dict()`` construction.
-    ``torch.distributed`` must be initialised before using this mode.
+    Non-routing clients require ``torch.distributed`` to be initialised in
+    this mode.
 
 
     Args:
@@ -308,14 +308,12 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
         assert (
             state_dict is not None
         ), "state_dict is required on first put_state_dict call with direct_rdma=True"
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
+        # source_rank is informational; routing publishers may not use torch.distributed.
+        rank = dist.get_rank() if dist.is_initialized() else 0
         handles = cache.source.register(
             state_dict, rank=rank, transfer_dtype=transfer_dtype
         )
-        await store.put(f"{key}/rank_{rank}", handles)
-        if rank == 0:
-            await store.put(f"{key}/num_ranks", world_size)
+        await store.publish_rdma_handles(key, handles)
         cache.registered.add(key)
     else:
         cache.source.refresh()
@@ -325,7 +323,7 @@ async def _get_state_dict_direct_rdma(store, key, user_state_dict):
     """Fetch RDMA handles and pull weights via direct RDMA reads.
 
     First call for a given key: fetches handles from TorchStore, caches them.
-    Transfer plan is built on first pull and cached by DirectWeightSyncDest.
+    DirectWeightSyncDest caches the transfer plan until the destination changes.
     All RDMA reads are issued concurrently for maximum throughput.
     """
     from torchstore.direct_weight_sync import DirectWeightSyncDest
@@ -336,12 +334,6 @@ async def _get_state_dict_direct_rdma(store, key, user_state_dict):
         cache.dest = DirectWeightSyncDest()
 
     if key not in cache.handles:
-        num_ranks = await store.get(f"{key}/num_ranks")
-        all_handles = defaultdict(list)
-        for r in range(num_ranks):
-            rank_handles = await store.get(f"{key}/rank_{r}")
-            for name, handle in rank_handles.items():
-                all_handles[name].append(handle)
-        cache.handles[key] = all_handles
+        cache.handles[key] = await store.get_rdma_handles(key)
 
     await cache.dest.pull(cache.handles[key], user_state_dict)

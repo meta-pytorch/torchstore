@@ -306,3 +306,45 @@ async def test_transfer_dtype():
     sync2 = DirectWeightSyncDest()
     await sync2.pull({"weight": [handle]}, {"weight": dest2})
     assert torch.equal(dest2, torch.full((10, 10), 42.0, dtype=torch.bfloat16))
+
+
+async def test_plan_follows_destination_changes():
+    """Rebuild the plan for new dest tensors, subsets and reallocated storage."""
+    weights = {
+        name: torch.arange(64, dtype=torch.float32).reshape(8, 8) + i
+        for i, name in enumerate(("a", "b"))
+    }
+    all_handles = {
+        name: _make_sharded_handles(t, num_shards=2, shard_dim=0)
+        for name, t in weights.items()
+    }
+    sync = DirectWeightSyncDest()
+
+    # Pull one key at a time, as when loading one FSDP group at a time.
+    dests = {name: torch.zeros_like(t) for name, t in weights.items()}
+    for name in dests:
+        await sync.pull(all_handles, {name: dests[name]})
+    torch.testing.assert_close(dests, weights, rtol=0, atol=0)
+
+    # Free and reallocate a destination's storage in place.
+    storage = dests["a"].untyped_storage()
+    nbytes = storage.nbytes()
+    storage.resize_(0)
+    storage.resize_(nbytes)
+    dests["a"].zero_()
+    await sync.pull(all_handles, {"a": dests["a"]})
+    torch.testing.assert_close(dests["a"], weights["a"], rtol=0, atol=0)
+
+    # Same memory reuses the plan.
+    plan = sync._plan
+    await sync.pull(all_handles, {"a": dests["a"]})
+    assert sync._plan is plan
+
+    # New handles for the same memory rebuild it.
+    new_weights = {name: t + 100 for name, t in weights.items()}
+    new_handles = {
+        name: _make_sharded_handles(t, num_shards=2, shard_dim=0)
+        for name, t in new_weights.items()
+    }
+    await sync.pull(new_handles, dests)
+    torch.testing.assert_close(dests, new_weights, rtol=0, atol=0)
