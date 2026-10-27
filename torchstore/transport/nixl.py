@@ -68,6 +68,14 @@ def nixl_available() -> bool:
     return ENV_TORCHSTORE_NIXL_ENABLED and find_spec("nixl") is not None
 
 
+def _in_leaked_transfer(ctx: TransportContext, tensor: torch.Tensor) -> bool:
+    """Return whether a retired agent's leaked transfer may use the tensor's storage."""
+    storage = tensor.untyped_storage().data_ptr()
+    return any(
+        storage in cache.leaked_storages for cache in ctx.retired(NixlAgentCache)
+    )
+
+
 @dataclass
 class _Registration:
     """Cached NIXL descriptors tied to the lifetime of their backing tensor storage."""
@@ -95,6 +103,9 @@ class NixlAgentCache(TransportCache):
         self.agent = nixl_agent(name, config)
         self._registrations: dict[tuple[int, int], _Registration] = {}
         self._remote_agents: dict[str, bytes] = {}
+        # Unfinished transfer handles, with the tensors their DMA may still use.
+        self.leaked: list[tuple[Any, list[torch.Tensor]]] = []
+        self.leaked_storages: set[int] = set()
 
     def register(self, tensor: torch.Tensor) -> Any:
         """Register a tensor's whole storage once for the lifetime of that storage.
@@ -124,6 +135,22 @@ class NixlAgentCache(TransportCache):
             return
         self.agent.deregister_memory(registration.descriptors)
         self._registrations.pop(key, None)
+
+    def leak(self, handle: Any, tensors: list[torch.Tensor]) -> None:
+        """Keep an unfinished transfer and its memory alive with this cache.
+
+        NIXL has no cancellation API: UCX keeps running RDMA after its handle
+        is released, and its memory, registrations and remote agents must
+        outlive it, so the cache is never cleared.
+        """
+        self.leaked.append((handle, tensors))
+        self.leaked_storages.update(
+            tensor.untyped_storage().data_ptr() for tensor in tensors
+        )
+
+    @override
+    def busy(self) -> bool:
+        return bool(self.leaked)
 
     def add_remote_agent(self, name: str, metadata: bytes) -> str:
         """Load new remote metadata, replacing an older copy when needed."""
@@ -170,7 +197,15 @@ class NixlRequestContext:
 
 
 class NixlTransportBuffer(TransportBuffer):
-    """Move StorageVolume tensors with NIXL's UCX backend."""
+    """Move StorageVolume tensors with NIXL's UCX backend.
+
+    NIXL cannot cancel transfers, so an agent with unfinished transfers and
+    their memory are kept for the life of the transport context. The volume
+    retires such an agent and uses a new one. Destinations of a failed
+    request, including the stored value of a failed in-place PUT, hold
+    undefined data. A failed GET's leaked transfers may still overwrite its
+    destinations later, even after a later GET into them succeeds.
+    """
 
     supports_batch_puts = True
     supports_batch_gets = True
@@ -186,10 +221,13 @@ class NixlTransportBuffer(TransportBuffer):
         self._client_metadata: bytes | None = None
         self._client_agent_name: str | None = None
         self._contexts: list[NixlRequestContext] = []
+        # GET destinations the volume may write into until the request succeeds.
+        self._destinations: list[torch.Tensor] = []
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["storage_volume_ref"] = None
+        state["_destinations"] = []
         return state
 
     def _client_cache(self) -> NixlAgentCache:
@@ -269,6 +307,11 @@ class NixlTransportBuffer(TransportBuffer):
 
             self._contexts.append(self._register_client_tensor(tensor))
         self._publish_client_metadata()
+        self._destinations = [
+            context.tensor
+            for context in self._contexts
+            if context.remote_descriptors is not None
+        ]
 
     async def _transfer(
         self,
@@ -279,12 +322,16 @@ class NixlTransportBuffer(TransportBuffer):
         if not transfers:
             return
 
-        cache = ctx.get(NixlAgentCache)
-        remote_agent = self._connect_client(cache)
-        transfer_groups: dict[tuple[Any, Any], tuple[Any, Any]] = {}
-        handles = []
+        keys = [request.key for request, _, _ in transfers]
+        transfer_groups: dict[tuple[Any, Any], tuple[Any, Any, list[torch.Tensor]]] = {}
+        # Posted handles with the tensors each one transfers.
+        handles: list[tuple[Any, list[torch.Tensor]]] = []
         dispatch_error: Exception | None = None
+        cache: NixlAgentCache | None = None
+        leaked = 0
         try:
+            cache = ctx.get(NixlAgentCache)
+            remote_agent = self._connect_client(cache)
             for _, tensor, serialized_remote_descs in transfers:
                 cache.register(tensor)
                 tensor_local_descs = cache.agent.get_xfer_descs(tensor)
@@ -303,16 +350,19 @@ class NixlTransportBuffer(TransportBuffer):
                     transfer_groups[group_key] = (
                         tensor_local_descs,
                         tensor_remote_descs,
+                        [tensor],
                     )
                 else:
-                    local_descs, remote_descs = group
+                    local_descs, remote_descs, group_tensors = group
                     for index in range(tensor_local_descs.descCount()):
                         local_descs.append(tensor_local_descs[index])
                     for index in range(tensor_remote_descs.descCount()):
                         remote_descs.append(tensor_remote_descs[index])
+                    group_tensors.append(tensor)
 
-            try:
-                for local_descs, remote_descs in transfer_groups.values():
+            for local_descs, remote_descs, group_tensors in transfer_groups.values():
+                handle = None
+                try:
                     handle = cache.agent.initialize_xfer(
                         operation.value,
                         local_descs,
@@ -320,66 +370,102 @@ class NixlTransportBuffer(TransportBuffer):
                         remote_agent,
                         backends=[cache.backend],
                     )
-                    handles.append(handle)
                     cache.agent.transfer(handle)
-            except Exception as error:
-                # Earlier handles may already be active. Drain them below before
-                # propagating the dispatch error.
-                dispatch_error = error
+                except Exception as error:
+                    # NIXL may have posted part of a failed transfer, so leak it.
+                    # Earlier handles may already be active. Wait for them below
+                    # before propagating the dispatch error.
+                    if handle is not None:
+                        cache.leak(handle, group_tensors)
+                        leaked += 1
+                    dispatch_error = error
+                    break
+                handles.append((handle, group_tensors))
 
             deadline = time.monotonic() + ENV_TORCHSTORE_NIXL_TIMEOUT_S
-            timed_out = False
+            timed_out = 0
             cancelled = False
-            failed = False
             check_error: Exception | None = None
 
             # All handles are already in flight, so waiting for them one at a time
-            # does not serialize the transfers. NIXL has no cancellation API, so a
-            # timeout is reported only after active operations reach a terminal
-            # state. Returning earlier could free registered tensor storage while
-            # DMA is still using it.
-            for handle in handles:
+            # does not serialize the transfers. NIXL has no cancellation API, so
+            # handles that do not finish by the deadline are leaked with their
+            # tensors instead of released: DMA may still use that memory.
+            for handle, group_tensors in handles:
                 while True:
                     try:
                         status = cache.agent.check_xfer_state(handle)
                     except Exception as error:
-                        # A status-query failure does not establish that the DMA has
-                        # stopped. Remember the error, but keep polling so registered
-                        # storage and the transfer handle remain alive until terminal.
+                        # NIXL raises for a failed transfer, and again on every
+                        # later check of the handle, so stop polling it.
                         if check_error is None:
+                            logger.warning(
+                                "NIXL %s status check failed for keys=%r: %s",
+                                operation.value,
+                                keys,
+                                error,
+                            )
                             check_error = error
-                        status = _NixlTransferStatus.PROCESSING
+                        status = None
+                        break
                     if status != _NixlTransferStatus.PROCESSING:
                         break
-                    timed_out |= time.monotonic() >= deadline
+                    if time.monotonic() >= deadline:
+                        break
                     try:
                         await asyncio.sleep(0.001)
                     except asyncio.CancelledError:
-                        # Keep polling so the RPC retains both sides' tensor storage.
+                        # Keep polling until the deadline so the transfer can
+                        # finish and its handle be released.
                         cancelled = True
-                if status != _NixlTransferStatus.DONE:
-                    failed = True
+                if status == _NixlTransferStatus.DONE:
+                    cache.agent.release_xfer_handle(handle)
+                    continue
+                cache.leak(handle, group_tensors)
+                leaked += 1
+                if status == _NixlTransferStatus.PROCESSING:
+                    timed_out += 1
+                elif status is not None and check_error is None:
+                    check_error = RuntimeError(
+                        f"Unexpected NIXL transfer status {status!r}"
+                    )
 
             if cancelled:
+                logger.warning(
+                    "NIXL %s cancelled for keys=%r with %d unfinished transfers: %r",
+                    operation.value,
+                    keys,
+                    leaked,
+                    dispatch_error or check_error,
+                )
                 raise asyncio.CancelledError
             if dispatch_error is not None:
                 raise dispatch_error
             if check_error is not None:
                 raise check_error
-            if failed:
-                raise RuntimeError("NIXL transfer failed")
             if timed_out:
-                raise TimeoutError("NIXL transfer timed out")
+                raise TimeoutError(
+                    f"{timed_out} NIXL transfers did not finish within "
+                    f"TORCHSTORE_NIXL_TIMEOUT_S={ENV_TORCHSTORE_NIXL_TIMEOUT_S}s"
+                )
         except Exception as error:
-            raise RuntimeError(
-                f"NIXL {operation.value} failed for keys="
-                f"{[request.key for request, _, _ in transfers]!r}"
-            ) from error
+            message = f"NIXL {operation.value} failed for keys={keys!r}"
+            if leaked:
+                message += (
+                    f"; {leaked} unfinished transfers may still access their memory"
+                )
+            raise RuntimeError(message) from error
         finally:
-            # Handles are released only after their transfers reach a terminal
-            # state; NIXL release is assumed safe at that point.
-            for handle in handles:
-                cache.agent.release_xfer_handle(handle)
+            if leaked:
+                assert cache is not None
+                # Later transfers use a new agent, so they never replace the
+                # remote agents or registrations that leaked transfers use.
+                ctx.retire(cache)
+                logger.warning(
+                    "Retired NIXL agent %s with %d unfinished transfers",
+                    cache.agent.name,
+                    leaked,
+                )
 
     def _connect_client(self, cache: NixlAgentCache) -> str:
         if self._client_agent_name is None or self._client_metadata is None:
@@ -403,6 +489,9 @@ class NixlTransportBuffer(TransportBuffer):
                 results.append(request_context.objects)
                 continue
 
+            if tensor is not None and _in_leaked_transfer(ctx, tensor):
+                # A leaked transfer may still write into the stored tensor.
+                tensor = None
             if tensor is None:
                 tensor = torch.empty(
                     request_context.shape,
@@ -468,6 +557,19 @@ class NixlTransportBuffer(TransportBuffer):
             )
         return results
 
+    @override
+    async def _post_request_success(self) -> None:
+        self._destinations = []
+
     async def drop(self) -> None:
+        if self._destinations:
+            # A failed or cancelled GET may leave volume transfers running, and
+            # NIXL cannot cancel them, so keep their destinations allocated.
+            self._client_cache().leak(None, self._destinations)
+            logger.warning(
+                "Keeping %d destinations of a failed NIXL GET",
+                len(self._destinations),
+            )
+        self._destinations = []
         self._client_metadata = None
         self._contexts = []
