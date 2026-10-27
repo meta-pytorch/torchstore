@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 ENV_TORCHSTORE_NIXL_BACKEND = os.environ.get("TORCHSTORE_NIXL_BACKEND", "UCX")
 ENV_TORCHSTORE_NIXL_ENABLED = os.environ.get("TORCHSTORE_NIXL_ENABLED", "0") == "1"
 ENV_TORCHSTORE_NIXL_TIMEOUT_S = int(os.environ.get("TORCHSTORE_NIXL_TIMEOUT_S", "60"))
+# Aggregate storage-volume memory allowed for contiguous copies of sliced gets.
+ENV_TORCHSTORE_NIXL_GET_STAGING_BYTES = int(
+    os.environ.get("TORCHSTORE_NIXL_GET_STAGING_BYTES", str(256 * 1024 * 1024))
+)
 
 
 class _NixlTransferStatus(str, Enum):
@@ -76,6 +80,40 @@ class _Registration:
     storage_ref: weakref.ReferenceType[Any]
 
 
+class _StagingByteLimiter:
+    """Bound staging bytes shared by concurrent gets on a storage volume."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("TORCHSTORE_NIXL_GET_STAGING_BYTES must be positive")
+        self._capacity = capacity
+        self._in_use = 0
+        self._condition = asyncio.Condition()
+
+    async def acquire(self, size: int, *, blocking: bool) -> bool:
+        """Reserve bytes, optionally returning immediately when unavailable."""
+        async with self._condition:
+
+            def available() -> bool:
+                return (
+                    self._in_use == 0
+                    if size > self._capacity
+                    else self._in_use + size <= self._capacity
+                )
+
+            if not blocking and not available():
+                return False
+            await self._condition.wait_for(available)
+            self._in_use += size
+        return True
+
+    async def release(self, size: int) -> None:
+        async with self._condition:
+            self._in_use -= size
+            assert self._in_use >= 0
+            self._condition.notify_all()
+
+
 class NixlAgentCache(TransportCache):
     """Process-local NIXL agent and reusable memory registrations."""
 
@@ -93,6 +131,9 @@ class NixlAgentCache(TransportCache):
             backends=[self.backend],
         )
         self.agent = nixl_agent(name, config)
+        self.get_staging_limiter = _StagingByteLimiter(
+            ENV_TORCHSTORE_NIXL_GET_STAGING_BYTES
+        )
         self._registrations: dict[tuple[int, int], _Registration] = {}
         self._remote_agents: dict[str, bytes] = {}
 
@@ -427,7 +468,8 @@ class NixlTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
-        transfers: list[tuple[Request, torch.Tensor, bytes]] = []
+        direct_transfers: list[tuple[Request, torch.Tensor, bytes]] = []
+        staged_transfers: list[tuple[Request, torch.Tensor, bytes]] = []
 
         for (request, data), request_context in zip(
             entries, self._contexts, strict=True
@@ -443,12 +485,57 @@ class NixlTransportBuffer(TransportBuffer):
                 request_context.shape,
                 must_be_contiguous=False,
             )
-            source = data if data.is_contiguous() else data.contiguous()
             # Empty tensors have no bytes to move or NIXL descriptors to transfer.
-            if source.numel() != 0:
-                assert request_context.remote_descriptors is not None
-                transfers.append((request, source, request_context.remote_descriptors))
-        await self._transfer(ctx, _NixlTransferOperation.WRITE, transfers)
+            if data.numel() == 0:
+                continue
+
+            assert request_context.remote_descriptors is not None
+            if data.is_contiguous():
+                direct_transfers.append(
+                    (request, data, request_context.remote_descriptors)
+                )
+            else:
+                staged_transfers.append(
+                    (request, data, request_context.remote_descriptors)
+                )
+
+        # Contiguous tensors need no temporary storage and do not consume the
+        # staging budget.
+        await self._transfer(ctx, _NixlTransferOperation.WRITE, direct_transfers)
+
+        if not staged_transfers:
+            return
+
+        cache = ctx.get(NixlAgentCache)
+        transfer_batch: list[tuple[Request, torch.Tensor, bytes]] = []
+        transfer_batch_size = 0
+
+        async def flush_transfer_batch() -> None:
+            nonlocal transfer_batch_size
+            try:
+                await self._transfer(ctx, _NixlTransferOperation.WRITE, transfer_batch)
+            finally:
+                # Drop staged tensors before making their bytes available.
+                transfer_batch.clear()
+                await cache.get_staging_limiter.release(transfer_batch_size)
+                transfer_batch_size = 0
+
+        try:
+            for request, tensor, remote_descriptors in staged_transfers:
+                transfer_size = tensor.numel() * tensor.element_size()
+                while not await cache.get_staging_limiter.acquire(
+                    transfer_size, blocking=not transfer_batch
+                ):
+                    await flush_transfer_batch()
+                transfer_batch_size += transfer_size
+                transfer_batch.append(
+                    (request, tensor.contiguous(), remote_descriptors)
+                )
+            await flush_transfer_batch()
+        finally:
+            if transfer_batch_size:
+                transfer_batch.clear()
+                await cache.get_staging_limiter.release(transfer_batch_size)
 
     @override
     async def _handle_storage_volume_response(
