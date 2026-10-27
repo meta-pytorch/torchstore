@@ -143,6 +143,8 @@ class StorageImpl:
 class InMemoryStore(StorageImpl):
     """Local in memory storage."""
 
+    supports_tensor_overwrite: bool = True
+
     def __init__(self) -> None:
         self.kv: dict[str, Any] = {}
         super().__init__()
@@ -158,8 +160,9 @@ class InMemoryStore(StorageImpl):
     def _extract_existing(self, request: "Request") -> torch.Tensor | None:
         """Extract existing tensor from storage for in-place update.
 
-        Looks up the key in kv storage and extracts the tensor if it exists.
-        Only asserts on type mismatches between existing data and incoming request.
+        Ordinary tensors reuse compatible allocations or return None to allocate
+        a replacement. DTensor shards retain their existing allocations; changing
+        shard shape, dtype, or layout under an existing key is unsupported.
 
         Args:
             request: The incoming put request
@@ -180,6 +183,8 @@ class InMemoryStore(StorageImpl):
             assert (
                 request.tensor_slice is None
             ), "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
+            if not self._is_compatible_tensor(current_object, request):
+                return None
             return current_object
 
         if isinstance(current_object, dict):
@@ -202,6 +207,14 @@ class InMemoryStore(StorageImpl):
             return None
 
         raise AssertionError(f"Unexpected current_object type: {type(current_object)}")
+
+    @staticmethod
+    def _is_compatible_tensor(tensor: torch.Tensor, request: "Request") -> bool:
+        if request.tensor_meta is None:
+            return True
+
+        shape, dtype = request.tensor_meta
+        return tensor.shape == shape and tensor.dtype == dtype
 
     def _handle_dtensor(
         self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor

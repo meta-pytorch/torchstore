@@ -77,6 +77,20 @@ import torchstore
 
 ## Usage
 
+### Reusing keys
+
+Ordinary tensors can overwrite an existing key with a different shape or dtype.
+Shared-memory transfers reuse compatible allocations and retire obsolete cached
+handles when a replacement succeeds or a reader attaches to a new handle. This
+also bounds cached allocations when keys cycle through delete/put operations.
+
+Callers must finish consuming a key before deleting or recycling it. The
+shared-memory lock serializes PUT/GET operations sharing one client cache; it
+does not coordinate independent clients or DELETE. Overwrites do not provide
+atomic snapshots or batch rollback. Changing a DTensor's shard shape, dtype, or
+layout under an existing key is unsupported; delete the old key before storing
+a different layout.
+
 TorchStore APIs are called from within Monarch actors. Each actor interacts
 with the store through the module-level `ts.*` functions.
 
