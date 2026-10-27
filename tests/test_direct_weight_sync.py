@@ -139,6 +139,17 @@ async def test_resharding(num_shards, shard_dim):
     assert len(sync._plan) == num_shards
 
 
+async def test_resharding_into_parameter():
+    """Resharded copies write into parameters that require grad."""
+    original = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64)
+    handles = _make_sharded_handles(original, num_shards=2, shard_dim=0)
+
+    dest = torch.nn.Parameter(torch.zeros_like(original))
+    await DirectWeightSyncDest().pull({"weight": handles}, {"weight": dest})
+
+    assert torch.equal(dest, original)
+
+
 async def test_replicated_dedup():
     """Replicated source (2 ranks, same data) → should only read once."""
     original = torch.arange(512 * 512, dtype=torch.float32).reshape(512, 512)

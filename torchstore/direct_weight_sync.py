@@ -381,17 +381,28 @@ class DirectWeightSyncDest:
             self._plan_handles = all_handles
             self._plan_signature = signature
 
+        # RDMA writes are not stream ordered: wait for queued kernels that may
+        # still use this memory (e.g. storage the caching allocator reused).
+        for device in {
+            op.dest_byte_view.device
+            for op in self._plan
+            if op.dest_byte_view.device.type == "cuda"
+        }:
+            torch.cuda.synchronize(device)
+
         # Issue all RDMA reads concurrently
         await asyncio.gather(
             *(op.rdma_buffer.read_into(op.dest_byte_view) for op in self._plan)
         )
 
-        # Post-read copies (only for resharded ops)
-        for op in self._plan:
-            if op.dest_tensor is None:
-                continue  # zero-copy, already in place
-            # Resharded: copy overlapping region
-            # recv_buffer contains the full source shard
-            # op.recv_buffer[op.src_slices] extracts the overlap from the source
-            # op.dest_tensor[op.dest_slices] targets where it goes in the dest
-            op.dest_tensor[op.dest_slices].copy_(op.recv_buffer[op.src_slices])
+        # Post-read copies (only for resharded ops). no_grad: dests may be
+        # parameters that require grad.
+        with torch.no_grad():
+            for op in self._plan:
+                if op.dest_tensor is None:
+                    continue  # zero-copy, already in place
+                # Resharded: copy overlapping region
+                # recv_buffer contains the full source shard
+                # op.recv_buffer[op.src_slices] extracts the overlap from the source
+                # op.dest_tensor[op.dest_slices] targets where it goes in the dest
+                op.dest_tensor[op.dest_slices].copy_(op.recv_buffer[op.src_slices])
