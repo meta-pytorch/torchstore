@@ -499,8 +499,8 @@ async def get_state_dict(
         strict (bool): Whether to enforce strict loading. Defaults to True.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
         direct_rdma (bool): If True, pull weights directly from the source's
-            GPU memory via one-sided RDMA reads. Handles are fetched from
-            TorchStore on the first call and cached for subsequent calls.
+            registered (GPU or pinned CPU) memory via one-sided RDMA reads.
+            Handles are fetched on the first call and cached for subsequent calls.
 
     Returns:
         dict: The retrieved state_dict.

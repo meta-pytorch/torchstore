@@ -18,14 +18,14 @@ Typical usage (RL trainer → generator weight sync):
     # Source side (trainer, called once at setup):
     source = DirectWeightSyncSource()
     handles = source.register(model.state_dict(), rank=dist.get_rank())
-    await ts.put(f"{RDMA_KEY_PREFIX}/rank_{rank}", handles)
+    await store.publish_rdma_handles(key, handles)
 
     # After each optimizer.step():
     source.refresh()
 
     # Destination side (generator):
     dest = DirectWeightSyncDest()
-    # First call fetches + caches handles, subsequent calls reuse them
+    all_handles = await store.get_rdma_handles(key)
     await dest.pull(all_handles, model.state_dict())
 """
 
@@ -223,13 +223,25 @@ class _TransferOp:
     dest_slices: tuple[slice, ...] | None = None
 
 
-def _plan_signature(dest_state_dict: dict[str, torch.Tensor]) -> tuple:
+def _plan_signature(
+    all_handles: dict[str, list[RDMAWeightHandle]],
+    dest_state_dict: dict[str, torch.Tensor],
+) -> tuple:
     """Identify the destination memory a plan was built for."""
     dests = []
     for name, param in dest_state_dict.items():
+        if name not in all_handles:
+            continue
         local = Request.from_any(name, param).tensor_val
         dests.append(
-            (name, local.data_ptr(), local.untyped_storage().nbytes(), local.dtype)
+            (
+                name,
+                local.data_ptr(),
+                local.untyped_storage().nbytes(),
+                local.dtype,
+                local.shape,
+                local.stride(),
+            )
         )
     return tuple(dests)
 
@@ -371,7 +383,7 @@ class DirectWeightSyncDest:
             dest_state_dict: Destination model state dict to write into
                 (parameters are updated in-place).
         """
-        signature = _plan_signature(dest_state_dict)
+        signature = _plan_signature(all_handles, dest_state_dict)
         if (
             self._plan is None
             or all_handles is not self._plan_handles
@@ -380,25 +392,26 @@ class DirectWeightSyncDest:
             self._plan = self._build_plan(all_handles, dest_state_dict)
             self._plan_handles = all_handles
             self._plan_signature = signature
+        plan = self._plan
 
         # RDMA writes are not stream ordered: wait for queued kernels that may
         # still use this memory (e.g. storage the caching allocator reused).
         for device in {
             op.dest_byte_view.device
-            for op in self._plan
+            for op in plan
             if op.dest_byte_view.device.type == "cuda"
         }:
             torch.cuda.synchronize(device)
 
         # Issue all RDMA reads concurrently
         await asyncio.gather(
-            *(op.rdma_buffer.read_into(op.dest_byte_view) for op in self._plan)
+            *(op.rdma_buffer.read_into(op.dest_byte_view) for op in plan)
         )
 
         # Post-read copies (only for resharded ops). no_grad: dests may be
         # parameters that require grad.
         with torch.no_grad():
-            for op in self._plan:
+            for op in plan:
                 if op.dest_tensor is None:
                     continue  # zero-copy, already in place
                 # Resharded: copy overlapping region

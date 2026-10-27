@@ -346,12 +346,29 @@ async def test_plan_follows_destination_changes():
     await sync.pull(all_handles, {"a": dests["a"]})
     torch.testing.assert_close(dests["a"], weights["a"], rtol=0, atol=0)
 
-    # Same memory reuses the plan.
+    # Same memory reuses the plan; extra non-tensor entries are ignored.
     plan = sync._plan
-    await sync.pull(all_handles, {"a": dests["a"]})
+    await sync.pull(all_handles, {"a": dests["a"], "extra": None})
     assert sync._plan is plan
 
-    # New handles for the same memory rebuild it.
+    # A different storage or view of the same size rebuilds it.
+    moved = torch.zeros_like(dests["a"])
+    await sync.pull(all_handles, {"a": moved})
+    assert sync._plan is not plan
+    torch.testing.assert_close(moved, weights["a"], rtol=0, atol=0)
+    plan = sync._plan
+    transposed = torch.zeros_like(moved).t()
+    await sync.pull(all_handles, {"a": transposed})
+    assert sync._plan is not plan
+
+    # New handles for the same memory and key set rebuild it.
+    plan = sync._plan
+    same_keys = {"a": _make_sharded_handles(weights["a"] + 50, num_shards=2, shard_dim=0)}
+    await sync.pull(same_keys, {"a": transposed})
+    assert sync._plan is not plan
+    torch.testing.assert_close(transposed, weights["a"] + 50, rtol=0, atol=0)
+
+    # New handles for all keys.
     new_weights = {name: t + 100 for name, t in weights.items()}
     new_handles = {
         name: _make_sharded_handles(t, num_shards=2, shard_dim=0)

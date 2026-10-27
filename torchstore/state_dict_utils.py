@@ -177,9 +177,11 @@ async def get_state_dict(
     When ``direct_rdma=False`` (default), each parameter is fetched from
     a StorageVolume via the normal two-hop transport path.
 
-    When ``direct_rdma=True``, RDMA handles are fetched from TorchStore
-    (first call only, cached afterwards) and weights are pulled directly
-    from the source's GPU memory via one-sided RDMA reads.
+    When ``direct_rdma=True``, the source's RDMA handles are fetched on the
+    first call and cached, and weights are pulled directly from the
+    source's registered (GPU or pinned CPU) memory via one-sided RDMA reads.
+    Routing clients fetch handles from the coordinator and wait for every
+    publisher.
     ``user_state_dict`` must be provided in this mode so the destination
     tensors are available for in-place writes.
     """
