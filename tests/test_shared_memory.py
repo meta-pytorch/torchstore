@@ -6,6 +6,7 @@
 
 """Tests for shared memory transport (unit tests + one e2e ts.put check)."""
 
+import asyncio
 import logging
 import os
 
@@ -180,6 +181,69 @@ class TestSharedMemoryDescriptor:
 
 class TestSharedMemoryCache:
     """Test SharedMemoryCache."""
+
+    @pytest.mark.asyncio
+    async def test_lock_keys_serializes_same_key_and_cleans_up(self):
+        cache = SharedMemoryCache()
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        order: list[str] = []
+
+        async def first():
+            async with cache.lock_keys(["key"]):
+                order.append("first_entered")
+                first_entered.set()
+                await release_first.wait()
+                order.append("first_released")
+
+        async def second():
+            await first_entered.wait()
+            async with cache.lock_keys(["key"]):
+                order.append("second_entered")
+
+        first_task = asyncio.create_task(first())
+        await first_entered.wait()
+        second_task = asyncio.create_task(second())
+        await asyncio.sleep(0)
+
+        try:
+            assert order == ["first_entered"]
+            assert cache._key_locks["key"].users == 2
+        finally:
+            release_first.set()
+            await asyncio.gather(first_task, second_task)
+
+        assert order == ["first_entered", "first_released", "second_entered"]
+        assert not cache._key_locks
+
+    @pytest.mark.asyncio
+    async def test_lock_keys_allows_different_keys(self):
+        cache = SharedMemoryCache()
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        second_entered = asyncio.Event()
+
+        async def first():
+            async with cache.lock_keys(["first"]):
+                first_entered.set()
+                await release_first.wait()
+
+        async def second():
+            await first_entered.wait()
+            async with cache.lock_keys(["second"]):
+                second_entered.set()
+
+        first_task = asyncio.create_task(first())
+        await first_entered.wait()
+        second_task = asyncio.create_task(second())
+
+        try:
+            await asyncio.wait_for(second_entered.wait(), timeout=1)
+        finally:
+            release_first.set()
+            await asyncio.gather(first_task, second_task)
+
+        assert not cache._key_locks
 
     def test_allocate(self):
         """Test allocate method creates and caches shared memory."""
@@ -1095,6 +1159,64 @@ async def test_shm_put_does_not_block_on_unrelated_stream() -> None:
     try:
         await actor_mesh.run.call()
     finally:
+        await ts.shutdown()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.asyncio
+async def test_shm_recycled_logits_across_actors(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    class LogitActor(Actor):
+        def __init__(self):
+            os.environ["LOCAL_RANK"] = "0"
+
+        async def check_cache(self):
+            client = await ts.client()
+            cache = client.strategy.transport_context.get(SharedMemoryCache)
+            assert len(cache._storages) <= 3
+            assert sum(s.nbytes() for s in cache._storages.values()) <= 3 * 7 * 8 * 4
+            assert not cache._key_locks
+
+        @endpoint
+        async def put(self, version, device):
+            tensor = torch.full((1, 1 + version % 7, 8), float(version), device=device)
+            await ts.put(f"logits/{version % 3}", tensor)
+            await self.check_cache()
+
+        @endpoint
+        async def consume(self, version):
+            key = f"logits/{version % 3}"
+            result = await ts.get(key)
+            expected = torch.full((1, 1 + version % 7, 8), float(version))
+            torch.testing.assert_close(result, expected)
+            del result
+            # Exercise both successful deletion and reuse after skipped cleanup.
+            if version % 2 == 0:
+                await ts.delete(key)
+            await self.check_cache()
+
+        @endpoint
+        async def close(self):
+            client = await ts.client()
+            client.strategy.transport_context.clear()
+
+    await ts.initialize(
+        num_storage_volumes=1,
+        strategy=ts.LocalRankStrategy(TransportType.SharedMemory),
+    )
+    writer = reader = None
+    try:
+        writer = await spawn_actors(1, LogitActor, f"logit_writer_{device}")
+        reader = await spawn_actors(1, LogitActor, f"logit_reader_{device}")
+        for version in range(96):
+            await writer.put.call(version, device)
+            await reader.consume.call(version)
+    finally:
+        for actor in (writer, reader):
+            if actor is not None:
+                await actor.close.call()
         await ts.shutdown()
 
 
