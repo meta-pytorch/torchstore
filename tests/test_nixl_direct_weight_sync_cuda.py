@@ -92,3 +92,24 @@ async def test_pull_waits_for_queued_destination_kernels():
             assert torch.all(dest_weight == 7.0).item()
     finally:
         await source.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_pull_every_separately_allocated_source_tensor():
+    """Source metadata must cover every registration, not only the first."""
+    weights = {
+        "a": torch.full((1 << 20,), 3.0).pin_memory(),
+        "b": torch.full((1 << 20,), 5.0).pin_memory(),
+    }
+    source = DirectWeightSyncSource()
+    handles = group_handles(
+        [pickle.loads(pickle.dumps(source.register(weights, rank=0)))]
+    )
+    dest = DirectWeightSyncDest()
+    dests = {name: torch.empty_like(w, device="cuda") for name, w in weights.items()}
+    try:
+        await dest.pull(handles, dests)
+        for name, weight in weights.items():
+            assert torch.equal(dests[name].cpu(), weight), name
+    finally:
+        await source.cleanup()

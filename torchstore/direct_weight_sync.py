@@ -550,8 +550,13 @@ class DirectWeightSyncDest:
                 results = await asyncio.shield(gathered)
             except asyncio.CancelledError:
                 # Cancelling does not stop RDMA writes into the destination;
-                # wait for them before the caller can free it.
-                await asyncio.wait([gathered])
+                # wait for them, even if cancelled again, before the caller
+                # can free it.
+                while not gathered.done():
+                    try:
+                        await asyncio.wait([gathered])
+                    except asyncio.CancelledError:
+                        pass
                 raise
             if read_error is None:
                 read_error = next(
@@ -560,11 +565,13 @@ class DirectWeightSyncDest:
         finally:
             # Destinations may be freed and reallocated at the same address
             # before the next pull (e.g. FSDP resharding), and a registration
-            # over the old allocation silently drops writes. Registering GPU
-            # memory costs ~0.15 ms per storage on GB200.
+            # over the old allocation silently drops writes. Receive buffers
+            # belong to the cached plan and never move, so they stay registered.
             if self._nixl is not None:
                 try:
-                    self._nixl.deregister_all()
+                    self._nixl.deregister(
+                        op.dest_byte_view for op in plan if op.dest_tensor is None
+                    )
                 except Exception:
                     if read_error is None:
                         raise

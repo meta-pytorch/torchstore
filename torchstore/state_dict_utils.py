@@ -85,6 +85,8 @@ class _DirectRDMACache:
     source: Any = None  # DirectWeightSyncSource, lazily created
     dest: Any = None  # DirectWeightSyncDest, lazily created
     registered: set = field(default_factory=set)
+    # Registered handles whose publish failed, kept for a retry.
+    unpublished: dict = field(default_factory=dict)
     handles: dict = field(default_factory=dict)
 
 
@@ -307,23 +309,21 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
         cache.source = DirectWeightSyncSource()
 
     if key not in cache.registered:
-        assert (
-            state_dict is not None
-        ), "state_dict is required on first put_state_dict call with direct_rdma=True"
-        # source_rank is informational; routing publishers may not use torch.distributed.
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        handles = cache.source.register(
-            state_dict, rank=rank, transfer_dtype=transfer_dtype
-        )
-        try:
-            await store.publish_rdma_handles(key, handles)
-        except BaseException:
-            # Unpublished registrations would leak; a retry registers again.
-            # The source tracks one registration set, so only release it
-            # when no other key is published from it.
-            if not cache.registered:
-                await cache.source.cleanup()
-            raise
+        # A retry after a failed publish republishes the same handles: the
+        # coordinator may already hold them, and it keeps the first it receives.
+        handles = cache.unpublished.get(key)
+        if handles is None:
+            assert (
+                state_dict is not None
+            ), "state_dict is required on first put_state_dict call with direct_rdma=True"
+            # source_rank is informational; routing publishers may not use torch.distributed.
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            handles = cache.source.register(
+                state_dict, rank=rank, transfer_dtype=transfer_dtype
+            )
+            cache.unpublished[key] = handles
+        await store.publish_rdma_handles(key, handles)
+        del cache.unpublished[key]
         cache.registered.add(key)
     else:
         cache.source.refresh()

@@ -433,34 +433,34 @@ async def test_local_client_publishes_and_fetches_every_rank(monkeypatch):
         await client.get_rdma_handles("missing")
 
 
-async def test_failed_publish_releases_registrations(monkeypatch):
-    events = []
+async def test_failed_publish_retry_republishes_the_same_handles(monkeypatch):
+    """The coordinator keeps the first handles it receives, so a retry must not
+    replace them with new registrations."""
+    registered = []
 
     def register(self, state_dict, rank, transfer_dtype=None):
-        events.append("register")
-        return {}
-
-    async def cleanup(self):
-        events.append("cleanup")
+        registered.append({"w": object()})
+        return registered[-1]
 
     class Store:
-        fail = True
+        def __init__(self) -> None:
+            self.published = []
 
         async def publish_rdma_handles(self, key, handles):
-            if self.fail:
+            # The handles reach the coordinator, but the reply fails.
+            self.published.append(handles)
+            if len(self.published) == 1:
                 raise RuntimeError("publish failed")
 
     monkeypatch.setattr(DirectWeightSyncSource, "register", register)
-    monkeypatch.setattr(DirectWeightSyncSource, "cleanup", cleanup)
     store = Store()
     try:
         with pytest.raises(RuntimeError, match="publish failed"):
             await state_dict_utils._put_state_dict_direct_rdma(store, {}, "w")
-        assert events == ["register", "cleanup"]
+        await state_dict_utils._put_state_dict_direct_rdma(store, None, "w")
 
-        store.fail = False
-        await state_dict_utils._put_state_dict_direct_rdma(store, {}, "w")
-        assert events == ["register", "cleanup", "register"]
+        assert len(registered) == 1
+        assert store.published == [registered[0], registered[0]]
     finally:
         state_dict_utils._rdma_cache.pop(id(store), None)
 
@@ -507,9 +507,10 @@ async def test_failed_monarch_submission_waits_for_submitted_reads():
         await pull
 
 
-async def test_cancelled_pull_waits_for_started_reads():
-    """Wait for started reads before propagating cancellation, since RDMA writes
-    into the destination continue after cancel."""
+@pytest.mark.parametrize("num_cancels", [1, 2])
+async def test_cancelled_pull_waits_for_started_reads(num_cancels):
+    """Wait for started reads before propagating cancellation, even when
+    cancelled again, since RDMA writes into the destination continue."""
 
     class StartedRead:
         def __init__(self) -> None:
@@ -541,10 +542,11 @@ async def test_cancelled_pull_waits_for_started_reads():
     # Let the pull run until it blocks.
     for _ in range(10):
         await asyncio.sleep(0)
-    pull.cancel()
-    for _ in range(10):
-        await asyncio.sleep(0)
-    assert not pull.done()
+    for _ in range(num_cancels):
+        pull.cancel()
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not pull.done()
     assert not started.future.cancelled()
     started.future.set_result(None)
     with pytest.raises(asyncio.CancelledError):

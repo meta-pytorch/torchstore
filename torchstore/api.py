@@ -463,7 +463,9 @@ async def put_state_dict(
         direct_rdma (bool): If True, register RDMA handles pointing at the
             caller's memory instead of copying data to a StorageVolume.
             First call registers handles; subsequent calls refresh staging
-            buffers for non-contiguous params.
+            buffers for non-contiguous params. Handles use NIXL when ``nixl``
+            is installed and ``TORCHSTORE_NIXL_ENABLED=1``, else Monarch RDMA;
+            readers need the same transport.
         transfer_dtype (torch.dtype, optional): If set, cast floating-point
             weights to this dtype for transfer. Allows the source to keep
             higher-precision master weights (e.g. float32) while transferring

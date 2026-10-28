@@ -15,6 +15,7 @@ import socket
 import time
 import uuid
 import weakref
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
@@ -173,10 +174,22 @@ class NixlAgentCache(TransportCache):
         self._remote_agents[name] = metadata
         return remote_name
 
+    def deregister(self, tensors: Iterable[torch.Tensor]) -> None:
+        """Deregister the tensors' storages, raising the first failure afterwards."""
+        self._evict_all(
+            self._keys_by_storage.get(id(tensor.untyped_storage()))
+            for tensor in tensors
+        )
+
     def deregister_all(self) -> None:
         """Deregister everything, raising the first failure afterwards."""
+        self._evict_all(list(self._registrations))
+
+    def _evict_all(self, keys: Iterable[tuple[int, int] | None]) -> None:
         error: Exception | None = None
-        for key in list(self._registrations):
+        for key in keys:
+            if key is None:
+                continue
             try:
                 self._evict(key)
             except Exception as e:

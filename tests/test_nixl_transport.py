@@ -842,6 +842,14 @@ def test_remote_agent_removal_failure_propagates(agent_cache):
     agent_cache.agent.remove_remote_agent.side_effect = None
 
 
+def _receive_buffer_keys(dest):
+    return {
+        (op.recv_buffer.data_ptr(), op.recv_buffer.untyped_storage().nbytes())
+        for op in dest._plan
+        if op.recv_buffer is not None
+    }
+
+
 @pytest.mark.asyncio
 async def test_direct_weight_sync_reads_every_source_agent_in_one_transfer():
     weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
@@ -889,12 +897,15 @@ async def test_direct_weight_sync_reads_every_source_agent_in_one_transfer():
         handle.operation == _NixlTransferOperation.READ for handle in agent.initialized
     )
 
-    # Destination registrations last one pull; remote metadata is reused.
-    assert dest._nixl._registrations == {}
+    # Destination registrations last one pull, but the plan's receive buffers
+    # stay registered; remote metadata is reused.
+    receive_keys = _receive_buffer_keys(dest)
+    assert len(receive_keys) == 2
+    assert dest._nixl._registrations.keys() == receive_keys
     register_calls = agent.register_memory.call_count
     await dest.pull(all_handles, dest_state_dict)
-    assert agent.register_memory.call_count == 2 * register_calls
-    assert dest._nixl._registrations == {}
+    assert agent.register_memory.call_count == register_calls + 1
+    assert dest._nixl._registrations.keys() == receive_keys
     assert agent.add_remote_agent.call_count == 2
 
     for source in sources:
@@ -923,20 +934,14 @@ async def test_direct_weight_sync_concurrent_pulls():
     await source.cleanup()
 
 
-def _row_sharded_sources(weight):
-    """Register ``weight`` split by rows across two sources."""
+def _per_source_tensors(weight):
+    """Register each half of ``weight`` as its own tensor on its own source."""
     sources = []
     per_rank = []
-    rows = weight.shape[0] // 2
     for rank in range(2):
         source = DirectWeightSyncSource()
-        handles = source.register({"weight": weight.chunk(2)[rank].clone()}, rank=rank)
-        handles["weight"].tensor_slice = TensorSlice(
-            offsets=(rows * rank, 0),
-            coordinates=(rank,),
-            global_shape=tuple(weight.shape),
-            local_shape=(rows, weight.shape[1]),
-            mesh_shape=(2,),
+        handles = source.register(
+            {f"weight{rank}": weight.chunk(2)[rank].clone()}, rank=rank
         )
         sources.append(source)
         per_rank.append(pickle.loads(pickle.dumps(handles)))
@@ -946,15 +951,16 @@ def _row_sharded_sources(weight):
 @pytest.mark.asyncio
 async def test_direct_weight_sync_reads_completing_out_of_order():
     weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
-    sources, all_handles = _row_sharded_sources(weight)
+    sources, all_handles = _per_source_tensors(weight)
     # The second source agent's READ completes polls after the first's.
     FakeNixlAgent.state_sequences = {0: ["PROC"], 1: ["PROC", "PROC", "PROC"]}
 
     dest = DirectWeightSyncDest()
-    dest_state_dict = {"weight": torch.zeros(8, 4)}
+    dest_state_dict = {"weight0": torch.zeros(4, 4), "weight1": torch.zeros(4, 4)}
     await dest.pull(all_handles, dest_state_dict)
 
-    assert torch.equal(dest_state_dict["weight"], weight)
+    assert torch.equal(dest_state_dict["weight0"], weight[:4])
+    assert torch.equal(dest_state_dict["weight1"], weight[4:])
     assert dest._nixl._registrations == {}
     for source in sources:
         await source.cleanup()
@@ -963,19 +969,20 @@ async def test_direct_weight_sync_reads_completing_out_of_order():
 @pytest.mark.asyncio
 async def test_direct_weight_sync_failed_read_deregisters_destinations():
     weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
-    sources, all_handles = _row_sharded_sources(weight)
+    sources, all_handles = _per_source_tensors(weight)
     # The first source agent's READ fails; the second completes afterwards,
     # and its data only lands if its destination is still registered.
     FakeNixlAgent.state_sequences = {0: ["ERR"], 1: ["PROC", "PROC"]}
 
     dest = DirectWeightSyncDest()
+    dest_state_dict = {"weight0": torch.zeros(4, 4), "weight1": torch.zeros(4, 4)}
     with pytest.raises(RuntimeError, match="NIXL transfer failed"):
-        await dest.pull(all_handles, {"weight": torch.zeros(8, 4)})
+        await dest.pull(all_handles, dest_state_dict)
 
     assert len(dest._nixl.agent.initialized) == 2
     assert dest._nixl.agent.pending == {}
-    # Rank 1's shard landed in its receive buffer before deregistration.
-    assert torch.equal(dest._plan[1].recv_buffer, weight[4:])
+    # Rank 1's tensor landed before deregistration.
+    assert torch.equal(dest_state_dict["weight1"], weight[4:])
     assert dest._nixl._registrations == {}
     for source in sources:
         await source.cleanup()
@@ -1032,6 +1039,6 @@ async def test_direct_weight_sync_cpu_sources_into_cuda_destinations(shard_dim):
     await dest.pull(group_handles(per_rank), {"weight": dest_weight})
 
     torch.testing.assert_close(dest_weight.cpu(), weight, rtol=0, atol=0)
-    assert dest._nixl._registrations == {}
+    assert dest._nixl._registrations.keys() == _receive_buffer_keys(dest)
     for source in sources:
         await source.cleanup()

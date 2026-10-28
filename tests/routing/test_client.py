@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torchstore.direct_weight_sync import RDMAWeightHandle
 
-from .utils import registered_clients
+from .utils import registered_clients, routing_clients, tensor_slice
 
 
 async def _publisher_and_requester_clients():
@@ -70,3 +71,33 @@ async def test_registration_methods_install_local_plans() -> None:
     requester = (await _publisher_and_requester_clients())["requester/0/0"]
 
     assert requester._routing_directory.routes.lookup("model/w")
+
+
+@pytest.mark.asyncio
+async def test_rdma_handles_are_grouped_by_publisher() -> None:
+    """Return every publisher's handles per key, whatever order they publish in."""
+    publishers = ("publisher/0", "publisher/1")
+    clients = await routing_clients(
+        publishers={rank: {} for rank in publishers},
+        requesters={"requester/0/0": {}},
+    )
+    handles = {
+        rank: {
+            "w": RDMAWeightHandle(
+                rdma_buffer=None,
+                tensor_slice=tensor_slice((2 * index,), (2,), global_shape=(4,)),
+                source_rank=index,
+            )
+        }
+        for index, rank in enumerate(publishers)
+    }
+    for rank in reversed(publishers):
+        await clients[rank].publish_rdma_handles("model", handles[rank])
+
+    grouped = await clients["requester/0/0"].get_rdma_handles("model")
+
+    assert dict(grouped) == {"w": [handles[rank]["w"] for rank in publishers]}
+    with pytest.raises(RuntimeError, match="only publisher"):
+        await clients["requester/0/0"].publish_rdma_handles("model", {})
+    with pytest.raises(RuntimeError, match="only requester"):
+        await clients["publisher/0"].get_rdma_handles("model")
