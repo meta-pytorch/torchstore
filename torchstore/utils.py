@@ -12,7 +12,6 @@ from logging import getLogger
 from typing import TYPE_CHECKING
 
 import torch
-from monarch.actor import this_host
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
@@ -137,6 +136,8 @@ async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
     """Actors are essentially processes wrapped in a class."""
 
     if mesh is None:
+        from monarch.actor import this_host
+
         logger.debug("Spawning actors on the local host")
         mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
 

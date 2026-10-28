@@ -21,8 +21,9 @@ from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
 from torchstore.utils import same_slice_geometry
+from ._gc import gc_paused
 from ._model import KeyRegistration, RankRole
-from .coordinator import RoutingCoordinator
+from .control_plane import ControlPlane
 from .directory import RoutingDirectory
 from .plan import RoutingPlan
 
@@ -36,14 +37,14 @@ class RoutingClient(LocalClient):
         self,
         rank: str,
         role: RankRole,
-        coordinator: RoutingCoordinator,
+        control_plane: ControlPlane,
         strategy: TorchStoreStrategy,
     ) -> None:
         directory = RoutingDirectory(rank)
         super().__init__(directory, strategy)
         self._routing_directory = directory
         self._role = role
-        self._coordinator = coordinator
+        self._control_plane = control_plane
         self._registered_layouts: set[str] = set()
 
     @torch.no_grad()
@@ -72,7 +73,7 @@ class RoutingClient(LocalClient):
         }
         rank = self._routing_directory.rank
         self._routing_directory.install(RoutingPlan.for_publisher(rank, registrations))
-        await self._coordinator.register_layout.call_one(
+        await self._control_plane.register_layout(
             rank=rank,
             key=key,
             registrations=registrations,
@@ -97,7 +98,7 @@ class RoutingClient(LocalClient):
                 "user_state_dict is required for the first routed get_state_dict"
             )
 
-        publishers = await self._coordinator.get_layouts.call_one(key=key)
+        publishers = await self._control_plane.get_layouts(key)
         slices, dtypes, _mapping = _state_dict_storage_metadata(state_dict, key)
         if not strict:
             published_keys = {
@@ -116,9 +117,11 @@ class RoutingClient(LocalClient):
             for name, tensor_slice in slices.items()
         }
         rank = self._routing_directory.rank
-        self._routing_directory.install(
-            RoutingPlan.for_requester(rank, registrations, publishers)
-        )
+        # Planning allocates objects for every publisher's slice of every key, and
+        # generational collections would keep walking the growing plan.
+        with gc_paused():
+            plan = RoutingPlan.for_requester(rank, registrations, publishers)
+        self._routing_directory.install(plan)
         self._registered_layouts.add(key)
 
     @torch.no_grad()
