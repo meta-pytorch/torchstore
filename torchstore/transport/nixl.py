@@ -180,6 +180,7 @@ class NixlAgentCache(TransportCache):
             return name
         if previous_metadata is not None:
             self.agent.remove_remote_agent(name)
+            del self._remote_agents[name]
         remote_name = self.agent.add_remote_agent(metadata)
         if isinstance(remote_name, bytes):
             remote_name = remote_name.decode()
