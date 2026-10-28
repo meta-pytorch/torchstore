@@ -11,13 +11,11 @@ import socket
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-import cloudpickle
-from monarch._src.actor import actor_mesh
-from monarch.actor import get_or_spawn_controller
 from torch.distributed import TCPStore
 
+# Imported on load because tests patch StoreJob. The package loads this module lazily.
 try:
     from monarch.job.spmd import StoreJob
 except ImportError as e:
@@ -35,9 +33,11 @@ except ImportError as e:
 
 
 import torchstore.api as _api
-from torchstore.controller import Controller
 from torchstore.strategy import HostStrategy, LocalRankStrategy, TorchStoreStrategy
 from torchstore.utils import TORCHSTORE_HOSTNAME_ENV
+
+if TYPE_CHECKING:
+    from torchstore.controller import Controller
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ class _SPMDSession:
         self,
         *,
         rendezvous: TCPStore,
-        controller: Controller,
+        controller: "Controller",
         store_name: str,
         job: StoreJob | None,
         host_mesh: Any | None,
@@ -317,12 +317,18 @@ async def initialize(
             enable Job API components such as telemetry or remote mounts.
     """
 
+    from monarch._src.actor import actor_mesh
+
+    from torchstore.controller import Controller
+
     strategy = _validate_strategy(strategy)
     if actor_mesh._context.get() is not None:
         raise RuntimeError(
             "torchstore.spmd.initialize() requires a fresh Monarch context; "
             "use torchstore.initialize(mesh=...) from an existing Monarch runtime"
         )
+    # After Monarch, which brings it, so a missing torchmonarch is reported as Monarch.
+    import cloudpickle
 
     if env is None:
         env = SPMDEnv.from_env()
@@ -372,7 +378,7 @@ async def initialize(
                 store_name=store_name,
                 mesh=storage_mesh,
             )
-            controller = await get_or_spawn_controller(store_name, Controller)
+            controller = await _api.get_or_spawn_controller(store_name, Controller)
 
             # @lint-ignore PYTHONPICKLEISBAD Handle broadcast is required for SPMD init.
             rendezvous.set(controller_key, cloudpickle.dumps(controller))
