@@ -819,10 +819,12 @@ async def test_direct_weight_sync_reads_every_source_agent_in_one_transfer():
         handle.operation == _NixlTransferOperation.READ for handle in agent.initialized
     )
 
-    # Later pulls reuse registrations and loaded remote metadata.
+    # Destination registrations last one pull; remote metadata is reused.
+    assert dest._nixl._registrations == {}
     register_calls = agent.register_memory.call_count
     await dest.pull(all_handles, dest_state_dict)
-    assert agent.register_memory.call_count == register_calls
+    assert agent.register_memory.call_count == 2 * register_calls
+    assert dest._nixl._registrations == {}
     assert agent.add_remote_agent.call_count == 2
 
     for source in sources:

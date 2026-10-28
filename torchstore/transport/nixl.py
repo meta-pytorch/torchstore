@@ -166,10 +166,13 @@ class NixlAgentCache(TransportCache):
         self._remote_agents[name] = metadata
         return remote_name
 
-    @override
-    def clear(self) -> None:
+    def deregister_all(self) -> None:
         for key in list(self._registrations):
             self._evict(key)
+
+    @override
+    def clear(self) -> None:
+        self.deregister_all()
         for remote_name in list(self._remote_agents):
             self.agent.remove_remote_agent(remote_name)
             self._remote_agents.pop(remote_name)

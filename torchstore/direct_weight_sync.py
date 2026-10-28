@@ -324,11 +324,7 @@ class DirectWeightSyncDest:
         source_agent: NixlSourceAgent,
         transfers: list[tuple[torch.Tensor, bytes]],
     ) -> None:
-        """Read every buffer of one source agent in a batched NIXL transfer.
-
-        Destination storages stay registered across pulls; the cache drops a
-        registration once its storage is freed or reallocated.
-        """
+        """Read every buffer of one source agent in a batched NIXL transfer."""
         if self._nixl is None:
             self._nixl = NixlAgentCache()
         remote_agent = self._nixl.add_remote_agent(
@@ -488,13 +484,26 @@ class DirectWeightSyncDest:
             agent = op.rdma_buffer.agent
             _, transfers = nixl_reads.setdefault(agent.name, (agent, []))
             transfers.append((op.dest_byte_view, op.rdma_buffer.descriptors))
-        await asyncio.gather(
-            *monarch_reads,
-            *(
-                self._read_nixl(agent, transfers)
-                for agent, transfers in nixl_reads.values()
-            ),
-        )
+        # return_exceptions: deregister only after every read has finished.
+        try:
+            results = await asyncio.gather(
+                *monarch_reads,
+                *(
+                    self._read_nixl(agent, transfers)
+                    for agent, transfers in nixl_reads.values()
+                ),
+                return_exceptions=True,
+            )
+        finally:
+            # Destinations may be freed and reallocated at the same address
+            # before the next pull (e.g. FSDP resharding), and a registration
+            # over the old allocation silently drops writes. Registering costs
+            # ~0.15 ms per storage for GPU memory.
+            if self._nixl is not None:
+                self._nixl.deregister_all()
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
         # Post-read copies (only for resharded ops). no_grad: dests may be
         # parameters that require grad.
