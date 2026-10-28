@@ -338,7 +338,8 @@ class DirectWeightSyncDest:
         self._plan_handles: dict[str, list[RDMAWeightHandle]] | None = None
         self._plan_signature: tuple | None = None
         self._nixl: NixlAgentCache | None = None
-        # Each pull deregisters every NIXL destination when it finishes.
+        # Pulls share the plan and its registrations; one must not rebuild the
+        # plan or deregister a destination another is reading into.
         # Excludes pulls on one event loop only.
         self._pull_lock = asyncio.Lock()
 

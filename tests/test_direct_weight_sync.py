@@ -435,12 +435,17 @@ async def test_local_client_publishes_and_fetches_every_rank(monkeypatch):
 
 async def test_failed_publish_retry_republishes_the_same_handles(monkeypatch):
     """The coordinator keeps the first handles it receives, so a retry must not
-    replace them with new registrations."""
+    replace them with new registrations, but must refresh their staging buffers."""
     registered = []
+    refreshed = []
 
     def register(self, state_dict, rank, transfer_dtype=None):
         registered.append({"w": object()})
         return registered[-1]
+
+    def refresh(self):
+        refreshed.append(len(store.published))
+        return 0
 
     class Store:
         def __init__(self) -> None:
@@ -453,6 +458,7 @@ async def test_failed_publish_retry_republishes_the_same_handles(monkeypatch):
                 raise RuntimeError("publish failed")
 
     monkeypatch.setattr(DirectWeightSyncSource, "register", register)
+    monkeypatch.setattr(DirectWeightSyncSource, "refresh", refresh)
     store = Store()
     try:
         with pytest.raises(RuntimeError, match="publish failed"):
@@ -461,6 +467,44 @@ async def test_failed_publish_retry_republishes_the_same_handles(monkeypatch):
 
         assert len(registered) == 1
         assert store.published == [registered[0], registered[0]]
+        # Refreshed before the retry's publish.
+        assert refreshed == [1]
+    finally:
+        state_dict_utils._rdma_cache.pop(id(store), None)
+
+
+async def test_concurrent_first_puts_publish_the_same_handles(monkeypatch):
+    registered = []
+
+    def register(self, state_dict, rank, transfer_dtype=None):
+        registered.append({"w": object()})
+        return registered[-1]
+
+    class Store:
+        def __init__(self) -> None:
+            self.published = []
+            self.release = asyncio.Event()
+
+        async def publish_rdma_handles(self, key, handles):
+            self.published.append(handles)
+            await self.release.wait()
+
+    async def put():
+        await state_dict_utils._put_state_dict_direct_rdma(store, {}, "w")
+
+    monkeypatch.setattr(DirectWeightSyncSource, "register", register)
+    monkeypatch.setattr(DirectWeightSyncSource, "refresh", lambda self: 0)
+    store = Store()
+    try:
+        first = asyncio.create_task(put())
+        second = asyncio.create_task(put())
+        while len(store.published) < 2:
+            await asyncio.sleep(0)
+        store.release.set()
+        await asyncio.gather(first, second)
+
+        assert store.published == [registered[0], registered[0]]
+        assert state_dict_utils._rdma_cache[id(store)].registered == {"w"}
     finally:
         state_dict_utils._rdma_cache.pop(id(store), None)
 

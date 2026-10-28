@@ -299,7 +299,8 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
 
     Subsequent calls: refreshes staging buffers for non-contiguous params.
     ``state_dict`` may be ``None`` to skip building it when only a refresh
-    is needed.
+    is needed. A retry after a failed publish reuses the first attempt's
+    registration, so it must not pass a different state dict.
     """
     from torchstore.direct_weight_sync import DirectWeightSyncSource
 
@@ -308,25 +309,30 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
     if cache.source is None:
         cache.source = DirectWeightSyncSource()
 
-    if key not in cache.registered:
-        # A retry after a failed publish republishes the same handles: the
-        # coordinator may already hold them, and it keeps the first it receives.
-        handles = cache.unpublished.get(key)
-        if handles is None:
-            assert (
-                state_dict is not None
-            ), "state_dict is required on first put_state_dict call with direct_rdma=True"
-            # source_rank is informational; routing publishers may not use torch.distributed.
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            handles = cache.source.register(
-                state_dict, rank=rank, transfer_dtype=transfer_dtype
-            )
-            cache.unpublished[key] = handles
-        await store.publish_rdma_handles(key, handles)
-        del cache.unpublished[key]
-        cache.registered.add(key)
-    else:
+    if key in cache.registered:
         cache.source.refresh()
+        return
+
+    # A retry after a failed publish republishes the same handles: the
+    # coordinator may already hold them, and it keeps the first it receives.
+    handles = cache.unpublished.get(key)
+    if handles is None:
+        assert (
+            state_dict is not None
+        ), "state_dict is required on first put_state_dict call with direct_rdma=True"
+        # source_rank is informational; routing publishers may not use torch.distributed.
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        handles = cache.source.register(
+            state_dict, rank=rank, transfer_dtype=transfer_dtype
+        )
+        cache.unpublished[key] = handles
+    else:
+        # The staging buffers still hold the failed attempt's weights.
+        cache.source.refresh()
+    await store.publish_rdma_handles(key, handles)
+    # Concurrent first puts publish the same handles; the first to finish pops.
+    cache.unpublished.pop(key, None)
+    cache.registered.add(key)
 
 
 async def _get_state_dict_direct_rdma(store, key, user_state_dict):
