@@ -4,10 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
-from logging import getLogger
+import importlib
+from typing import Any, TYPE_CHECKING
 
-from torchstore import spmd
+import torchstore.api as _api
 from torchstore.api import (
     client,
     delete,
@@ -26,7 +26,8 @@ from torchstore.api import (
 )
 from torchstore.client import ClientType
 from torchstore.logging import init_logging
-from torchstore.routing._model import RankRole
+from torchstore.routing._model import KeyRegistration, RankRole, Registrations
+from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
 from torchstore.strategy import (
     ControllerStorageVolumes,
     HostStrategy,
@@ -34,16 +35,30 @@ from torchstore.strategy import (
     TorchStoreStrategy,
 )
 
-initialize_spmd = spmd.initialize
-
-if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
+# Monarch reads the frame length when it first loads, which importing TorchStore never
+# does, so a process that loads Monarch afterwards uses the default too, and one that
+# loaded Monarch first keeps Monarch's own limit. Monarch entry points log the export.
+if _api._export_frame_length_default():
     init_logging()
-    logger = getLogger(__name__)
-    logger.warning(
-        "Warning: setting HYPERACTOR_CODEC_MAX_FRAME_LENGTH since this needs to be set"
-        " to enable large RPC calls via Monarch"
-    )
-    os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = "910737418240"
+
+
+# Type checkers see these names but not __getattr__, so they still flag misspelled ones.
+if TYPE_CHECKING:
+    from torchstore import spmd
+    from torchstore.spmd import initialize as initialize_spmd
+else:
+
+    def __getattr__(name: str) -> Any:
+        """Load ``spmd`` on first use, since it imports Monarch's job API when it loads."""
+        if name == "spmd":
+            return importlib.import_module("torchstore.spmd")
+        if name == "initialize_spmd":
+            return importlib.import_module("torchstore.spmd").initialize
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), "initialize_spmd", "spmd"})
 
 
 __all__ = [
@@ -61,6 +76,10 @@ __all__ = [
     "client",
     "ClientType",
     "RankRole",
+    "ControlPlane",
+    "ControlPlaneAddress",
+    "KeyRegistration",
+    "Registrations",
     "shutdown",
     "TorchStoreStrategy",
     "LocalRankStrategy",

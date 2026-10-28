@@ -1,0 +1,392 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""A storage volume's request handling, as a plain class that any host can serve."""
+
+from typing import Any
+
+import torch
+
+from torchstore.transport.buffers import TransportBuffer, TransportContext
+from torchstore.transport.types import Request, TensorSlice
+from torchstore.utils import get_local_hostname, get_slice_intersection
+
+__all__ = ["InMemoryStore", "StorageImpl", "StorageVolumeCore"]
+
+
+class StorageVolumeCore:
+    """Handles one storage volume's requests, for a host such as the Monarch actor.
+
+    Hosts run one call at a time, each to completion (a put reads, transfers and stores a tensor, and a cancel
+    does not stop Gloo's transfer threads), pass deserialized arguments (the store keeps what buffers and
+    requests carry) and reply with a copy made before the next call (replies may share stored tensors and objects).
+    """
+
+    def __init__(self, volume_id: str) -> None:
+        self.volume_id = volume_id
+        self.store = InMemoryStore()
+
+    async def get_id(self) -> tuple[str, str]:
+        return (self.volume_id, get_local_hostname())
+
+    async def handshake(
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> list[Any]:
+        return await self.store.handshake(transport_buffer, requests)
+
+    async def put(
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> None:
+        await self.store.put(transport_buffer, requests)
+
+    async def get(
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> TransportBuffer:
+        return await self.store.get(transport_buffer, requests)
+
+    async def get_meta(
+        self,
+        requests: list[Request],
+    ) -> list[tuple[torch.Size, torch.dtype] | str]:
+        return await self.store.get_meta(requests)
+
+    async def delete(self, key: str) -> None:
+        await self.store.delete(key)
+        self.store.transport_context.delete(key)
+
+    async def delete_batch(self, keys: list[str]) -> None:
+        await self.store.delete_batch(keys)
+        self.store.transport_context.delete(keys)
+
+    async def reset(self) -> None:
+        self.store.reset()
+
+
+class StorageImpl:
+    """Abstract base class for storage implementations."""
+
+    def __init__(self) -> None:
+        self.transport_context = TransportContext()
+
+    async def put(
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> None:
+        """Store data in the storage backend."""
+        raise NotImplementedError()
+
+    async def get(
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> TransportBuffer:
+        """Retrieve data from the storage backend."""
+        raise NotImplementedError()
+
+    async def get_meta(
+        self, requests: list[Request]
+    ) -> list[tuple[torch.Size, torch.dtype] | str]:
+        """Get metadata about stored data."""
+        raise NotImplementedError()
+
+    async def delete(self, key: str) -> None:
+        """Delete data from the storage backend."""
+        raise NotImplementedError()
+
+    async def delete_batch(self, keys: list[str]) -> None:
+        """Delete multiple keys from the storage backend."""
+        raise NotImplementedError()
+
+    async def handshake(
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> list[Any]:
+        raise NotImplementedError()
+
+
+class InMemoryStore(StorageImpl):
+    """Local in memory storage."""
+
+    supports_tensor_overwrite: bool = True
+
+    def __init__(self) -> None:
+        self.kv: dict[str, Any] = {}
+        super().__init__()
+
+    async def handshake(
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> list[Any]:
+        pairs = [(request, self._extract_existing(request)) for request in requests]
+        return await transport_buffer.recv_handshake(self.transport_context, pairs)
+
+    def _extract_existing(self, request: "Request") -> torch.Tensor | None:
+        """Extract existing tensor from storage for in-place update.
+
+        Ordinary tensors reuse compatible allocations or return None to allocate
+        a replacement. DTensor shards retain their existing allocations; changing
+        shard shape, dtype, or layout under an existing key is unsupported.
+
+        Args:
+            request: The incoming put request
+
+        Returns:
+            The existing tensor if found, None otherwise.
+
+        Raises:
+            AssertionError: If there's a type mismatch between existing data and request.
+        """
+        current_object = self.kv.get(request.key, None)
+
+        if current_object is None:
+            return None
+
+        if isinstance(current_object, torch.Tensor):
+            # Regular tensor - request must also be a regular tensor (no tensor_slice)
+            assert (
+                request.tensor_slice is None
+            ), "Existing data is a regular tensor but incoming request has tensor_slice (DTensor)"
+            if not self._is_compatible_tensor(current_object, request):
+                return None
+            return current_object
+
+        if isinstance(current_object, dict):
+            if "obj" in current_object:
+                # Object dict - request must also be an object
+                assert (
+                    request.is_object
+                ), "Existing data is an object but request.is_object is False"
+                return None
+
+            # DTensor shard dict - incoming request must also be a DTensor
+            assert (
+                request.tensor_slice is not None
+            ), "Existing data is DTensor shards but incoming request has no tensor_slice"
+            # Look up by coordinates
+            shard = current_object.get(request.tensor_slice.coordinates)
+            if shard is not None and "tensor" in shard:
+                return shard["tensor"]
+            # Coordinates don't match - new shard, return None to allocate new
+            return None
+
+        raise AssertionError(f"Unexpected current_object type: {type(current_object)}")
+
+    @staticmethod
+    def _is_compatible_tensor(tensor: torch.Tensor, request: "Request") -> bool:
+        if request.tensor_meta is None:
+            return True
+
+        shape, dtype = request.tensor_meta
+        return tensor.shape == shape and tensor.dtype == dtype
+
+    def _handle_dtensor(
+        self, key: str, tensor_slice: TensorSlice, tensor: torch.Tensor
+    ) -> None:
+        if key not in self.kv:
+            self.kv[key] = {}
+
+        self.kv[key][tensor_slice.coordinates] = {
+            "slice": tensor_slice,
+            "tensor": tensor,
+        }
+
+    def _extract_slice_from_tensor(
+        self, tensor: torch.Tensor, tensor_slice: TensorSlice
+    ) -> torch.Tensor:
+        """Extract a slice from a full tensor.
+
+        Args:
+            tensor: The full stored tensor.
+            tensor_slice: The slice specification to extract.
+
+        Returns:
+            The extracted tensor slice.
+        """
+        indices = []
+        for dim in range(len(tensor_slice.global_shape)):
+            start = tensor_slice.offsets[dim]
+            end = start + tensor_slice.local_shape[dim]
+            indices.append(slice(start, end))
+        return tensor[tuple(indices)]
+
+    def _get_sharded_tensor(self, request: Request) -> torch.Tensor | None:
+        """
+        Searches stored shards and returns one which completely contains the requested tensor slice
+
+        Args:
+            request: Request object containing the tensor_slice specification
+
+        Returns:
+            The extracted tensor slice if found completely within a stored shard,
+            None otherwise.
+        """
+        for shard in self.kv[request.key].values():
+            stored_slice = shard["slice"]
+            stored_tensor = shard["tensor"]
+
+            intersection_slice = get_slice_intersection(
+                stored_slice, request.tensor_slice
+            )
+
+            # We don't want to visit the shard where requested tensor slice is not completely contained
+            # in the stored tensor slice.
+            if (
+                intersection_slice is None
+                or intersection_slice.local_shape != request.tensor_slice.local_shape
+                or intersection_slice.offsets != request.tensor_slice.offsets
+            ):
+                continue
+
+            # Extract the intersection from the stored tensor
+            indices = []
+            for dim in range(len(stored_slice.global_shape)):
+                start = intersection_slice.offsets[dim] - stored_slice.offsets[dim]
+                indices.append(
+                    slice(
+                        start,
+                        start + intersection_slice.local_shape[dim],
+                    )
+                )
+            extracted_tensor = stored_tensor[tuple(indices)]
+
+            if extracted_tensor is not None:
+                return extracted_tensor
+
+    async def put(
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> None:
+        # Extract existing tensor for potential in-place update
+        entries_with_current_obj = [
+            (request, self._extract_existing(request)) for request in requests
+        ]
+
+        # fetch from remote
+        results = await transport_buffer.handle_put_request(
+            self.transport_context, entries_with_current_obj
+        )
+
+        # store locally
+        for request, result in zip(requests, results, strict=True):
+            self._store(request, result)
+
+    def _store(self, request: "Request", data: Any) -> None:
+        """Store data in kv, wrapping objects and handling DTensor shards."""
+        key = request.key
+        if request.is_object:
+            self.kv[key] = {"obj": data}
+            return
+
+        if request.tensor_slice is not None:
+            # tensor is actually part of a DTensor
+            self._handle_dtensor(key, request.tensor_slice, data)
+            return
+
+        self.kv[key] = data
+
+    async def get(
+        self,
+        transport_buffer: TransportBuffer,
+        requests: list[Request],
+    ) -> TransportBuffer:
+        data_entries = []
+        for request in requests:
+            if request.key not in self.kv:
+                raise KeyError(
+                    f"Key '{request.key}' not found. {list(self.kv.keys())=}"
+                )
+            data_entries.append((request, self._get_data(request)))
+        await transport_buffer.handle_get_request(self.transport_context, data_entries)
+        return transport_buffer
+
+    def _get_data(self, request):
+        key = request.key
+        val = self.kv[key]
+        if isinstance(val, dict) and "obj" in val:
+            return val["obj"]
+
+        # Full tensor stored - return it (possibly sliced)
+        if isinstance(val, torch.Tensor):
+            if request.tensor_slice is None:
+                return val
+            # User wants a slice of the full tensor - extract it
+            return self._extract_slice_from_tensor(val, request.tensor_slice)
+
+        # Must be sharded tensor dict - delegate to _get_sharded_tensor
+        if request.tensor_slice is None:
+            # TODO: currently, it seems we only support requested a subsection of a shard.
+            # this needs to be made more general, such that we can request any region of the stored tensor
+            # (with the most useful case really being even to fetch all shards at once, so we can recreate them locally)
+            raise RuntimeError(
+                f"Key '{key}' contains sharded tensor but no tensor_slice was requested"
+            )
+
+        extracted_tensor = self._get_sharded_tensor(request)
+
+        if extracted_tensor is not None:
+            return extracted_tensor
+
+        raise RuntimeError(
+            f"Tensor slice {request.tensor_slice} not found in any stored shards for {key}"
+        )
+
+    async def get_meta(
+        self,
+        requests: list[Request],
+    ) -> list[tuple[torch.Size, torch.dtype] | str]:
+        return [self._get_meta(request) for request in requests]
+
+    def _get_meta(self, request: Request) -> tuple[torch.Size, torch.dtype] | str:
+        key = request.key
+        if key not in self.kv:
+            raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
+
+        stored_object = self.kv[key]
+        if isinstance(stored_object, torch.Tensor):
+            return stored_object.shape, stored_object.dtype
+
+        assert isinstance(stored_object, dict)
+        if "obj" in stored_object:
+            return "obj"
+
+        if "tensor" in stored_object:
+            return stored_object["tensor"].shape, stored_object["tensor"].dtype
+
+        if request.tensor_slice is not None:
+            extracted_tensor = self._get_sharded_tensor(request)
+            if extracted_tensor is not None:
+                return extracted_tensor.shape, extracted_tensor.dtype
+
+            raise KeyError(
+                f"Could not find shard slice with {request.tensor_slice=}  Slices:{stored_object}"
+            )
+
+        raise RuntimeError(
+            f"Unknown type for {key} type={type(stored_object)} {stored_object=}"
+        )
+
+    async def delete(self, key: str) -> None:
+        if key not in self.kv:
+            raise KeyError(f"Key '{key}' not found. {list(self.kv.keys())=}")
+        del self.kv[key]
+
+    async def delete_batch(self, keys: list[str]) -> None:
+        for key in set(keys):
+            self.kv.pop(key, None)
+
+    def reset(self) -> None:
+        self.kv = {}
+        self.transport_context.clear()
