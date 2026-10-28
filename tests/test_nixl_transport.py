@@ -108,6 +108,9 @@ class FakeNixlAgent:
             setattr(self, method_name, Mock(wraps=getattr(self, method_name)))
         FakeNixlAgent.instances.append(self)
 
+    def create_backend(self, backend, initParams) -> None:
+        self.backend_params = {backend: initParams}
+
     def register_memory(self, tensor, *, backends):
         assert tensor.numel() > 0
         descriptor = id(tensor)
@@ -705,6 +708,38 @@ async def test_objects_stay_on_rpc_path_without_creating_nixl_agent(ref, ctx):
 
     assert results == [{"step": 3}]
     assert FakeNixlAgent.instances == []
+
+
+@pytest.mark.asyncio
+async def test_uncached_registration_lasts_until_last_drop(ref):
+    """Buffers of one get share a storage's registration until both drop."""
+    first = NixlTransportBuffer(ref)
+    second = NixlTransportBuffer(ref)
+    destination = torch.zeros(4, 16)
+
+    first._register_client_tensor(destination[0], cached=False)
+    first._register_client_tensor(destination[1], cached=False)
+    second._register_client_tensor(destination[2], cached=False)
+    cache = first._client_cache()
+    agent = cache.agent
+    ((descriptors, holders),) = cache._leases.values()
+
+    assert holders == 2
+    agent.register_memory.assert_called_once()
+    assert cache._registrations == {}
+    assert _storage_volume_copy(first)._leases == set()
+    await first.drop()
+    agent.deregister_memory.assert_not_called()
+    await second.drop()
+    agent.deregister_memory.assert_called_once_with(descriptors)
+    assert cache._leases == {}
+
+
+def test_agent_disables_ucx_registration_reuse(agent_cache):
+    assert agent_cache.agent.config.kwargs["backends"] == []
+    assert agent_cache.agent.backend_params == {
+        "UCX": {"engine_config": "CUDA_COPY_REG_WHOLE_ALLOC=off,RCACHE_ENABLE=n"}
+    }
 
 
 def test_memory_registration_is_reused_for_same_tensor(agent_cache):

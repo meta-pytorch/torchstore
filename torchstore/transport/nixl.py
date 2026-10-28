@@ -116,6 +116,26 @@ def _staging_pieces(tensor: torch.Tensor, max_bytes: int):
         yield tensor[start : start + rows]
 
 
+def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
+    storage = tensor.untyped_storage()
+    return storage.data_ptr(), storage.nbytes()
+
+
+_BACKEND_PARAMS = {
+    "UCX": {
+        # CUDA_COPY_REG_WHOLE_ALLOC: UCX otherwise registers the cuMem allocation
+        # holding a CUDA buffer's start. With expandable segments that is one 20 MiB
+        # chunk, so a buffer no longer than a chunk that crosses a chunk boundary is
+        # only partly registered; registration fails, or RDMA past it fails with a
+        # local access violation that leaves the transfer stuck. Each registration
+        # covers its whole storage.
+        # RCACHE_ENABLE: UCX otherwise keeps deregistered memory registered, which
+        # pins CUDA memory torch has since freed so the device cannot reuse it.
+        "engine_config": "CUDA_COPY_REG_WHOLE_ALLOC=off,RCACHE_ENABLE=n",
+    },
+}
+
+
 @dataclass
 class _Registration:
     """Cached NIXL descriptors tied to the lifetime of their backing tensor storage."""
@@ -138,10 +158,13 @@ class NixlAgentCache(TransportCache):
         config = nixl_agent_config(
             enable_prog_thread=True,
             enable_listen_thread=False,
-            backends=[self.backend],
+            backends=[],
         )
         self.agent = nixl_agent(name, config)
+        self.agent.create_backend(self.backend, _BACKEND_PARAMS.get(self.backend, {}))
         self._registrations: dict[tuple[int, int], _Registration] = {}
+        # Uncached registrations: storage key -> [descriptors, holders].
+        self._leases: dict[tuple[int, int], list[Any]] = {}
         self._remote_agents: dict[str, bytes] = {}
 
     def register(self, tensor: torch.Tensor) -> Any:
@@ -165,6 +188,34 @@ class NixlAgentCache(TransportCache):
         storage_ref = weakref.ref(storage, lambda _ref, _key=key: self._evict(_key))
         self._registrations[key] = _Registration(descriptors, storage_ref)
         return descriptors
+
+    def acquire(self, tensor: torch.Tensor) -> tuple[int, int]:
+        """Register a tensor's storage until every ``acquire`` is released.
+
+        For CUDA get destinations: ``register`` drops registrations only when the
+        storage dies, but FSDP frees and reallocates parameter storage in place
+        with ``resize_``, which would leave a registration over freed memory.
+        Concurrent buffers of one get share a registration rather than
+        registering the storage again.
+        """
+        key = _storage_key(tensor)
+        lease = self._leases.get(key)
+        if lease is not None:
+            lease[1] += 1
+            return key
+        region = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+            tensor.untyped_storage()
+        )
+        descriptors = self.agent.register_memory(region, backends=[self.backend])
+        self._leases[key] = [descriptors, 1]
+        return key
+
+    def release(self, key: tuple[int, int]) -> None:
+        lease = self._leases[key]
+        lease[1] -= 1
+        if lease[1] == 0:
+            del self._leases[key]
+            self.agent.deregister_memory(lease[0])
 
     def _evict(self, key: tuple[int, int]) -> None:
         registration = self._registrations.get(key)
@@ -234,16 +285,21 @@ class NixlTransportBuffer(TransportBuffer):
         self._client_metadata: bytes | None = None
         self._client_agent_name: str | None = None
         self._contexts: list[NixlRequestContext] = []
+        # Storage keys of this request's CUDA destinations acquired from the cache.
+        self._leases: set[tuple[int, int]] = set()
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["storage_volume_ref"] = None
+        state["_leases"] = set()
         return state
 
     def _client_cache(self) -> NixlAgentCache:
         return self.storage_volume_ref.transport_context.get(NixlAgentCache)
 
-    def _register_client_tensor(self, tensor: torch.Tensor) -> NixlRequestContext:
+    def _register_client_tensor(
+        self, tensor: torch.Tensor, *, cached: bool = True
+    ) -> NixlRequestContext:
         assert tensor.is_contiguous()
         context = NixlRequestContext(
             tensor=tensor,
@@ -255,7 +311,10 @@ class NixlTransportBuffer(TransportBuffer):
             return context
 
         cache = self._client_cache()
-        cache.register(tensor)
+        if cached:
+            cache.register(tensor)
+        elif _storage_key(tensor) not in self._leases:
+            self._leases.add(cache.acquire(tensor))
         descriptors = cache.agent.get_xfer_descs(tensor)
         context.remote_descriptors = cache.agent.get_serialized_descs(descriptors)
         return context
@@ -315,7 +374,9 @@ class NixlTransportBuffer(TransportBuffer):
                     shape = request.tensor_slice.local_shape
                 tensor = torch.empty(shape, dtype=dtype, device="cpu")
 
-            self._contexts.append(self._register_client_tensor(tensor))
+            self._contexts.append(
+                self._register_client_tensor(tensor, cached=not tensor.is_cuda)
+            )
         self._publish_client_metadata()
 
     async def _transfer(
@@ -620,3 +681,8 @@ class NixlTransportBuffer(TransportBuffer):
     async def drop(self) -> None:
         self._client_metadata = None
         self._contexts = []
+        leases, self._leases = self._leases, set()
+        if leases:
+            cache = self._client_cache()
+            for key in leases:
+                cache.release(key)
