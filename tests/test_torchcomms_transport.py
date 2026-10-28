@@ -15,6 +15,7 @@ import torchstore.transport as transport_module
 import torchstore.transport.torchcomms.cache as cache_mod
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
+from torchstore.transport.torch_distributed import TorchDistributedTransportBuffer
 from torchstore.transport.torchcomms.buffer import (
     RdmaContext as TorchCommsRdmaContext,
     TorchCommsRdmaTransportBuffer,
@@ -494,6 +495,9 @@ class TestTorchCommsSelection:
         self, monkeypatch
     ) -> None:
         monkeypatch.setattr(
+            transport_module, "torch_transport_available", lambda: False
+        )
+        monkeypatch.setattr(
             transport_module,
             "torchcomms_uniflow_available",
             lambda: False,
@@ -527,6 +531,42 @@ class TestTorchCommsSelection:
             transport_module.create_transport_buffer(
                 _storage_volume_ref(default_transport_type=TransportType.TorchComms)
             )
+
+
+class TestTorchDistributedSelection:
+    def test_enum_value_is_stable(self) -> None:
+        assert TransportType.TorchDistributed.value == 8
+
+    def test_preferred_over_nixl(self, monkeypatch) -> None:
+        monkeypatch.setattr(transport_module, "SHM_ENABLED", False)
+        monkeypatch.setattr(transport_module, "torch_transport_available", lambda: True)
+        monkeypatch.setattr(transport_module, "nixl_available", lambda: True)
+
+        assert (
+            transport_module.get_available_transport(_storage_volume_ref())
+            == TransportType.TorchDistributed
+        )
+
+    def test_shared_memory_is_preferred(self, monkeypatch) -> None:
+        monkeypatch.setattr(transport_module, "SHM_ENABLED", True)
+        monkeypatch.setattr(transport_module, "is_local_to_volume", lambda _ref: True)
+        monkeypatch.setattr(transport_module, "torch_transport_available", lambda: True)
+
+        assert (
+            transport_module.get_available_transport(_storage_volume_ref())
+            == TransportType.SharedMemory
+        )
+
+    def test_create_transport_buffer(self, monkeypatch) -> None:
+        import torchstore.transport.torch_distributed as td_transport
+
+        monkeypatch.setattr(transport_module, "SHM_ENABLED", False)
+        monkeypatch.setattr(transport_module, "torch_transport_available", lambda: True)
+        monkeypatch.setattr(td_transport, "torch_transport_available", lambda: True)
+
+        buffer = transport_module.create_transport_buffer(_storage_volume_ref())
+
+        assert isinstance(buffer, TorchDistributedTransportBuffer)
 
 
 class TestTorchCommsEmptyTensor:
