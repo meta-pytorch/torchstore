@@ -4,35 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 import logging
 import os
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import Any, NamedTuple, TYPE_CHECKING
 
 import torch
-
-try:
-    from monarch.rdma import RDMAAction, RDMABuffer
-
-    try:
-        # monarch >= 0.4.0
-        from monarch.rdma import is_ibverbs_available as monarch_rdma_available
-    except ImportError:
-        # monarch < 0.4.0
-        from monarch.rdma import is_rdma_available as monarch_rdma_available
-except ImportError:
-    monarch_rdma_available = lambda: False
-
-    def RDMABuffer(*args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "RDMABuffer is not available. This environment was likely not built with rdma support."
-        )
-
-    def RDMAAction(*args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError(
-            "RDMAAction is not available. This environment was likely not built with rdma support."
-        )
-
 
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.types import Request
@@ -43,15 +23,64 @@ if TYPE_CHECKING:
     from torchstore.transport.buffers import TransportContext
 
 
+class _RdmaApi(NamedTuple):
+    action: Callable[..., Any]
+    buffer: Callable[..., Any]
+    available: Callable[[], bool]
+
+
+@functools.cache
+def _rdma_api() -> _RdmaApi | None:
+    """Monarch's RDMA API loaded on first use, or None if Monarch lacks it."""
+    try:
+        from monarch.rdma import RDMAAction, RDMABuffer
+
+        try:
+            # monarch >= 0.4.0
+            from monarch.rdma import is_ibverbs_available as available
+        except ImportError:
+            # monarch < 0.4.0
+            from monarch.rdma import is_rdma_available as available
+    except ImportError:
+        return None
+    return _RdmaApi(RDMAAction, RDMABuffer, available)
+
+
+def monarch_rdma_available() -> bool:
+    """Whether Monarch provides RDMA and reports it usable on this host."""
+    api = _rdma_api()
+    return api is not None and api.available()
+
+
+def RDMABuffer(*args: Any, **kwargs: Any) -> Any:
+    """Build Monarch's ``RDMABuffer``."""
+    api = _rdma_api()
+    if api is None:
+        raise NotImplementedError(
+            "RDMABuffer is not available. This environment was likely not built with rdma support."
+        )
+    return api.buffer(*args, **kwargs)
+
+
+def RDMAAction(*args: Any, **kwargs: Any) -> Any:
+    """Build Monarch's ``RDMAAction``."""
+    api = _rdma_api()
+    if api is None:
+        raise NotImplementedError(
+            "RDMAAction is not available. This environment was likely not built with rdma support."
+        )
+    return api.action(*args, **kwargs)
+
+
 def monarch_rdma_transport_available() -> bool:
     """Check if Monarch RDMA transport is available for use.
 
-    Returns True if:
-    - TORCHSTORE_RDMA_ENABLED environment variable is set to "1" (default)
-    - The monarch RDMA library is available and functional
+    True if TORCHSTORE_RDMA_ENABLED is "1" (the default), Monarch's actor API is
+    loaded, as on every Monarch path, and the Monarch RDMA library is functional.
     """
     rdma_enabled = os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
-    return rdma_enabled and monarch_rdma_available()
+    # Probing loads Monarch's RDMA package, needed only where Monarch's actors are used.
+    return rdma_enabled and "monarch.actor" in sys.modules and monarch_rdma_available()
 
 
 @dataclass

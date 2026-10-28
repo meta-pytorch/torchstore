@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,7 +17,7 @@ import torchstore.api as store_api
 from torchstore import RankRole
 from torchstore.client import ClientType
 from torchstore.routing.client import RoutingClient
-from torchstore.routing.coordinator import RoutingCoordinator
+from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.storage_volume import StorageVolume
 
 
@@ -65,9 +67,9 @@ def test_routing_initialization_validates_required_arguments(mesh, strategy) -> 
 
 
 def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
-    monkeypatch,
+    monkeypatch, caplog
 ) -> None:
-    """Initialize publisher storage and register every participating rank."""
+    """Initialize publisher storage and register every rank through the Monarch adapter."""
 
     # 1. Replace actor creation with async mocks so initialization stays local.
     class Mesh:
@@ -88,6 +90,7 @@ def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
     monkeypatch.setattr(store_api, "get_or_spawn_controller", spawn_coordinator)
     monkeypatch.setattr(store_api, "current_rank", lambda: SimpleNamespace(rank=0))
     publisher = Mesh("publisher-mesh", 2)
+    caplog.set_level(logging.INFO, logger="torchstore.routing.coordinator")
     # 2. Initialize the publisher mesh.
     asyncio.run(
         store_api.initialize(
@@ -112,6 +115,15 @@ def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
         },
         strategy=strategy,
     )
+    # The adapter logs each call it forwards.
+    assert [
+        match.group(1)
+        for record in caplog.records
+        if record.name == "torchstore.routing.coordinator"
+        and (
+            match := re.search(r"control_plane=monarch (.+) took ", record.getMessage())
+        )
+    ] == ["init"]
 
 
 def test_client_constructs_and_caches_a_routing_client(monkeypatch) -> None:
@@ -141,6 +153,7 @@ def test_client_constructs_and_caches_a_routing_client(monkeypatch) -> None:
     assert isinstance(first, RoutingClient)
     assert first._routing_directory.rank == "requester/1/2"
     assert first._role == RankRole.REQUESTER
+    assert isinstance(first._control_plane, MonarchControlPlane)
     assert first.strategy is strategy
     assert second is first
     spawn_coordinator.assert_awaited_once_with("routing-test", RoutingCoordinator)
