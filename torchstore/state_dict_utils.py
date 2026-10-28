@@ -299,8 +299,9 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
 
     Subsequent calls: refreshes staging buffers for non-contiguous params.
     ``state_dict`` may be ``None`` to skip building it when only a refresh
-    is needed. A retry after a failed publish reuses the first attempt's
-    registration, so it must not pass a different state dict.
+    is needed. A call made during or after a first call whose publish is in
+    flight or failed reuses that registration and ignores a new
+    ``state_dict`` and ``transfer_dtype``.
     """
     from torchstore.direct_weight_sync import DirectWeightSyncSource
 
@@ -327,7 +328,7 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
         )
         cache.unpublished[key] = handles
     else:
-        # The staging buffers may hold a failed attempt's weights.
+        # The weights may have changed since register().
         cache.source.refresh()
     await store.publish_rdma_handles(key, handles)
     # Concurrent first puts publish the same handles; the first to succeed pops.
