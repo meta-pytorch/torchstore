@@ -15,7 +15,7 @@ import torchstore as ts
 from monarch.actor import get_or_spawn_controller, this_host
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
-from torchstore.routing.coordinator import RoutingCoordinator
+from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 
@@ -53,12 +53,13 @@ async def routing_clients(
         store_name=store_name,
     )
     coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
+    control_plane = MonarchControlPlane(coordinator)
     roles = {
         **{rank: RankRole.PUBLISHER for rank in publishers},
         **{rank: RankRole.REQUESTER for rank in requesters},
     }
     clients = {
-        rank: RoutingClient(rank, role, coordinator, strategy)
+        rank: RoutingClient(rank, role, control_plane, strategy)
         for rank, role in roles.items()
     }
     return clients
