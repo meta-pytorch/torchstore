@@ -327,10 +327,10 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
         )
         cache.unpublished[key] = handles
     else:
-        # The staging buffers still hold the failed attempt's weights.
+        # The staging buffers may hold a failed attempt's weights.
         cache.source.refresh()
     await store.publish_rdma_handles(key, handles)
-    # Concurrent first puts publish the same handles; the first to finish pops.
+    # Concurrent first puts publish the same handles; the first to succeed pops.
     cache.unpublished.pop(key, None)
     cache.registered.add(key)
 

@@ -465,7 +465,9 @@ async def put_state_dict(
             First call registers handles; subsequent calls refresh staging
             buffers for non-contiguous params. Handles use NIXL when ``nixl``
             is installed and ``TORCHSTORE_NIXL_ENABLED=1``, else Monarch RDMA;
-            readers need the same transport.
+            readers need the same transport. A retry after a failed first
+            call republishes that call's registration and ignores a new
+            ``state_dict``.
         transfer_dtype (torch.dtype, optional): If set, cast floating-point
             weights to this dtype for transfer. Allows the source to keep
             higher-precision master weights (e.g. float32) while transferring

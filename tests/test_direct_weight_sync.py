@@ -498,7 +498,10 @@ async def test_concurrent_first_puts_publish_the_same_handles(monkeypatch):
     try:
         first = asyncio.create_task(put())
         second = asyncio.create_task(put())
-        while len(store.published) < 2:
+        # Bounded so a serializing implementation fails instead of hanging.
+        for _ in range(100):
+            if len(store.published) == 2 or first.done() or second.done():
+                break
             await asyncio.sleep(0)
         store.release.set()
         await asyncio.gather(first, second)
