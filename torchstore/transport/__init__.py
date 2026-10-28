@@ -32,6 +32,7 @@ from torchstore.transport.torchcomms.cache import (
 )
 from torchstore.transport.torchcomms.uniflow_buffer import TorchCommsTransportBuffer
 from torchstore.transport.types import Request, TensorSlice
+from torchstore.transport.xccl import xccl_available, XcclTransportBuffer
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -48,6 +49,7 @@ class TransportType(Enum):
     TorchComms = auto()
     TorchCommsRDMA = TorchComms  # Backward compatible alias
     Gloo = auto()
+    XCCL = auto()  # Intel oneCCL via torch.distributed; device-resident on XPU
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
     NIXL = auto()
     TorchDistributed = auto()  # torch.distributed._transport backends
@@ -57,8 +59,8 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
     """Determine the best available transport type for the given storage volume.
 
     Prefers SharedMemory for same-host transfers, then explicitly enabled
-    torch.distributed and NIXL transports, TorchComms, MonarchRDMA, and Gloo,
-    before falling back to MonarchRPC.
+    torch.distributed and NIXL transports, TorchComms, MonarchRDMA, XCCL (XPU),
+    and Gloo, before falling back to MonarchRPC.
     """
     # Prefer SharedMemory for same-host transfers
     if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
@@ -75,6 +77,8 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
         return TransportType.TorchComms
     elif monarch_rdma_transport_available():
         return TransportType.MonarchRDMA
+    elif xccl_available():
+        return TransportType.XCCL
     elif gloo_available():
         return TransportType.Gloo
 
@@ -85,13 +89,14 @@ def _log_transport_resolution(
     storage_volume_ref: "StorageVolumeRef", transport_type: TransportType
 ) -> None:
     logger.info(
-        "[ts-transport] resolved=%s (torch_distributed=%s, nixl=%s, uniflow=%s, tc_rdma=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
+        "[ts-transport] resolved=%s (torch_distributed=%s, nixl=%s, uniflow=%s, tc_rdma=%s, monarch_rdma=%s, xccl=%s, gloo=%s, shm=%s)",
         transport_type.name,
         torch_transport_available(),
         nixl_available(),
         torchcomms_uniflow_available(),
         torchcomms_rdma_available(),
         monarch_rdma_transport_available(),
+        xccl_available(),
         gloo_available(),
         SHM_ENABLED and is_local_to_volume(storage_volume_ref),
     )
@@ -126,6 +131,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
         TransportType.Gloo: GlooTransportBuffer,
         TransportType.NIXL: NixlTransportBuffer,
         TransportType.TorchDistributed: TorchDistributedTransportBuffer,
+        TransportType.XCCL: XcclTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
 
