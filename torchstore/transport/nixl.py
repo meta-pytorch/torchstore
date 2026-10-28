@@ -36,6 +36,12 @@ logger = logging.getLogger(__name__)
 ENV_TORCHSTORE_NIXL_BACKEND = os.environ.get("TORCHSTORE_NIXL_BACKEND", "UCX")
 ENV_TORCHSTORE_NIXL_ENABLED = os.environ.get("TORCHSTORE_NIXL_ENABLED", "0") == "1"
 ENV_TORCHSTORE_NIXL_TIMEOUT_S = int(os.environ.get("TORCHSTORE_NIXL_TIMEOUT_S", "60"))
+# Maximum size of each of the two buffers that stage non-contiguous tensors for a get.
+ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES = int(
+    os.environ.get("TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", str(32 * 1024 * 1024))
+)
+# Staged pieces start at this byte alignment so any dtype can view the buffer.
+_STAGING_ALIGNMENT = 64
 
 
 class _NixlTransferStatus(str, Enum):
@@ -66,6 +72,48 @@ def _load_nixl_api() -> tuple[Any, Any]:
 def nixl_available() -> bool:
     """Return whether the optional NIXL transport was explicitly enabled."""
     return ENV_TORCHSTORE_NIXL_ENABLED and find_spec("nixl") is not None
+
+
+def _aligned(nbytes: int) -> int:
+    return -(-nbytes // _STAGING_ALIGNMENT) * _STAGING_ALIGNMENT
+
+
+async def _wait_terminal(tasks: list[asyncio.Task[None]]) -> None:
+    """Wait until every task is done, even if cancelled meanwhile.
+
+    Returning early could free storage while DMA may still use it.
+    """
+    cancelled = False
+    while True:
+        try:
+            await asyncio.wait(tasks)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+    for task in tasks:
+        if not task.cancelled():
+            task.exception()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+def _staging_pieces(tensor: torch.Tensor, max_bytes: int):
+    """Split a tensor into row-major pieces of at most max_bytes.
+
+    Each piece is a view covering a contiguous byte range of the tensor's
+    contiguous layout, so it maps to one destination descriptor.
+    """
+    if tensor.dim() == 0 or tensor.nbytes <= max_bytes:
+        yield tensor
+        return
+    row_bytes = tensor.nbytes // tensor.shape[0]
+    if row_bytes > max_bytes:
+        for row in tensor:
+            yield from _staging_pieces(row, max_bytes)
+        return
+    rows = max_bytes // row_bytes
+    for start in range(0, tensor.shape[0], rows):
+        yield tensor[start : start + rows]
 
 
 @dataclass
@@ -428,6 +476,7 @@ class NixlTransportBuffer(TransportBuffer):
     ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
         transfers: list[tuple[Request, torch.Tensor, bytes]] = []
+        staged: list[tuple[Request, torch.Tensor, bytes]] = []
 
         for (request, data), request_context in zip(
             entries, self._contexts, strict=True
@@ -443,12 +492,112 @@ class NixlTransportBuffer(TransportBuffer):
                 request_context.shape,
                 must_be_contiguous=False,
             )
-            source = data if data.is_contiguous() else data.contiguous()
             # Empty tensors have no bytes to move or NIXL descriptors to transfer.
-            if source.numel() != 0:
-                assert request_context.remote_descriptors is not None
-                transfers.append((request, source, request_context.remote_descriptors))
-        await self._transfer(ctx, _NixlTransferOperation.WRITE, transfers)
+            if data.numel() == 0:
+                continue
+            assert request_context.remote_descriptors is not None
+            if data.is_contiguous():
+                transfers.append((request, data, request_context.remote_descriptors))
+            elif data.device.type == "cpu":
+                staged.append((request, data, request_context.remote_descriptors))
+            else:
+                transfers.append(
+                    (request, data.contiguous(), request_context.remote_descriptors)
+                )
+
+        tasks = [
+            asyncio.create_task(
+                self._transfer(ctx, _NixlTransferOperation.WRITE, transfers)
+            )
+        ]
+        try:
+            # Start the direct transfer before staging.
+            await asyncio.sleep(0)
+            await self._write_staged(ctx, staged, tasks)
+            await asyncio.gather(*tasks)
+        finally:
+            await _wait_terminal(tasks)
+
+    async def _write_staged(
+        self,
+        ctx: TransportContext,
+        staged: list[tuple[Request, torch.Tensor, bytes]],
+        tasks: list[asyncio.Task[None]],
+    ) -> None:
+        """Write non-contiguous CPU tensors through two reused staging buffers.
+
+        Copying every non-contiguous tensor with .contiguous() before the transfer
+        doubles peak memory for a large batch. Instead, pack row ranges into one
+        buffer while the other buffer's transfer is in flight.
+
+        Started transfer tasks are appended to ``tasks``; the caller must wait for
+        all of them to finish, even if this raises or is cancelled.
+        """
+        if not staged:
+            return
+        if ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES < _STAGING_ALIGNMENT:
+            raise ValueError(
+                "TORCHSTORE_NIXL_STAGING_BUFFER_BYTES must be at least "
+                f"{_STAGING_ALIGNMENT}, got {ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES}"
+            )
+
+        cache = ctx.get(NixlAgentCache)
+        memory_type_names = {
+            cache.agent.nixl_mems[name]: name for name in ("DRAM", "VRAM")
+        }
+        size = min(
+            ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES,
+            sum(_aligned(tensor.nbytes) for _, tensor, _ in staged),
+        )
+        buffers: list[torch.Tensor | None] = [None, None]
+        buffer_tasks: list[asyncio.Task[None] | None] = [None, None]
+        index = 0
+        offset = 0
+        pending: list[tuple[Request, torch.Tensor, bytes]] = []
+
+        def flush() -> None:
+            task = asyncio.create_task(
+                self._transfer(ctx, _NixlTransferOperation.WRITE, pending.copy())
+            )
+            tasks.append(task)
+            buffer_tasks[index] = task
+            pending.clear()
+
+        for request, source, serialized_remote_descs in staged:
+            remote_descs = cache.agent.deserialize_descs(serialized_remote_descs)
+            assert remote_descs.descCount() == 1
+            remote_addr, _, remote_device = remote_descs[0]
+            remote_type = memory_type_names[remote_descs.getType()]
+            remote_offset = 0
+            for piece in _staging_pieces(source, size):
+                start = _aligned(offset)
+                if buffers[index] is None or start + piece.nbytes > size:
+                    if pending:
+                        flush()
+                        # Let the transfer start before filling the other buffer.
+                        await asyncio.sleep(0)
+                        index ^= 1
+                    if buffer_tasks[index] is not None:
+                        await buffer_tasks[index]
+                    if buffers[index] is None:
+                        buffers[index] = torch.empty(
+                            size, dtype=torch.uint8, device="cpu"
+                        )
+                    start = 0
+                buffer = buffers[index]
+                assert buffer is not None
+                local = buffer[start : start + piece.nbytes]
+                local.view(piece.dtype).view(piece.shape).copy_(piece)
+                remote = cache.agent.get_xfer_descs(
+                    [(remote_addr + remote_offset, piece.nbytes, remote_device)],
+                    remote_type,
+                )
+                pending.append(
+                    (request, local, cache.agent.get_serialized_descs(remote))
+                )
+                offset = start + piece.nbytes
+                remote_offset += piece.nbytes
+        flush()
 
     @override
     async def _handle_storage_volume_response(
