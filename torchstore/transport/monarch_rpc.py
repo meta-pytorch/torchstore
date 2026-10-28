@@ -37,7 +37,7 @@ class MonarchRPCTransportBuffer(TransportBuffer):
         self.inplace_tensor: torch.Tensor | None = None  # For in-place GET operations
 
     def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
+        state = super().__getstate__()
         state["inplace_tensor"] = None
         return state
 
