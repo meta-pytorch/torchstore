@@ -4,15 +4,44 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Storage-location interface shared by TorchStore clients."""
+"""Storage-location interface and metadata shared by TorchStore clients."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from enum import auto, Enum
 
-if TYPE_CHECKING:
-    from torchstore.controller import StorageInfo
+from torchstore.transport.types import Request, TensorSlice
+
+
+# TODO: move this into request as a field
+class ObjectType(Enum):
+    OBJECT = auto()
+    TENSOR = auto()
+    TENSOR_SLICE = auto()
+
+    @classmethod
+    def from_request(cls, request: Request) -> ObjectType:
+        if request.is_object:
+            return cls.OBJECT
+        elif request.tensor_slice is not None:
+            return cls.TENSOR_SLICE
+        else:
+            return cls.TENSOR
+
+
+@dataclass
+class StorageInfo:
+    object_type: ObjectType
+    tensor_slices: set[TensorSlice | None] = field(default_factory=set)
+
+    def update(self, other_storage_info: StorageInfo):
+        assert (
+            self.object_type == other_storage_info.object_type
+        ), "Particularly dangerous to change storage type of an existing key, are you sure? Raise an issue if so."
+
+        self.tensor_slices.update(other_storage_info.tensor_slices)
 
 
 class VolumeDirectory(ABC):
