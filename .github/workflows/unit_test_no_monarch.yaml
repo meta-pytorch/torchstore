@@ -1,0 +1,102 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+name: Unit Test without torchmonarch
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: unit-test-no-monarch-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -l -eo pipefail {0}
+
+jobs:
+  unit_tests_no_monarch:
+    if: github.repository_owner == 'meta-pytorch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        python-version: ['3.10']
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+      - name: Setup python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install torchstore and every runtime dependency except torchmonarch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-deps .
+          python -m pip install --no-warn-conflicts pygtrie portpicker
+      - name: Check that the installed torchstore imports without torchmonarch
+        # Before the test tools install, so a load-time import of anything they bring fails here.
+        # Outside the checkout, so the import resolves to the installed package.
+        working-directory: ${{ runner.temp }}
+        run: |
+          python - <<'EOF'
+          import importlib
+          import importlib.util
+          import pkgutil
+          import subprocess
+          import sys
+
+          found = [m for m in ("monarch", "cloudpickle", "numpy") if importlib.util.find_spec(m)]
+          if found:
+              sys.exit(f"Expected no monarch, cloudpickle or numpy, found: {', '.join(found)}")
+          # Every requirement of TorchStore's but its torchmonarch pin must be installed.
+          check = subprocess.run([sys.executable, "-m", "pip", "check"], capture_output=True, text=True)
+          lines = check.stdout.splitlines()
+          unmet = [line for line in lines if line.startswith("torchstore ") and "torchmonarch" not in line]
+          if unmet:
+              sys.exit("Unmet requirements:\n" + "\n".join(unmet))
+
+          import torchstore
+          # Every module but the three that define Monarch actors.
+          actors = {"torchstore.controller", "torchstore.routing.coordinator", "torchstore.storage_volume"}
+          for module in pkgutil.walk_packages(torchstore.__path__, "torchstore."):
+              if module.name not in actors:
+                  importlib.import_module(module.name)
+
+          loaded = sorted(m for m in sys.modules if m.split(".")[0] == "monarch")
+          if loaded:
+              sys.exit(f"TorchStore loaded Monarch modules: {', '.join(loaded)}")
+          print(f"Imported {torchstore.__file__} and every module but the actor modules, no Monarch loaded")
+          EOF
+      - name: Install the test tools
+        run: python -m pip install --no-warn-conflicts pytest pytest-asyncio pytest-timeout
+      - name: Run the Monarch-free tests
+        # Test files that import none of Monarch, cloudpickle or numpy at load, even via a
+        # helper, and pass without them installed.
+        run: |
+          tests=(
+            tests/routing/test_control_plane.py
+            tests/routing/test_gc.py
+            tests/routing/test_import_scope.py
+            tests/routing/test_layout_registry.py
+            tests/routing/test_no_monarch.py
+            tests/test_direct_weight_sync.py
+            tests/test_monarch_rdma.py
+            tests/test_nixl_transport.py
+            tests/test_rdma_memory_cache.py
+            tests/test_state_dict_utils.py
+            tests/test_torchcomms_transport.py
+            tests/test_transport_pickling.py
+            tests/test_utils.py
+            tests/test_volume_core.py
+            tests/test_volume_host.py
+          )
+          TORCHSTORE_RDMA_ENABLED=0 \
+          USE_TORCHCOMMS_RDMA=0 \
+          pytest "${tests[@]}" \
+            --timeout=600 --durations=20 -vv -rfEs
