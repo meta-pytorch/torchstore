@@ -734,6 +734,19 @@ def test_memory_registration_is_replaced_when_storage_is_reallocated(agent_cache
     assert list(agent_cache._registrations) == [(storage.data_ptr(), storage.nbytes())]
 
 
+def test_memory_registration_is_shared_by_storages_over_same_memory(agent_cache):
+    buffer = bytearray(64)
+    first = torch.frombuffer(buffer, dtype=torch.float32)
+    second = torch.frombuffer(buffer, dtype=torch.float32)
+    assert first.untyped_storage() is not second.untyped_storage()
+
+    descriptors = agent_cache.register(first)
+
+    assert agent_cache.register(second) is descriptors
+    assert agent_cache.agent.register_memory.call_count == 1
+    agent_cache.agent.deregister_memory.assert_not_called()
+
+
 def test_memory_deregistration_failure_propagates(agent_cache):
     tensor = torch.zeros(16)
     key = (tensor.data_ptr(), tensor.nbytes)
@@ -830,6 +843,24 @@ async def test_direct_weight_sync_reads_every_source_agent_in_one_transfer():
     for source in sources:
         await source.cleanup()
         assert source._nixl._registrations == {}
+
+
+@pytest.mark.asyncio
+async def test_direct_weight_sync_concurrent_pulls():
+    weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    source = DirectWeightSyncSource()
+    handles = pickle.loads(pickle.dumps(source.register({"weight": weight}, rank=0)))
+    all_handles = group_handles([handles])
+    dest = DirectWeightSyncDest()
+    first = {"weight": torch.zeros(8, 4)}
+    second = {"weight": torch.zeros(8, 4)}
+
+    await asyncio.gather(dest.pull(all_handles, first), dest.pull(all_handles, second))
+
+    assert torch.equal(first["weight"], weight)
+    assert torch.equal(second["weight"], weight)
+    assert dest._nixl._registrations == {}
+    await source.cleanup()
 
 
 @pytest.mark.asyncio

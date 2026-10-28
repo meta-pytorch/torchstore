@@ -112,13 +112,18 @@ class NixlAgentCache(TransportCache):
         storage = tensor.untyped_storage()
         key = (storage.data_ptr(), storage.nbytes())
         existing = self._registrations.get(key)
-        if existing is not None and existing.storage_ref() is storage:
-            return existing.descriptors
-
-        # The memory moved or was reused (e.g. FSDP freed and reallocated a
-        # parameter's storage): drop registrations over memory the caching
-        # allocator may hand out again.
         if existing is not None:
+            registered = existing.storage_ref()
+            # The same storage, or another live one over the same memory (e.g.
+            # two torch.from_numpy() tensors over one array).
+            if registered is not None and key == (
+                registered.data_ptr(),
+                registered.nbytes(),
+            ):
+                return existing.descriptors
+            # The memory moved or was reused (e.g. FSDP freed and reallocated a
+            # parameter's storage): drop registrations over memory the caching
+            # allocator may hand out again.
             self._evict(key)
         stale_key = self._keys_by_storage.get(id(storage))
         if stale_key is not None:

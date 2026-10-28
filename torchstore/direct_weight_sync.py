@@ -9,7 +9,8 @@
 Instead of routing tensor data through a StorageVolume (two hops),
 this module lets the destination read directly from the source's
 registered memory via one-sided RDMA reads (one hop).
-Reads use NIXL when ``TORCHSTORE_NIXL_ENABLED=1``, else Monarch RDMA.
+Reads use the transport of the published handles: NIXL when the source set
+``TORCHSTORE_NIXL_ENABLED=1``, else Monarch RDMA.
 
 TorchStore is still used for metadata exchange (RDMA handle registration),
 but the actual weight data travels directly source → destination.
@@ -318,6 +319,8 @@ class DirectWeightSyncDest:
         self._plan_handles: dict[str, list[RDMAWeightHandle]] | None = None
         self._plan_signature: tuple | None = None
         self._nixl: NixlAgentCache | None = None
+        # Each pull deregisters every NIXL destination when it finishes.
+        self._pull_lock = asyncio.Lock()
 
     async def _read_nixl(
         self,
@@ -444,7 +447,9 @@ class DirectWeightSyncDest:
                 raise ValueError(
                     f"source handles do not cover {name!r} exactly: {covered} of "
                     f"{wanted} elements at offsets={dest_slice.offsets}, "
-                    f"shape={dest_slice.local_shape}"
+                    f"shape={dest_slice.local_shape}, global "
+                    f"shape={dest_slice.global_shape} (source global "
+                    f"shape={handles[0].tensor_slice.global_shape})"
                 )
 
         logger.debug(f"Built transfer plan with {len(ops)} RDMA ops")
@@ -460,8 +465,7 @@ class DirectWeightSyncDest:
         The transfer plan is built on the first call and reused while the
         handles and destination memory stay the same.
         All RDMA reads are issued concurrently for maximum throughput.
-        Run one pull at a time per instance: each pull deregisters every
-        NIXL destination when it finishes.
+        Concurrent pulls on one instance run one at a time.
 
         Args:
             all_handles: Per-param list of handles from all source ranks.
@@ -472,12 +476,22 @@ class DirectWeightSyncDest:
             ValueError: If the handles do not cover a destination tensor
                 that has handles exactly.
         """
+        async with self._pull_lock:
+            await self._pull(all_handles, dest_state_dict)
+
+    async def _pull(
+        self,
+        all_handles: dict[str, list[RDMAWeightHandle]],
+        dest_state_dict: dict[str, torch.Tensor],
+    ) -> None:
         signature = _plan_signature(all_handles, dest_state_dict)
         if (
             self._plan is None
             or all_handles is not self._plan_handles
             or signature != self._plan_signature
         ):
+            # Free the old plan's receive buffers before allocating new ones.
+            self._plan = None
             self._plan = self._build_plan(all_handles, dest_state_dict)
             self._plan_handles = all_handles
             self._plan_signature = signature
