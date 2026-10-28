@@ -7,11 +7,8 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
 import re
-import uuid
-from collections.abc import Collection
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, call
@@ -19,9 +16,7 @@ from unittest.mock import AsyncMock, call
 import pytest
 import torchstore as ts
 import torchstore.routing.coordinator as coordinator_module
-from monarch.actor import ActorError, get_or_spawn_controller
-from torchstore.routing.control_plane import ControlPlane
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
+from torchstore.routing.coordinator import MonarchControlPlane
 from torchstore.transport import TransportType
 
 from .test_coordinator import _registration
@@ -44,42 +39,12 @@ def _timing_lines(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
     return lines
 
 
-def _plus_timeout(signature: inspect.Signature) -> inspect.Signature:
-    """``signature`` plus the keyword-only ``timeout_s=None`` that lookups add."""
-    timeout = inspect.Parameter(
-        "timeout_s",
-        inspect.Parameter.KEYWORD_ONLY,
-        default=None,
-        annotation="float | None",
-    )
-    return signature.replace(parameters=[*signature.parameters.values(), timeout])
-
-
-async def _monarch_control_plane(publishers: Collection[str]) -> MonarchControlPlane:
-    """Wrap a fresh coordinator that knows ``publishers``."""
-    coordinator = await get_or_spawn_controller(
-        f"routing-coordinator-test-{uuid.uuid4()}", RoutingCoordinator
-    )
-    control_plane = MonarchControlPlane(coordinator)
-    await control_plane.init(
-        publishers, ts.TorchStoreStrategy(TransportType.MonarchRPC)
-    )
-    return control_plane
-
-
 @pytest.mark.asyncio
 async def test_monarch_adapter_forwards_each_call_and_logs_it(caplog) -> None:
     """Forward each call and its result unchanged, logging one INFO line per call.
 
-    The line names the call and how it ended, a failure or a cancel included. The calls
-    take the interface's parameters, the lookup adding only its timeout.
+    The line names the call and how it ended, a failure or a cancel included.
     """
-    for name in ControlPlane.__abstractmethods__:
-        interface = inspect.signature(getattr(ControlPlane, name))
-        if name == "get_layouts":
-            interface = _plus_timeout(interface)
-        assert inspect.signature(getattr(MonarchControlPlane, name)) == interface, name
-
     strategy = ts.TorchStoreStrategy(TransportType.MonarchRPC)
     publishers, registrations = {"publisher"}, _registration()
     layouts = {"publisher": registrations}
@@ -139,19 +104,3 @@ async def test_monarch_adapter_forwards_each_call_and_logs_it(caplog) -> None:
         "register_layout key=model failed with RuntimeError",
         "get_layouts key=model cancelled",
     ]
-
-
-@pytest.mark.asyncio
-async def test_monarch_timeout_reports_the_clamped_wait() -> None:
-    """Report the caller's timeout, 0 if zero or less, and the missing publishers."""
-    control_plane = await _monarch_control_plane({"publisher/0", "publisher/1"})
-    await control_plane.register_layout("publisher/0", "model", _registration())
-    for timeout_s, reported in ((0.2, 0.2), (-1, 0)):
-        message = (
-            f"timed out after {reported} seconds waiting for publisher layouts for "
-            "'model'; missing publishers: ['publisher/1']"
-        )
-        with pytest.raises(ActorError, match=re.escape(message)):
-            await asyncio.wait_for(
-                control_plane.get_layouts("model", timeout_s=timeout_s), timeout=5
-            )

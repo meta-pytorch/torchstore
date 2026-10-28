@@ -6,8 +6,12 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
+from abc import ABC
+from collections.abc import Iterable
 
+import torchstore.routing.control_plane as control_plane_module
 from torchstore.routing.control_plane import ControlPlane
 
 # The design doc's ControlPlane sketch.
@@ -19,6 +23,17 @@ _DESIGN = {
 }
 
 
+def _imported(nodes: Iterable[ast.AST]) -> set[str]:
+    """The modules that the import statements among ``nodes`` name."""
+    modules = set()
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            modules.add("." * node.level + (node.module or ""))
+    return modules
+
+
 def test_interface_signatures_match_the_design() -> None:
     """Keep the design doc's four async methods, with exactly its signatures."""
     assert ControlPlane.__abstractmethods__ == set(_DESIGN)
@@ -28,3 +43,27 @@ def test_interface_signatures_match_the_design() -> None:
         method = getattr(ControlPlane, name)
         assert inspect.iscoroutinefunction(method), name
         assert str(inspect.signature(method)) == signature, name
+
+
+def test_control_plane_imports_no_backend() -> None:
+    """Keep the interface a plain ABC that imports no backend itself."""
+    # Exact for TorchStore modules: any of them can load Monarch, as ``_model`` does.
+    tree = ast.parse(inspect.getsource(control_plane_module))
+    type_checking = [
+        statement
+        for node in tree.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "TYPE_CHECKING"
+        for statement in node.body
+    ]
+
+    def torchstore_imports(nodes: Iterable[ast.AST]) -> set[str]:
+        return {
+            module
+            for module in _imported(nodes)
+            if module.startswith(".") or module.split(".")[0] == "torchstore"
+        }
+
+    assert torchstore_imports(tree.body) == {"._model"}
+    assert torchstore_imports(type_checking) == {"torchstore.strategy"}
+    assert torchstore_imports(ast.walk(tree)) == {"._model", "torchstore.strategy"}
+    assert ControlPlane.__mro__[1:] == (ABC, object)
