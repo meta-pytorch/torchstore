@@ -286,6 +286,10 @@ class NixlTransportBuffer(TransportBuffer):
                     request.key,
                 )
                 tensor = tensor.cpu().contiguous()
+            if tensor.is_conj() or tensor.is_neg():
+                tensor = tensor.clone(memory_format=torch.contiguous_format)
+                if tensor.is_cuda:
+                    torch.cuda.current_stream(tensor.device).synchronize()
             self._contexts.append(self._register_client_tensor(tensor))
         self._publish_client_metadata()
 
@@ -496,14 +500,15 @@ class NixlTransportBuffer(TransportBuffer):
             if data.numel() == 0:
                 continue
             assert request_context.remote_descriptors is not None
-            if data.is_contiguous():
+            if data.is_contiguous() and not data.is_conj() and not data.is_neg():
                 transfers.append((request, data, request_context.remote_descriptors))
             elif data.device.type == "cpu":
                 staged.append((request, data, request_context.remote_descriptors))
             else:
-                transfers.append(
-                    (request, data.contiguous(), request_context.remote_descriptors)
-                )
+                data = data.clone(memory_format=torch.contiguous_format)
+                # NIXL reads raw bytes without waiting on PyTorch's copy stream.
+                torch.cuda.current_stream(data.device).synchronize()
+                transfers.append((request, data, request_context.remote_descriptors))
 
         tasks = [
             asyncio.create_task(

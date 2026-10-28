@@ -331,6 +331,7 @@ async def test_put_reads_client_tensor_into_storage_volume(ref, ctx):
 
     assert not client_buffer.requires_handshake([request])
     await client_buffer._pre_put_hook([request])
+    assert client_buffer._contexts[0].tensor is source
     assert client_buffer._client_metadata is not None
     storage_volume_buffer = _storage_volume_copy(client_buffer)
     results = await storage_volume_buffer.handle_put_request(
@@ -363,6 +364,49 @@ async def test_get_writes_storage_tensor_into_client_destination(ref, ctx):
     assert agent.release_xfer_handle.call_args_list == _expected_handle_calls(
         agent.initialized
     )
+
+
+@pytest.mark.parametrize("operation", ["put", "get"])
+@pytest.mark.parametrize("view", ["conjugate", "negative", "conjugate_negative"])
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.asyncio
+async def test_transfer_preserves_lazy_source_values(
+    operation, view, contiguous, monkeypatch, ref, ctx
+):
+    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", 64)
+    backing = torch.arange(48).reshape(6, 8).to(torch.complex64) + 3j
+    original = backing.clone()
+    source = backing[1:5] if contiguous else backing[1:5, ::2]
+    if "conjugate" in view:
+        source = source.conj()
+    if "negative" in view:
+        source = torch._neg_view(source)
+    expected = source.clone()
+    client_buffer = NixlTransportBuffer(ref)
+
+    if operation == "put":
+        request = Request.from_tensor("weight", source)
+        await client_buffer._pre_put_hook([request])
+        remote_buffer = _storage_volume_copy(client_buffer)
+        results = await remote_buffer.handle_put_request(ctx, _put_entries([request]))
+        actual = results[0]
+    else:
+        actual = torch.empty_like(source, memory_format=torch.contiguous_format)
+        request = Request.from_tensor("weight", actual)
+        await client_buffer._pre_get_hook([request])
+        remote_buffer = _storage_volume_copy(client_buffer)
+        await remote_buffer.handle_get_request(ctx, [(request.meta_only(), source)])
+
+    assert torch.equal(actual, expected)
+    assert torch.equal(backing, original)
+    assert source.is_conj() == ("conjugate" in view)
+    assert source.is_neg() == ("negative" in view)
+    if operation == "get":
+        # Lazy CPU views reuse bounded staging instead of cloning the whole tensor.
+        agent = FakeNixlAgent.instances[-1]
+        assert all(
+            region.nbytes <= 64 for (region,), _ in agent.register_memory.call_args_list
+        )
 
 
 @pytest.mark.asyncio
