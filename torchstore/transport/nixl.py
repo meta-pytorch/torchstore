@@ -115,7 +115,8 @@ class NixlAgentCache(TransportCache):
         if existing is not None:
             registered = existing.storage_ref()
             # The same storage, or another live one over the same memory (e.g.
-            # two torch.from_numpy() tensors over one array).
+            # two torch.from_numpy() tensors over one array). The registration
+            # dies with the first storage; an alias then re-registers.
             if registered is not None and key == (
                 registered.data_ptr(),
                 registered.nbytes(),

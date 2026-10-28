@@ -441,7 +441,8 @@ class DirectWeightSyncDest:
                     )
 
             # Same check as the routed plan: a gap would leave uninitialized
-            # destination memory.
+            # destination memory. Counting elements assumes source shards do
+            # not overlap, which holds for handles from one sharding.
             wanted = get_slice_numel(dest_slice)
             if covered != wanted:
                 raise ValueError(
@@ -517,6 +518,7 @@ class DirectWeightSyncDest:
             _, transfers = nixl_reads.setdefault(agent.name, (agent, []))
             transfers.append((op.dest_byte_view, op.rdma_buffer.descriptors))
         # return_exceptions: deregister only after every read has finished.
+        read_error: BaseException | None = None
         try:
             results = await asyncio.gather(
                 *monarch_reads,
@@ -526,16 +528,23 @@ class DirectWeightSyncDest:
                 ),
                 return_exceptions=True,
             )
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
+            read_error = next(
+                (r for r in results if isinstance(r, BaseException)), None
+            )
         finally:
             # Destinations may be freed and reallocated at the same address
             # before the next pull (e.g. FSDP resharding), and a registration
-            # over the old allocation silently drops writes. Registering costs
-            # ~0.15 ms per storage for GPU memory.
+            # over the old allocation silently drops writes. Registering GPU
+            # memory costs ~0.15 ms per storage on GB200.
             if self._nixl is not None:
-                self._nixl.deregister_all()
+                try:
+                    self._nixl.deregister_all()
+                except Exception:
+                    if read_error is None:
+                        raise
+                    logger.exception("failed to deregister after a failed read")
+        if read_error is not None:
+            raise read_error
 
         # Post-read copies (only for resharded ops). no_grad: dests may be
         # parameters that require grad.

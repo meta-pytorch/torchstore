@@ -92,7 +92,11 @@ class RoutingCoordinator(Actor):
         key: str,
         handles: Mapping[str, Any],
     ) -> None:
-        """Record one publisher's direct-RDMA handles without waiting."""
+        """Record one publisher's direct-RDMA handles without waiting.
+
+        The first handles per publisher and key are kept, and requesters cache
+        them, so a restarted publisher must publish under a new key.
+        """
         await self._register(self._rdma_handles, rank, key, dict(handles))
 
     @concurrent_endpoint

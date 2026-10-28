@@ -7,6 +7,7 @@
 """Focused tests for the NIXL StorageVolume transport lifecycle."""
 
 import asyncio
+import dataclasses
 import gc
 import pickle
 import weakref
@@ -95,6 +96,8 @@ class FakeNixlAgent:
         # Registered address ranges by descriptor; like NIXL, a transfer
         # descriptor must fall inside one of them.
         self.regions: dict[int, tuple[int, int]] = {}
+        # Transfers dispatched but not yet reported DONE, by handle ID.
+        self.pending: dict[int, FakeXferHandle] = {}
         self.calls = Mock()
         for method_name in ("transfer", "check_xfer_state", "release_xfer_handle"):
             method = Mock(wraps=getattr(self, method_name))
@@ -165,6 +168,12 @@ class FakeNixlAgent:
     def transfer(self, handle):
         if self.transfer_error_handle_id == handle.handle_id:
             raise RuntimeError("transfer failed")
+        self.pending[handle.handle_id] = handle
+        return _NixlTransferStatus.PROCESSING
+
+    def _complete(self, handle):
+        # Data lands when the transfer completes. Like NIXL, writes into local
+        # memory that is no longer registered are silently dropped.
         for local_descriptor, remote_descriptor in zip(
             handle.local_descriptors, handle.remote_descriptors, strict=True
         ):
@@ -172,13 +181,16 @@ class FakeNixlAgent:
             client_tensor = self.tensors[remote_descriptor]()
             assert storage_volume_tensor is not None
             assert client_tensor is not None
+            start = storage_volume_tensor.data_ptr()
+            end = start + storage_volume_tensor.nbytes
+            if not any(lo <= start and end <= hi for lo, hi in self.regions.values()):
+                continue
             if handle.operation == _NixlTransferOperation.READ:
                 storage_volume_tensor.copy_(client_tensor)
             elif handle.operation == _NixlTransferOperation.WRITE:
                 client_tensor.copy_(storage_volume_tensor)
             else:
                 raise AssertionError(f"unexpected operation: {handle.operation}")
-        return _NixlTransferStatus.PROCESSING
 
     def check_xfer_state(self, handle):
         if self.force_processing:
@@ -192,9 +204,14 @@ class FakeNixlAgent:
             raise RuntimeError("check failed")
         # Consume the status for this poll; default to DONE once none remain.
         sequence = self.state_sequences.get(handle_id)
-        if sequence:
-            return sequence.pop(0)
-        return _NixlTransferStatus.DONE
+        status = sequence.pop(0) if sequence else _NixlTransferStatus.DONE
+        if status == _NixlTransferStatus.PROCESSING:
+            return status
+        # Handles whose dispatch failed never started.
+        pending = self.pending.pop(handle_id, None)
+        if pending is not None and status == _NixlTransferStatus.DONE:
+            self._complete(pending)
+        return status
 
     def release_xfer_handle(self, handle):
         pass
@@ -747,6 +764,51 @@ def test_memory_registration_is_shared_by_storages_over_same_memory(agent_cache)
     agent_cache.agent.deregister_memory.assert_not_called()
 
 
+def test_memory_registration_with_dead_storage_ref_is_replaced(agent_cache):
+    tensor = torch.zeros(16)
+    key = (tensor.data_ptr(), tensor.nbytes)
+    agent = agent_cache.agent
+    (descriptor,) = agent_cache.register(tensor)
+
+    # The registered storage died but its registration survived (e.g. the
+    # eviction callback failed), and live memory now sits at the same key.
+    class _Dead:
+        pass
+
+    dead = _Dead()
+    dead_ref = weakref.ref(dead)
+    del dead
+    agent_cache._registrations[key] = dataclasses.replace(
+        agent_cache._registrations[key], storage_ref=dead_ref
+    )
+    agent_cache.register(tensor)
+
+    agent.deregister_memory.assert_called_once_with([descriptor])
+    assert agent.register_memory.call_count == 2
+    assert agent_cache._registrations[key].storage_ref() is tensor.untyped_storage()
+
+
+def test_deregister_all_evicts_the_rest_before_raising(agent_cache):
+    tensors = [torch.zeros(16), torch.zeros(16)]
+    keys = [(t.data_ptr(), t.nbytes) for t in tensors]
+    (failing,) = agent_cache.register(tensors[0])
+    agent_cache.register(tensors[1])
+    agent = agent_cache.agent
+
+    def fail_first(descriptors):
+        if descriptors == [failing]:
+            raise RuntimeError("deregister failed")
+
+    agent.deregister_memory.side_effect = fail_first
+
+    with pytest.raises(RuntimeError, match="deregister failed"):
+        agent_cache.deregister_all()
+
+    assert list(agent_cache._registrations) == [keys[0]]
+    assert agent.deregister_memory.call_count == 2
+    agent.deregister_memory.side_effect = None
+
+
 def test_memory_deregistration_failure_propagates(agent_cache):
     tensor = torch.zeros(16)
     key = (tensor.data_ptr(), tensor.nbytes)
@@ -854,6 +916,9 @@ async def test_direct_weight_sync_concurrent_pulls():
     dest = DirectWeightSyncDest()
     first = {"weight": torch.zeros(8, 4)}
     second = {"weight": torch.zeros(8, 4)}
+    # The second pull's READ completes after the first pull has finished, so
+    # it fails if the first pull deregisters the second's destination.
+    FakeNixlAgent.state_sequences = {0: ["PROC"], 1: ["PROC", "PROC"]}
 
     await asyncio.gather(dest.pull(all_handles, first), dest.pull(all_handles, second))
 
@@ -880,14 +945,51 @@ async def test_direct_weight_sync_failed_read_deregisters_destinations():
         )
         sources.append(source)
         per_rank.append(pickle.loads(pickle.dumps(handles)))
-    # The first source agent's READ fails; the second still completes.
-    FakeNixlAgent.state_sequences = {0: ["ERR"]}
+    # The first source agent's READ fails; the second completes afterwards,
+    # and its data only lands if its destination is still registered.
+    FakeNixlAgent.state_sequences = {0: ["ERR"], 1: ["PROC", "PROC"]}
 
     dest = DirectWeightSyncDest()
     with pytest.raises(RuntimeError, match="NIXL transfer failed"):
         await dest.pull(group_handles(per_rank), {"weight": torch.zeros(8, 4)})
 
     assert len(dest._nixl.agent.initialized) == 2
+    assert dest._nixl.agent.pending == {}
+    # Rank 1's shard landed in its receive buffer before deregistration.
+    assert torch.equal(dest._plan[1].recv_buffer, weight[4:])
+    assert dest._nixl._registrations == {}
+    for source in sources:
+        await source.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("shard_dim", [0, 1], ids=["in_place", "resharded"])
+async def test_direct_weight_sync_cpu_sources_into_cuda_destinations(shard_dim):
+    weight = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    sources = []
+    per_rank = []
+    for rank in range(2):
+        source = DirectWeightSyncSource()
+        shard = weight.chunk(2, dim=shard_dim)[rank].contiguous()
+        handles = source.register({"weight": shard}, rank=rank)
+        offsets = [0, 0]
+        offsets[shard_dim] = 4 * rank
+        handles["weight"].tensor_slice = TensorSlice(
+            offsets=tuple(offsets),
+            coordinates=(rank,),
+            global_shape=(8, 8),
+            local_shape=tuple(shard.shape),
+            mesh_shape=(2,),
+        )
+        sources.append(source)
+        per_rank.append(pickle.loads(pickle.dumps(handles)))
+
+    dest = DirectWeightSyncDest()
+    dest_weight = torch.zeros(8, 8, device="cuda")
+    await dest.pull(group_handles(per_rank), {"weight": dest_weight})
+
+    torch.testing.assert_close(dest_weight.cpu(), weight, rtol=0, atol=0)
     assert dest._nixl._registrations == {}
     for source in sources:
         await source.cleanup()

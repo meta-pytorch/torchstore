@@ -12,7 +12,9 @@ simulating what real RDMA does. No GPU or RDMA infrastructure needed.
 
 import pytest
 import torch
+import torch.distributed as dist
 
+from torchstore.client import LocalClient
 from torchstore.direct_weight_sync import (
     DirectWeightSyncDest,
     DirectWeightSyncSource,
@@ -348,14 +350,21 @@ async def test_plan_follows_destination_changes():
         await sync.pull(all_handles, {name: dests[name]})
     torch.testing.assert_close(dests, weights, rtol=0, atol=0)
 
-    # Free and reallocate a destination's storage in place.
+    # Free and reallocate a destination's storage in place at a new address.
+    await sync.pull(all_handles, {"a": dests["a"]})
+    plan = sync._plan
     storage = dests["a"].untyped_storage()
     nbytes = storage.nbytes()
+    old_ptr = storage.data_ptr()
     storage.resize_(0)
+    occupied = torch.empty(nbytes, dtype=torch.uint8)  # take the freed memory
     storage.resize_(nbytes)
+    assert storage.data_ptr() != old_ptr
     dests["a"].zero_()
     await sync.pull(all_handles, {"a": dests["a"]})
+    assert sync._plan is not plan
     torch.testing.assert_close(dests["a"], weights["a"], rtol=0, atol=0)
+    del occupied
 
     # Same memory reuses the plan; extra non-tensor entries are ignored.
     plan = sync._plan
@@ -389,3 +398,33 @@ async def test_plan_follows_destination_changes():
     }
     await sync.pull(new_handles, dests)
     torch.testing.assert_close(dests, new_weights, rtol=0, atol=0)
+
+
+async def test_local_client_publishes_and_fetches_every_rank(monkeypatch):
+    weight = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    per_rank = _make_sharded_handles(weight, num_shards=2, shard_dim=0)
+    store = {}
+
+    async def put(key, value):
+        store[key] = value
+
+    async def get(key):
+        return store[key]
+
+    client = object.__new__(LocalClient)
+    monkeypatch.setattr(client, "put", put, raising=False)
+    monkeypatch.setattr(client, "get", get, raising=False)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+    # Rank 1 may publish before rank 0.
+    for rank in (1, 0):
+        monkeypatch.setattr(dist, "get_rank", lambda rank=rank: rank)
+        await client.publish_rdma_handles("w", {"weight": per_rank[rank]})
+
+    all_handles = await client.get_rdma_handles("w")
+
+    assert dict(all_handles) == {"weight": per_rank}
+    dest = torch.zeros_like(weight)
+    await DirectWeightSyncDest().pull(all_handles, {"weight": dest})
+    torch.testing.assert_close(dest, weight, rtol=0, atol=0)
+    with pytest.raises(KeyError):
+        await client.get_rdma_handles("missing")
