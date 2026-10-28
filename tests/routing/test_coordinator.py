@@ -7,21 +7,13 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextlib
 import inspect
 import re
 import threading
 import time
 import uuid
-from collections.abc import (
-    AsyncIterator,
-    Awaitable,
-    Callable,
-    Collection,
-    Coroutine,
-    Mapping,
-)
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
 from typing import Any, Protocol
 from unittest.mock import ANY, create_autospec
 
@@ -43,7 +35,7 @@ from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.transport import TransportType
 
 from ..volume_meshes import VolumeMesh
-from .utils import tensor_slice
+from .utils import registry_store, tensor_slice
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -99,77 +91,10 @@ async def _coordinator(publishers=None, strategy=None):
     return coordinator
 
 
-class _HostedRegistry(ControlPlane):
-    """Runs each call as a task on the registry's loop, like a concurrent endpoint."""
-
-    def __init__(
-        self, registry: LayoutRegistry, loop: asyncio.AbstractEventLoop
-    ) -> None:
-        self._registry = registry
-        self._loop = loop
-
-    async def _on_host(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
-        return await asyncio.wrap_future(
-            asyncio.run_coroutine_threadsafe(coroutine, self._loop)
-        )
-
-    async def init(
-        self, publishers: Collection[str], strategy: ts.TorchStoreStrategy
-    ) -> None:
-        await self._on_host(self._registry.init(publishers, strategy))
-
-    async def strategy(self) -> ts.TorchStoreStrategy:
-        return await self._on_host(self._registry.strategy())
-
-    async def register_layout(
-        self, rank: str, key: str, registrations: Mapping[str, KeyRegistration]
-    ) -> None:
-        await self._on_host(self._registry.register_layout(rank, key, registrations))
-
-    async def get_layouts(
-        self, key: str, *, timeout_s: float | None = None
-    ) -> Registrations:
-        layouts = await self._on_host(
-            self._registry.get_layouts(key, timeout_s=timeout_s)
-        )
-        # Callers own their layouts, as with Monarch's pickled replies.
-        return {rank: dict(registrations) for rank, registrations in layouts.items()}
-
-
-@contextlib.asynccontextmanager
-async def _registry_store() -> AsyncIterator[Callable[[], Awaitable[_HostedRegistry]]]:
-    """Host one ``LayoutRegistry`` on a thread's own event loop, without Monarch.
-
-    Exit fails if the host loop has not stopped within 10 s.
-    """
-    hosting: concurrent.futures.Future = concurrent.futures.Future()
-
-    async def host() -> None:
-        stop = asyncio.Event()
-        hosting.set_result((asyncio.get_running_loop(), stop))
-        await stop.wait()
-
-    thread = threading.Thread(target=asyncio.run, args=(host(),), daemon=True)
-    thread.start()
-    loop, stop = await asyncio.wrap_future(hosting)
-    registry = LayoutRegistry()
-
-    async def connect() -> _HostedRegistry:
-        return _HostedRegistry(registry, loop)
-
-    try:
-        yield connect
-    finally:
-        # ``asyncio.run`` cancels any call still running on the host loop.
-        loop.call_soon_threadsafe(stop.set)
-        await asyncio.to_thread(thread.join, 10)
-        assert not thread.is_alive(), "the registry's host loop did not stop"
-
-
 @pytest_asyncio.fixture(
     params=[
         pytest.param(_monarch_store, id="monarch"),
-        pytest.param(_registry_store, id="registry"),
+        pytest.param(registry_store, id="registry"),
     ]
 )
 async def make_control_plane(

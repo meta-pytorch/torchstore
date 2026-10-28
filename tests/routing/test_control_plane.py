@@ -7,12 +7,16 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
+import pickle
 from abc import ABC
 from collections.abc import Iterable
 
+import pytest
+import torchstore as ts
 import torchstore.routing.control_plane as control_plane_module
-from torchstore.routing.control_plane import ControlPlane
+from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
 
 # The design doc's ControlPlane sketch.
 _DESIGN = {
@@ -21,6 +25,17 @@ _DESIGN = {
     "get_layouts": "(self, key: 'str') -> 'Registrations'",
     "strategy": "(self) -> 'TorchStoreStrategy'",
 }
+
+
+@dataclasses.dataclass(frozen=True)
+class _Address(ControlPlaneAddress):
+    port: int
+
+    async def connect(self) -> ControlPlane:
+        raise NotImplementedError
+
+    def __str__(self) -> str:
+        return f"host:{self.port}"
 
 
 def _imported(nodes: Iterable[ast.AST]) -> set[str]:
@@ -35,14 +50,20 @@ def _imported(nodes: Iterable[ast.AST]) -> set[str]:
 
 
 def test_interface_signatures_match_the_design() -> None:
-    """Keep the design doc's four async methods, with exactly its signatures."""
+    """Keep the design doc's four async methods, with exactly its signatures.
+
+    Beside them, only an optional log name and an async ``close`` that does nothing.
+    """
     assert ControlPlane.__abstractmethods__ == set(_DESIGN)
     public = {name for name in dir(ControlPlane) if not name.startswith("_")}
-    assert public == set(_DESIGN)
+    assert public == set(_DESIGN) | {"kind", "close"}
     for name, signature in _DESIGN.items():
         method = getattr(ControlPlane, name)
         assert inspect.iscoroutinefunction(method), name
         assert str(inspect.signature(method)) == signature, name
+    assert ControlPlane.kind is None
+    assert inspect.iscoroutinefunction(ControlPlane.close)
+    assert str(inspect.signature(ControlPlane.close)) == "(self) -> 'None'"
 
 
 def test_control_plane_imports_no_backend() -> None:
@@ -67,3 +88,32 @@ def test_control_plane_imports_no_backend() -> None:
     assert torchstore_imports(type_checking) == {"torchstore.strategy"}
     assert torchstore_imports(ast.walk(tree)) == {"._model", "torchstore.strategy"}
     assert ControlPlane.__mro__[1:] == (ABC, object)
+
+
+def test_address_is_an_abstract_frozen_dataclass() -> None:
+    """Name a store, connect asynchronously, and pickle and compare by value."""
+    assert ts.ControlPlaneAddress is ControlPlaneAddress
+    assert ts.ControlPlane is ControlPlane
+    assert ControlPlaneAddress.__abstractmethods__ == {"connect", "__str__"}
+    assert inspect.iscoroutinefunction(ControlPlaneAddress.connect)
+    assert [field.name for field in dataclasses.fields(ControlPlaneAddress)] == [
+        "store_name"
+    ]
+    with pytest.raises(TypeError, match="abstract"):
+        ControlPlaneAddress("store")
+
+    # A dataclass's str() is its repr, whose spaces would split the log line's field.
+    @dataclasses.dataclass(frozen=True)
+    class Unnamed(ControlPlaneAddress):
+        async def connect(self) -> ControlPlane:
+            raise NotImplementedError
+
+    with pytest.raises(TypeError, match="abstract"):
+        Unnamed("store")
+
+    address = _Address("store", 1)
+    assert pickle.loads(pickle.dumps(address)) == address
+    assert hash(address) == hash(_Address("store", 1))
+    assert address not in (_Address("store", 2), _Address("other", 1))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        address.port = 2
