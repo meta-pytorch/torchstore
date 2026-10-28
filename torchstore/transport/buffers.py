@@ -153,6 +153,7 @@ class TransportBuffer:
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
     - `recv_handshake`: StorageVolume side of the default handshake
     - `drop`: Resource cleanup (especially important for RDMA buffers)
+    - `__getstate__`: Start from `super().__getstate__()`, which leaves out the client-only volume handle
 
     Attributes
     ----------
@@ -180,6 +181,12 @@ class TransportBuffer:
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Omit the client-only volume handle and the transport caches it holds."""
+        state = self.__dict__.copy()
+        state["storage_volume_ref"] = None
+        return state
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         """Determine if a handshake is needed before the operation.
