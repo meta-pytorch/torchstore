@@ -89,7 +89,11 @@ class LocalClient:
             await self.put(f"{key}/num_ranks", dist.get_world_size())
 
     async def get_rdma_handles(self, key: str) -> dict[str, list[RDMAWeightHandle]]:
-        """Fetch every source rank's direct-RDMA handles for ``key``."""
+        """Fetch every source rank's direct-RDMA handles for ``key``.
+
+        Raises:
+            KeyError: If the handles have not been published.
+        """
         num_ranks = await self.get(f"{key}/num_ranks")
         return group_handles(
             [await self.get(f"{key}/rank_{r}") for r in range(num_ranks)]

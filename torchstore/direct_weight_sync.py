@@ -8,7 +8,7 @@
 
 Instead of routing tensor data through a StorageVolume (two hops),
 this module lets the destination read directly from the source's
-registered (GPU or pinned CPU) memory via one-sided RDMA reads (one hop).
+registered memory via one-sided RDMA reads (one hop).
 Reads use NIXL when ``TORCHSTORE_NIXL_ENABLED=1``, else Monarch RDMA.
 
 TorchStore is still used for metadata exchange (RDMA handle registration),
@@ -45,7 +45,7 @@ from torchstore.transport.nixl import (
     NixlAgentCache,
 )
 from torchstore.transport.types import Request, TensorSlice
-from torchstore.utils import get_slice_intersection, to_byte_view
+from torchstore.utils import get_slice_intersection, get_slice_numel, to_byte_view
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +363,7 @@ class DirectWeightSyncDest:
             # Deduplicate: for replicated params, all trainer ranks have
             # identical shards. Only read from the first matching one.
             seen: set[tuple] = set()
+            covered = 0
 
             for handle in handles:
                 # Use get_slice_intersection to find overlap
@@ -381,6 +382,7 @@ class DirectWeightSyncDest:
                 if region_key in seen:
                     continue
                 seen.add(region_key)
+                covered += get_slice_numel(intersection)
 
                 is_exact = (
                     handle.tensor_slice.offsets == dest_slice.offsets
@@ -435,7 +437,17 @@ class DirectWeightSyncDest:
                         )
                     )
 
-        logger.info(f"Built transfer plan with {len(ops)} RDMA ops")
+            # Same check as the routed plan: a gap would leave uninitialized
+            # destination memory.
+            wanted = get_slice_numel(dest_slice)
+            if covered != wanted:
+                raise ValueError(
+                    f"source handles do not cover {name!r} exactly: {covered} of "
+                    f"{wanted} elements at offsets={dest_slice.offsets}, "
+                    f"shape={dest_slice.local_shape}"
+                )
+
+        logger.debug(f"Built transfer plan with {len(ops)} RDMA ops")
         return ops
 
     async def pull(
@@ -448,11 +460,17 @@ class DirectWeightSyncDest:
         The transfer plan is built on the first call and reused while the
         handles and destination memory stay the same.
         All RDMA reads are issued concurrently for maximum throughput.
+        Run one pull at a time per instance: each pull deregisters every
+        NIXL destination when it finishes.
 
         Args:
             all_handles: Per-param list of handles from all source ranks.
             dest_state_dict: Destination model state dict to write into
                 (parameters are updated in-place).
+
+        Raises:
+            ValueError: If the handles do not cover a destination tensor
+                that has handles exactly.
         """
         signature = _plan_signature(all_handles, dest_state_dict)
         if (
@@ -494,6 +512,9 @@ class DirectWeightSyncDest:
                 ),
                 return_exceptions=True,
             )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
         finally:
             # Destinations may be freed and reallocated at the same address
             # before the next pull (e.g. FSDP resharding), and a registration
@@ -501,9 +522,6 @@ class DirectWeightSyncDest:
             # ~0.15 ms per storage for GPU memory.
             if self._nixl is not None:
                 self._nixl.deregister_all()
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
 
         # Post-read copies (only for resharded ops). no_grad: dests may be
         # parameters that require grad.

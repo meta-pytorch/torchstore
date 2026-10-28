@@ -108,7 +108,7 @@ async def put_state_dict(
     StorageVolume via the normal two-hop transport path.
 
     When ``direct_rdma=True``, RDMA handles are registered against the
-    caller's GPU memory and only the handles (not tensor data) are stored
+    caller's memory and only the handles (not tensor data) are stored
     in TorchStore.  On the first call the handles are registered; on
     subsequent calls only non-contiguous staging buffers are refreshed.
     ``state_dict`` may be ``None`` on subsequent calls to skip the
@@ -179,7 +179,7 @@ async def get_state_dict(
 
     When ``direct_rdma=True``, the source's RDMA handles are fetched on the
     first call and cached, and weights are pulled directly from the
-    source's registered (GPU or pinned CPU) memory via one-sided RDMA reads.
+    source's registered memory via one-sided RDMA reads.
     Routing clients fetch handles from the coordinator and wait for every
     publisher.
     ``user_state_dict`` must be provided in this mode so the destination

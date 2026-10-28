@@ -167,8 +167,15 @@ class NixlAgentCache(TransportCache):
         return remote_name
 
     def deregister_all(self) -> None:
+        """Deregister everything, raising the first failure afterwards."""
+        error: Exception | None = None
         for key in list(self._registrations):
-            self._evict(key)
+            try:
+                self._evict(key)
+            except Exception as e:
+                error = error or e
+        if error is not None:
+            raise error
 
     @override
     def clear(self) -> None:

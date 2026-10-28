@@ -16,6 +16,7 @@ import torchstore as ts
 from monarch.actor import Actor, concurrent_endpoint, current_rank, this_host
 from torchstore.transport import TransportType
 from torchstore.transport.monarch_rdma import monarch_rdma_available
+from torchstore.transport.nixl import nixl_available
 
 _KEY = "model_state_dict"
 _PUBLISHER_RANKS = 2
@@ -113,7 +114,8 @@ class _Requester(Actor):
         pytest.param(
             True,
             marks=pytest.mark.skipif(
-                not monarch_rdma_available(), reason="RDMA is unavailable"
+                not (nixl_available() or monarch_rdma_available()),
+                reason="RDMA is unavailable",
             ),
         ),
     ],

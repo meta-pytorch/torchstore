@@ -461,7 +461,7 @@ async def put_state_dict(
         key (str): Unique identifier for the state_dict.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
         direct_rdma (bool): If True, register RDMA handles pointing at the
-            caller's GPU memory instead of copying data to a StorageVolume.
+            caller's memory instead of copying data to a StorageVolume.
             First call registers handles; subsequent calls refresh staging
             buffers for non-contiguous params.
         transfer_dtype (torch.dtype, optional): If set, cast floating-point
@@ -499,7 +499,7 @@ async def get_state_dict(
         strict (bool): Whether to enforce strict loading. Defaults to True.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
         direct_rdma (bool): If True, pull weights directly from the source's
-            registered (GPU or pinned CPU) memory via one-sided RDMA reads.
+            registered memory via one-sided RDMA reads.
             Handles are fetched on the first call and cached for subsequent calls.
 
     Returns:

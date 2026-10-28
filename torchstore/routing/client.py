@@ -135,7 +135,11 @@ class RoutingClient(LocalClient):
         )
 
     async def get_rdma_handles(self, key: str) -> dict[str, list[RDMAWeightHandle]]:
-        """Wait for every publisher's direct-RDMA handles for ``key``."""
+        """Wait for every publisher's direct-RDMA handles for ``key``.
+
+        Raises:
+            TimeoutError: If a publisher has not registered within 5 minutes.
+        """
         if self._role != RankRole.REQUESTER:
             raise RuntimeError("only requester clients get RDMA handles")
         publishers = await self._coordinator.get_rdma_handles.call_one(key=key)

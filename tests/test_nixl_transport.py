@@ -830,3 +830,33 @@ async def test_direct_weight_sync_reads_every_source_agent_in_one_transfer():
     for source in sources:
         await source.cleanup()
         assert source._nixl._registrations == {}
+
+
+@pytest.mark.asyncio
+async def test_direct_weight_sync_failed_read_deregisters_destinations():
+    weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    sources = []
+    per_rank = []
+    for rank in range(2):
+        source = DirectWeightSyncSource()
+        handles = source.register({"weight": weight.chunk(2)[rank].clone()}, rank=rank)
+        handles["weight"].tensor_slice = TensorSlice(
+            offsets=(4 * rank, 0),
+            coordinates=(rank,),
+            global_shape=(8, 4),
+            local_shape=(4, 4),
+            mesh_shape=(2,),
+        )
+        sources.append(source)
+        per_rank.append(pickle.loads(pickle.dumps(handles)))
+    # The first source agent's READ fails; the second still completes.
+    FakeNixlAgent.state_sequences = {0: ["ERR"]}
+
+    dest = DirectWeightSyncDest()
+    with pytest.raises(RuntimeError, match="NIXL transfer failed"):
+        await dest.pull(group_handles(per_rank), {"weight": torch.zeros(8, 4)})
+
+    assert len(dest._nixl.agent.initialized) == 2
+    assert dest._nixl._registrations == {}
+    for source in sources:
+        await source.cleanup()

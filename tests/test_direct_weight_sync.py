@@ -150,6 +150,17 @@ async def test_resharding_into_parameter():
     assert torch.equal(dest, original)
 
 
+async def test_partial_coverage_raises():
+    """Handles that leave part of a destination unwritten are rejected."""
+    original = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    handles = _make_sharded_handles(original, num_shards=2, shard_dim=0)[:1]
+
+    with pytest.raises(ValueError, match="do not cover 'weight' exactly: 32 of 64"):
+        await DirectWeightSyncDest().pull(
+            {"weight": handles}, {"weight": torch.zeros_like(original)}
+        )
+
+
 async def test_replicated_dedup():
     """Replicated source (2 ranks, same data) → should only read once."""
     original = torch.arange(512 * 512, dtype=torch.float32).reshape(512, 512)
@@ -363,7 +374,9 @@ async def test_plan_follows_destination_changes():
 
     # New handles for the same memory and key set rebuild it.
     plan = sync._plan
-    same_keys = {"a": _make_sharded_handles(weights["a"] + 50, num_shards=2, shard_dim=0)}
+    same_keys = {
+        "a": _make_sharded_handles(weights["a"] + 50, num_shards=2, shard_dim=0)
+    }
     await sync.pull(same_keys, {"a": transposed})
     assert sync._plan is not plan
     torch.testing.assert_close(transposed, weights["a"] + 50, rtol=0, atol=0)
