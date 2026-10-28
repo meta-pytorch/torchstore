@@ -208,6 +208,32 @@ async def test_destination_only_entry_is_ignored_by_non_strict_read() -> None:
     torch.testing.assert_close(destination["local_only"], torch.full((2,), -1))
 
 
+@pytest.mark.asyncio
+async def test_transfer_dtype_preserves_keys() -> None:
+    """Publish weights in transfer_dtype while preserved keys keep their dtype."""
+    source = {"weight": torch.full((4,), 1.5), "buffer": torch.full((4,), 1 / 3)}
+    destination = {
+        "weight": torch.zeros(4, dtype=torch.bfloat16),
+        "buffer": torch.zeros(4),
+    }
+    clients = await routing_clients(
+        publishers={"publisher/0": source},
+        requesters={"requester/0/0": destination},
+    )
+
+    await put_state_dict(
+        clients["publisher/0"],
+        source,
+        "model",
+        transfer_dtype=torch.bfloat16,
+        preserve_dtype_keys=frozenset({"buffer"}),
+    )
+    result = await get_state_dict(clients["requester/0/0"], "model", destination)
+
+    torch.testing.assert_close(result["weight"], source["weight"].bfloat16())
+    torch.testing.assert_close(result["buffer"], source["buffer"])
+
+
 # Shard dim of each tensor on two publishers, or None for a whole copy on each.
 # Column shards of out.weight are strided in every requester's buffer, so reads
 # copy them in rather than writing in place.

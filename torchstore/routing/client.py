@@ -122,8 +122,16 @@ class RoutingClient(LocalClient):
         self._registered_layouts.add(key)
 
     @torch.no_grad()
-    async def put_batch(self, entries: dict[str, torch.Tensor | Any]) -> None:
-        """Put batches to the one volume this rank publishes through."""
+    async def put_batch(
+        self,
+        entries: dict[str, torch.Tensor | Any],
+        *,
+        transfer_dtypes: Mapping[str, torch.dtype] | None = None,
+    ) -> None:
+        """Put batches to the one volume this rank publishes through.
+
+        See LocalClient.put_batch for ``transfer_dtypes``.
+        """
         assert (
             isinstance(entries, dict) and entries
         ), "put_batch requires a non-empty dict"
@@ -134,6 +142,7 @@ class RoutingClient(LocalClient):
         for key, value in entries.items():
             if isinstance(value, (torch.Tensor, DTensor)):
                 request = Request.from_any(key, value)
+                request.transfer_dtype = (transfer_dtypes or {}).get(key)
                 self._match_plan(request)
             else:
                 request = Request.from_objects(key, value)
