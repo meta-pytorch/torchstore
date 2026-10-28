@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -35,6 +37,7 @@ from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.transport import TransportType
 
 from ..volume_meshes import VolumeMesh
+from .file_store_control_plane import FileStoreControlPlane
 from .utils import registry_store, tensor_slice
 
 pytestmark = pytest.mark.timeout(60)
@@ -91,10 +94,23 @@ async def _coordinator(publishers=None, strategy=None):
     return coordinator
 
 
+@contextlib.asynccontextmanager
+async def _file_store() -> AsyncIterator[Callable[[], Awaitable[TimedControlPlane]]]:
+    """Open handles on one ``FileStoreControlPlane`` store in a temporary directory."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "control_plane")
+
+        async def connect() -> TimedControlPlane:
+            return FileStoreControlPlane(path)
+
+        yield connect
+
+
 @pytest_asyncio.fixture(
     params=[
         pytest.param(_monarch_store, id="monarch"),
         pytest.param(registry_store, id="registry"),
+        pytest.param(_file_store, id="filestore"),
     ]
 )
 async def make_control_plane(

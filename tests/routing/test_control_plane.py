@@ -16,6 +16,7 @@ from collections.abc import Iterable
 import pytest
 import torchstore as ts
 import torchstore.routing.control_plane as control_plane_module
+from torchstore.routing._model import KeyRegistration, Registrations
 from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
 
 # The design doc's ControlPlane sketch.
@@ -117,3 +118,10 @@ def test_address_is_an_abstract_frozen_dataclass() -> None:
     assert address not in (_Address("store", 2), _Address("other", 1))
     with pytest.raises(dataclasses.FrozenInstanceError):
         address.port = 2
+
+
+def test_control_plane_types_are_public() -> None:
+    """Export the two TorchStore types that the interface's signatures name."""
+    public = {"KeyRegistration": KeyRegistration, "Registrations": Registrations}
+    for name, value in public.items():
+        assert name in ts.__all__ and getattr(ts, name) is value, name
