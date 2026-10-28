@@ -543,9 +543,16 @@ class DirectWeightSyncDest:
                 self._read_nixl(agent, transfers)
                 for agent, transfers in nixl_reads.values()
             )
+        # return_exceptions: deregister only after every read has finished.
+        gathered = asyncio.gather(*reads, return_exceptions=True)
         try:
-            # return_exceptions: deregister only after every read has finished.
-            results = await asyncio.gather(*reads, return_exceptions=True)
+            try:
+                results = await asyncio.shield(gathered)
+            except asyncio.CancelledError:
+                # Cancelling does not stop RDMA writes into the destination;
+                # wait for them before the caller can free it.
+                await asyncio.wait([gathered])
+                raise
             if read_error is None:
                 read_error = next(
                     (r for r in results if isinstance(r, BaseException)), None

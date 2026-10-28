@@ -16,6 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from torchstore import state_dict_utils
 from torchstore.client import LocalClient
 from torchstore.direct_weight_sync import (
     DirectWeightSyncDest,
@@ -428,8 +429,40 @@ async def test_local_client_publishes_and_fetches_every_rank(monkeypatch):
     dest = torch.zeros_like(weight)
     await DirectWeightSyncDest().pull(all_handles, {"weight": dest})
     torch.testing.assert_close(dest, weight, rtol=0, atol=0)
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match="missing"):
         await client.get_rdma_handles("missing")
+
+
+async def test_failed_publish_releases_registrations(monkeypatch):
+    events = []
+
+    def register(self, state_dict, rank, transfer_dtype=None):
+        events.append("register")
+        return {}
+
+    async def cleanup(self):
+        events.append("cleanup")
+
+    class Store:
+        fail = True
+
+        async def publish_rdma_handles(self, key, handles):
+            if self.fail:
+                raise RuntimeError("publish failed")
+
+    monkeypatch.setattr(DirectWeightSyncSource, "register", register)
+    monkeypatch.setattr(DirectWeightSyncSource, "cleanup", cleanup)
+    store = Store()
+    try:
+        with pytest.raises(RuntimeError, match="publish failed"):
+            await state_dict_utils._put_state_dict_direct_rdma(store, {}, "w")
+        assert events == ["register", "cleanup"]
+
+        store.fail = False
+        await state_dict_utils._put_state_dict_direct_rdma(store, {}, "w")
+        assert events == ["register", "cleanup", "register"]
+    finally:
+        state_dict_utils._rdma_cache.pop(id(store), None)
 
 
 async def test_failed_monarch_submission_waits_for_submitted_reads():
@@ -471,4 +504,48 @@ async def test_failed_monarch_submission_waits_for_submitted_reads():
     assert not pull.done()
     started.future.set_result(None)
     with pytest.raises(RuntimeError, match="submit failed"):
+        await pull
+
+
+async def test_cancelled_pull_waits_for_started_reads():
+    """Wait for started reads before propagating cancellation, since RDMA writes
+    into the destination continue after cancel."""
+
+    class StartedRead:
+        def __init__(self) -> None:
+            self.future = asyncio.get_running_loop().create_future()
+
+        def read_into(self, dest_byte_view: torch.Tensor):
+            return self.future
+
+    started = StartedRead()
+    handles = {
+        "a": [
+            RDMAWeightHandle(
+                rdma_buffer=started,
+                tensor_slice=TensorSlice(
+                    offsets=(0,),
+                    coordinates=(0,),
+                    global_shape=(4,),
+                    local_shape=(4,),
+                    mesh_shape=(1,),
+                ),
+                source_rank=0,
+            )
+        ]
+    }
+
+    pull = asyncio.create_task(
+        DirectWeightSyncDest().pull(handles, {"a": torch.zeros(4)})
+    )
+    # Let the pull run until it blocks.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    pull.cancel()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not pull.done()
+    assert not started.future.cancelled()
+    started.future.set_result(None)
+    with pytest.raises(asyncio.CancelledError):
         await pull

@@ -85,14 +85,14 @@ class FakeNixlAgent:
     force_processing = False
     # Raise while dispatching the transfer with this handle ID.
     transfer_error_handle_id: int | None = None
-    # Raise on the first status check of the transfer with this handle ID.
-    check_error_once_handle_id: int | None = None
+    # Raise on every status check of the transfer with this handle ID, as
+    # NIXL's binding does for a failed transfer.
+    check_error_handle_id: int | None = None
 
     def __init__(self, name, config) -> None:
         self.name = name
         self.config = config
         self.initialized = []
-        self._check_errors_raised: set[int] = set()
         # Registered address ranges by descriptor; like NIXL, a transfer
         # descriptor must fall inside one of them.
         self.regions: dict[int, tuple[int, int]] = {}
@@ -196,11 +196,8 @@ class FakeNixlAgent:
         if self.force_processing:
             return _NixlTransferStatus.PROCESSING
         handle_id = handle.handle_id
-        if (
-            self.check_error_once_handle_id == handle_id
-            and handle_id not in self._check_errors_raised
-        ):
-            self._check_errors_raised.add(handle_id)
+        if self.check_error_handle_id == handle_id:
+            self.pending.pop(handle_id, None)
             raise RuntimeError("check failed")
         # Consume the status for this poll; default to DONE once none remain.
         sequence = self.state_sequences.get(handle_id)
@@ -276,7 +273,7 @@ def fake_nixl(monkeypatch):
     FakeNixlAgent.state_sequences = {}
     FakeNixlAgent.force_processing = False
     FakeNixlAgent.transfer_error_handle_id = None
-    FakeNixlAgent.check_error_once_handle_id = None
+    FakeNixlAgent.check_error_handle_id = None
     monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_ENABLED", True)
     monkeypatch.setattr(nixl_transport, "find_spec", lambda _name: object())
     monkeypatch.setattr(
@@ -452,10 +449,10 @@ async def test_dispatch_error_drains_started_handles_before_releasing(ref, ctx):
 
 
 @pytest.mark.asyncio
-async def test_status_check_error_retries_and_drains_all_handles_before_releasing(
+async def test_status_check_error_fails_handle_and_drains_others_before_releasing(
     ref, ctx
 ):
-    FakeNixlAgent.check_error_once_handle_id = 0
+    FakeNixlAgent.check_error_handle_id = 0
     _, requests, storage_volume_buffer = await _prepare_mixed_memory_put(ref)
 
     with pytest.raises(RuntimeError, match="NIXL READ failed") as exc_info:
@@ -466,11 +463,9 @@ async def test_status_check_error_retries_and_drains_all_handles_before_releasin
 
     agent = FakeNixlAgent.instances[-1]
     assert str(exc_info.value.__cause__) == "check failed"
-    assert agent.check_xfer_state.call_args_list == [
-        call(agent.initialized[0]),
-        call(agent.initialized[0]),
-        call(agent.initialized[1]),
-    ]
+    assert agent.check_xfer_state.call_args_list == _expected_handle_calls(
+        agent.initialized
+    )
     assert agent.release_xfer_handle.call_args_list == _expected_handle_calls(
         agent.initialized
     )
@@ -928,30 +923,54 @@ async def test_direct_weight_sync_concurrent_pulls():
     await source.cleanup()
 
 
-@pytest.mark.asyncio
-async def test_direct_weight_sync_failed_read_deregisters_destinations():
-    weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+def _row_sharded_sources(weight):
+    """Register ``weight`` split by rows across two sources."""
     sources = []
     per_rank = []
+    rows = weight.shape[0] // 2
     for rank in range(2):
         source = DirectWeightSyncSource()
         handles = source.register({"weight": weight.chunk(2)[rank].clone()}, rank=rank)
         handles["weight"].tensor_slice = TensorSlice(
-            offsets=(4 * rank, 0),
+            offsets=(rows * rank, 0),
             coordinates=(rank,),
-            global_shape=(8, 4),
-            local_shape=(4, 4),
+            global_shape=tuple(weight.shape),
+            local_shape=(rows, weight.shape[1]),
             mesh_shape=(2,),
         )
         sources.append(source)
         per_rank.append(pickle.loads(pickle.dumps(handles)))
+    return sources, group_handles(per_rank)
+
+
+@pytest.mark.asyncio
+async def test_direct_weight_sync_reads_completing_out_of_order():
+    weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    sources, all_handles = _row_sharded_sources(weight)
+    # The second source agent's READ completes polls after the first's.
+    FakeNixlAgent.state_sequences = {0: ["PROC"], 1: ["PROC", "PROC", "PROC"]}
+
+    dest = DirectWeightSyncDest()
+    dest_state_dict = {"weight": torch.zeros(8, 4)}
+    await dest.pull(all_handles, dest_state_dict)
+
+    assert torch.equal(dest_state_dict["weight"], weight)
+    assert dest._nixl._registrations == {}
+    for source in sources:
+        await source.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_direct_weight_sync_failed_read_deregisters_destinations():
+    weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    sources, all_handles = _row_sharded_sources(weight)
     # The first source agent's READ fails; the second completes afterwards,
     # and its data only lands if its destination is still registered.
     FakeNixlAgent.state_sequences = {0: ["ERR"], 1: ["PROC", "PROC"]}
 
     dest = DirectWeightSyncDest()
     with pytest.raises(RuntimeError, match="NIXL transfer failed"):
-        await dest.pull(group_handles(per_rank), {"weight": torch.zeros(8, 4)})
+        await dest.pull(all_handles, {"weight": torch.zeros(8, 4)})
 
     assert len(dest._nixl.agent.initialized) == 2
     assert dest._nixl.agent.pending == {}
@@ -960,6 +979,29 @@ async def test_direct_weight_sync_failed_read_deregisters_destinations():
     assert dest._nixl._registrations == {}
     for source in sources:
         await source.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_direct_weight_sync_waits_for_active_read():
+    weight = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+    source = DirectWeightSyncSource()
+    handles = pickle.loads(pickle.dumps(source.register({"weight": weight}, rank=0)))
+    FakeNixlAgent.state_sequences = {0: ["PROC"] * 5}
+    dest = DirectWeightSyncDest()
+    dest_state_dict = {"weight": torch.zeros(8, 4)}
+
+    pull = asyncio.create_task(dest.pull(group_handles([handles]), dest_state_dict))
+    while dest._nixl is None or not dest._nixl.agent.pending:
+        await asyncio.sleep(0)
+    pull.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pull
+
+    # The READ finished, and landed, before its destination was deregistered.
+    assert dest._nixl.agent.pending == {}
+    assert torch.equal(dest_state_dict["weight"], weight)
+    assert dest._nixl._registrations == {}
+    await source.cleanup()
 
 
 @pytest.mark.asyncio

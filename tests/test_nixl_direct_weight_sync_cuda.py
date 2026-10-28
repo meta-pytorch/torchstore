@@ -43,7 +43,8 @@ async def test_pull_into_reallocated_destination():
     Expandable segments unmap freed memory, so the reallocation at the same
     address is backed by new pages that a stale registration does not cover.
     """
-    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+    prior = torch._C._accelerator_getAllocatorSettings()
+    torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
     weight = torch.zeros(1 << 20).pin_memory()
     source = DirectWeightSyncSource()
     handles = group_handles(
@@ -52,17 +53,21 @@ async def test_pull_into_reallocated_destination():
     dest = DirectWeightSyncDest()
     dest_weight = torch.empty_like(weight, device="cuda")
     storage = dest_weight.untyped_storage()
+    addresses = []
     try:
         for value in range(1, 4):
             weight.fill_(value)
             storage.resize_(dest_weight.nbytes)
+            addresses.append(storage.data_ptr())
             await dest.pull(handles, {"w": dest_weight})
             assert torch.all(dest_weight == value).item(), value
             storage.resize_(0)
             torch.cuda.empty_cache()
+        assert len(set(addresses)) < len(addresses), "no address was reused"
     finally:
         await source.cleanup()
-        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+        expandable = "expandable_segments:True" in prior
+        torch._C._accelerator_setAllocatorSettings(f"expandable_segments:{expandable}")
 
 
 @pytest.mark.asyncio

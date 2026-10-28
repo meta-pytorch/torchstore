@@ -315,7 +315,15 @@ async def _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype=Non
         handles = cache.source.register(
             state_dict, rank=rank, transfer_dtype=transfer_dtype
         )
-        await store.publish_rdma_handles(key, handles)
+        try:
+            await store.publish_rdma_handles(key, handles)
+        except BaseException:
+            # Unpublished registrations would leak; a retry registers again.
+            # The source tracks one registration set, so only release it
+            # when no other key is published from it.
+            if not cache.registered:
+                await cache.source.cleanup()
+            raise
         cache.registered.add(key)
     else:
         cache.source.refresh()

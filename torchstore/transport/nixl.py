@@ -43,6 +43,7 @@ class _NixlTransferStatus(str, Enum):
 
     PROCESSING = "PROC"
     DONE = "DONE"
+    ERR = "ERR"
 
 
 class _NixlTransferOperation(str, Enum):
@@ -253,21 +254,20 @@ async def _transfer_tensors(
         check_error: Exception | None = None
 
         # All handles are already in flight, so waiting for them one at a time
-        # does not serialize the transfers. NIXL has no cancellation API, so a
-        # timeout is reported only after active operations reach a terminal
-        # state. Returning earlier could free registered tensor storage while
-        # DMA is still using it.
+        # does not serialize the transfers. NIXL cannot reliably cancel an
+        # active transfer, so a timeout is reported only after active
+        # operations reach a terminal state. Returning earlier could free
+        # registered tensor storage while DMA is still using it.
         for handle in handles:
             while True:
                 try:
                     status = cache.agent.check_xfer_state(handle)
                 except Exception as error:
-                    # A status-query failure does not establish that the DMA has
-                    # stopped. Remember the error, but keep polling so registered
-                    # storage and the transfer handle remain alive until terminal.
+                    # NIXL's binding raises for a failed transfer instead of
+                    # returning ERR; retrying raises again.
                     if check_error is None:
                         check_error = error
-                    status = _NixlTransferStatus.PROCESSING
+                    status = _NixlTransferStatus.ERR
                 if status != _NixlTransferStatus.PROCESSING:
                     break
                 timed_out |= time.monotonic() >= deadline
