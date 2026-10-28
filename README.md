@@ -316,6 +316,157 @@ await ts.get_state_dict("policy", user_state_dict=model.state_dict(), direct_rdm
 `transfer_dtype` can cast weights for transfer (e.g. float32 master weights
 transferred as bfloat16).
 
+## Routing Control Planes
+
+Routing stores (`client_type=ts.ClientType.ROUTING`) sync state dicts from a publisher
+mesh, such as RL trainers, to requester meshes, such as generators: publishers register
+their layouts and requesters plan their reads from them. Ranks share the publisher set,
+the strategy and these layouts through a control plane, by default `"monarch"`, which
+spawns TorchStore's routing coordinator as a Monarch actor:
+
+```python
+# Driver: spawns a storage volume on each trainer rank, then sets up the control plane
+await ts.initialize(
+    mesh=trainer_mesh,
+    strategy=ts.TorchStoreStrategy(),
+    client_type=ts.ClientType.ROUTING,
+    store_name="weights",
+    control_plane="monarch",  # the default
+)
+# Each trainer rank, before its state-dict calls
+await ts.client(store_name="weights", role=ts.RankRole.PUBLISHER)
+# Each generator rank, before its state-dict calls (group is its mesh's index)
+await ts.client(store_name="weights", role=ts.RankRole.REQUESTER, group=group)
+```
+
+Initialize each routing store once per job. On the `"monarch"` plane a second
+`ts.initialize` of the same name raises, so start over with a new `store_name`, and a
+bring-your-own plane takes another `ts.initialize` only after the store's `ts.shutdown`.
+Give standard and routing stores different names on every plane, since a process keeps
+one client per store name. In one process, never overlap two `ts.initialize`,
+`ts.client` or `ts.shutdown` calls for one store, except concurrent first `ts.client`
+calls through one address, which share one client and its connection.
+
+`ts.initialize` and each new routing client log one INFO selection line naming the
+control plane, its address, store, rank and pid, such as
+`routing control_plane=monarch address=- store=weights rank=publisher/0 pid=1234`.
+The `"monarch"` plane also logs one INFO line per call with its duration, such as
+`routing control_plane=monarch init took 0.0042s`. Ranks in Monarch actors start with
+no logging handler, so call `ts.init_logging()` in each rank before its first
+`ts.client` to see these lines.
+
+On the `"monarch"` plane, `ts.shutdown` cannot shut down a routing store: it looks the
+name up as a standard store's controller and raises `AttributeError`. The store's
+routing coordinator runs in the driver's process and keeps the strategy and every layout
+it collected until that process exits. This is a known limitation, so skip `ts.shutdown`
+for a routing store on that plane and stop its meshes when the job is done.
+
+A routing store's volumes outlive `ts.shutdown` on every control plane and, unlike a
+standard store's, keep every tensor published to them until `mesh` stops. Each
+`ts.initialize` spawns a new volume on every rank of `mesh` beside the old ones, so stop
+`mesh`, or use a new one, before you initialize a routing store on it again. Publish
+each state dict under one key on every push: routing clients cannot delete, so each new
+key adds tensors to the volumes, layouts to the plane and routes to every rank for good.
+
+### Bring Your Own Control Plane
+
+To run this coordination on your own service, subclass `ts.ControlPlane`:
+
+```python
+from collections.abc import Collection, Mapping
+
+import torchstore as ts
+
+
+class MyControlPlane(ts.ControlPlane):
+    kind = "mine"  # its name in log lines (the class name if unset)
+
+    async def init(
+        self, publishers: Collection[str], strategy: ts.TorchStoreStrategy
+    ) -> None:
+        """Fix the publisher set and the volume-resolution strategy."""
+        ...
+
+    async def register_layout(
+        self, rank: str, key: str, registrations: Mapping[str, ts.KeyRegistration]
+    ) -> None:
+        """Record one publisher's layout. Idempotent per rank, never blocks."""
+        ...
+
+    async def get_layouts(self, key: str) -> ts.Registrations:
+        """Every publisher layout for ``key``. Blocks until the set is complete."""
+        ...
+
+    async def strategy(self) -> ts.TorchStoreStrategy:
+        """Return a strategy that resolves the registered publishers' volumes."""
+        ...
+
+    async def close(self) -> None:
+        """Optional: release the connection of a plane an address's connect() returned."""
+        ...
+```
+
+Your plane must keep these rules:
+
+- `ts.initialize` calls `init` once, on the driver's instance. Until then, make the other
+  methods raise on every instance
+- Give each `ts.initialize` plane state that no earlier run wrote, such as a new
+  directory or key prefix: TorchStore never clears a plane, so leftover state would hand
+  ranks an earlier run's layouts or volumes
+- A rank's first layout per key wins. Registering a rank outside the publisher set raises
+- TorchStore calls the skeleton's methods, and an address's `connect()`, with no timeout,
+  so give each call a deadline of your own past which it raises. `get_layouts`, which
+  waits for every publisher (Monarch's coordinator waits 300 s), raises naming the
+  missing ones
+- `strategy()` returns, on every rank, the strategy `init` received or a copy of it. It
+  holds the store's Monarch volume handles, which can be pickled
+- Unpickling can run arbitrary code, so keep anything you pickle where only the job's
+  ranks can write
+- TorchStore may call your plane from any thread or event loop, so hold no loop-bound
+  state. Each store needs its own instance
+- Keep the skeleton's parameter names: TorchStore passes `init` and `register_layout`
+  their arguments by keyword
+
+The driver passes an instance to
+`ts.initialize(..., client_type=ts.ClientType.ROUTING, control_plane=plane)`. Each rank
+passes `ts.client(role=..., control_plane=...)` its own instance on the same service, or
+passes `address=` a `ts.ControlPlaneAddress` from the driver: a frozen dataclass subclass
+whose `store_name` names the store, whose async `connect()` returns a connected plane and
+whose `__str__` names the address in log lines without whitespace, such as `host:port`.
+Pass a rank's instance once: later `ts.client` calls in the process return the cached
+client, which refuses any other instance, even a copy an actor call delivers. That cache
+holds one client per store and process whatever its role, so give each process at most
+one routing rank per store.
+
+TorchStore closes each plane `connect()` returned, through its async `close()`, when
+`ts.shutdown` releases this process's record of the store (its volumes stay, as above),
+when a later selection replaces that record, or when the `ts.client` call that dialed
+it fails or finds that another call recorded the same address first. If that call is
+cancelled, TorchStore starts the close without waiting for it. Return a new plane from
+each `connect()`, one whose `close()` leaves the others working. TorchStore never closes
+a plane you passed in.
+
+`ts.shutdown` raises any error from the `close()` it runs, or `TimeoutError` after 5 s,
+leaving the close running on the event loop, where `asyncio.run` cancels it as it
+returns. Give each blocking call inside `close()` a timeout of its own.
+
+Only the coordination is yours: `ts.initialize` still spawns the store's volumes as
+Monarch actors on `mesh`, and `ts.client` takes each rank's id from Monarch's
+`current_rank()`, which follows the actor's context, not the process. So make each
+rank's first `ts.client` call in an endpoint of an actor on `mesh` or on a requester
+mesh, or in an `asyncio.to_thread` call that endpoint makes, which copies the context,
+and make no `ts.client` or state-dict call for a routing store in the driver. A
+bring-your-own control plane therefore needs `torchmonarch`. TorchStore's interfaces for
+resolving volumes stay internal, so this holds for every plane you bring.
+
+The contract tests' own bring-your-own plane, a worked example over a local directory
+rather than a plane to deploy, is
+[`tests/routing/file_store_control_plane.py`](tests/routing/file_store_control_plane.py).
+It passes the same contract tests as Monarch's coordinator
+([`tests/routing/test_coordinator.py`](tests/routing/test_coordinator.py)), and
+[`tests/routing/test_routed_sync.py`](tests/routing/test_routed_sync.py) syncs weights
+through it.
+
 ## Transport Backends
 
 TorchStore automatically selects the best available transport for each transfer. No
