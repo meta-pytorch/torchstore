@@ -774,6 +774,58 @@ def test_remote_agent_metadata_is_loaded_once(agent_cache):
     agent_cache.agent.remove_remote_agent.assert_called_once_with("remote-agent")
 
 
+@pytest.mark.parametrize("retry_metadata", [b"remote-agent:v1", b"remote-agent:v2"])
+def test_failed_remote_metadata_replacement_can_retry(agent_cache, retry_metadata):
+    agent_cache.add_remote_agent("remote-agent", b"remote-agent:v1")
+    agent = agent_cache.agent
+    agent.add_remote_agent.side_effect = RuntimeError("add failed")
+
+    with pytest.raises(RuntimeError, match="add failed"):
+        agent_cache.add_remote_agent("remote-agent", b"remote-agent:v2")
+    agent.add_remote_agent.side_effect = None
+
+    assert agent_cache._remote_agents == {}
+    assert (
+        agent_cache.add_remote_agent("remote-agent", retry_metadata) == "remote-agent"
+    )
+    assert agent_cache._remote_agents == {"remote-agent": retry_metadata}
+    assert agent.add_remote_agent.call_args_list == [
+        call(b"remote-agent:v1"),
+        call(b"remote-agent:v2"),
+        call(retry_metadata),
+    ]
+    agent.remove_remote_agent.assert_called_once_with("remote-agent")
+
+
+def test_failed_remote_metadata_replacement_can_clear(agent_cache):
+    agent_cache.add_remote_agent("remote-agent", b"remote-agent:v1")
+    agent_cache.agent.add_remote_agent.side_effect = RuntimeError("add failed")
+
+    with pytest.raises(RuntimeError, match="add failed"):
+        agent_cache.add_remote_agent("remote-agent", b"remote-agent:v2")
+    agent_cache.clear()
+
+    assert agent_cache._remote_agents == {}
+    agent_cache.agent.remove_remote_agent.assert_called_once_with("remote-agent")
+
+
+def test_failed_remote_metadata_removal_preserves_cache(agent_cache):
+    agent_cache.add_remote_agent("remote-agent", b"remote-agent:v1")
+    agent = agent_cache.agent
+    agent.remove_remote_agent.side_effect = RuntimeError("remove failed")
+
+    with pytest.raises(RuntimeError, match="remove failed"):
+        agent_cache.add_remote_agent("remote-agent", b"remote-agent:v2")
+    agent.remove_remote_agent.side_effect = None
+
+    assert agent_cache._remote_agents == {"remote-agent": b"remote-agent:v1"}
+    assert (
+        agent_cache.add_remote_agent("remote-agent", b"remote-agent:v1")
+        == "remote-agent"
+    )
+    agent.add_remote_agent.assert_called_once_with(b"remote-agent:v1")
+
+
 def test_remote_agent_removal_failure_propagates(agent_cache):
     agent_cache.add_remote_agent("remote-agent", b"remote-agent:v1")
     agent_cache.agent.remove_remote_agent.side_effect = RuntimeError("remove failed")
