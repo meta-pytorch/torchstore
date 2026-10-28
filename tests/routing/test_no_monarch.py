@@ -46,6 +46,7 @@ _MONARCH_FREE = [
     "torchstore.routing.client",
     "torchstore.routing.control_plane",
     "torchstore.routing.layout_registry",
+    "torchstore.routing._gc",
     "torchstore.direct_weight_sync",
     "torchstore.transport.monarch_rdma",
     "torchstore.storage",
