@@ -74,11 +74,37 @@ _closing: set["asyncio.Task[None]"] = set()
 
 _TActor = TypeVar("_TActor", bound="Actor")
 
+# Whether this process exported Monarch's frame-length default, until the first Monarch
+# path logs that.
+_frame_length_warning_pending: bool = False
+
+
+def _export_frame_length_default() -> bool:
+    """Export Monarch's frame-length default unless it is set, and say whether this did."""
+    global _frame_length_warning_pending
+    if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH") is not None:
+        return False
+    os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = "910737418240"
+    _frame_length_warning_pending = True
+    return True
+
+
+def _log_frame_length_export() -> None:
+    """Log this process's frame-length export once, from a path that loaded Monarch."""
+    global _frame_length_warning_pending
+    if _frame_length_warning_pending:
+        _frame_length_warning_pending = False
+        getLogger("torchstore").warning(
+            "Warning: setting HYPERACTOR_CODEC_MAX_FRAME_LENGTH since this needs to be set"
+            " to enable large RPC calls via Monarch"
+        )
+
 
 def current_rank() -> "Point":
     """Monarch's ``current_rank``, imported when first called."""
     from monarch.actor import current_rank as monarch_current_rank
 
+    _log_frame_length_export()
     return monarch_current_rank()
 
 
@@ -88,6 +114,7 @@ def get_or_spawn_controller(
     """Monarch's ``get_or_spawn_controller``, imported when first called."""
     from monarch.actor import get_or_spawn_controller as monarch_get_or_spawn_controller
 
+    _log_frame_length_export()
     return monarch_get_or_spawn_controller(name, Class, *args, **kwargs)
 
 
@@ -356,6 +383,8 @@ async def _initialize_routing(
     """Spawn trainer volumes, then initialize the given control plane or Monarch's."""
     from torchstore.storage_volume import StorageVolume
 
+    # Volumes are Monarch actors, also under a caller's own control plane.
+    _log_frame_length_export()
     if control_plane is not None:
         with _selection_lock:
             _check_one_store(store_name, control_plane)

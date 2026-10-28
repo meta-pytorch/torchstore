@@ -1416,7 +1416,7 @@ def test_a_child_forked_while_a_parent_thread_holds_the_lock_dials_its_own() -> 
     Another parent thread holds the lock across the fork. A call without the address
     raises, and no finalizer of the parent's connection runs in the child.
     """
-    # A set variable keeps Monarch, and its threads, out of the child until used.
+    # A set variable skips TorchStore's logging setup, so its INFO lines stay off stdout.
     env = {**os.environ, "HYPERACTOR_CODEC_MAX_FRAME_LENGTH": "910737418240"}
     child = subprocess.run(
         [sys.executable, "-c", _FORK_HELD_LOCK_CHILD, _ROOT, _store_name()],
