@@ -9,8 +9,9 @@
 Instead of routing tensor data through a StorageVolume (two hops),
 this module lets the destination read directly from the source's
 registered memory via one-sided RDMA reads (one hop).
-Reads use the transport of the published handles: NIXL when the source set
-``TORCHSTORE_NIXL_ENABLED=1``, else Monarch RDMA.
+Reads use the transport of the published handles: NIXL when the source had
+``nixl`` installed and ``TORCHSTORE_NIXL_ENABLED=1`` set at import, else
+Monarch RDMA.
 
 TorchStore is still used for metadata exchange (RDMA handle registration),
 but the actual weight data travels directly source → destination.
@@ -36,6 +37,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -302,6 +304,23 @@ def _plan_signature(
     return tuple(dests)
 
 
+def _submit_monarch_reads(
+    ops: list[_TransferOp],
+) -> tuple[list[Any], Exception | None]:
+    """Submit Monarch reads, stopping at the first failure.
+
+    Monarch starts each read on submission, so the caller must still wait for
+    the returned reads when submission fails.
+    """
+    reads = []
+    for op in ops:
+        try:
+            reads.append(op.rdma_buffer.read_into(op.dest_byte_view))
+        except Exception as e:
+            return reads, e
+    return reads, None
+
+
 class DirectWeightSyncDest:
     """Pulls weights via direct RDMA reads from source handles.
 
@@ -320,6 +339,7 @@ class DirectWeightSyncDest:
         self._plan_signature: tuple | None = None
         self._nixl: NixlAgentCache | None = None
         # Each pull deregisters every NIXL destination when it finishes.
+        # Excludes pulls on one event loop only.
         self._pull_lock = asyncio.Lock()
 
     async def _read_nixl(
@@ -508,29 +528,28 @@ class DirectWeightSyncDest:
             torch.cuda.synchronize(device)
 
         # Issue all RDMA reads concurrently, one NIXL batch per source agent.
-        monarch_reads = []
+        monarch_ops = []
         nixl_reads: dict[str, tuple[NixlSourceAgent, list]] = {}
         for op in plan:
             if not isinstance(op.rdma_buffer, NixlBuffer):
-                monarch_reads.append(op.rdma_buffer.read_into(op.dest_byte_view))
+                monarch_ops.append(op)
                 continue
             agent = op.rdma_buffer.agent
             _, transfers = nixl_reads.setdefault(agent.name, (agent, []))
             transfers.append((op.dest_byte_view, op.rdma_buffer.descriptors))
-        # return_exceptions: deregister only after every read has finished.
-        read_error: BaseException | None = None
+        reads, read_error = _submit_monarch_reads(monarch_ops)
+        if read_error is None:
+            reads.extend(
+                self._read_nixl(agent, transfers)
+                for agent, transfers in nixl_reads.values()
+            )
         try:
-            results = await asyncio.gather(
-                *monarch_reads,
-                *(
-                    self._read_nixl(agent, transfers)
-                    for agent, transfers in nixl_reads.values()
-                ),
-                return_exceptions=True,
-            )
-            read_error = next(
-                (r for r in results if isinstance(r, BaseException)), None
-            )
+            # return_exceptions: deregister only after every read has finished.
+            results = await asyncio.gather(*reads, return_exceptions=True)
+            if read_error is None:
+                read_error = next(
+                    (r for r in results if isinstance(r, BaseException)), None
+                )
         finally:
             # Destinations may be freed and reallocated at the same address
             # before the next pull (e.g. FSDP resharding), and a registration

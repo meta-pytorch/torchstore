@@ -10,6 +10,8 @@ Uses a MockRDMABuffer that copies source bytes into the dest byte view,
 simulating what real RDMA does. No GPU or RDMA infrastructure needed.
 """
 
+import asyncio
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -428,3 +430,45 @@ async def test_local_client_publishes_and_fetches_every_rank(monkeypatch):
     torch.testing.assert_close(dest, weight, rtol=0, atol=0)
     with pytest.raises(KeyError):
         await client.get_rdma_handles("missing")
+
+
+async def test_failed_monarch_submission_waits_for_submitted_reads():
+    """Wait for reads Monarch already started before raising a submission error."""
+
+    class StartedRead:
+        def __init__(self) -> None:
+            self.future = asyncio.get_running_loop().create_future()
+
+        def read_into(self, dest_byte_view: torch.Tensor):
+            return self.future
+
+    class FailedSubmission:
+        def read_into(self, dest_byte_view: torch.Tensor):
+            raise RuntimeError("submit failed")
+
+    started = StartedRead()
+    handles = {}
+    for name, buf in (("a", started), ("b", FailedSubmission())):
+        handles[name] = [
+            RDMAWeightHandle(
+                rdma_buffer=buf,
+                tensor_slice=TensorSlice(
+                    offsets=(0,),
+                    coordinates=(0,),
+                    global_shape=(4,),
+                    local_shape=(4,),
+                    mesh_shape=(1,),
+                ),
+                source_rank=0,
+            )
+        ]
+    dest = {"a": torch.zeros(4), "b": torch.zeros(4)}
+
+    pull = asyncio.create_task(DirectWeightSyncDest().pull(handles, dest))
+    # Let the pull run until it blocks.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not pull.done()
+    started.future.set_result(None)
+    with pytest.raises(RuntimeError, match="submit failed"):
+        await pull

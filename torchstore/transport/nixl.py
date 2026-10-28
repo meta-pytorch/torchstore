@@ -153,7 +153,7 @@ class NixlAgentCache(TransportCache):
         self._registrations.pop(key, None)
         storage_id = registration.storage_id
         if self._keys_by_storage.get(storage_id) == key:
-            del self._keys_by_storage[storage_id]
+            self._keys_by_storage.pop(storage_id, None)
 
     def add_remote_agent(self, name: str, metadata: bytes) -> str:
         """Load new remote metadata, replacing an older copy when needed."""

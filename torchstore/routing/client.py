@@ -138,7 +138,8 @@ class RoutingClient(LocalClient):
         """Wait for every publisher's direct-RDMA handles for ``key``.
 
         Raises:
-            TimeoutError: If a publisher has not registered within 5 minutes.
+            ActorError: Wrapping the coordinator's ``TimeoutError`` if a
+                publisher has not registered within 5 minutes.
         """
         if self._role != RankRole.REQUESTER:
             raise RuntimeError("only requester clients get RDMA handles")
