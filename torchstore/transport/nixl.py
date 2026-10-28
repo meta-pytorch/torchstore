@@ -315,6 +315,11 @@ class NixlTransportBuffer(TransportBuffer):
                     shape = request.tensor_slice.local_shape
                 tensor = torch.empty(shape, dtype=dtype, device="cpu")
 
+            if not tensor.is_contiguous() or tensor.is_conj() or tensor.is_neg():
+                tensor = torch.empty_like(tensor, memory_format=torch.contiguous_format)
+                if tensor.is_cuda:
+                    # NIXL does not observe the allocator's CUDA stream ordering.
+                    torch.cuda.current_stream(tensor.device).synchronize()
             self._contexts.append(self._register_client_tensor(tensor))
         self._publish_client_metadata()
 
@@ -607,14 +612,22 @@ class NixlTransportBuffer(TransportBuffer):
     ) -> list[Any]:
         assert isinstance(transport_buffer, NixlTransportBuffer)
         results: list[Any] = []
-        for client_context, volume_context in zip(
-            self._contexts, transport_buffer._contexts, strict=True
+        for request, client_context, volume_context in zip(
+            requests, self._contexts, transport_buffer._contexts, strict=True
         ):
-            results.append(
-                volume_context.objects
-                if volume_context.is_object
-                else client_context.tensor
-            )
+            if volume_context.is_object:
+                results.append(volume_context.objects)
+                continue
+            tensor = client_context.tensor
+            destination = request.tensor_val
+            if destination is not None and destination is not tensor:
+                with torch.no_grad():
+                    destination.copy_(tensor)
+                if destination.is_cuda:
+                    # Finish the copy before drop() can deregister its source.
+                    torch.cuda.current_stream(destination.device).synchronize()
+                tensor = destination
+            results.append(tensor)
         return results
 
     async def drop(self) -> None:
