@@ -203,9 +203,11 @@ class NixlTransportBuffer(TransportBuffer):
     their memory are kept for the life of the transport context. The volume
     retires such an agent and uses a new one. Destinations of a failed
     request, including the stored value of a failed in-place PUT, hold
-    undefined data. Within the same transport context, a later GET cannot
-    republish retained storage as its NIXL destination. This does not prevent
-    late writes racing with direct access, copy-back, or another context.
+    undefined data. Within the same transport context, GETs reject nonempty
+    destinations that share retained storage, including disjoint views, for the
+    context's lifetime; clear() does not make the storage reusable. The check
+    uses PyTorch storage base addresses, not overlapping byte ranges. It does
+    not protect PUT sources, direct access, copy-back, or other contexts.
     """
 
     supports_batch_puts = True
@@ -308,7 +310,8 @@ class NixlTransportBuffer(TransportBuffer):
             ):
                 raise RuntimeError(
                     f"NIXL GET destination for key={request.key!r} shares storage "
-                    "with an unfinished transfer; use a fresh destination tensor"
+                    "retained after a failed request; use a fresh destination tensor. "
+                    "Retained storage stays blocked for this transport context's lifetime"
                 )
 
         # 2. build contexts

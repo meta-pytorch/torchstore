@@ -677,7 +677,9 @@ def get_rpc(ref, ctx):
 
 
 @pytest.mark.parametrize("retire_cache", [False, True])
-@pytest.mark.parametrize("retry_destination", ["same", "offset_view", "fresh"])
+@pytest.mark.parametrize(
+    "retry_destination", ["same", "offset_view", "disjoint_view", "dtype_view", "fresh"]
+)
 @pytest.mark.asyncio
 async def test_get_retry_checks_destination_storage(
     retire_cache, retry_destination, ref, get_rpc
@@ -693,14 +695,26 @@ async def test_get_retry_checks_destination_storage(
 
     if retry_destination == "offset_view":
         destination = backing[2:6]
+    elif retry_destination == "disjoint_view":
+        destination = backing[4:8]
+    elif retry_destination == "dtype_view":
+        destination = destination.view(torch.uint8)
     elif retry_destination == "fresh":
         destination = torch.zeros_like(destination)
-    # A mixed batch also verifies that no earlier entry is dispatched first.
+    # Reject the whole batch before registering even an earlier valid destination.
     requests = [
+        Request.from_tensor("valid", torch.zeros(4, dtype=torch.int64)),
         Request.from_any("other", None),
         Request.from_tensor("weight", destination),
     ]
     ref.volume.get_meta.call_one.return_value = [(torch.Size([4]), torch.int64)]
+    caches = [
+        ref.transport_context.get(NixlAgentCache),
+        *ref.transport_context.retired(NixlAgentCache),
+    ]
+    retained_counts = [len(cache.leaked) for cache in caches]
+    for cache in caches:
+        cache.agent.register_memory.reset_mock()
     get_rpc.reset_mock()
     retry = NixlTransportBuffer(ref)
 
@@ -713,6 +727,12 @@ async def test_get_retry_checks_destination_storage(
         with pytest.raises(RuntimeError, match="NIXL GET.*weight.*fresh"):
             await retry.get_from_storage_volume(requests)
         get_rpc.assert_not_awaited()
+        for cache in caches:
+            cache.agent.register_memory.assert_not_called()
+        assert retry._destinations == []
+        assert retry._client_metadata is None
+        assert retry._client_agent_name is None
+        assert [len(cache.leaked) for cache in caches] == retained_counts
 
 
 @pytest.mark.asyncio
