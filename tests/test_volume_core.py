@@ -31,6 +31,8 @@ from torchstore.transport.buffers import (
 from torchstore.transport.types import Request
 from torchstore.utils import get_local_hostname
 
+from .volume_meshes import get_through, put_through
+
 pytestmark = pytest.mark.timeout(120)
 
 _ENDPOINTS = (
@@ -109,17 +111,6 @@ def _ref(volume: Any, volume_id: str, transport: TransportType) -> StorageVolume
     )
 
 
-async def _put(ref: StorageVolumeRef, key: str, value: torch.Tensor) -> None:
-    buffer = create_transport_buffer(ref)
-    await buffer.put_to_storage_volume([Request.from_tensor(key, value)])
-
-
-async def _get(ref: StorageVolumeRef, key: str) -> torch.Tensor:
-    buffer = create_transport_buffer(ref)
-    [value] = await buffer.get_from_storage_volume([Request(key=key)])
-    return value
-
-
 async def _endpoint_shape(self) -> None:
     pass
 
@@ -138,8 +129,8 @@ async def test_transport_round_trip_makes_only_its_calls(volume, transport) -> N
     ref = _ref(volume, volume.core.volume_id, transport)
     source = torch.arange(12, dtype=torch.float32).view(3, 4)
     try:
-        await _put(ref, "weights", source)
-        result = await _get(ref, "weights")
+        await put_through(ref, "weights", source)
+        result = await get_through(ref, "weights")
     finally:
         ref.transport_context.clear()
     assert torch.equal(result, source)
@@ -198,7 +189,7 @@ async def test_delete_drops_the_key_and_its_cache_entries(volume) -> None:
     """Drop each deleted key and its cache entries, and leave other keys alone."""
     ref = _ref(volume, volume.core.volume_id, TransportType.MonarchRPC)
     for key in ("a", "b", "c", "e", "f"):
-        await _put(ref, key, torch.ones(2))
+        await put_through(ref, key, torch.ones(2))
     store = volume.core.store
     cache = store.transport_context.get(_KeyedCache)
     cache.keys.update({"a", "b", "c", "d", "e", "f"})
@@ -207,7 +198,7 @@ async def test_delete_drops_the_key_and_its_cache_entries(volume) -> None:
     assert sorted(store.kv) == ["b", "c", "e", "f"]
     assert cache.keys == {"b", "c", "d", "e", "f"}
     with pytest.raises(KeyError, match="Key 'a' not found"):
-        await _get(ref, "a")
+        await get_through(ref, "a")
     # A missing key raises before any cache entry is dropped.
     with pytest.raises(KeyError, match="Key 'd' not found"):
         await volume.core.delete("d")
@@ -221,7 +212,7 @@ async def test_delete_drops_the_key_and_its_cache_entries(volume) -> None:
 async def test_reset_drops_every_key_and_cache(volume) -> None:
     """Drop every key and clear every cache, so the next cache lookup builds a new one."""
     ref = _ref(volume, volume.core.volume_id, TransportType.MonarchRPC)
-    await _put(ref, "a", torch.ones(2))
+    await put_through(ref, "a", torch.ones(2))
     store = volume.core.store
     cache = store.transport_context.get(_KeyedCache)
     cache.keys.add("a")
