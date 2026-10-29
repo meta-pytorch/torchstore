@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -232,6 +234,80 @@ async def test_transfer_dtype_preserves_keys() -> None:
 
     torch.testing.assert_close(result["weight"], source["weight"].bfloat16())
     torch.testing.assert_close(result["buffer"], source["buffer"])
+
+
+@pytest.mark.asyncio
+async def test_strict_read_rejects_key_skipped_by_non_strict_read() -> None:
+    source = torch.arange(2)
+    destination = {"weight": torch.zeros_like(source), "local_only": torch.zeros(2)}
+    clients = await routing_clients(
+        publishers={"publisher/0": {"weight": source}},
+        requesters={"requester/0/0": destination},
+    )
+    await put_state_dict(clients["publisher/0"], {"weight": source}, "model")
+    requester = clients["requester/0/0"]
+    await get_state_dict(requester, "model", destination, strict=False)
+
+    with pytest.raises(KeyError, match="no publisher"):
+        await get_state_dict(
+            requester, "model", {"local_only": destination["local_only"]}
+        )
+
+
+@pytest.mark.asyncio
+async def test_non_strict_reads_plan_and_fetch_one_subset_per_call() -> None:
+    """Read one subset of the state dict per call, as a per-layer load does."""
+    sources = {"first": torch.arange(2), "second": torch.arange(2, 4)}
+    sources["third"] = torch.arange(4, 6)
+    clients = await routing_clients(
+        publishers={
+            "publisher/0": {"first": sources["first"]},
+            "publisher/1": {"second": sources["second"], "third": sources["third"]},
+        },
+        requesters={"requester/0/0": {}},
+    )
+    await put_state_dict(clients["publisher/0"], {"first": sources["first"]}, "model")
+    await put_state_dict(
+        clients["publisher/1"],
+        {"second": sources["second"], "third": sources["third"]},
+        "model",
+    )
+    requester = clients["requester/0/0"]
+    requester._control_plane = Mock(wraps=requester._control_plane)
+    get_batch = Mock(wraps=requester.get_batch)
+    requester.get_batch = get_batch
+
+    # A failed plan leaves its keys to be planned by the next get.
+    with pytest.raises(ValueError, match="inconsistent global shape"):
+        await get_state_dict(
+            requester, "model", {"first": torch.zeros(3)}, strict=False
+        )
+    # Subsets: new, new, already planned, mixed, then planned after a get with
+    # no published keys.
+    for names, local_only in (
+        (["first"], False),
+        (["second"], False),
+        (["first"], False),
+        (["second", "third"], False),
+        ([], True),
+        (["first", "third"], False),
+    ):
+        get_batch.reset_mock()
+        destination = {name: torch.zeros_like(sources[name]) for name in names}
+        if local_only:
+            destination["local_only"] = torch.zeros(2)
+        result = await get_state_dict(requester, "model", destination, strict=False)
+
+        assert set(result) == set(names)
+        for name in names:
+            assert result[name] is destination[name]
+            torch.testing.assert_close(result[name], sources[name])
+        if names:
+            ((batch,), _kwargs) = get_batch.call_args
+            assert set(batch) == {f"model/{name}" for name in names}
+        else:
+            get_batch.assert_not_called()
+    requester._control_plane.get_layouts.assert_called_once_with("model")
 
 
 # Shard dim of each tensor on two publishers, or None for a whole copy on each.

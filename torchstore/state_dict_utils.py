@@ -257,6 +257,14 @@ async def get_state_dict(
         )
 
     flattened_keys = list(fetched_mapping.keys())
+    from torchstore.routing.client import RoutingClient
+
+    if not strict and user_state_dict is not None and isinstance(store, RoutingClient):
+        # A routed read may pass one subset of the state dict per call; fetch only
+        # that subset rather than every key planned by earlier calls.
+        flattened_keys = [
+            fk for fk in flattened_keys if fk in user_flattened_state_dict
+        ]
 
     get_batch_dict = {}
     for fk in flattened_keys:
@@ -267,7 +275,8 @@ async def get_state_dict(
             logger.warning(f"non-tensor value found for in-place: {fk}")
         get_batch_dict[_state_dict_storage_key(key, fk)] = t
 
-    results = await store.get_batch(get_batch_dict)
+    # A routed subset may have no published keys once an earlier get planned routes.
+    results = await store.get_batch(get_batch_dict) if get_batch_dict else {}
     nbytes = _flattened_nbytes(results)
     tracker.track_step("get_batch", nbytes=nbytes)
     fetched_state_dict = {

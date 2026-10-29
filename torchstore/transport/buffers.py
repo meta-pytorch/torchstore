@@ -113,7 +113,7 @@ class TransportBuffer:
     `_get_requests(requests)`:
       1. Runs `perform_handshake(...)` if `requires_handshake(requests)` returns True
       2. Calls `_pre_get_hook(requests)` [CLIENT] - save metadata for response handling
-      3. Sends to StorageVolume via `volume.get.call()`
+      3. Sends to StorageVolume via `_call_volume_get(meta_requests)`
       4. StorageVolume calls `handle_get_request(ctx, entries)` [STORAGE VOLUME]
       5. Client calls `_handle_storage_volume_response(requests, transport_buffer)` [CLIENT]
       6. Calls `drop()` [CLIENT] - cleanup resources
@@ -152,6 +152,7 @@ class TransportBuffer:
     - `perform_handshake`: Override for multi-step handshakes; default is one RPC
     - `_pre_put_hook`: Custom buffer allocation for puts
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
+    - `_call_volume_get`: Custom handling of the get RPC (e.g. cancellation)
     - `recv_handshake`: StorageVolume side of the default handshake
     - `drop`: Resource cleanup (especially important for RDMA buffers)
 
@@ -253,8 +254,7 @@ class TransportBuffer:
             l.track_step("_pre_get_hook")
 
             response = await self._handle_storage_volume_response(
-                requests,
-                await self.storage_volume_ref.volume.get.call_one(self, meta_requests),
+                requests, await self._call_volume_get(meta_requests)
             )
             l.track_step("volume.get.call")
 
@@ -265,6 +265,9 @@ class TransportBuffer:
             l.track_step("drop")
             l.track_e2e()
         return response
+
+    async def _call_volume_get(self, meta_requests: list[Request]) -> "TransportBuffer":
+        return await self.storage_volume_ref.volume.get.call_one(self, meta_requests)
 
     async def perform_handshake(
         self,
