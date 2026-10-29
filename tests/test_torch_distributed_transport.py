@@ -810,22 +810,245 @@ async def test_first_get_with_tensor_slice_of_full_tensor(ref):
     assert torch.equal(result, source[1:])
 
 
-@pytest.mark.asyncio
-async def test_non_contiguous_get_destination_is_staged(ref):
-    source = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    await _put(ref, [Request.from_tensor("w", source)])
-    destination = torch.empty(3, 2).t()
+def test_runs_of_strided_tensors():
+    base = torch.empty(2, 8, 4)
+    assert td_transport._runs(base) == [0]
+    # Offsets from the view's start: one 64 byte run per index of dim 0.
+    assert td_transport._runs(base[:, 4:]) == [0, 128]
+    assert td_transport._runs(torch.empty(3, 2).t()) == [0, 8, 16, 4, 12, 20]
+    # Size 1 dims keep runs contiguous, whatever their stride.
+    assert td_transport._runs(base[:, 4:5].transpose(1, 2)) == [0, 128]
+    # Leading dims in row-major order.
+    assert td_transport._runs(torch.empty(2, 3, 8)[:, :2, 4:]) == [0, 32, 96, 128]
+    # Overlapping and too many runs.
+    assert td_transport._runs(torch.empty(1, 4).expand(2, 4)) is None
+    assert td_transport._runs(torch.empty(5).as_strided((2, 3), (2, 1))) is None
+    assert len(td_transport._runs(torch.empty(64, 2)[:, :1])) == 64
+    assert td_transport._runs(torch.empty(65, 2)[:, :1]) is None
 
-    # The result is returned in a contiguous staging tensor.
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int8])
+@pytest.mark.asyncio
+async def test_strided_get_destination_is_written_in_place(ref, monkeypatch, dtype):
+    source = torch.arange(32).reshape(2, 4, 4).to(dtype)
+    await _put(ref, [Request.from_tensor("w", source)])
+    volume = _volume_endpoint(ref)
+    writes = _record_writes(monkeypatch, volume.transport)
+    client = _client_endpoint(ref)
+    registrations = _record_registrations(monkeypatch, client)
+    # Part of a larger shard, like a resharded fused weight.
+    shard = torch.zeros(2, 8, 4, dtype=dtype)
+    destination = shard[:, 4:]
+
     (result,) = await _get(ref, [Request.from_tensor("w", destination)])
-    assert result.is_contiguous() and torch.equal(result, source)
-    assert result.data_ptr() != destination.data_ptr()
+    assert result is destination
+    assert torch.equal(shard[:, 4:], source) and not shard[:, :4].any()
+    # One write per run into the shard, without a staging tensor.
+    run = 16 * source.element_size()
+    address = writes[0][2]
+    assert writes == [(0, run, address), (run, run, address + 2 * run)]
+    assert registrations == [destination.nbytes]
+    assert td_transport._storage_key(shard) in client._registrations
+
+
+@pytest.mark.asyncio
+async def test_strided_get_stages_strided_runs(ref, monkeypatch):
+    source = torch.arange(32.0).reshape(2, 4, 4)
+    await _put(ref, [Request.from_tensor("w", source)])
+    volume = _volume_endpoint(ref)
+    writes = _record_writes(monkeypatch, volume.transport)
+    shard = torch.zeros(2, 8, 2)
+    destination = shard[:, 4:]
+    tensor_slice = TensorSlice(
+        offsets=(0, 0, 2),
+        coordinates=(1,),
+        global_shape=(2, 4, 4),
+        local_shape=(2, 4, 2),
+        mesh_shape=(2,),
+    )
+
+    (result,) = await _get(
+        ref, [Request(key="w", tensor_val=destination, tensor_slice=tensor_slice)]
+    )
+    assert result is destination
+    assert torch.equal(shard[:, 4:], source[..., 2:]) and not shard[:, :4].any()
+    # Each run's rows are packed into the staging buffer.
+    assert [(offset, length) for offset, length, _ in writes] == [(0, 32), (64, 32)]
+    assert writes[1][2] - writes[0][2] == 64
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.asyncio
+async def test_non_contiguous_get_destination_is_staged(ref, monkeypatch, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    source = torch.arange(130.0).reshape(65, 2)
+    await _put(ref, [Request.from_tensor("w", source[:, :1].contiguous())])
+    client = _client_endpoint(ref)
+    registrations = _record_registrations(monkeypatch, client)
+    # Too many runs.
+    shard = torch.zeros(65, 2, device=device)
+    destination = shard[:, 1:]
+
+    (result,) = await _get(ref, [Request.from_tensor("w", destination)])
+    # The client copies the staged result into the destination.
+    assert result is destination
+    assert torch.equal(shard[:, 1:].cpu(), source[:, :1]) and not shard[:, 0].any()
+    assert registrations == [destination.nbytes]
+    # Staged on CPU, not in place.
+    assert td_transport._storage_key(shard) not in client._registrations
+    assert all(key[2] == "cpu" for key in client._registrations)
+
+
+@pytest.mark.asyncio
+async def test_strided_get_destination_with_leading_dims(ref, monkeypatch):
+    source = torch.arange(16.0).reshape(2, 2, 4)
+    await _put(ref, [Request.from_tensor("w", source)])
+    volume = _volume_endpoint(ref)
+    writes = _record_writes(monkeypatch, volume.transport)
+    shard = torch.zeros(2, 3, 8)
+    destination = shard[:, :2, 4:]
+
+    (result,) = await _get(ref, [Request.from_tensor("w", destination)])
+    assert result is destination
+    assert torch.equal(shard[:, :2, 4:], source)
+    assert not shard[:, 2].any() and not shard[..., :4].any()
+    address = writes[0][2]
+    assert writes == [
+        (offset, 16, address + run)
+        for offset, run in zip((0, 16, 32, 48), (0, 32, 96, 128), strict=True)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("neg", [False, True])
+async def test_strided_lazy_get_destination_is_staged(ref, neg):
+    source = torch.randn(2, 4, 4, dtype=torch.float32 if neg else torch.complex64)
+    await _put(ref, [Request.from_tensor("w", source)])
+    destination = torch.zeros(2, 8, 4, dtype=torch.complex64).conj()
+    # The imaginary part of a conjugate has the lazy neg bit.
+    destination = (destination.imag if neg else destination)[:, 4:]
+
+    (result,) = await _get(ref, [Request.from_tensor("w", destination)])
+    assert result is destination
+    assert torch.equal(destination, source)
+
+
+@pytest.mark.asyncio
+async def test_failed_strided_get_holds_destination(ref):
+    await _put(ref, [Request.from_tensor("w", torch.arange(32.0).reshape(2, 4, 4))])
+    volume = _volume_endpoint(ref)
+    shard = torch.zeros(2, 8, 4)
+    held = weakref.ref(shard.untyped_storage())
+    FakeTransport.hang = True
+    cancelled = asyncio.create_task(_get(ref, [Request.from_tensor("w", shard[:, 4:])]))
+    await _until(lambda: len(volume.transport.pending) >= 1)
+    del shard
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    del cancelled
+    FakeTransport.hang = False
+    _finish(volume.transport)
+    await _bounded(asyncio.gather(*ref.volume.tasks))
+    gc.collect()
+    # The volume may still write the destination until a request succeeds.
+    assert held() is not None
+    await _put(ref, [Request.from_tensor("w", torch.ones(4))])
+    gc.collect()
+    assert held() is None
+
+
+@pytest.mark.asyncio
+async def test_failed_staged_get_holds_staging_tensor(ref):
+    await _put(ref, [Request.from_tensor("w", torch.arange(65.0).reshape(65, 1))])
+    volume, client = _volume_endpoint(ref), _client_endpoint(ref)
+    shard = torch.zeros(65, 2)
+    FakeTransport.hang = True
+    cancelled = asyncio.create_task(_get(ref, [Request.from_tensor("w", shard[:, 1:])]))
+    await _until(lambda: len(volume.transport.pending) >= 1)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    # Too many runs to write in place, so the staging tensor is held instead.
+    held = [s for failed in client.held.values() for _, ss in failed for s in ss]
+    assert held and shard.data_ptr() not in {s.data_ptr() for s in held}
+    assert all((s.data_ptr(), s.nbytes(), "cpu") in client._registrations for s in held)
+    FakeTransport.hang = False
+    _finish(volume.transport)
+    await _bounded(asyncio.gather(*ref.volume.tasks))
+
+
+@pytest.mark.asyncio
+async def test_client_resharded_get_is_written_in_place(ref, monkeypatch):
+    from torchstore.client import LocalClient
+    from torchstore.controller import ObjectType, StorageInfo
+
+    source = torch.arange(16.0).reshape(2, 8)
+    left, right = _columns(2, 8, 0, 4), _columns(2, 8, 4, 4)
+    for part in (left, right):
+        start = part.offsets[1]
+        value = source[:, start : start + 4].contiguous()
+        await _put(ref, [Request(key="w", tensor_val=value, tensor_slice=part)])
+    registrations = _record_registrations(monkeypatch, _client_endpoint(ref))
+    client = object.__new__(LocalClient)
+    buffers = {"v": TorchDistributedTransportBuffer(ref)}
+    destination = torch.zeros(2, 8)
+    request = Request.from_tensor("w", destination)
+    request.tensor_slice = _columns(2, 8, 0, 8)
+    storage = StorageInfo(ObjectType.TENSOR_SLICE, {left, right})
+
+    volume_requests, whole = client._build_volume_requests(
+        [request], {"w": {"v": storage}}, buffers
+    )
+    pairs = await _bounded(client._fetch_results(volume_requests, buffers))
+    assert client._assemble_results([request], pairs, whole)["w"] is destination
+    assert torch.equal(destination, source)
+    # The column views are written in place through the destination's storage.
+    assert registrations == [32, 32]
+    assert (
+        td_transport._storage_key(destination) in _client_endpoint(ref)._registrations
+    )
 
 
 def test_request_context_state_strips_client_tensors():
-    context = td_transport.TorchTransportRequestContext(tensor=torch.zeros(2))
+    context = td_transport.TorchTransportRequestContext(
+        tensor=torch.zeros(2), dest=torch.zeros(4)[::2], runs=[]
+    )
     state = pickle.loads(pickle.dumps(context))
-    assert state.tensor is None and context.tensor is not None
+    assert state.tensor is None and state.dest is None and state.runs == []
+    assert context.tensor is not None and context.dest is not None
+
+
+@pytest.mark.parametrize("strided", [[False], [True], [True, False]])
+def test_client_passes_strided_destinations(strided):
+    from torchstore.client import LocalClient
+    from torchstore.controller import ObjectType, StorageInfo
+
+    client = object.__new__(LocalClient)
+    buffers = {
+        f"v{i}": SimpleNamespace(
+            supports_inplace_resharding=True, supports_strided_destinations=value
+        )
+        for i, value in enumerate(strided)
+    }
+    storage = StorageInfo(
+        ObjectType.TENSOR_SLICE, {_columns(2, 8, 0, 4), _columns(2, 8, 4, 4)}
+    )
+    destination = torch.zeros(2, 8)
+    request = Request.from_tensor("w", destination)
+    request.tensor_slice = _columns(2, 8, 0, 8)
+
+    volume_requests, _ = client._build_volume_requests(
+        [request], {"w": dict.fromkeys(buffers, storage)}, buffers
+    )
+    values = {r.tensor_slice.offsets[1]: r.tensor_val for r in volume_requests["v0"]}
+    if not all(strided):
+        assert values == {0: None, 4: None}
+        return
+    for start, value in values.items():
+        assert value.data_ptr() == destination[:, start:].data_ptr()
+        assert value.stride() == (8, 1) and value.shape == (2, 4)
 
 
 def _columns(rows: int, columns: int, start: int, width: int) -> TensorSlice:
@@ -1373,6 +1596,20 @@ async def test_real_backend_staged_get(backend_name, device, probe, caplog):
             ],
         )
         assert torch.equal(result.cpu(), source[:, 32:])
+        # Contiguous runs of a strided destination are written in place.
+        shard = torch.zeros(64, 64, device=device)
+        corner = TensorSlice(
+            offsets=(0, 0),
+            coordinates=(0,),
+            global_shape=(64, 64),
+            local_shape=(32, 32),
+            mesh_shape=(2,),
+        )
+        (result,) = await _get(
+            ref, [Request(key="w", tensor_val=shard[:32, 32:], tensor_slice=corner)]
+        )
+        assert result.data_ptr() == shard[:32, 32:].data_ptr()
+        assert torch.equal(shard[:32, 32:].cpu(), source[:32, :32])
     finally:
         transport_context.clear()
         volume.store.reset()

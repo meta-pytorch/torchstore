@@ -11,6 +11,7 @@ import torch
 from torchstore.transport.types import TensorSlice
 from torchstore.utils import (
     assemble_tensor,
+    get_destination_view,
     get_local_tensor,
     get_slice_numel,
     same_slice_geometry,
@@ -269,3 +270,27 @@ def test_slice_covers_uses_global_geometry() -> None:
 
     assert slice_covers(outer, inner)
     assert not slice_covers(inner, outer)
+
+
+def test_get_destination_view_allow_strided() -> None:
+    """Return non-contiguous destination views only when allowed."""
+    dest = torch.zeros(2, 8)
+    dest_slice = TensorSlice(
+        offsets=(0, 0),
+        coordinates=(),
+        global_shape=(2, 8),
+        local_shape=(2, 8),
+        mesh_shape=(),
+    )
+    fetch_slice = TensorSlice(
+        offsets=(0, 4),
+        coordinates=(),
+        global_shape=(2, 8),
+        local_shape=(2, 4),
+        mesh_shape=(),
+    )
+
+    assert get_destination_view(dest, dest_slice, fetch_slice) is None
+    view = get_destination_view(dest, dest_slice, fetch_slice, allow_strided=True)
+    assert view is not None and view.data_ptr() == dest[:, 4:].data_ptr()
+    assert view.shape == (2, 4) and view.stride() == (8, 1)
