@@ -335,8 +335,16 @@ torch.distributed transport, preferred after shared memory and over NIXL. Requir
 a PyTorch build whose `torch.distributed._transport` has multi-peer `connect`
 (https://github.com/pytorch/pytorch/pull/202536) and descriptor reloads
 (https://github.com/pytorch/pytorch/pull/202534, not yet merged). The variable
-is read at import time. This transport registers every tensor per request,
-so large state dicts are slower than with NIXL until registrations are cached.
+is read at import time. Tensor memory stays registered (pinned), so transfers
+reusing tensors register once. It is unregistered once every storage using it is
+freed, at the next torch transport request or delete through the same
+`TransportContext`, or when that `TransportContext` is cleared (e.g. by
+`reset_client` or `shutdown`). Don't move a registered storage's memory
+(`resize_`, `share_memory_`): its old memory stays registered (pinned) until the
+storage is freed or the `TransportContext` is cleared. A cancelled request keeps
+its tensors alive until the storage volume answers, as the volume may still
+access them; don't use, modify or move (`resize_`, `share_memory_`) them until
+then. If the volume call itself is cancelled, they are leaked.
 
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:

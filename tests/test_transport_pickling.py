@@ -137,6 +137,7 @@ _RESET_ON_PICKLE = {
     },
     "TorchDistributedTransportBuffer": {
         "_endpoint": lambda: ("process-local", None),
+        "_storages": lambda: (["process-local"], []),
         "_keys": lambda: (["process-local"], []),
     },
 }

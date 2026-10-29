@@ -19,6 +19,7 @@ from torchstore.client import ClientType
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.storage_volume import StorageVolume
+from torchstore.transport.buffers import TransportContext
 
 
 def test_routing_namespaces_distinguish_participant_meshes(monkeypatch) -> None:
@@ -130,7 +131,7 @@ def test_client_constructs_and_caches_a_routing_client(monkeypatch, caplog) -> N
     """Create one rank-local routing client and reuse it for later API calls."""
     caplog.set_level(logging.INFO, logger="torchstore.routing.coordinator")
     # 1. Supply a local coordinator handle and a known calling rank.
-    strategy = object()
+    strategy = SimpleNamespace(transport_context=TransportContext())
     coordinator = SimpleNamespace(
         strategy=SimpleNamespace(call_one=AsyncMock(return_value=strategy))
     )
