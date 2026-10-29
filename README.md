@@ -337,8 +337,8 @@ descriptor reloads and `RemoteBuffer.slice`
 (https://github.com/pytorch/pytorch/pull/202534,
 https://github.com/pytorch/pytorch/pull/202535,
 https://github.com/pytorch/pytorch/pull/202536). The variable is
-read at import time. This transport registers every tensor per request,
-so large state dicts are slower than with NIXL until registrations are cached.
+read at import time. Tensor memory stays registered (pinned) until its storage is
+freed.
 
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:
