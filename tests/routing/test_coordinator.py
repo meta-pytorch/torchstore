@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -35,6 +37,7 @@ from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.transport import TransportType
 
 from ..volume_meshes import VolumeMesh
+from .file_store_control_plane import FileStoreControlPlane
 from .utils import registry_store, tensor_slice
 
 pytestmark = pytest.mark.timeout(60)
@@ -91,10 +94,23 @@ async def _coordinator(publishers=None, strategy=None):
     return coordinator
 
 
+@contextlib.asynccontextmanager
+async def _file_store() -> AsyncIterator[Callable[[], Awaitable[TimedControlPlane]]]:
+    """Open handles on one ``FileStoreControlPlane`` store in a temporary directory."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "control_plane")
+
+        async def connect() -> TimedControlPlane:
+            return FileStoreControlPlane(path)
+
+        yield connect
+
+
 @pytest_asyncio.fixture(
     params=[
         pytest.param(_monarch_store, id="monarch"),
         pytest.param(registry_store, id="registry"),
+        pytest.param(_file_store, id="filestore"),
     ]
 )
 async def make_control_plane(
@@ -768,3 +784,42 @@ async def test_monarch_adapter_passes_actor_errors_through() -> None:
             await asyncio.wait_for(
                 control_plane.get_layouts("model", timeout_s=0), timeout=1
             )
+
+
+@pytest.mark.asyncio
+async def test_file_store_trusts_only_its_own_finished_directory(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refuse an existing directory, one without ``ready`` and one others may write.
+
+    A value whose link fails never lands, so no partial value wins.
+    """
+    path = str(tmp_path / "earlier_run")
+    os.mkdir(path, 0o700)
+    plane = FileStoreControlPlane(path)
+    with pytest.raises(RuntimeError, match="init has not run"):
+        await plane.strategy()
+    with pytest.raises(FileExistsError):
+        await plane.init({"publisher/0"}, ts.TorchStoreStrategy())
+    with open(os.path.join(path, "ready"), "wb"):
+        pass
+    # An unreadable directory raises its own error, not "init has not run".
+    os.chmod(path, 0)
+    try:
+        with pytest.raises(PermissionError, match="Permission denied"):
+            await plane.strategy()
+    finally:
+        os.chmod(path, 0o777)
+    with pytest.raises(PermissionError, match="open to other users"):
+        await plane.strategy()
+
+    failing = str(tmp_path / "failing")
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            os, "link", create_autospec(os.link, side_effect=OSError("full"))
+        )
+        with pytest.raises(OSError, match="full"):
+            await FileStoreControlPlane(failing).init(
+                {"publisher/0"}, ts.TorchStoreStrategy()
+            )
+    assert os.listdir(failing) == []
