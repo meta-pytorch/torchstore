@@ -203,8 +203,11 @@ class NixlTransportBuffer(TransportBuffer):
     their memory are kept for the life of the transport context. The volume
     retires such an agent and uses a new one. Destinations of a failed
     request, including the stored value of a failed in-place PUT, hold
-    undefined data. A failed GET's leaked transfers may still overwrite its
-    destinations later, even after a later GET into them succeeds.
+    undefined data. Within the same transport context, GETs reject nonempty
+    destinations that share retained storage, including disjoint views, for the
+    context's lifetime; clear() does not make the storage reusable. The check
+    uses PyTorch storage base addresses, not overlapping byte ranges. It does
+    not protect PUT sources, direct access, copy-back, or other contexts.
     """
 
     supports_batch_puts = True
@@ -290,6 +293,26 @@ class NixlTransportBuffer(TransportBuffer):
             else []
         )
         meta_iterator = iter(meta_results)
+
+        # A concurrent request may have failed during the metadata await. Check
+        # the whole batch before registering or publishing any destination.
+        for request in requests:
+            tensor = request.tensor_val
+            if tensor is None or tensor.numel() == 0:
+                continue
+            cache = self._client_cache()
+            retired = self.storage_volume_ref.transport_context.retired(NixlAgentCache)
+            if not cache.leaked_storages and not retired:
+                break
+            storage = tensor.untyped_storage().data_ptr()
+            if storage in cache.leaked_storages or any(
+                storage in previous.leaked_storages for previous in retired
+            ):
+                raise RuntimeError(
+                    f"NIXL GET destination for key={request.key!r} shares storage "
+                    "retained after a failed request; use a fresh destination tensor. "
+                    "Retained storage stays blocked for this transport context's lifetime"
+                )
 
         # 2. build contexts
         self._contexts = []
