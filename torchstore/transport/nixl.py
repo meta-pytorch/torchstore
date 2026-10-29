@@ -25,6 +25,7 @@ import torch
 from typing_extensions import override
 
 from torchstore.transport.buffers import TransportBuffer, TransportCache
+from torchstore.transport.staging import aligned, STAGING_ALIGNMENT, staging_pieces
 from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
@@ -40,8 +41,6 @@ ENV_TORCHSTORE_NIXL_TIMEOUT_S = int(os.environ.get("TORCHSTORE_NIXL_TIMEOUT_S", 
 ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES = int(
     os.environ.get("TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", str(32 * 1024 * 1024))
 )
-# Staged pieces start at this byte alignment so any dtype can view the buffer.
-_STAGING_ALIGNMENT = 64
 
 
 class _NixlTransferStatus(str, Enum):
@@ -74,10 +73,6 @@ def nixl_available() -> bool:
     return ENV_TORCHSTORE_NIXL_ENABLED and find_spec("nixl") is not None
 
 
-def _aligned(nbytes: int) -> int:
-    return -(-nbytes // _STAGING_ALIGNMENT) * _STAGING_ALIGNMENT
-
-
 async def _wait_terminal(tasks: list[asyncio.Task[None]]) -> None:
     """Wait until every task is done, even if cancelled meanwhile.
 
@@ -95,25 +90,6 @@ async def _wait_terminal(tasks: list[asyncio.Task[None]]) -> None:
             task.exception()
     if cancelled:
         raise asyncio.CancelledError
-
-
-def _staging_pieces(tensor: torch.Tensor, max_bytes: int):
-    """Split a tensor into row-major pieces of at most max_bytes.
-
-    Each piece is a view covering a contiguous byte range of the tensor's
-    contiguous layout, so it maps to one destination descriptor.
-    """
-    if tensor.dim() == 0 or tensor.nbytes <= max_bytes:
-        yield tensor
-        return
-    row_bytes = tensor.nbytes // tensor.shape[0]
-    if row_bytes > max_bytes:
-        for row in tensor:
-            yield from _staging_pieces(row, max_bytes)
-        return
-    rows = max_bytes // row_bytes
-    for start in range(0, tensor.shape[0], rows):
-        yield tensor[start : start + rows]
 
 
 @dataclass
@@ -535,10 +511,10 @@ class NixlTransportBuffer(TransportBuffer):
         """
         if not staged:
             return
-        if ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES < _STAGING_ALIGNMENT:
+        if ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES < STAGING_ALIGNMENT:
             raise ValueError(
                 "TORCHSTORE_NIXL_STAGING_BUFFER_BYTES must be at least "
-                f"{_STAGING_ALIGNMENT}, got {ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES}"
+                f"{STAGING_ALIGNMENT}, got {ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES}"
             )
 
         cache = ctx.get(NixlAgentCache)
@@ -547,7 +523,7 @@ class NixlTransportBuffer(TransportBuffer):
         }
         size = min(
             ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES,
-            sum(_aligned(tensor.nbytes) for _, tensor, _ in staged),
+            sum(aligned(tensor.nbytes) for _, tensor, _ in staged),
         )
         buffers: list[torch.Tensor | None] = [None, None]
         buffer_tasks: list[asyncio.Task[None] | None] = [None, None]
@@ -569,8 +545,8 @@ class NixlTransportBuffer(TransportBuffer):
             remote_addr, _, remote_device = remote_descs[0]
             remote_type = memory_type_names[remote_descs.getType()]
             remote_offset = 0
-            for piece in _staging_pieces(source, size):
-                start = _aligned(offset)
+            for piece in staging_pieces(source, size):
+                start = aligned(offset)
                 if buffers[index] is None or start + piece.nbytes > size:
                     if pending:
                         flush()

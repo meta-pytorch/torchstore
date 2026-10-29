@@ -24,6 +24,8 @@ Limitations:
 - Memory stays registered (pinned) until every storage using it is freed, so
   only new tensors pay registration, e.g. get results without a destination.
   Freed memory stays registered until the endpoint's next request or delete.
+- Each get stages its non-contiguous values through two CPU buffers of up to
+  ``TORCHSTORE_TORCH_TRANSPORT_STAGING_BUFFER_BYTES``.
 - Do not ``resize_`` registered storages; transfers may use the old memory,
   even if the storage regrows at the same address.
 - Volumes stay connected to every client endpoint they served until reset.
@@ -43,9 +45,11 @@ import torch
 from typing_extensions import override
 
 from torchstore.transport.buffers import TransportBuffer, TransportCache
+from torchstore.transport.staging import aligned, STAGING_ALIGNMENT, staging_pieces
 from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
+    from torch.distributed import Work
     from torch.distributed._transport import Memory, RemoteBuffer, Transport
 
     from torchstore.strategy import StorageVolumeRef
@@ -61,6 +65,13 @@ _unclosed_held: list[Any] = []
 ENV_TORCHSTORE_TORCH_TRANSPORT_BACKEND = os.environ.get(
     "TORCHSTORE_TORCH_TRANSPORT_BACKEND", ""
 ).lower()
+# Maximum size of each of the two buffers that stage a get's non-contiguous
+# tensors.
+ENV_TORCHSTORE_TORCH_TRANSPORT_STAGING_BUFFER_BYTES = int(
+    os.environ.get(
+        "TORCHSTORE_TORCH_TRANSPORT_STAGING_BUFFER_BYTES", str(32 * 1024 * 1024)
+    )
+)
 
 _RegistrationKey = tuple[int, int, str]
 
@@ -215,6 +226,11 @@ class _Endpoint:
         except Exception:
             logger.error("Failed to unregister torch transport memory", exc_info=True)
 
+    def _unregister_if_current(self, registration: _Registration) -> None:
+        # Closing the endpoint drops every registration.
+        if self._registrations.get(registration.key) is registration:
+            self._unregister(registration)
+
     def expose(self, tensor: torch.Tensor) -> RemoteBuffer:
         """Register tensor and describe it for the peer."""
         registration = self.register(tensor)
@@ -261,49 +277,114 @@ class _Endpoint:
             return
         self.held.clear()
 
-    async def transfer(
-        self, read: bool, transfers: list[tuple[torch.Tensor, RemoteBuffer]]
-    ) -> None:
-        """Run transfers and wait until all of them finished."""
-        from torch.distributed._transport import wait_all
-
+    async def read(self, transfers: list[tuple[torch.Tensor, RemoteBuffer]]) -> None:
+        """Read into tensors and wait until all reads finished."""
         works = []
         self.active += 1
         try:
             for tensor, remote_buffer in transfers:
-                memory = self.register(tensor).memory
-                if read:
-                    work = self.transport.read(
-                        memory.to_mutable_view(), remote_buffer, async_op=True
-                    )
-                else:
-                    work = self.transport.write(
-                        memory.to_view(), remote_buffer, async_op=True
-                    )
-                works.append(work)
+                view = self.register(tensor).memory.to_mutable_view()
+                works.append(self.transport.read(view, remote_buffer, async_op=True))
         finally:
-            # Drain submitted transfers even if a submission failed or the
-            # caller is cancelled.
-            waiter = asyncio.ensure_future(wait_all(works))
+            await self._drain(works)
 
-            def done(future: asyncio.Future[None]) -> None:
-                if not future.cancelled() and future.exception() is not None:
-                    logger.warning(
-                        "torch transport transfer failed", exc_info=future.exception()
+    async def write(
+        self,
+        transfers: list[tuple[torch.Tensor, RemoteBuffer]],
+        staged: list[tuple[torch.Tensor, RemoteBuffer]],
+    ) -> None:
+        """Write contiguous tensors directly and non-contiguous tensors through
+        two reused staging buffers, then wait until all writes finished.
+
+        Copying every non-contiguous tensor with .contiguous() doubles peak
+        memory for a large batch. Instead, pack row ranges into one buffer
+        while the other buffer's transfers are in flight.
+        """
+        from torch.distributed._transport import wait_all
+
+        buffer_bytes = ENV_TORCHSTORE_TORCH_TRANSPORT_STAGING_BUFFER_BYTES
+        if staged and buffer_bytes < STAGING_ALIGNMENT:
+            raise ValueError(
+                "TORCHSTORE_TORCH_TRANSPORT_STAGING_BUFFER_BYTES must be at least "
+                f"{STAGING_ALIGNMENT}, got {buffer_bytes}"
+            )
+        size = min(buffer_bytes, sum(aligned(t.nbytes) for t, _ in staged))
+        buffers: list[tuple[torch.Tensor, _Registration] | None] = [None, None]
+        direct: list[Work] = []
+        works: list[list[Work]] = [[], []]
+        index = 0
+        offset = 0
+        self.active += 1
+        try:
+            for tensor, remote_buffer in transfers:
+                view = self.register(tensor).memory.to_view()
+                direct.append(self.transport.write(view, remote_buffer, async_op=True))
+            for source, remote_buffer in staged:
+                remote_offset = 0
+                for piece in staging_pieces(source, size):
+                    nbytes = piece.nbytes
+                    start = aligned(offset)
+                    if buffers[index] is None or start + nbytes > size:
+                        if buffers[index] is not None:
+                            index ^= 1
+                        # Reuse the other buffer once its transfers finished.
+                        await wait_all(works[index])
+                        works[index] = []
+                        if buffers[index] is None:
+                            buffer = torch.empty(size, dtype=torch.uint8, device="cpu")
+                            buffers[index] = (buffer, self.register(buffer))
+                        start = 0
+                    buffer, registration = buffers[index]
+                    local = buffer[start : start + nbytes]
+                    local.view(piece.dtype).view(piece.shape).copy_(piece)
+                    works[index].append(
+                        self.transport.write(
+                            registration.memory.to_view(start, nbytes),
+                            remote_buffer.slice(remote_offset, nbytes),
+                            async_op=True,
+                        )
                     )
-                self.release()
-
-            waiter.add_done_callback(done)
+                    offset = start + nbytes
+                    remote_offset += nbytes
+        except BaseException:
             try:
-                await asyncio.shield(waiter)
-            except asyncio.CancelledError:
-                # Keep the RPC open so the client keeps its memory registered.
-                while not waiter.done():
-                    try:
-                        await asyncio.wait([waiter])
-                    except asyncio.CancelledError:
-                        pass
-                raise
+                await self._drain(direct + works[0] + works[1])
+            except Exception:
+                pass  # _drain logged it; keep the original error.
+            raise
+        else:
+            await self._drain(direct + works[0] + works[1])
+        finally:
+            # Staging buffers are freed on return.
+            for entry in buffers:
+                if entry is not None:
+                    self._unregister_if_current(entry[1])
+
+    async def _drain(self, works: list[Work]) -> None:
+        """Wait for submitted transfers, even if the caller is cancelled, then
+        release the endpoint."""
+        from torch.distributed._transport import wait_all
+
+        waiter = asyncio.ensure_future(wait_all(works))
+
+        def done(future: asyncio.Future[None]) -> None:
+            if not future.cancelled() and future.exception() is not None:
+                logger.warning(
+                    "torch transport transfer failed", exc_info=future.exception()
+                )
+            self.release()
+
+        waiter.add_done_callback(done)
+        try:
+            await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            # Keep the RPC open so the client keeps its memory registered.
+            while not waiter.done():
+                try:
+                    await asyncio.wait([waiter])
+                except asyncio.CancelledError:
+                    pass
+            raise
 
 
 class TorchTransportCache(TransportCache):
@@ -560,19 +641,11 @@ class TorchDistributedTransportBuffer(TransportBuffer):
             )
         await self._register_client_tensors()
 
-    async def _transfer(
-        self,
-        ctx: TransportContext,
-        read: bool,
-        transfers: list[tuple[torch.Tensor, RemoteBuffer]],
-    ) -> None:
-        cache = ctx.get(TorchTransportCache)
-        cache.sweep()
-        if not transfers:
-            return
+    async def _volume_endpoint(self, ctx: TransportContext) -> _Endpoint:
         assert self._client_url is not None
-        endpoint = await cache.connect(self._backend, self._client_url)
-        await endpoint.transfer(read, transfers)
+        return await ctx.get(TorchTransportCache).connect(
+            self._backend, self._client_url
+        )
 
     @override
     async def handle_put_request(
@@ -581,6 +654,7 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
         """Called by storage volume. Read from the client's registered tensors."""
+        ctx.get(TorchTransportCache).sweep()
         results: list[Any] = []
         transfers = []
         for (_, tensor), context in zip(entries, self._contexts, strict=True):
@@ -595,7 +669,9 @@ class TorchDistributedTransportBuffer(TransportBuffer):
                 assert context.remote_buffer is not None
                 transfers.append((tensor, context.remote_buffer))
             results.append(tensor)
-        await self._transfer(ctx, True, transfers)
+        if transfers:
+            endpoint = await self._volume_endpoint(ctx)
+            await endpoint.read(transfers)
         return results
 
     @override
@@ -605,7 +681,9 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         entries: list[tuple[Request, Any]],
     ) -> None:
         """Called by storage volume. Write into the client's registered tensors."""
+        ctx.get(TorchTransportCache).sweep()
         transfers = []
+        staged = []
         for (_, data), context in zip(entries, self._contexts, strict=True):
             if not isinstance(data, torch.Tensor):
                 context.is_object = True
@@ -615,10 +693,16 @@ class TorchDistributedTransportBuffer(TransportBuffer):
             self._assert_valid_tensor(
                 data, context.dtype, context.shape, must_be_contiguous=False
             )
-            if data.numel() != 0:
-                assert context.remote_buffer is not None
-                transfers.append((data.contiguous(), context.remote_buffer))
-        await self._transfer(ctx, False, transfers)
+            if data.numel() == 0:
+                continue
+            assert context.remote_buffer is not None
+            if data.is_contiguous():
+                transfers.append((data, context.remote_buffer))
+            else:
+                staged.append((data, context.remote_buffer))
+        if transfers or staged:
+            endpoint = await self._volume_endpoint(ctx)
+            await endpoint.write(transfers, staged)
 
     @override
     async def _handle_storage_volume_response(
