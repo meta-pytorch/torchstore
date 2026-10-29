@@ -83,8 +83,12 @@ async def test_monarch_adapter_forwards_each_call_and_logs_it(caplog) -> None:
     strategy = ts.TorchStoreStrategy(TransportType.MonarchRPC)
     publishers, registrations = {"publisher"}, _registration()
     layouts = {"publisher": registrations}
+
+    async def slow_init(**_: Any) -> None:
+        await asyncio.sleep(0.05)
+
     endpoints = {
-        "init": AsyncMock(),
+        "init": AsyncMock(side_effect=slow_init),
         "strategy": AsyncMock(return_value=strategy),
         "register_layout": AsyncMock(),
         "get_layouts": AsyncMock(return_value=layouts),
@@ -117,6 +121,12 @@ async def test_monarch_adapter_forwards_each_call_and_logs_it(caplog) -> None:
     with pytest.raises(RuntimeError) as raised:
         await control_plane.register_layout("publisher", "model", registrations)
     assert raised.value is error
+    # An ActorError's line names the coordinator's own error, which it carries.
+    wrapped = RuntimeError("actor failed")
+    wrapped.exception = KeyError("'requester' is not a publisher rank")
+    endpoints["strategy"].side_effect = wrapped
+    with pytest.raises(RuntimeError):
+        await control_plane.strategy()
     entered = asyncio.Event()
 
     async def wait_forever(**_: Any) -> None:
@@ -130,28 +140,38 @@ async def test_monarch_adapter_forwards_each_call_and_logs_it(caplog) -> None:
     with pytest.raises(asyncio.CancelledError):
         await pending
 
-    assert [operation for operation, _ in _timing_lines(caplog)] == [
+    lines = _timing_lines(caplog)
+    # Each line reports its call's own duration, the slow init's included.
+    assert float(lines[0][1]) >= 0.05
+    assert [operation for operation, _ in lines] == [
         "init",
         "strategy",
         "register_layout key=model",
         "get_layouts key=model",
         "get_layouts key=model",
         "register_layout key=model failed with RuntimeError",
+        "strategy failed with KeyError",
         "get_layouts key=model cancelled",
     ]
 
 
 @pytest.mark.asyncio
 async def test_monarch_timeout_reports_the_clamped_wait() -> None:
-    """Report the caller's timeout, 0 if zero or less, and the missing publishers."""
+    """Report the caller's timeout, 0 if zero or less, and the missing publishers.
+
+    A positive timeout is waited out and zero or less checks once.
+    """
     control_plane = await _monarch_control_plane({"publisher/0", "publisher/1"})
     await control_plane.register_layout("publisher/0", "model", _registration())
-    for timeout_s, reported in ((0.2, 0.2), (-1, 0)):
+    loop = asyncio.get_running_loop()
+    for timeout_s, reported in ((0.2, 0.2), (0, 0), (-1, 0)):
         message = (
             f"timed out after {reported} seconds waiting for publisher layouts for "
             "'model'; missing publishers: ['publisher/1']"
         )
+        started = loop.time()
         with pytest.raises(ActorError, match=re.escape(message)):
             await asyncio.wait_for(
                 control_plane.get_layouts("model", timeout_s=timeout_s), timeout=5
             )
+        assert loop.time() - started >= timeout_s - 0.005, "it must wait its timeout"
