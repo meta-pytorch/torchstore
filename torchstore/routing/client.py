@@ -22,7 +22,7 @@ from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
 from torchstore.utils import same_slice_geometry
 from ._model import KeyRegistration, RankRole
-from .coordinator import RoutingCoordinator
+from .control_plane import ControlPlane
 from .directory import RoutingDirectory
 from .plan import RoutingPlan
 
@@ -36,14 +36,19 @@ class RoutingClient(LocalClient):
         self,
         rank: str,
         role: RankRole,
-        coordinator: RoutingCoordinator,
+        control_plane: ControlPlane,
         strategy: TorchStoreStrategy,
     ) -> None:
+        if not isinstance(control_plane, ControlPlane):
+            raise TypeError(
+                "control_plane must be a ControlPlane. Wrap a RoutingCoordinator actor "
+                f"as MonarchControlPlane(coordinator), got {control_plane!r}"
+            )
         directory = RoutingDirectory(rank)
         super().__init__(directory, strategy)
         self._routing_directory = directory
         self._role = role
-        self._coordinator = coordinator
+        self._control_plane = control_plane
         self._registered_layouts: set[str] = set()
 
     @torch.no_grad()
@@ -72,7 +77,7 @@ class RoutingClient(LocalClient):
         }
         rank = self._routing_directory.rank
         self._routing_directory.install(RoutingPlan.for_publisher(rank, registrations))
-        await self._coordinator.register_layout.call_one(
+        await self._control_plane.register_layout(
             rank=rank,
             key=key,
             registrations=registrations,
@@ -97,7 +102,7 @@ class RoutingClient(LocalClient):
                 "user_state_dict is required for the first routed get_state_dict"
             )
 
-        publishers = await self._coordinator.get_layouts.call_one(key=key)
+        publishers = await self._control_plane.get_layouts(key)
         slices, dtypes, _mapping = _state_dict_storage_metadata(state_dict, key)
         if not strict:
             published_keys = {
