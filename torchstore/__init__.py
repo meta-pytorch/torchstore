@@ -39,7 +39,7 @@ from torchstore.api import (
 )
 from torchstore.client import ClientType
 from torchstore.logging import init_logging
-from torchstore.routing._model import RankRole
+from torchstore.routing._model import KeyRegistration, RankRole, Registrations
 from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
 from torchstore.strategy import (
     ControllerStorageVolumes,
@@ -94,6 +94,8 @@ __all__ = [
     "RankRole",
     "ControlPlane",
     "ControlPlaneAddress",
+    "KeyRegistration",
+    "Registrations",
     "shutdown",
     "TorchStoreStrategy",
     "LocalRankStrategy",

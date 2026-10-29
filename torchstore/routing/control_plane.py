@@ -64,6 +64,7 @@ class ControlPlane(ABC):
     async def get_layouts(self, key: str) -> Registrations:
         """Every publisher layout for ``key``. Blocks until the set is complete.
 
+        The result is keyed by each publisher's rank as passed to ``register_layout``.
         Routed reads pass no timeout, so the plane's own deadline (300 s on TorchStore's
         planes) ends a wait, raising with ``missing publishers: [...]`` in the message.
         """
