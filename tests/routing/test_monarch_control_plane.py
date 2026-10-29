@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 from types import SimpleNamespace
@@ -16,10 +17,11 @@ from unittest.mock import AsyncMock, call
 import pytest
 import torchstore as ts
 import torchstore.routing.coordinator as coordinator_module
+from torchstore.routing.control_plane import ControlPlane
 from torchstore.routing.coordinator import MonarchControlPlane
 from torchstore.transport import TransportType
 
-from .test_coordinator import _registration
+from .test_coordinator import _plus_timeout, _registration
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -48,8 +50,12 @@ async def test_monarch_adapter_forwards_each_call_and_logs_it(caplog) -> None:
     strategy = ts.TorchStoreStrategy(TransportType.MonarchRPC)
     publishers, registrations = {"publisher"}, _registration()
     layouts = {"publisher": registrations}
+
+    async def slow_init(**_: Any) -> None:
+        await asyncio.sleep(0.05)
+
     endpoints = {
-        "init": AsyncMock(),
+        "init": AsyncMock(side_effect=slow_init),
         "strategy": AsyncMock(return_value=strategy),
         "register_layout": AsyncMock(),
         "get_layouts": AsyncMock(return_value=layouts),
@@ -82,6 +88,12 @@ async def test_monarch_adapter_forwards_each_call_and_logs_it(caplog) -> None:
     with pytest.raises(RuntimeError) as raised:
         await control_plane.register_layout("publisher", "model", registrations)
     assert raised.value is error
+    # An ActorError's line names the coordinator's own error, which it carries.
+    wrapped = RuntimeError("actor failed")
+    wrapped.exception = KeyError("'requester' is not a publisher rank")
+    endpoints["strategy"].side_effect = wrapped
+    with pytest.raises(RuntimeError):
+        await control_plane.strategy()
     entered = asyncio.Event()
 
     async def wait_forever(**_: Any) -> None:
@@ -95,12 +107,25 @@ async def test_monarch_adapter_forwards_each_call_and_logs_it(caplog) -> None:
     with pytest.raises(asyncio.CancelledError):
         await pending
 
-    assert [operation for operation, _ in _timing_lines(caplog)] == [
+    lines = _timing_lines(caplog)
+    # Each line reports its call's own duration, the slow init's included.
+    assert float(lines[0][1]) >= 0.05
+    assert [operation for operation, _ in lines] == [
         "init",
         "strategy",
         "register_layout key=model",
         "get_layouts key=model",
         "get_layouts key=model",
         "register_layout key=model failed with RuntimeError",
+        "strategy failed with KeyError",
         "get_layouts key=model cancelled",
     ]
+
+
+def test_monarch_adapter_keeps_the_interface_signatures() -> None:
+    """Match each interface call's signature, annotations included. Lookups add a timeout."""
+    for name in ControlPlane.__abstractmethods__:
+        interface = inspect.signature(getattr(ControlPlane, name))
+        if name == "get_layouts":
+            interface = _plus_timeout(interface)
+        assert inspect.signature(getattr(MonarchControlPlane, name)) == interface, name

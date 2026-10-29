@@ -324,7 +324,7 @@ configuration is needed — the selection happens at runtime:
 | Priority | Transport | When used |
 |----------|-----------|-----------|
 | 1 | **POSIX Shared Memory** | Client and storage volume are on the same host |
-| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
+| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available in a process that loaded `monarch.actor` |
 | 3 | **TorchComms RDMA** | Cross-host, `torchcomms` installed |
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
