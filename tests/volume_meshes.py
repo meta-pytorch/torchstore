@@ -4,9 +4,27 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""A Monarch-free stand-in for a storage volume mesh."""
+"""A Monarch-free stand-in for a storage volume mesh, and put and get through a volume."""
 
 from __future__ import annotations
+
+import torch
+from torchstore.strategy import StorageVolumeRef
+from torchstore.transport import create_transport_buffer
+from torchstore.transport.types import Request
+
+
+async def put_through(ref: StorageVolumeRef, key: str, value: torch.Tensor) -> None:
+    """Put ``value`` under ``key`` in the volume ``ref`` names, over its transport."""
+    buffer = create_transport_buffer(ref)
+    await buffer.put_to_storage_volume([Request.from_tensor(key, value)])
+
+
+async def get_through(ref: StorageVolumeRef, key: str) -> torch.Tensor:
+    """Get ``key`` from the volume ``ref`` names, over its transport."""
+    buffer = create_transport_buffer(ref)
+    [value] = await buffer.get_from_storage_volume([Request(key=key)])
+    return value
 
 
 class _GetId:

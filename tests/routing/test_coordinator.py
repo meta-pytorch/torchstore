@@ -17,7 +17,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
 from typing import Any, Protocol
-from unittest.mock import ANY, create_autospec
+from unittest.mock import ANY, call, create_autospec
 
 import pytest
 import pytest_asyncio
@@ -51,7 +51,7 @@ class TimedControlPlane(Protocol):
 
     ``timeout_s=None`` waits the plane's default and zero or less checks once. A lookup
     that times out raises ``timed out after <wait> seconds waiting for publisher layouts
-    for <key>; missing publishers: <sorted ranks>``, the wait 0 for zero or less.
+    for <key repr>; missing publishers: <sorted rank list repr>``, the wait 0 for zero or less.
     """
 
     async def init(
@@ -342,7 +342,8 @@ async def test_a_timeout_reports_the_wait_it_took(make_control_plane) -> None:
                 control_plane.get_layouts("model", timeout_s=timeout_s),
                 timeout=guard_s,
             )
-        assert loop.time() - started >= timeout_s / 2, "a positive timeout must wait"
+        # The plane's deadline starts after the call is sent, so the caller waits longer.
+        assert loop.time() - started >= timeout_s - 0.005, "it must wait its timeout"
 
 
 @pytest.mark.asyncio
@@ -353,9 +354,7 @@ async def test_a_timeout_ends_only_its_own_lookup(make_control_plane) -> None:
     )
     first, second = _registration("model/first"), _registration("model/second")
     patient = asyncio.ensure_future(patient_handle.get_layouts("model", timeout_s=30))
-    expiring = asyncio.ensure_future(
-        impatient_handle.get_layouts("model", timeout_s=1.5)
-    )
+    expiring = asyncio.ensure_future(impatient_handle.get_layouts("model", timeout_s=3))
     await _assert_still_pending(patient, expiring)
     # A check and a short wait of the still-empty key time out while both lookups wait.
     for timeout_s, guard_s in ((0, 1), (0.1, 5)):
@@ -372,7 +371,7 @@ async def test_a_timeout_ends_only_its_own_lookup(make_control_plane) -> None:
     )
 
     message = (
-        "timed out after 1.5 seconds waiting for publisher layouts for 'model'; "
+        "timed out after 3 seconds waiting for publisher layouts for 'model'; "
         "missing publishers: ['publisher/1']"
     )
     with pytest.raises(Exception, match=re.escape(message)):
@@ -608,9 +607,10 @@ async def test_layout_lookup_requires_initialization(make_control_plane) -> None
 
 @pytest.mark.asyncio
 async def test_each_call_takes_the_interface_parameters(make_control_plane) -> None:
-    """Take each interface call's parameters, which callers pass by keyword.
+    """Take each interface call's parameter names, kinds and defaults.
 
-    The lookup adds only a keyword-only timeout.
+    TorchStore passes ``init`` and ``register_layout`` arguments by keyword. The lookup
+    adds only a keyword-only timeout.
     """
     control_plane = await make_control_plane()
     for name in sorted(ControlPlane.__abstractmethods__):
@@ -737,8 +737,35 @@ async def test_coordinator_delegates_each_endpoint_to_its_registry(
             )
         # The registry's own error crosses as a copy, not wrapped in another.
         assert repr(raised.value.exception) == repr(error)
-    # The coordinator built its one registry when it started.
-    registry_class.assert_called_once_with()
+    # One registry when the coordinator started, then a new one for each init.
+    assert registry_class.call_args_list == [call(), call(), call()]
+
+
+@pytest.mark.asyncio
+async def test_a_second_init_starts_the_coordinator_over() -> None:
+    """Drop the old layouts and strategy, as initializing a store again does.
+
+    A refused init keeps the store it would have replaced.
+    """
+    coordinator = await _coordinator(
+        {"publisher/0"}, ts.TorchStoreStrategy(TransportType.MonarchRPC)
+    )
+    await coordinator.register_layout.call_one("publisher/0", "model", _registration())
+    await coordinator.init.call_one(
+        {"publisher/1"}, ts.TorchStoreStrategy(TransportType.Gloo)
+    )
+    with pytest.raises(ActorError, match="at least one publisher rank"):
+        await coordinator.init.call_one(
+            [], ts.TorchStoreStrategy(TransportType.MonarchRPC)
+        )
+    strategy = await asyncio.wait_for(coordinator.strategy.call_one(), timeout=5)
+    assert strategy.default_transport_type == TransportType.Gloo
+    with pytest.raises(
+        ActorError, match=re.escape("missing publishers: ['publisher/1']")
+    ):
+        await asyncio.wait_for(
+            coordinator.get_layouts.call_one("model", timeout_s=0), timeout=5
+        )
 
 
 @pytest.mark.asyncio
@@ -757,3 +784,42 @@ async def test_monarch_adapter_passes_actor_errors_through() -> None:
             await asyncio.wait_for(
                 control_plane.get_layouts("model", timeout_s=0), timeout=1
             )
+
+
+@pytest.mark.asyncio
+async def test_file_store_trusts_only_its_own_finished_directory(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refuse an existing directory, one without ``ready`` and one others may write.
+
+    A value whose link fails never lands, so no partial value wins.
+    """
+    path = str(tmp_path / "earlier_run")
+    os.mkdir(path, 0o700)
+    plane = FileStoreControlPlane(path)
+    with pytest.raises(RuntimeError, match="init has not run"):
+        await plane.strategy()
+    with pytest.raises(FileExistsError):
+        await plane.init({"publisher/0"}, ts.TorchStoreStrategy())
+    with open(os.path.join(path, "ready"), "wb"):
+        pass
+    # An unreadable directory raises its own error, not "init has not run".
+    os.chmod(path, 0)
+    try:
+        with pytest.raises(PermissionError, match="Permission denied"):
+            await plane.strategy()
+    finally:
+        os.chmod(path, 0o777)
+    with pytest.raises(PermissionError, match="open to other users"):
+        await plane.strategy()
+
+    failing = str(tmp_path / "failing")
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            os, "link", create_autospec(os.link, side_effect=OSError("full"))
+        )
+        with pytest.raises(OSError, match="full"):
+            await FileStoreControlPlane(failing).init(
+                {"publisher/0"}, ts.TorchStoreStrategy()
+            )
+    assert os.listdir(failing) == []

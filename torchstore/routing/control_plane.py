@@ -29,7 +29,7 @@ class ControlPlane(ABC):
     or event loop, so hold no loop-bound state.
     """
 
-    # Names the plane in TorchStore's log lines. None means its class name.
+    # Names the plane in TorchStore's log lines, without whitespace. None means its class.
     kind: ClassVar[str | None] = None
 
     @abstractmethod
@@ -40,9 +40,9 @@ class ControlPlane(ABC):
     ) -> None:
         """Fix the publisher set and the volume-resolution strategy.
 
-        Call at most once per routing store, on one instance. Until that call has run,
-        the other methods raise on every instance of the store, with ``init has not run``
-        in the message.
+        ``ts.initialize`` calls it on the driver's instance on every run. A second call
+        starts the store over, as Monarch's coordinator does, or raises. Until it has run,
+        the other methods raise on every instance of the store, with ``init has not run``.
         """
         raise NotImplementedError
 
@@ -78,7 +78,8 @@ class ControlPlane(ABC):
     async def close(self) -> None:
         """Release what the plane holds, by default nothing.
 
-        TorchStore calls it only on a plane that a ``ControlPlaneAddress`` connected.
+        TorchStore calls it only on a plane that a ``ControlPlaneAddress`` connected, maybe
+        while clients from other threads or loops still call it. Fail those calls, not hang.
         """
 
 

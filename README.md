@@ -152,6 +152,22 @@ if __name__ == "__main__":
 
 ```
 
+### Importing TorchStore and Monarch
+
+`import torchstore` loads no Monarch module. Monarch loads on the first TorchStore call
+that needs it, such as `ts.initialize` or `ts.client`, and reads its `HYPERACTOR_*`
+settings then, so ones you set after importing TorchStore apply to this process too.
+
+If `HYPERACTOR_CODEC_MAX_FRAME_LENGTH` is unset, importing TorchStore exports
+`910737418240` for it. A process that loads Monarch afterwards uses that limit, which
+also outranks `monarch.config.configure(codec_max_frame_length=...)`, while one that
+imported Monarch first keeps Monarch's own limit. Set the variable before importing
+TorchStore to choose the limit yourself.
+
+Monarch registers its runtime's shutdown at exit when it loads, and exit hooks run in
+reverse order of registration. So register an exit hook that calls TorchStore after the
+first TorchStore call, or import `monarch.actor` before registering it.
+
 ### SPMD Usage (torchrun / torchx)
 
 If your job is launched with `torchrun` or `torchx` rather than from inside a
@@ -324,7 +340,7 @@ configuration is needed — the selection happens at runtime:
 | Priority | Transport | When used |
 |----------|-----------|-----------|
 | 1 | **POSIX Shared Memory** | Client and storage volume are on the same host |
-| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
+| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available in a process that loaded `monarch.actor` |
 | 3 | **TorchComms RDMA** | Cross-host, `torchcomms` installed |
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
