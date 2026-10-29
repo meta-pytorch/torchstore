@@ -92,9 +92,11 @@ class DirectWeightSyncSource:
     """
 
     def __init__(self) -> None:
-        self._handles: dict[str, RDMAWeightHandle] = {}
-        # name → (staging_buffer, source_local_tensor)
-        self._staging: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Track registrations by identity: separate batches can reuse names.
+        self._handles: dict[int, RDMAWeightHandle] = {}
+        # registration identity → (staging_buffer, source_local_tensor)
+        self._staging: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._cleanup_lock = asyncio.Lock()
 
     def register(
         self,
@@ -115,6 +117,9 @@ class DirectWeightSyncSource:
 
         Returns a dict of serializable :class:`RDMAWeightHandle` objects
         that can be stored in TorchStore or sent to the destination actor.
+
+        If registration fails, previously created buffers remain owned by this
+        source. Call :meth:`cleanup` to release them before discarding it.
         """
         from monarch.rdma import RDMABuffer
 
@@ -131,7 +136,6 @@ class DirectWeightSyncSource:
                 # Always stage: cast to transfer dtype for RDMA transfer.
                 # refresh() will re-copy from the original source tensor.
                 buf_tensor = local_tensor.to(transfer_dtype).contiguous()
-                self._staging[name] = (buf_tensor, local_tensor)
                 num_staged += 1
             else:
                 assert (
@@ -145,13 +149,16 @@ class DirectWeightSyncSource:
                 else RDMABuffer(to_byte_view(buf_tensor))
             )
 
-            handles[name] = RDMAWeightHandle(
+            handle = RDMAWeightHandle(
                 rdma_buffer=rdma_buf,
                 tensor_slice=tensor_slice,
                 source_rank=rank,
             )
+            self._handles[id(handle)] = handle
+            if transfer_dtype is not None:
+                self._staging[id(handle)] = (buf_tensor, local_tensor)
+            handles[name] = handle
 
-        self._handles = handles
         logger.info(
             f"Registered {len(handles)} RDMA handles "
             f"({num_staged} staged, {len(handles) - num_staged} direct)"
@@ -172,12 +179,25 @@ class DirectWeightSyncSource:
         return len(self._staging)
 
     async def cleanup(self) -> None:
-        """Release all RDMA registrations."""
-        for handle in self._handles.values():
-            if handle.rdma_buffer is not None:
-                await handle.rdma_buffer.drop()
-        self._handles.clear()
-        self._staging.clear()
+        """Release registrations, retaining failed ones for a cleanup retry."""
+        async with self._cleanup_lock:
+            errors = []
+            for handle_id, handle in list(self._handles.items()):
+                if handle.rdma_buffer is not None:
+                    try:
+                        await handle.rdma_buffer.drop()
+                    except Exception as error:
+                        errors.append(error)
+                        continue
+                del self._handles[handle_id]
+                self._staging.pop(handle_id, None)
+
+            if errors:
+                raise RuntimeError(
+                    f"Failed to release {len(errors)} RDMA buffer(s); retry cleanup()."
+                ) from errors[0]
+            if not self._handles:
+                self._staging.clear()
 
 
 # ---------------------------------------------------------------------------
