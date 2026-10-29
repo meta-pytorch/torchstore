@@ -68,15 +68,26 @@ def _state_dict_storage_metadata(
             ) from error
         assert request.tensor_val is not None
         slices[storage_key] = _request_to_slice(request, request.tensor_val)
-        dtype = request.tensor_val.dtype
-        if (
-            transfer_dtype is not None
-            and flat_key not in preserve_dtype_keys
-            and request.tensor_val.is_floating_point()
-        ):
-            dtype = transfer_dtype
-        dtypes[storage_key] = dtype
+        dtypes[storage_key] = _wire_dtype(
+            flat_key, request.tensor_val, transfer_dtype, preserve_dtype_keys
+        )
     return slices, dtypes, mapping
+
+
+def _wire_dtype(
+    flat_key: str,
+    tensor: torch.Tensor,
+    transfer_dtype: torch.dtype | None,
+    preserve_dtype_keys: frozenset[str],
+) -> torch.dtype:
+    """Return the dtype a state-dict tensor is stored and transferred in."""
+    if (
+        transfer_dtype is not None
+        and flat_key not in preserve_dtype_keys
+        and tensor.is_floating_point()
+    ):
+        return transfer_dtype
+    return tensor.dtype
 
 
 @dataclass
@@ -101,7 +112,13 @@ def _get_rdma_cache(store) -> _DirectRDMACache:
 
 
 async def put_state_dict(
-    store, state_dict, key, direct_rdma=False, transfer_dtype=None
+    store,
+    state_dict,
+    key,
+    direct_rdma=False,
+    transfer_dtype=None,
+    *,
+    preserve_dtype_keys: frozenset[str] = frozenset(),
 ):
     """Store a state dict in TorchStore.
 
@@ -121,6 +138,11 @@ async def put_state_dict(
         transfer_dtype: If set, cast floating-point weights to this dtype for
             transfer. Allows the source to keep higher-precision master weights
             while transferring in a lower precision (e.g. bfloat16).
+        preserve_dtype_keys: Flattened state-dict keys that keep their own
+            dtype when ``transfer_dtype`` is set (e.g. buffers). Ignored
+            unless ``transfer_dtype`` is set; then raises ``ValueError`` if a
+            key is missing, and ``NotImplementedError`` with
+            ``direct_rdma=True``.
     """
     # Coarse weight-sync phase timing, logged at INFO (no TORCHSTORE_LOG_LEVEL
     # =DEBUG / init_logging() needed) so callers can attribute latency to the
@@ -131,6 +153,10 @@ async def put_state_dict(
     )
 
     if direct_rdma:
+        if transfer_dtype is not None and preserve_dtype_keys:
+            raise NotImplementedError(
+                "preserve_dtype_keys is not supported with direct_rdma=True"
+            )
         await _put_state_dict_direct_rdma(store, state_dict, key, transfer_dtype)
         # No throughput here: the direct-RDMA put only registers handles (and on
         # repeat calls refreshes staging buffers). The bytes move on the
@@ -139,30 +165,40 @@ async def put_state_dict(
         tracker.track_e2e()
         return
 
+    flattened_state_dict, mapping = flatten_state_dict(state_dict)
+    tracker.track_step("flatten")
+    unknown_keys = preserve_dtype_keys - flattened_state_dict.keys()
+    if transfer_dtype is not None and unknown_keys:
+        raise ValueError(
+            f"preserve_dtype_keys not in the state dict: {sorted(unknown_keys)}"
+        )
+
     await store.register_layout(
         state_dict,
         key,
         transfer_dtype=transfer_dtype,
+        preserve_dtype_keys=preserve_dtype_keys,
     )
-
-    flattened_state_dict, mapping = flatten_state_dict(state_dict)
-    tracker.track_step("flatten")
-    # TODO: when transfer_dtype actually casts (source dtype != transfer_dtype),
-    # this allocates a full auxiliary copy of the floating weights. Fold the cast
-    # into the per-tensor staging copy (allocate the staging buffer at
-    # transfer_dtype and copy_ into it) so peak extra memory is one tensor, not
-    # the whole state dict.
-    flattened_state_dict = _cast_floating_tensors(flattened_state_dict, transfer_dtype)
-    tracker.track_step("cast")
-    nbytes = _flattened_nbytes(flattened_state_dict)
+    tracker.track_step("register_layout")
 
     # Batch all tensor entries, then put the mapping separately.
     # The mapping is stored last so it acts as a commit marker for the state dict.
-    entries = {
-        _state_dict_storage_key(key, flat_key): value
-        for flat_key, value in flattened_state_dict.items()
-    }
-    await store.put_batch(entries)
+    entries = {}
+    transfer_dtypes = {}
+    nbytes = 0
+    for flat_key, value in flattened_state_dict.items():
+        storage_key = _state_dict_storage_key(key, flat_key)
+        entries[storage_key] = value
+        if not isinstance(value, torch.Tensor):
+            continue
+        dtype = _wire_dtype(flat_key, value, transfer_dtype, preserve_dtype_keys)
+        if dtype != value.dtype:
+            transfer_dtypes[storage_key] = dtype
+        nbytes += value.numel() * dtype.itemsize
+    if transfer_dtypes:
+        await store.put_batch(entries, transfer_dtypes=transfer_dtypes)
+    else:
+        await store.put_batch(entries)
     tracker.track_step("put_batch", nbytes=nbytes)
     await store.put(_state_dict_mapping_key(key), mapping)
     tracker.track_step("put_mapping")
@@ -242,23 +278,6 @@ async def get_state_dict(
     tracker.track_step("unflatten")
     tracker.track_e2e(nbytes=nbytes)
     return out
-
-
-def _cast_floating_tensors(flattened_state_dict, dtype):
-    if dtype is None:
-        return flattened_state_dict
-    return {
-        key: (
-            value.to(dtype)
-            if (
-                isinstance(value, torch.Tensor)
-                and value.is_floating_point()
-                and value.dtype != dtype
-            )
-            else value
-        )
-        for key, value in flattened_state_dict.items()
-    }
 
 
 def _flattened_nbytes(flattened_state_dict) -> int:

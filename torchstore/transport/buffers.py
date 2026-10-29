@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import Any, TYPE_CHECKING, TypeVar
@@ -164,6 +165,11 @@ class TransportBuffer:
     supports_batch_gets : bool
         If True, `get_from_storage_volume` passes all requests to `_get_requests`
         in a single call. If False (default), requests are dispatched one at a time.
+    casts_on_put : bool
+        If True, the transport applies `Request.transfer_dtype` while copying put
+        data. If False (default), `_put_requests` casts each dispatched batch
+        before the transport sees it, so batched transports hold a cast copy of
+        the whole batch.
 
     Parameters
     ----------
@@ -177,6 +183,8 @@ class TransportBuffer:
     # Transitionary period. These should eventually be TRUE for all transports.
     supports_batch_puts: bool = False
     supports_batch_gets: bool = False
+
+    casts_on_put: bool = False
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
@@ -203,6 +211,8 @@ class TransportBuffer:
 
     async def _put_requests(self, requests: list[Request]) -> None:
         l = LatencyTracker("put")
+        if not self.casts_on_put:
+            requests = _apply_transfer_dtypes(requests)
         meta_requests = [r.meta_only() for r in requests]
         try:
             if self.requires_handshake(requests):
@@ -359,3 +369,23 @@ class TransportBuffer:
         assert tensor.dtype == dtype, f"{tensor.dtype} != {dtype}"
         assert tensor.shape == shape, f"{tensor.shape} != {shape}"
         assert not must_be_contiguous or tensor.is_contiguous()
+
+
+def _apply_transfer_dtypes(requests: list[Request]) -> list[Request]:
+    """Return requests whose tensor_val is already in its transfer dtype."""
+    cast_requests = []
+    cuda_devices = set()
+    for request in requests:
+        if request.transfer_dtype is None or request.tensor_val is None:
+            cast_requests.append(request)
+            continue
+        tensor = request.tensor_val.to(request.transfer_dtype)
+        if tensor.is_cuda:
+            cuda_devices.add(tensor.device)
+        cast_requests.append(
+            dataclasses.replace(request, tensor_val=tensor, transfer_dtype=None)
+        )
+    # Transports may read the cast tensors outside CUDA stream order (e.g. RDMA).
+    for device in cuda_devices:
+        torch.cuda.current_stream(device).synchronize()
+    return cast_requests
