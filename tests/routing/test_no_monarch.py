@@ -4,9 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""What ``import torchstore`` loads with Monarch absent, blocked, stubbed or installed.
+"""What ``import torchstore`` loads with Monarch blocked or installed.
 
-Other cases run the code paths that import Monarch or cloudpickle only on first use.
+CI's Monarch-free job also runs this file without torchmonarch. Other cases run the code
+paths that import Monarch or cloudpickle only on first use.
 """
 
 from __future__ import annotations
@@ -49,7 +50,13 @@ _FRAME_WARNING = [
 ]
 # Monarch's actor log filter prefixes a message once for each handler it passes.
 _ACTOR_PREFIXES = re.compile(r"^(\[actor=[^\]]*\] )+")
-_IMPORT_TARGETS = ["torchstore"]
+_IMPORT_TARGETS = [
+    "torchstore",
+    "torchstore.transport.monarch_rdma",
+    "torchstore.direct_weight_sync",
+]
+# A launcher's own frame length, which importing TorchStore keeps.
+_PRESET_FRAME_LENGTH = "1234567890"
 
 # Later Monarch-free modules join this list.
 _MONARCH_FREE = [
@@ -169,13 +176,18 @@ _INSTALLED_CHILD = (
     + """
 import importlib, json, os, sys
 
-root, out, target = sys.argv[1:]
+root, out, targets = sys.argv[1:]
 sys.path.insert(0, root)
-importlib.import_module(target)
+for target in targets.split(","):
+    importlib.import_module(target)
 report = {
     "modules": sorted(name for name in sys.modules if name.split(".")[0] == "monarch"),
     "env": os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH"),
     "frame_warnings": list(frame_warnings),
+    "stdout_handler": any(
+        getattr(handler, "stream", None) is sys.stdout
+        for handler in logging.getLogger().handlers
+    ),
 }
 from monarch.config import get_global_config
 
@@ -250,7 +262,9 @@ def _run_child(
             check=False,
         )
     except subprocess.TimeoutExpired as error:
-        pytest.fail(f"child timed out:\n{error.stdout}{error.stderr}")
+        # Its partial output arrives as bytes, or None, even with text=True.
+        output = b"".join(stream or b"" for stream in (error.stdout, error.stderr))
+        pytest.fail(f"child timed out:\n{output.decode(errors='replace')}")
     assert child.returncode == 0, child.stdout + child.stderr
     return json.loads(out.read_text())
 
@@ -282,11 +296,17 @@ def blocked(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
 
 @pytest.fixture(scope="module")
 def installed(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
+    """One child per import order, keyed by its comma-joined modules, and one preset."""
     root = tmp_path_factory.mktemp("installed")
-    return {
+    reports = {
         target: _run_child(_INSTALLED_CHILD, root / f"{target}.json", target)
-        for target in (*_IMPORT_TARGETS, "monarch")
+        for target in (*_IMPORT_TARGETS, "monarch", "monarch,torchstore")
     }
+    preset = {"HYPERACTOR_CODEC_MAX_FRAME_LENGTH": _PRESET_FRAME_LENGTH}
+    reports["preset"] = _run_child(
+        _INSTALLED_CHILD, root / "preset.json", "torchstore", extra_env=preset
+    )
+    return reports
 
 
 @pytest.mark.parametrize("module", _MONARCH_FREE)
@@ -309,6 +329,13 @@ def test_public_names_resolve_with_monarch_blocked(blocked) -> None:
     assert blocked["unknown"] == (
         "AttributeError: module 'torchstore' has no attribute 'no_such_name'"
     )
+
+
+def test_package_logger_stays_public() -> None:
+    """Keep ``torchstore.logger``, the package's own logger."""
+    import torchstore as ts
+
+    assert ts.logger is logging.getLogger("torchstore")
 
 
 def test_frame_length_default_is_exported_with_monarch_blocked(blocked) -> None:
@@ -354,6 +381,31 @@ def test_rdma_wrappers_forward_to_the_loaded_api(monkeypatch) -> None:
         monarch_rdma, "_rdma_api", lambda: api._replace(available=lambda: False)
     )
     assert monarch_rdma.monarch_rdma_available() is False
+
+
+def test_unset_transport_takes_monarch_rdma_only_when_its_probe_says_so(
+    monkeypatch,
+) -> None:
+    """Resolve an unset transport to Monarch RDMA once Monarch reports RDMA usable."""
+    import types
+
+    from torchstore import transport
+    from torchstore.transport import monarch_rdma, TransportType
+
+    actor_api = sys.modules.get("monarch.actor", types.ModuleType("monarch.actor"))
+    monkeypatch.setitem(sys.modules, "monarch.actor", actor_api)
+    monkeypatch.setenv("TORCHSTORE_RDMA_ENABLED", "1")
+    monkeypatch.setattr(transport, "SHM_ENABLED", False)
+    for name in ("nixl", "torchcomms_uniflow", "torchcomms_rdma"):
+        monkeypatch.setattr(transport, f"{name}_available", lambda: False)
+    monkeypatch.setattr(transport, "gloo_available", lambda: True)
+    for available, expected in (
+        (True, TransportType.MonarchRDMA),
+        (False, TransportType.Gloo),
+    ):
+        api = monarch_rdma._RdmaApi(None, None, lambda available=available: available)
+        monkeypatch.setattr(monarch_rdma, "_rdma_api", lambda api=api: api)
+        assert transport.get_available_transport(object()) is expected
 
 
 def test_shared_types_resolve_their_type_hints() -> None:
@@ -425,6 +477,26 @@ def test_monarch_loaded_after_torchstore_reads_the_exported_frame_length(
     assert control["frame_length"] != _FRAME_LENGTH_DEFAULT
     assert installed[target]["env"] == str(_FRAME_LENGTH_DEFAULT)
     assert installed[target]["frame_length"] == _FRAME_LENGTH_DEFAULT
+    assert installed[target]["stdout_handler"] is True
+
+
+@_monarch_installed
+def test_monarch_loaded_before_torchstore_keeps_its_own_frame_length(installed) -> None:
+    """Export the default for later processes while a Monarch loaded first keeps its own."""
+    first = installed["monarch,torchstore"]
+    assert first["env"] == str(_FRAME_LENGTH_DEFAULT)
+    assert first["frame_length"] == installed["monarch"]["frame_length"]
+    assert first["frame_length"] != _FRAME_LENGTH_DEFAULT
+
+
+@_monarch_installed
+def test_a_preset_frame_length_is_kept_without_logging_setup(installed) -> None:
+    """Keep a frame length set before the import, and leave logging and warnings alone."""
+    preset = installed["preset"]
+    assert preset["env"] == _PRESET_FRAME_LENGTH
+    assert preset["frame_length"] == int(_PRESET_FRAME_LENGTH)
+    assert preset["frame_warnings"] == []
+    assert preset["stdout_handler"] is False
 
 
 @_monarch_installed
@@ -446,12 +518,16 @@ def test_frame_length_warning_logs_once_on_the_first_monarch_path(
 
 @_monarch_installed
 @pytest.mark.parametrize(
-    "path", ["current_rank", "get_or_spawn_controller", "initialize_routing"]
+    "path",
+    ["current_rank", "get_or_spawn_controller", "initialize", "initialize_routing"],
 )
 def test_each_monarch_path_logs_the_frame_length_warning_once(
     monkeypatch, caplog, path: str
 ) -> None:
-    """Log the warning from each of the API's Monarch paths, and only on its first run."""
+    """Log the warning from each of the API's Monarch paths, and only on its first run.
+
+    A standard initialize logs it before its first spawn, which fails here.
+    """
     import torchstore as ts
     import torchstore.api as store_api
     from torchstore.routing.control_plane import ControlPlane
@@ -464,11 +540,22 @@ def test_each_monarch_path_logs_the_frame_length_warning_once(
     monkeypatch.setattr("monarch.actor.get_or_spawn_controller", MagicMock())
     monkeypatch.setattr(StorageVolume, "spawn", AsyncMock())
     caplog.set_level(logging.WARNING, logger="torchstore")
+
+    def initialize() -> None:
+        monkeypatch.setattr(
+            StorageVolume, "spawn", AsyncMock(side_effect=RuntimeError("spawn failed"))
+        )
+        with pytest.raises(RuntimeError, match="spawn failed"):
+            asyncio.run(
+                ts.initialize(num_storage_volumes=2, strategy=ts.HostStrategy())
+            )
+
     run = {
         "current_rank": store_api.current_rank,
         "get_or_spawn_controller": lambda: store_api.get_or_spawn_controller(
             "probe", StorageVolume
         ),
+        "initialize": initialize,
         # Under its own control plane, a store's initialize makes no Monarch lookup.
         "initialize_routing": lambda: asyncio.run(
             ts.initialize(

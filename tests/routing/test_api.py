@@ -161,8 +161,9 @@ def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
     ] == ["init"]
 
 
-def test_client_constructs_and_caches_a_routing_client(monkeypatch) -> None:
+def test_client_constructs_and_caches_a_routing_client(monkeypatch, caplog) -> None:
     """Create one rank-local routing client and reuse it for later API calls."""
+    caplog.set_level(logging.INFO, logger="torchstore.routing.coordinator")
     # 1. Supply a local coordinator handle and a known calling rank.
     strategy = object()
     coordinator = SimpleNamespace(
@@ -193,6 +194,12 @@ def test_client_constructs_and_caches_a_routing_client(monkeypatch) -> None:
     assert second is first
     spawn_coordinator.assert_awaited_once_with("routing-test", RoutingCoordinator)
     coordinator.strategy.call_one.assert_awaited_once_with()
+    # The strategy came through the adapter, which logs each call it forwards.
+    assert [
+        record.getMessage().split(" took ")[0]
+        for record in caplog.records
+        if record.name == "torchstore.routing.coordinator"
+    ] == ["routing control_plane=monarch strategy"]
 
 
 @dataclass(frozen=True)
@@ -779,6 +786,12 @@ def test_a_selection_that_replaces_a_dialed_connection_closes_it(monkeypatch) ->
             await dial(first)
             instance.close.assert_not_called()
             assert [connection.close.await_count for connection in dialed] == [1, 1, 0]
+            # Choosing the dialed connection itself as an instance keeps it open.
+            ts.reset_client(store_name)
+            await ts.client(
+                store_name, role=RankRole.PUBLISHER, control_plane=dialed[2]
+            )
+            assert [connection.close.await_count for connection in dialed] == [1, 1, 0]
 
     asyncio.run(run())
 
@@ -993,9 +1006,12 @@ def test_shutdown_releases_state_when_close_fails(monkeypatch) -> None:
 
 
 @pytest.mark.timeout(60)
-@pytest.mark.parametrize("selection", ["initialized", "dialed", "spmd"])
+@pytest.mark.parametrize("selection", ["initialized", "dialed", "spmd", "standard"])
 def test_a_released_store_spawns_no_monarch_controller(monkeypatch, selection) -> None:
-    """After a shutdown releases a store, spawn nothing for its name until re-selected."""
+    """After a shutdown releases a store, role-less calls and shutdown spawn nothing.
+
+    A selection, or a standard or Monarch initialize, takes the name back.
+    """
     actors = _patch_actors(monkeypatch)
     store_name = _store_name()
 
@@ -1020,6 +1036,15 @@ def test_a_released_store_spawns_no_monarch_controller(monkeypatch, selection) -
                 assert client._controller is session.controller
                 await ts.shutdown(store_name)
                 session.shutdown.assert_awaited_once_with()
+                return
+            if selection == "standard":
+                controller = _mock_controller()
+                actors.lookup.side_effect = None
+                actors.lookup.return_value = controller
+                await ts.initialize(store_name=store_name)
+                assert (await ts.client(store_name))._controller is controller
+                await ts.shutdown(store_name)
+                controller.teardown.call.assert_awaited_once_with()
                 return
             await ts.shutdown(store_name)
             with pytest.raises(ValueError, match="needs role on its first ts.client"):
@@ -1105,13 +1130,17 @@ def test_an_address_connects_once_until_shutdown(monkeypatch) -> None:
 
 
 @pytest.mark.timeout(60)
-@pytest.mark.parametrize("call", ["client", "slow_client", "cancelled", "shutdown"])
+@pytest.mark.parametrize(
+    "call", ["client", "slow_client", "cancelled", "shutdown", "cancelled_shutdown"]
+)
 def test_a_failing_dialed_close_is_only_logged(monkeypatch, caplog, call) -> None:
     """Log a failing close of a dialed connection, never in place of the call's own outcome.
 
     A failed client keeps the record it found and waits 5 s for its close, logging one that
-    outlasts the wait, a cancelled one never waits, and a shutdown stops waiting at 5 s.
+    outlasts the wait, a cancelled one never waits, and a shutdown stops waiting at 5 s or
+    when cancelled, leaving the close to run on.
     """
+    caplog.set_level(logging.WARNING, logger=store_api.logger.name)
     _patch_actors(monkeypatch)
     waits = _RecordedWaits()
     monkeypatch.setattr(store_api, "asyncio", waits)
@@ -1170,8 +1199,12 @@ def test_a_failing_dialed_close_is_only_logged(monkeypatch, caplog, call) -> Non
                     await ts.client(
                         store_name, role=RankRole.PUBLISHER, address=address
                     )
-                with pytest.raises(TimeoutError, match="took over"):
-                    await ts.shutdown(store_name)
+                if call == "shutdown":
+                    with pytest.raises(TimeoutError, match="took over"):
+                        await ts.shutdown(store_name)
+                else:
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(ts.shutdown(store_name), timeout=0.1)
                 assert store_api._control_plane_map == store_api._local_clent_map == {}
                 # The close runs on and fails once the shutdown stopped waiting.
                 [closing] = store_api._closing
@@ -1199,6 +1232,124 @@ def test_a_failing_dialed_close_is_only_logged(monkeypatch, caplog, call) -> Non
 
 
 @pytest.mark.timeout(60)
+def test_a_dialed_close_that_ends_cancelled_counts_as_failed(
+    monkeypatch, caplog
+) -> None:
+    """Raise or log a close that cancels itself as a failure, never as the caller's cancel."""
+    caplog.set_level(logging.WARNING, logger=store_api.logger.name)
+    _patch_actors(monkeypatch)
+    store_name = _store_name()
+
+    async def run() -> None:
+        async with _hosted_registry() as host:
+            await (await _HOSTS[host]()).init({"publisher/0"}, _strategy())
+            address = _RegistryAddress(store_name, host)
+            dialed = await _HOSTS[host]()
+
+            async def close() -> None:
+                raise asyncio.CancelledError
+
+            dialed.close = close
+            connect = patch.object(
+                _RegistryAddress, "connect", AsyncMock(return_value=dialed)
+            )
+            with connect:
+                await ts.client(store_name, role=RankRole.PUBLISHER, address=address)
+            with pytest.raises(RuntimeError, match="was cancelled"):
+                await ts.shutdown(store_name)
+            dialed.strategy = AsyncMock(side_effect=ValueError("strategy failed"))
+            with connect, pytest.raises(ValueError, match="strategy failed"):
+                await ts.client(store_name, role=RankRole.PUBLISHER, address=address)
+
+    asyncio.run(run())
+    [failed] = [
+        r
+        for r in caplog.records
+        if r.name == store_api.logger.name and r.levelno == logging.WARNING
+    ]
+    assert failed.getMessage().endswith("failed")
+    assert isinstance(failed.exc_info[1], RuntimeError)
+
+
+@pytest.mark.timeout(60)
+def test_a_failed_connect_records_nothing(monkeypatch) -> None:
+    """Raise a failed connect's error, record and cache nothing and look up no Monarch actor."""
+    actors = _patch_actors(monkeypatch)
+    store_name = _store_name()
+    refused = patch.object(
+        _RegistryAddress,
+        "connect",
+        AsyncMock(side_effect=ConnectionRefusedError("refused")),
+    )
+
+    async def run() -> None:
+        with refused, pytest.raises(ConnectionRefusedError, match="refused"):
+            await ts.client(
+                store_name,
+                role=RankRole.PUBLISHER,
+                address=_RegistryAddress(store_name, "down"),
+            )
+
+    asyncio.run(run())
+    assert store_api._control_plane_map == store_api._local_clent_map == {}
+    actors.lookup.assert_not_called()
+
+
+@pytest.mark.timeout(60)
+def test_initialize_closes_a_dialed_record_and_drops_the_client(monkeypatch) -> None:
+    """Close the connection this process dialed for the store and drop its cached client."""
+    _patch_actors(monkeypatch)
+    store_name = _store_name()
+
+    async def run() -> None:
+        async with _hosted_registry() as host, _hosted_registry() as other:
+            await (await _HOSTS[host]()).init({"publisher/0"}, _strategy())
+            dialed = await _HOSTS[host]()
+            dialed.close = AsyncMock()
+            address = _RegistryAddress(store_name, host)
+            with patch.object(
+                _RegistryAddress, "connect", AsyncMock(return_value=dialed)
+            ):
+                old = await ts.client(
+                    store_name, role=RankRole.PUBLISHER, address=address
+                )
+            instance = await _HOSTS[other]()
+            await _initialize(store_name, instance)
+            dialed.close.assert_awaited_once_with()
+            new = await ts.client(
+                store_name, role=RankRole.PUBLISHER, control_plane=instance
+            )
+            assert new is not old and new._control_plane is instance
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(60)
+def test_addresses_compare_by_every_attribute(monkeypatch) -> None:
+    """Tell apart addresses of a subclass that sets attributes outside its fields."""
+    _patch_actors(monkeypatch)
+    store_name = _store_name()
+
+    class _RegionAddress(_RegistryAddress):
+        def __init__(self, store_name: str, host: str, region: str) -> None:
+            super().__init__(store_name, host)
+            object.__setattr__(self, "region", region)
+
+    async def run() -> None:
+        async with _hosted_registry() as host:
+            await (await _HOSTS[host]()).init({"publisher/0"}, _strategy())
+            east = _RegionAddress(store_name, host, "east")
+            west = _RegionAddress(store_name, host, "west")
+            # The inherited dataclass equality reads only the dataclass fields.
+            assert east == west
+            await ts.client(store_name, role=RankRole.PUBLISHER, address=east)
+            with pytest.raises(ValueError, match="did not connect through"):
+                await ts.client(store_name, role=RankRole.PUBLISHER, address=west)
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("step", ["plane-init", "volumes"])
 def test_a_failed_initialize_records_nothing(monkeypatch, caplog, step) -> None:
     """Record a caller's control plane only once its initialize succeeds."""
@@ -1223,11 +1374,15 @@ def test_a_failed_initialize_records_nothing(monkeypatch, caplog, step) -> None:
 
 
 @pytest.mark.timeout(60)
-def test_racing_first_clients_on_one_address_share_one_connection(monkeypatch) -> None:
+def test_racing_first_clients_on_one_address_share_one_connection(
+    monkeypatch, caplog
+) -> None:
     """Keep the client and connection recorded first, and close the racing call's own dial.
 
-    Each call gets its own equal copy of the address, as each actor call does.
+    Each call gets its own equal copy of the address, as each actor call does. Only the
+    call that builds the client logs a selection line.
     """
+    caplog.set_level(logging.INFO)
     actors = _patch_actors(monkeypatch)
     store_name = _store_name()
     dialed: list[ControlPlane] = []
@@ -1275,6 +1430,121 @@ def test_racing_first_clients_on_one_address_share_one_connection(monkeypatch) -
 
     asyncio.run(run())
     actors.lookup.assert_not_called()
+    assert len(_selection_lines(caplog)) == 1
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("reset", ["before", "between"])
+def test_racing_clients_around_a_reset_share_the_recorded_connection(
+    monkeypatch, reset
+) -> None:
+    """Share one client and connection when ``reset_client`` comes before or between races.
+
+    Before: both calls reuse the record, and the second takes the first's client.
+    Between: the second fresh dial closes itself and builds on the first's connection.
+    """
+    actors = _patch_actors(monkeypatch)
+    store_name = _store_name()
+    dialed: list[ControlPlane] = []
+
+    async def run() -> None:
+        async with _hosted_registry() as host:
+            await (await _HOSTS[host]()).init({"publisher/0"}, _strategy())
+            address = _RegistryAddress(store_name, host)
+            gates: list[asyncio.Event] = []
+            entered: list[None] = []
+
+            def gate(connection: ControlPlane) -> None:
+                strategy, opened = connection.strategy, asyncio.Event()
+                gates.append(opened)
+
+                async def gated() -> Any:
+                    entered.append(None)
+                    await opened.wait()
+                    return await strategy()
+
+                connection.strategy = gated
+
+            async def connect(_: _RegistryAddress) -> ControlPlane:
+                connection = await _HOSTS[host]()
+                connection.close = AsyncMock()
+                dialed.append(connection)
+                if reset == "between":
+                    gate(connection)
+                return connection
+
+            def call() -> Any:
+                return ts.client(store_name, role=RankRole.PUBLISHER, address=address)
+
+            with patch.object(_RegistryAddress, "connect", connect):
+                if reset == "before":
+                    gate((await call())._control_plane)
+                    ts.reset_client(store_name)
+                calls = [asyncio.ensure_future(call()) for _ in range(2)]
+                while len(entered) < 2:
+                    await asyncio.sleep(0)
+                if reset == "before":
+                    gates[0].set()
+                    clients = await asyncio.wait_for(asyncio.gather(*calls), timeout=30)
+                    assert clients[0] is clients[1] and len(dialed) == 1
+                    return
+                gates[0].set()
+                done, pending = await asyncio.wait(
+                    calls, timeout=30, return_when=asyncio.FIRST_COMPLETED
+                )
+                ts.reset_client(store_name)
+                gates[1].set()
+                [first], [second] = done, pending
+                first, second = first.result(), await asyncio.wait_for(second, 30)
+            kept, _ = store_api._control_plane_map[store_name]
+            assert first._control_plane is second._control_plane is kept is dialed[0]
+            dialed[0].close.assert_not_awaited()
+            dialed[1].close.assert_awaited_once_with()
+
+    asyncio.run(run())
+    actors.lookup.assert_not_called()
+
+
+@pytest.mark.timeout(60)
+def test_racing_first_clients_of_two_stores_cannot_share_an_instance(
+    monkeypatch,
+) -> None:
+    """Let only one of two stores whose first clients race record the same instance."""
+    _patch_actors(monkeypatch)
+    stores = [_store_name(), _store_name()]
+
+    async def run() -> list[Any]:
+        async with _hosted_registry() as host:
+            await (await _HOSTS[host]()).init({"publisher/0"}, _strategy())
+            instance = await _HOSTS[host]()
+            strategy, entered, both = instance.strategy, [], asyncio.Event()
+
+            async def strategy_once_both_entered() -> Any:
+                entered.append(None)
+                if len(entered) == 2:
+                    both.set()
+                await both.wait()
+                return await strategy()
+
+            instance.strategy = strategy_once_both_entered
+            return await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        ts.client(name, role=RankRole.PUBLISHER, control_plane=instance)
+                        for name in stores
+                    ),
+                    return_exceptions=True,
+                ),
+                timeout=30,
+            )
+
+    results = asyncio.run(run())
+    assert sorted(type(result).__name__ for result in results) == [
+        "RoutingClient",
+        "ValueError",
+    ]
+    [error] = [result for result in results if isinstance(result, ValueError)]
+    assert "already serves store" in str(error)
 
 
 @pytest.mark.timeout(60)
@@ -1368,9 +1638,19 @@ class Address(ts.ControlPlaneAddress):
         return "driver:1"
 
 
+async def no_monarch(*args, **kwargs):
+    raise LookupError("looked up a Monarch actor")
+
+
 store_api.current_rank = lambda: SimpleNamespace(rank=0)
-address = Address(store_name)
-asyncio.run(ts.client(store_name, role=ts.RankRole.PUBLISHER, address=address))
+store_api.get_or_spawn_controller = no_monarch
+address, other, given = Address(store_name), Address(store_name + "-b"), Connection()
+for name, kwargs in (
+    (store_name, {"address": address}),
+    (other.store_name, {"address": other}),
+    (store_name + "-c", {"control_plane": given}),
+):
+    asyncio.run(ts.client(name, role=ts.RankRole.PUBLISHER, **kwargs))
 held, release = threading.Event(), threading.Event()
 
 
@@ -1389,16 +1669,29 @@ if pid == 0:
     signal.alarm(60)  # ends a child stuck on the lock it inherited
     try:
         gc.collect()
-        try:
-            asyncio.run(ts.client(store_name, role=ts.RankRole.PUBLISHER))
-        except RuntimeError as error:
-            assert "inherited across fork" in str(error), error
-        else:
-            raise AssertionError("a call without address kept the parent's record")
+        for kwargs in ({"role": ts.RankRole.PUBLISHER}, {}):
+            try:
+                asyncio.run(ts.client(store_name, **kwargs))
+            except RuntimeError as error:
+                assert "inherited across fork" in str(error), error
+            else:
+                raise AssertionError("a call without address kept the parent's record")
+        # A shutdown of a dropped record needs no Monarch lookup.
+        asyncio.run(ts.shutdown(other.store_name))
+        # A caller's own plane stays recorded, so the child shares it and its client.
+        shared = asyncio.run(ts.client(store_name + "-c"))
+        assert shared._control_plane is given, "the fork dropped a caller's plane"
         client = asyncio.run(
             ts.client(store_name, role=ts.RankRole.PUBLISHER, address=address)
         )
         assert client._control_plane.pid == os.getpid(), "the child reused the parent's"
+        ts.reset_client(store_name)
+        try:
+            asyncio.run(ts.client(store_name))
+        except ValueError as error:
+            assert "needs role" in str(error), error
+        else:
+            raise AssertionError("a role-less call ignored the child's new record")
         print("the child built a client", flush=True)
     except BaseException:
         traceback.print_exc()
@@ -1413,8 +1706,9 @@ sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
 def test_a_child_forked_while_a_parent_thread_holds_the_lock_dials_its_own() -> None:
     """Give a forked child a fresh selection lock, and make it dial its own connection.
 
-    Another parent thread holds the lock across the fork. A call without the address
-    raises, and no finalizer of the parent's connection runs in the child.
+    Another parent thread holds the lock across the fork. Calls without the address raise,
+    shutdown needs no Monarch, a caller's plane stays shared and the os._exit child runs
+    no finalizer of the parent's connections.
     """
     # A set variable skips TorchStore's logging setup, so its INFO lines stay off stdout.
     env = {**os.environ, "HYPERACTOR_CODEC_MAX_FRAME_LENGTH": "910737418240"}

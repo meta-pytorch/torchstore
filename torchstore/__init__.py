@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import importlib
+from logging import getLogger
 from typing import Any, TYPE_CHECKING
 
 import torchstore.api as _api
@@ -35,9 +36,11 @@ from torchstore.strategy import (
     TorchStoreStrategy,
 )
 
+logger = getLogger(__name__)
+
 # Monarch reads the frame length when it first loads, which importing TorchStore never
 # does, so a process that loads Monarch afterwards uses the default too, and one that
-# loaded Monarch first keeps Monarch's own limit. Monarch entry points log the export.
+# loaded Monarch first keeps its own. TorchStore's first Monarch path logs the export.
 if _api._export_frame_length_default():
     init_logging()
 
