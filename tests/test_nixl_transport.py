@@ -113,10 +113,16 @@ class FakeNixlAgent:
 
     def register_memory(self, tensor, *, backends):
         assert tensor.numel() > 0
+        start, end = tensor.data_ptr(), tensor.data_ptr() + tensor.nbytes
+        # NIXL accepts this, but peers then fail to load the agent's metadata.
+        assert all(
+            (start, end) != (other_start, other_end)
+            for other_start, other_end, _ in self.regions.values()
+        ), "same memory registered twice"
         descriptor = id(tensor)
         self.regions[descriptor] = (
-            tensor.data_ptr(),
-            tensor.data_ptr() + tensor.nbytes,
+            start,
+            end,
             # Weak, so registration does not keep the storage alive.
             weakref.ref(tensor.untyped_storage()),
         )
@@ -732,6 +738,180 @@ async def test_uncached_registration_lasts_until_last_drop(ref):
     agent.deregister_memory.assert_not_called()
     await second.drop()
     agent.deregister_memory.assert_called_once_with(descriptors)
+    assert cache._leases == {}
+
+
+async def _cancel_get_during_volume_call(ref, late_error=False):
+    """Cancel a CUDA-style get while the volume is answering it.
+
+    Returns once the get waits for the volume, or has finished without waiting,
+    with a weak reference to the destination.
+    """
+    client_buffer = NixlTransportBuffer(ref)
+    destinations = []
+    volume_called = asyncio.Event()
+    answer = asyncio.Event()
+    waiting = asyncio.Event()
+
+    async def pre_get_hook(requests):
+        destination = torch.zeros(4)
+        destinations.append(weakref.ref(destination))
+        client_buffer._contexts = [
+            client_buffer._register_client_tensor(destination, cached=False)
+        ]
+
+    async def volume_get(transport_buffer, meta_requests):
+        volume_called.set()
+        await answer.wait()
+        if late_error:
+            raise RuntimeError("late transfer failed")
+        return transport_buffer
+
+    wait_for_volume = client_buffer._wait_for_volume
+
+    async def signal_and_wait_for_volume(call):
+        waiting.set()
+        await wait_for_volume(call)
+
+    client_buffer._pre_get_hook = pre_get_hook
+    client_buffer._wait_for_volume = signal_and_wait_for_volume
+    ref.volume.get = SimpleNamespace(call_one=volume_get)
+    get = asyncio.create_task(
+        client_buffer._get_requests([Request.from_any("weight", None)])
+    )
+    await asyncio.wait_for(volume_called.wait(), timeout=10)
+    get.cancel()
+    signal = asyncio.create_task(waiting.wait())
+    await asyncio.wait([get, signal], timeout=10, return_when=asyncio.FIRST_COMPLETED)
+    signal.cancel()
+    return client_buffer, get, answer, destinations[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_error", [False, True])
+async def test_cancelled_get_waits_for_volume_answer(ref, late_error):
+    """The volume may still write after the caller stops waiting."""
+    client_buffer, get, answer, _ = await _cancel_get_during_volume_call(
+        ref, late_error
+    )
+    cache = client_buffer._client_cache()
+
+    assert not get.done()
+    cache.agent.deregister_memory.assert_not_called()
+    answer.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(get, timeout=10)
+    cache.agent.deregister_memory.assert_called_once()
+    assert cache._leases == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("give_up", ["cancel", "timeout"])
+async def test_abandoned_get_releases_registration_when_volume_answers(
+    ref, monkeypatch, give_up
+):
+    """A second cancel or a timeout returns without deregistering.
+
+    Until the volume answers, the destination stays referenced and another get
+    cannot register its storage.
+    """
+    if give_up == "timeout":
+        monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_TIMEOUT_S", 0)
+    client_buffer, get, answer, destination_ref = await _cancel_get_during_volume_call(
+        ref
+    )
+    cache = client_buffer._client_cache()
+    if give_up == "cancel":
+        get.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(get, timeout=10)
+
+    cache.agent.deregister_memory.assert_not_called()
+    assert len(cache._leases) == 1
+    with pytest.raises(RuntimeError, match="has not answered"):
+        cache.acquire(destination_ref())
+    gc.collect()
+    assert destination_ref() is not None
+    released = asyncio.Event()
+    release = cache.release
+
+    def release_and_signal(key):
+        release(key)
+        released.set()
+
+    cache.release = release_and_signal
+    answer.set()
+    await asyncio.wait_for(released.wait(), timeout=10)
+    cache.agent.deregister_memory.assert_called_once()
+    assert cache._leases == {}
+    assert not cache._abandoned
+    gc.collect()
+    assert destination_ref() is None
+
+
+@pytest.mark.asyncio
+async def test_get_cancelled_before_volume_call_releases_registration(ref):
+    client_buffer = NixlTransportBuffer(ref)
+    destination = torch.zeros(4)
+    registered = asyncio.Event()
+
+    async def pre_get_hook(requests):
+        client_buffer._contexts = [
+            client_buffer._register_client_tensor(destination, cached=False)
+        ]
+        registered.set()
+        await asyncio.Event().wait()
+
+    client_buffer._pre_get_hook = pre_get_hook
+    get = asyncio.create_task(
+        client_buffer._get_requests([Request.from_any("weight", None)])
+    )
+    await registered.wait()
+    get.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await get
+
+    cache = client_buffer._client_cache()
+    cache.agent.deregister_memory.assert_called_once()
+    assert cache._leases == {}
+
+
+def test_lease_replaces_cached_registration(agent_cache):
+    """A CUDA put source can later be a get destination."""
+    tensor = torch.zeros(16)
+    cached = agent_cache.register(tensor)
+
+    key = agent_cache.acquire(tensor)
+
+    agent_cache.agent.deregister_memory.assert_called_once_with(cached)
+    assert agent_cache._registrations == {}
+    agent_cache.release(key)
+    agent_cache.register(tensor)
+    assert agent_cache.agent.register_memory.call_count == 3
+
+
+def test_register_reuses_lease(agent_cache):
+    tensor = torch.zeros(16)
+    key = agent_cache.acquire(tensor)
+
+    assert agent_cache.register(tensor[1:]) == agent_cache._leases[key][0]
+    assert agent_cache._registrations == {}
+    agent_cache.agent.register_memory.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_drop_releases_every_lease_when_one_fails(ref):
+    client_buffer = NixlTransportBuffer(ref)
+    first, second = torch.zeros(4), torch.zeros(4)
+    client_buffer._register_client_tensor(first, cached=False)
+    client_buffer._register_client_tensor(second, cached=False)
+    cache = client_buffer._client_cache()
+    cache.agent.deregister_memory.side_effect = [RuntimeError("failed"), None]
+
+    with pytest.raises(RuntimeError, match="failed"):
+        await client_buffer.drop()
+
+    assert cache.agent.deregister_memory.call_count == 2
     assert cache._leases == {}
 
 

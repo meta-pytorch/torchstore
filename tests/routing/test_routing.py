@@ -237,6 +237,24 @@ async def test_transfer_dtype_preserves_keys() -> None:
 
 
 @pytest.mark.asyncio
+async def test_strict_read_rejects_key_skipped_by_non_strict_read() -> None:
+    source = torch.arange(2)
+    destination = {"weight": torch.zeros_like(source), "local_only": torch.zeros(2)}
+    clients = await routing_clients(
+        publishers={"publisher/0": {"weight": source}},
+        requesters={"requester/0/0": destination},
+    )
+    await put_state_dict(clients["publisher/0"], {"weight": source}, "model")
+    requester = clients["requester/0/0"]
+    await get_state_dict(requester, "model", destination, strict=False)
+
+    with pytest.raises(KeyError, match="no publisher"):
+        await get_state_dict(
+            requester, "model", {"local_only": destination["local_only"]}
+        )
+
+
+@pytest.mark.asyncio
 async def test_non_strict_reads_plan_and_fetch_one_subset_per_call() -> None:
     """Read one subset of the state dict per call, as a per-layer load does."""
     sources = {"first": torch.arange(2), "second": torch.arange(2, 4)}

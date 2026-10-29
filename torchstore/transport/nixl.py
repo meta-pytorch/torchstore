@@ -15,6 +15,8 @@ import socket
 import time
 import uuid
 import weakref
+from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
@@ -165,6 +167,8 @@ class NixlAgentCache(TransportCache):
         self._registrations: dict[tuple[int, int], _Registration] = {}
         # Uncached registrations: storage key -> [descriptors, holders].
         self._leases: dict[tuple[int, int], list[Any]] = {}
+        # Storage key -> cancelled gets whose storage volume may still write into it.
+        self._abandoned: Counter[tuple[int, int]] = Counter()
         self._remote_agents: dict[str, bytes] = {}
 
     def register(self, tensor: torch.Tensor) -> Any:
@@ -181,6 +185,12 @@ class NixlAgentCache(TransportCache):
         existing = self._registrations.get(key)
         if existing is not None:
             return existing.descriptors
+        # Two registrations of the same range break this agent's metadata for
+        # peers (add_remote_agent fails with NIXL_ERR_NOT_ALLOWED). Not cached:
+        # the registration ends with the lease.
+        lease = self._leases.get(key)
+        if lease is not None:
+            return lease[0]
 
         # Not kept: a tensor over the storage would keep the storage alive.
         region = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(storage)
@@ -199,10 +209,18 @@ class NixlAgentCache(TransportCache):
         registering the storage again.
         """
         key = _storage_key(tensor)
+        if self._abandoned[key]:
+            raise RuntimeError(
+                "NIXL get destination is still registered for a cancelled get "
+                "the storage volume has not answered"
+            )
         lease = self._leases.get(key)
         if lease is not None:
             lease[1] += 1
             return key
+        # Two registrations of the same range break this agent's metadata for
+        # peers, and a cached one could outlive this storage's memory.
+        self._evict(key)
         region = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
             tensor.untyped_storage()
         )
@@ -216,6 +234,35 @@ class NixlAgentCache(TransportCache):
         if lease[1] == 0:
             del self._leases[key]
             self.agent.deregister_memory(lease[0])
+
+    def release_when_answered(
+        self,
+        keys: set[tuple[int, int]],
+        call: asyncio.Future[Any],
+        tensors: list[torch.Tensor],
+    ) -> None:
+        """Release a cancelled get's leases once its storage volume call finishes.
+
+        Until then the volume may still write into them, so ``acquire`` refuses
+        these storages instead of sharing a registration over memory FSDP may
+        have reallocated, and ``tensors`` stay referenced.
+        """
+        self._abandoned.update(keys)
+
+        def release(answer: asyncio.Future[Any]) -> None:
+            del tensors[:]
+            if answer.cancelled():
+                # The volume may still be writing; leak the registrations.
+                return
+            answer.exception()
+            self._abandoned.subtract(keys)
+            self._abandoned = +self._abandoned
+            # Releases every lease even if one fails.
+            with ExitStack() as stack:
+                for key in keys:
+                    stack.callback(self.release, key)
+
+        call.add_done_callback(release)
 
     def _evict(self, key: tuple[int, int]) -> None:
         registration = self._registrations.get(key)
@@ -661,6 +708,42 @@ class NixlTransportBuffer(TransportBuffer):
         flush()
 
     @override
+    async def _call_volume_get(self, meta_requests: list[Request]) -> TransportBuffer:
+        if not self._leases:
+            return await super()._call_volume_get(meta_requests)
+        call = asyncio.ensure_future(super()._call_volume_get(meta_requests))
+        try:
+            return await asyncio.shield(call)
+        except asyncio.CancelledError:
+            await self._wait_for_volume(call)
+            raise
+
+    async def _wait_for_volume(self, call: asyncio.Future[TransportBuffer]) -> None:
+        """Keep a cancelled get's destinations registered while the volume writes.
+
+        Waits for the volume's answer so drop() deregisters them and the caller
+        reuses them only afterwards. On a timeout or another cancel, hands the
+        leases to the cache to release once the volume answers.
+        """
+        try:
+            await asyncio.wait([call], timeout=ENV_TORCHSTORE_NIXL_TIMEOUT_S)
+        finally:
+            if not call.done():
+                logger.warning(
+                    "NIXL get cancelled while the storage volume may still write "
+                    "into its destinations; they stay registered until it answers"
+                )
+                tensors = [
+                    context.tensor
+                    for context in self._contexts
+                    if context.tensor is not None
+                ]
+                leases, self._leases = self._leases, set()
+                self._client_cache().release_when_answered(leases, call, tensors)
+            elif not call.cancelled():
+                call.exception()
+
+    @override
     async def _handle_storage_volume_response(
         self,
         requests: list[Request],
@@ -682,7 +765,10 @@ class NixlTransportBuffer(TransportBuffer):
         self._client_metadata = None
         self._contexts = []
         leases, self._leases = self._leases, set()
-        if leases:
-            cache = self._client_cache()
+        if not leases:
+            return
+        cache = self._client_cache()
+        # Releases every lease even if one fails.
+        with ExitStack() as stack:
             for key in leases:
-                cache.release(key)
+                stack.callback(cache.release, key)

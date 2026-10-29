@@ -162,7 +162,8 @@ class RoutingClient(LocalClient):
         self._routing_directory.install(
             RoutingPlan.for_requester(rank, registrations, publishers)
         )
-        requested.update(new_keys)
+        # Unpublished keys stay unplanned so a strict get still rejects them.
+        requested.update(slices)
         self._registered_layouts.add(key)
 
     @torch.no_grad()
