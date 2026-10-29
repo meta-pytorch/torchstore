@@ -322,6 +322,7 @@ async def initialize(
 
     from torchstore.controller import Controller
 
+    _api._log_frame_length_export()
     strategy = _validate_strategy(strategy)
     if actor_mesh._context.get() is not None:
         raise RuntimeError(

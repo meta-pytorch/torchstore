@@ -4,23 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import importlib.util
-import os
-import sys
+import importlib
 from logging import getLogger
 from typing import Any, TYPE_CHECKING
 
-# Monarch reads its settings when first imported, so loading it before the
-# frame-length default below keeps that default for spawned processes only.
-# With the variable already set nothing is exported, so Monarch loads on first use.
-# find_spec raises on a spec-less stub, so skip it once monarch is in sys.modules.
-if (
-    os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH") is None
-    and "monarch" not in sys.modules
-    and importlib.util.find_spec("monarch") is not None
-):
-    importlib.import_module("monarch")
-
+import torchstore.api as _api
 from torchstore.api import (
     client,
     delete,
@@ -48,14 +36,13 @@ from torchstore.strategy import (
     TorchStoreStrategy,
 )
 
-if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
+logger = getLogger(__name__)
+
+# Monarch reads the frame length when it first loads, which importing TorchStore never
+# does, so a process that loads Monarch afterwards uses the default too, and one that
+# loaded Monarch first keeps its own. TorchStore's first Monarch path logs the export.
+if _api._export_frame_length_default():
     init_logging()
-    logger = getLogger(__name__)
-    logger.warning(
-        "Warning: setting HYPERACTOR_CODEC_MAX_FRAME_LENGTH since this needs to be set"
-        " to enable large RPC calls via Monarch"
-    )
-    os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = "910737418240"
 
 
 # Type checkers see these names but not __getattr__, so they still flag misspelled ones.

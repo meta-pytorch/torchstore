@@ -20,9 +20,8 @@ _IMPORT_MONARCH_ON_LOAD = {
     "routing.coordinator",
     "storage_volume",
 }
-# The package init's find_spec guard keeps Monarch's frame length, and spmd keeps
-# its try-guarded StoreJob import at module scope because tests patch it.
-_GUARDED_ON_LOAD = {"__init__", "spmd"}
+# spmd keeps its try-guarded StoreJob import at module scope because tests patch it.
+_GUARDED_ON_LOAD = {"spmd"}
 _IMPORT_CALLS = {"__import__", "import_module", "importlib.import_module"}
 
 
