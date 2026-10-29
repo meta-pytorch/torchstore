@@ -14,6 +14,7 @@ import inspect
 import pickle
 import uuid
 from functools import partial
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -21,7 +22,7 @@ import pytest
 import torch
 from torchstore.storage import InMemoryStore, StorageImpl, StorageVolumeCore
 from torchstore.strategy import StorageVolumeRef
-from torchstore.transport import create_transport_buffer, gloo, TransportType
+from torchstore.transport import create_transport_buffer, TransportType
 from torchstore.transport.buffers import (
     TransportBuffer,
     TransportCache,
@@ -29,6 +30,8 @@ from torchstore.transport.buffers import (
 )
 from torchstore.transport.types import Request
 from torchstore.utils import get_local_hostname
+
+from .volume_meshes import get_through, put_through
 
 pytestmark = pytest.mark.timeout(120)
 
@@ -108,27 +111,14 @@ def _ref(volume: Any, volume_id: str, transport: TransportType) -> StorageVolume
     )
 
 
-async def _put(ref: StorageVolumeRef, key: str, value: torch.Tensor) -> None:
-    buffer = create_transport_buffer(ref)
-    await buffer.put_to_storage_volume([Request.from_tensor(key, value)])
-
-
-async def _get(ref: StorageVolumeRef, key: str) -> torch.Tensor:
-    buffer = create_transport_buffer(ref)
-    [value] = await buffer.get_from_storage_volume([Request(key=key)])
-    return value
-
-
 async def _endpoint_shape(self) -> None:
     pass
 
 
 @pytest.fixture
 def volume():
-    # Gloo caches each volume's connection for the whole process, by volume id.
     core = StorageVolumeCore(f"volume-{uuid.uuid4()}")
     yield _StandInVolume(core)
-    gloo._store_addrs.pop(core.volume_id, None)
     core.store.reset()
 
 
@@ -139,8 +129,8 @@ async def test_transport_round_trip_makes_only_its_calls(volume, transport) -> N
     ref = _ref(volume, volume.core.volume_id, transport)
     source = torch.arange(12, dtype=torch.float32).view(3, 4)
     try:
-        await _put(ref, "weights", source)
-        result = await _get(ref, "weights")
+        await put_through(ref, "weights", source)
+        result = await get_through(ref, "weights")
     finally:
         ref.transport_context.clear()
     assert torch.equal(result, source)
@@ -199,7 +189,7 @@ async def test_delete_drops_the_key_and_its_cache_entries(volume) -> None:
     """Drop each deleted key and its cache entries, and leave other keys alone."""
     ref = _ref(volume, volume.core.volume_id, TransportType.MonarchRPC)
     for key in ("a", "b", "c", "e", "f"):
-        await _put(ref, key, torch.ones(2))
+        await put_through(ref, key, torch.ones(2))
     store = volume.core.store
     cache = store.transport_context.get(_KeyedCache)
     cache.keys.update({"a", "b", "c", "d", "e", "f"})
@@ -208,7 +198,7 @@ async def test_delete_drops_the_key_and_its_cache_entries(volume) -> None:
     assert sorted(store.kv) == ["b", "c", "e", "f"]
     assert cache.keys == {"b", "c", "d", "e", "f"}
     with pytest.raises(KeyError, match="Key 'a' not found"):
-        await _get(ref, "a")
+        await get_through(ref, "a")
     # A missing key raises before any cache entry is dropped.
     with pytest.raises(KeyError, match="Key 'd' not found"):
         await volume.core.delete("d")
@@ -222,7 +212,7 @@ async def test_delete_drops_the_key_and_its_cache_entries(volume) -> None:
 async def test_reset_drops_every_key_and_cache(volume) -> None:
     """Drop every key and clear every cache, so the next cache lookup builds a new one."""
     ref = _ref(volume, volume.core.volume_id, TransportType.MonarchRPC)
-    await _put(ref, "a", torch.ones(2))
+    await put_through(ref, "a", torch.ones(2))
     store = volume.core.store
     cache = store.transport_context.get(_KeyedCache)
     cache.keys.add("a")
@@ -252,6 +242,22 @@ def test_storage_volume_is_an_actor_over_a_plain_core() -> None:
     # The volume module re-exports the store classes.
     assert storage_volume.StorageImpl is StorageImpl
     assert storage_volume.InMemoryStore is InMemoryStore
+
+
+def test_storage_volume_keeps_its_store_and_volume_id() -> None:
+    """Read and set the core's store and volume ID, as on upstream's actor."""
+    pytest.importorskip("monarch.actor")
+    from torchstore.storage_volume import StorageVolume
+
+    stand_in = SimpleNamespace(core=StorageVolumeCore("volume"))
+    store, properties = InMemoryStore(), vars(StorageVolume)
+    properties["store"].fset(stand_in, store)
+    assert stand_in.core.store is store
+    assert properties["store"].fget(stand_in) is store
+    assert properties["volume_id"].fget(stand_in) == "volume"
+    properties["volume_id"].fset(stand_in, "renamed")
+    assert stand_in.core.volume_id == "renamed"
+    assert properties["volume_id"].fget(stand_in) == "renamed"
 
 
 def test_storage_volume_endpoints_stay_serial() -> None:
@@ -293,11 +299,16 @@ async def test_storage_volume_delegates_each_endpoint_to_its_core(
         "reset": (),
     }
     assert set(calls) == set(_ENDPOINTS)
+    # Only the core produces each reply, so a dropped one cannot pass.
     replies = {
         "get_id": ("volume", "host"),
         "handshake": [True, True],
-        "get": "buffer",
+        "put": None,
+        "get": "reply-buffer",
         "get_meta": [(torch.Size([2]), torch.float32), "object"],
+        "delete": None,
+        "delete_batch": None,
+        "reset": None,
     }
     for name, reply in replies.items():
         getattr(core, name).return_value = reply
@@ -311,7 +322,7 @@ async def test_storage_volume_delegates_each_endpoint_to_its_core(
             endpoint.call_one(**dict(zip(names[1:], args))), timeout=30
         )
         method.assert_awaited_once_with(*args)
-        assert result == replies.get(name), name
+        assert result == replies[name], name
         error = RuntimeError(name)
         method.side_effect = error
         with pytest.raises(ActorError) as raised:

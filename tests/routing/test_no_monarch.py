@@ -322,6 +322,31 @@ def test_rdma_wrappers_forward_to_the_loaded_api(monkeypatch) -> None:
     assert monarch_rdma.monarch_rdma_available() is False
 
 
+def test_unset_transport_takes_monarch_rdma_only_when_its_probe_says_so(
+    monkeypatch,
+) -> None:
+    """Resolve an unset transport to Monarch RDMA once Monarch reports RDMA usable."""
+    import types
+
+    from torchstore import transport
+    from torchstore.transport import monarch_rdma, TransportType
+
+    actor_api = sys.modules.get("monarch.actor", types.ModuleType("monarch.actor"))
+    monkeypatch.setitem(sys.modules, "monarch.actor", actor_api)
+    monkeypatch.setenv("TORCHSTORE_RDMA_ENABLED", "1")
+    monkeypatch.setattr(transport, "SHM_ENABLED", False)
+    for name in ("nixl", "torchcomms_uniflow", "torchcomms_rdma"):
+        monkeypatch.setattr(transport, f"{name}_available", lambda: False)
+    monkeypatch.setattr(transport, "gloo_available", lambda: True)
+    for available, expected in (
+        (True, TransportType.MonarchRDMA),
+        (False, TransportType.Gloo),
+    ):
+        api = monarch_rdma._RdmaApi(None, None, lambda available=available: available)
+        monkeypatch.setattr(monarch_rdma, "_rdma_api", lambda api=api: api)
+        assert transport.get_available_transport(object()) is expected
+
+
 def test_shared_types_resolve_their_type_hints() -> None:
     """Resolve the hints of the types the controller, client and routing directory share."""
     from torchstore.directory import ObjectType, StorageInfo
