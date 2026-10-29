@@ -27,6 +27,11 @@ Limitations:
   Endpoints register whole storages, so a view pins its entire storage.
 - Each get stages its non-contiguous values through two CPU buffers of up to
   ``TORCHSTORE_TORCH_TRANSPORT_STAGING_BUFFER_BYTES``.
+- Gets write non-contiguous destination views (e.g. part of a resharded
+  shard) in place, one write per contiguous run, when the view has at most
+  ``_MAX_RUNS`` non-overlapping runs. Others are fetched into a contiguous
+  CPU tensor and copied to the destination. A failed get may have partly written
+  its destinations.
 - Do not ``resize_`` registered storages; transfers may use the old memory,
   even if the storage regrows at the same address.
 - Distinct storages over overlapping memory register overlapping regions, so
@@ -37,7 +42,9 @@ Limitations:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
+import math
 import os
 import weakref
 from dataclasses import dataclass
@@ -75,6 +82,10 @@ ENV_TORCHSTORE_TORCH_TRANSPORT_STAGING_BUFFER_BYTES = int(
         "TORCHSTORE_TORCH_TRANSPORT_STAGING_BUFFER_BYTES", str(32 * 1024 * 1024)
     )
 )
+
+# Contiguous runs a get writes into a strided destination; destinations with
+# more are staged.
+_MAX_RUNS = 64
 
 _RegistrationKey = tuple[int, int, str]
 
@@ -128,6 +139,44 @@ def _sender() -> str:
 def _storage_key(tensor: torch.Tensor) -> _RegistrationKey:
     storage = tensor.untyped_storage()
     return (storage.data_ptr(), storage.nbytes(), str(tensor.device))
+
+
+def _runs(tensor: torch.Tensor) -> list[int] | None:
+    """Byte offsets from tensor's start of its contiguous runs in row-major
+    order; None if there are more than ``_MAX_RUNS`` or they overlap."""
+    dims = tensor.dim()
+    numel = 1
+    while dims > 0 and (
+        tensor.shape[dims - 1] == 1 or tensor.stride(dims - 1) == numel
+    ):
+        numel *= tensor.shape[dims - 1]
+        dims -= 1
+    leading = tensor.shape[:dims]
+    if math.prod(leading) > _MAX_RUNS:
+        return None
+    strides = [stride * tensor.element_size() for stride in tensor.stride()[:dims]]
+    runs = [
+        sum(i * stride for i, stride in zip(index, strides, strict=True))
+        for index in itertools.product(*map(range, leading))
+    ]
+    starts = sorted(runs)
+    run_bytes = numel * tensor.element_size()
+    if any(b - a < run_bytes for a, b in itertools.pairwise(starts)):
+        return None
+    return runs
+
+
+def _rows(tensor: torch.Tensor, count: int) -> list[torch.Tensor]:
+    """Split tensor into count row-major views over its leading dims."""
+    dims = 0
+    rows = 1
+    while rows < count:
+        rows *= tensor.shape[dims]
+        dims += 1
+    assert rows == count, f"{count} runs do not match shape {tensor.shape}"
+    return [
+        tensor[index] for index in itertools.product(*map(range, tensor.shape[:dims]))
+    ]
 
 
 def _alias(key: _RegistrationKey) -> torch.Tensor:
@@ -239,13 +288,14 @@ class _Endpoint:
         if self._registrations.get(registration.key) is registration:
             self._unregister(registration)
 
-    def expose(self, tensor: torch.Tensor) -> RemoteBuffer:
-        """Register tensor and describe it for the peer."""
+    def expose(self, tensor: torch.Tensor, nbytes: int | None = None) -> RemoteBuffer:
+        """Register tensor and describe nbytes (default tensor.nbytes) from its
+        start for the peer."""
         registration = self.register(tensor)
         if registration.remote_buffer is None:
             registration.remote_buffer = registration.memory.to_remote_buffer()
-        offset = registration.offset(tensor)
-        return registration.remote_buffer.slice(offset, tensor.nbytes)
+        nbytes = tensor.nbytes if nbytes is None else nbytes
+        return registration.remote_buffer.slice(registration.offset(tensor), nbytes)
 
     def hold(self, peer: tuple[str, str], storages: list[torch.UntypedStorage]) -> None:
         self.failures += 1
@@ -514,10 +564,16 @@ class TorchTransportRequestContext:
     dtype: torch.dtype | None = None
     is_object: bool = False
     objects: Any = None
+    # Remote ranges of a strided get destination's contiguous runs, in place
+    # of remote_buffer.
+    runs: list[RemoteBuffer] | None = None
+    # Client-local get destination that tensor stages; stripped from RPC state.
+    dest: torch.Tensor | None = None
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["tensor"] = None
+        state["dest"] = None
         return state
 
 
@@ -526,6 +582,7 @@ class TorchDistributedTransportBuffer(TransportBuffer):
 
     supports_batch_puts = True
     supports_batch_gets = True
+    supports_strided_destinations = True
 
     def __init__(self, storage_volume_ref: StorageVolumeRef) -> None:
         super().__init__(storage_volume_ref)
@@ -589,7 +646,18 @@ class TorchDistributedTransportBuffer(TransportBuffer):
             # Empty tensors cannot be registered and have no bytes to move.
             if tensor is None or tensor.numel() == 0:
                 continue
-            assert tensor.is_contiguous()
+            if not tensor.is_contiguous():
+                # Writing raw bytes would skip a lazy conj or neg.
+                lazy = tensor.is_conj() or tensor.is_neg()
+                if not lazy and (runs := _runs(tensor)) is not None:
+                    run_bytes = tensor.nbytes // len(runs)
+                    remote_buffer = endpoint.expose(tensor, runs[-1] + run_bytes)
+                    context.runs = [remote_buffer.slice(r, run_bytes) for r in runs]
+                    continue
+                # Stage into a CPU tensor that the response copies to the
+                # destination.
+                context.dest = tensor
+                tensor = context.tensor = torch.empty(tensor.shape, dtype=tensor.dtype)
             context.remote_buffer = endpoint.expose(tensor)
 
     @override
@@ -643,12 +711,6 @@ class TorchDistributedTransportBuffer(TransportBuffer):
                 if request.tensor_slice is not None:
                     shape = request.tensor_slice.local_shape
                 tensor = torch.empty(shape, dtype=dtype, device="cpu")
-            elif not tensor.is_contiguous():
-                # Transfers need contiguous memory; the result is returned in
-                # the staging tensor.
-                tensor = torch.empty(
-                    tensor.shape, dtype=tensor.dtype, device=tensor.device
-                )
             self._contexts.append(
                 TorchTransportRequestContext(
                     tensor=tensor, shape=tensor.shape, dtype=tensor.dtype
@@ -710,11 +772,16 @@ class TorchDistributedTransportBuffer(TransportBuffer):
             )
             if data.numel() == 0:
                 continue
-            assert context.remote_buffer is not None
-            if data.is_contiguous():
-                transfers.append((data, context.remote_buffer))
+            if context.runs is not None:
+                pieces = zip(_rows(data, len(context.runs)), context.runs, strict=True)
             else:
-                staged.append((data, context.remote_buffer))
+                assert context.remote_buffer is not None
+                pieces = [(data, context.remote_buffer)]
+            for piece, remote_buffer in pieces:
+                if piece.is_contiguous():
+                    transfers.append((piece, remote_buffer))
+                else:
+                    staged.append((piece, remote_buffer))
         if transfers or staged:
             endpoint = await self._volume_endpoint(ctx)
             await endpoint.write(transfers, staged)
@@ -726,16 +793,19 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         transport_buffer: TransportBuffer,
     ) -> list[Any]:
         assert isinstance(transport_buffer, TorchDistributedTransportBuffer)
-        return [
-            (
-                volume_context.objects
-                if volume_context.is_object
-                else client_context.tensor
-            )
-            for client_context, volume_context in zip(
-                self._contexts, transport_buffer._contexts, strict=True
-            )
-        ]
+        results = []
+        for client_context, volume_context in zip(
+            self._contexts, transport_buffer._contexts, strict=True
+        ):
+            if volume_context.is_object:
+                results.append(volume_context.objects)
+                continue
+            if client_context.dest is None:
+                results.append(client_context.tensor)
+                continue
+            client_context.dest.copy_(client_context.tensor)
+            results.append(client_context.dest)
+        return results
 
     @override
     async def _post_request_success(self) -> None:

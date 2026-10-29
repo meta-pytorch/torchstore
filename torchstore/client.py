@@ -287,6 +287,10 @@ class LocalClient:
                 and request.tensor_val is not None
                 and request.tensor_val.is_contiguous()
             )
+            strided = use_inplace and all(
+                transport_buffer_map[vid].supports_strided_destinations
+                for vid in volume_map
+            )
 
             for volume_id, storage_info in volume_map.items():
                 if storage_info.object_type == ObjectType.OBJECT:
@@ -301,7 +305,9 @@ class LocalClient:
                     break
                 else:
                     volume_requests[volume_id].extend(
-                        self._expand_tensor_slices(request, storage_info, use_inplace)
+                        self._expand_tensor_slices(
+                            request, storage_info, use_inplace, strided=strided
+                        )
                     )
 
         return dict(volume_requests), whole_keys
@@ -311,6 +317,8 @@ class LocalClient:
         request: Request,
         storage_info,
         use_inplace: bool,
+        *,
+        strided: bool = False,
     ) -> list[Request]:
         """Expand a single key's tensor slices into sub-requests."""
         sub_requests = []
@@ -331,6 +339,7 @@ class LocalClient:
                     request.tensor_val,
                     request.tensor_slice,
                     fetch_slice,
+                    allow_strided=strided,
                 )
                 if dest_view is not None:
                     slice_request.tensor_val = dest_view

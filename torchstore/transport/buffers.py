@@ -158,6 +158,11 @@ class TransportBuffer:
     ----------
     supports_inplace_resharding : bool
         Whether this transport supports inplace resharding.
+    supports_strided_destinations : bool
+        If True, resharded gets may pass non-contiguous views of the
+        destination tensor as ``tensor_val``, which the transport must fill in
+        place. If False (default), those parts are fetched into new tensors
+        and copied.
     supports_batch_puts : bool
         If True, `put_to_storage_volume` passes all requests to `_put_requests`
         in a single call. If False (default), requests are dispatched one at a time.
@@ -173,6 +178,7 @@ class TransportBuffer:
     """
 
     supports_inplace_resharding: bool = True
+    supports_strided_destinations: bool = False
 
     # Transitionary period. These should eventually be TRUE for all transports.
     supports_batch_puts: bool = False
