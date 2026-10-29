@@ -18,7 +18,12 @@ from torchstore.controller import ObjectType
 from torchstore.directory import VolumeDirectory
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
-from torchstore.transport import create_transport_buffer, Request, TensorSlice
+from torchstore.transport import (
+    create_transport_buffer,
+    Request,
+    TensorSlice,
+    TransportBuffer,
+)
 from torchstore.utils import (
     assemble_tensor,
     get_destination_view,
@@ -310,7 +315,12 @@ class LocalClient:
                     break
                 else:
                     volume_requests[volume_id].extend(
-                        self._expand_tensor_slices(request, storage_info, use_inplace)
+                        self._expand_tensor_slices(
+                            request,
+                            storage_info,
+                            use_inplace,
+                            transport_buffer_map[volume_id],
+                        )
                     )
 
         return dict(volume_requests), whole_keys
@@ -320,6 +330,7 @@ class LocalClient:
         request: Request,
         storage_info,
         use_inplace: bool,
+        transport_buffer: TransportBuffer,
     ) -> list[Request]:
         """Expand a single key's tensor slices into sub-requests."""
         sub_requests = []
@@ -340,8 +351,12 @@ class LocalClient:
                     request.tensor_val,
                     request.tensor_slice,
                     fetch_slice,
+                    allow_strided=True,
                 )
-                if dest_view is not None:
+                if dest_view is not None and (
+                    dest_view.is_contiguous()
+                    or transport_buffer.accepts_strided_destination(dest_view)
+                ):
                     slice_request.tensor_val = dest_view
 
             sub_requests.append(slice_request)

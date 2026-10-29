@@ -161,6 +161,8 @@ class TransportBuffer:
     - `supports_batch_puts`: Set True if the transport can handle multiple entries at once for puts
     - `supports_batch_gets`: Set True if the transport can handle multiple entries at once for gets
     - `requires_handshake`: Return True if a handshake is needed before put/get
+    - `accepts_strided_destination`: Return True for non-contiguous get destinations the
+      transport fills in place
     - `perform_handshake`: Override for multi-step handshakes; default is one RPC
     - `_pre_put_hook`: Custom buffer allocation for puts
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
@@ -236,6 +238,18 @@ class TransportBuffer:
 
         Args:
             requests: List of Request for the current operation.
+        """
+        return False
+
+    def accepts_strided_destination(self, view: torch.Tensor) -> bool:
+        """Whether resharded gets may pass ``view``, a non-contiguous view of
+        the destination (possibly with a lazy conj or neg bit), as
+        ``tensor_val`` for the transport to fill in place. If False (default),
+        that part is fetched into a new tensor and copied.
+
+        Only asked when ``supports_inplace_resharding`` is True and the
+        destination is contiguous. Whole-key gets pass the caller's tensor
+        regardless.
         """
         return False
 

@@ -37,6 +37,8 @@ def get_destination_view(
     dest_tensor: torch.Tensor,
     dest_slice: "TensorSlice | None",
     fetch_slice: "TensorSlice",
+    *,
+    allow_strided: bool = False,
 ) -> torch.Tensor | None:
     """Get a view of the destination tensor where the fetched slice should be written.
 
@@ -46,10 +48,12 @@ def get_destination_view(
             If None, the destination tensor is assumed to cover the full global shape
             (offsets all zero, shape = dest_tensor.shape).
         fetch_slice: TensorSlice describing the slice being fetched
+        allow_strided: Return the view even if it is not contiguous.
 
     Returns:
         A view of dest_tensor for the region where fetch_slice should be written,
-        or None if the fetch_slice doesn't map to a contiguous region in dest_tensor.
+        or None if the fetch_slice doesn't map to a contiguous region in dest_tensor
+        (unless allow_strided).
     """
     from torchstore.transport import TensorSlice  # inline to avoid circular import
 
@@ -91,8 +95,8 @@ def get_destination_view(
     # Create the view
     view = dest_tensor[tuple(slices)]
 
-    # Check if the view is contiguous - required for RDMA transports
-    if not view.is_contiguous():
+    # RDMA transports need contiguous views unless they write strided ones.
+    if not allow_strided and not view.is_contiguous():
         return None
 
     return view
