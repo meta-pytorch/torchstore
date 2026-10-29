@@ -168,17 +168,32 @@ def test_expected_buffers_are_discovered():
     assert not missing, f"transport buffers no longer discovered: {sorted(missing)}"
 
 
+# Process-local fields that a transport's own hook resets on purpose.
+_RESET_ON_PICKLE = {
+    "GlooTransportBuffer": {"_tcp_store", "_pg_task", "_send_task", "_recv_task"},
+    "MonarchRPCTransportBuffer": {"inplace_tensor"},
+    "TorchCommsRdmaTransportBuffer": {"_transports"},
+    "TorchCommsTransportBuffer": {"_connections"},
+}
+
+
 @pytest.mark.parametrize("buffer_cls", BUFFERS, ids=lambda cls: cls.__name__)
 def test_pickle_drops_unpicklable_volume_handle(buffer_cls, locked_ref):
     with pytest.raises(TypeError):
         pickle.dumps(locked_ref)
     buffer = buffer_cls(locked_ref)
+    # Every other attribute holds a value, so a hook that also drops one shows.
+    reset = _RESET_ON_PICKLE.get(buffer_cls.__name__, set())
+    for name in vars(buffer).keys() - {"storage_volume_ref", *reset}:
+        setattr(buffer, name, f"sentinel-{name}")
 
     copy = _wire(buffer)
 
     assert copy.storage_volume_ref is None
     # The volume still gets every other attribute, with its value.
-    assert vars(copy) == {**vars(buffer), "storage_volume_ref": None}
+    kept = {name: value for name, value in vars(copy).items() if name not in reset}
+    sent = {name: value for name, value in vars(buffer).items() if name not in reset}
+    assert kept == {**sent, "storage_volume_ref": None}
     # The client keeps using its buffer after sending it.
     assert buffer.storage_volume_ref is locked_ref
 

@@ -75,11 +75,12 @@ def RDMAAction(*args: Any, **kwargs: Any) -> Any:
 def monarch_rdma_transport_available() -> bool:
     """Check if Monarch RDMA transport is available for use.
 
-    True if TORCHSTORE_RDMA_ENABLED is "1" (the default), Monarch's actor API is
-    loaded, as on every Monarch path, and the Monarch RDMA library is functional.
+    True if TORCHSTORE_RDMA_ENABLED is "1" (the default), ``monarch.actor`` is loaded and
+    Monarch RDMA works. TorchStore loads ``monarch.actor`` before it picks a transport,
+    so only a caller that checks earlier reads False.
     """
     rdma_enabled = os.environ.get("TORCHSTORE_RDMA_ENABLED", "1") == "1"
-    # Probing loads Monarch's RDMA package, needed only where Monarch's actors are used.
+    # Probing loads Monarch's RDMA package, so only processes using Monarch actors probe.
     return rdma_enabled and "monarch.actor" in sys.modules and monarch_rdma_available()
 
 
