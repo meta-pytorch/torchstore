@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import random
 from collections import defaultdict
 from collections.abc import Mapping
 from enum import Enum
@@ -36,6 +37,19 @@ class ClientType(str, Enum):
     ROUTING = "routing"
 
 
+def _pick_fetch_offset() -> int:
+    """Offset into the sorted volumes a get reads concurrently where a new client starts fetching.
+
+    Ranks of one torch.distributed world get offsets that differ modulo its size. A random
+    multiple of the size, from OS entropy so seeded ranks still differ, spreads other worlds.
+    """
+    rank, world_size = 0, 1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+    return rank + world_size * random.SystemRandom().randrange(1 << 32)
+
+
 class LocalClient:
     """Client-side interface for TorchStore operations.
 
@@ -54,6 +68,7 @@ class LocalClient:
         self._directory = directory
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
+        self._fetch_offset = _pick_fetch_offset()
 
     async def register_layout(
         self,
@@ -360,8 +375,15 @@ class LocalClient:
             )
             return list(zip(sub_requests, results, strict=True))
 
+        # The client's offset spreads the first requests of clients that read the same
+        # volumes over them instead of queueing all at one volume while the rest idle.
+        order = sorted(volume_requests)
+        start = self._fetch_offset % len(order) if order else 0
         per_volume = await asyncio.gather(
-            *[_fetch_one(vid, reqs) for vid, reqs in volume_requests.items()]
+            *[
+                _fetch_one(volume_id, volume_requests[volume_id])
+                for volume_id in order[start:] + order[:start]
+            ]
         )
         # Flatten list-of-lists into a single list of (sub_request, result) pairs
         return [pair for pairs in per_volume for pair in pairs]
