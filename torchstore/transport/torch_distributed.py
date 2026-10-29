@@ -24,10 +24,13 @@ Limitations:
 - Memory stays registered (pinned) until every storage using it is freed, so
   only new tensors pay registration, e.g. get results without a destination.
   Freed memory stays registered until the endpoint's next request or delete.
+  Endpoints register whole storages, so a view pins its entire storage.
 - Each get stages its non-contiguous values through two CPU buffers of up to
   ``TORCHSTORE_TORCH_TRANSPORT_STAGING_BUFFER_BYTES``.
 - Do not ``resize_`` registered storages; transfers may use the old memory,
   even if the storage regrows at the same address.
+- Distinct storages over overlapping memory register overlapping regions, so
+  NIXL resets the peer when alternating between them.
 - Volumes stay connected to every client endpoint they served until reset.
 """
 
@@ -122,8 +125,9 @@ def _sender() -> str:
     return str(context().actor_instance.actor_id)
 
 
-def _view_key(tensor: torch.Tensor) -> _RegistrationKey:
-    return (tensor.data_ptr(), tensor.nbytes, str(tensor.device))
+def _storage_key(tensor: torch.Tensor) -> _RegistrationKey:
+    storage = tensor.untyped_storage()
+    return (storage.data_ptr(), storage.nbytes(), str(tensor.device))
 
 
 def _alias(key: _RegistrationKey) -> torch.Tensor:
@@ -147,6 +151,10 @@ class _Registration:
     # storages resized to new memory.
     storages: list[tuple[weakref.ref[torch.UntypedStorage], int]]
     remote_buffer: RemoteBuffer | None = None
+
+    def offset(self, tensor: torch.Tensor) -> int:
+        """Byte offset of tensor in the registered memory."""
+        return tensor.data_ptr() - self.key[0]
 
     def prune(self) -> bool:
         """Drop freed or moved storages; return whether any remain."""
@@ -195,8 +203,8 @@ class _Endpoint:
                 self._unregister(registration)
 
     def register(self, tensor: torch.Tensor) -> _Registration:
-        """Register a contiguous tensor's memory."""
-        key = _view_key(tensor)
+        """Register tensor's storage."""
+        key = _storage_key(tensor)
         storage = tensor.untyped_storage()
         registration = self._registrations.get(key)
         if registration is not None:
@@ -236,7 +244,8 @@ class _Endpoint:
         registration = self.register(tensor)
         if registration.remote_buffer is None:
             registration.remote_buffer = registration.memory.to_remote_buffer()
-        return registration.remote_buffer
+        offset = registration.offset(tensor)
+        return registration.remote_buffer.slice(offset, tensor.nbytes)
 
     def hold(self, peer: tuple[str, str], storages: list[torch.UntypedStorage]) -> None:
         self.failures += 1
@@ -283,7 +292,10 @@ class _Endpoint:
         self.active += 1
         try:
             for tensor, remote_buffer in transfers:
-                view = self.register(tensor).memory.to_mutable_view()
+                registration = self.register(tensor)
+                view = registration.memory.to_mutable_view(
+                    registration.offset(tensor), tensor.nbytes
+                )
                 works.append(self.transport.read(view, remote_buffer, async_op=True))
         finally:
             await self._drain(works)
@@ -317,7 +329,10 @@ class _Endpoint:
         self.active += 1
         try:
             for tensor, remote_buffer in transfers:
-                view = self.register(tensor).memory.to_view()
+                registration = self.register(tensor)
+                view = registration.memory.to_view(
+                    registration.offset(tensor), tensor.nbytes
+                )
                 direct.append(self.transport.write(view, remote_buffer, async_op=True))
             for source, remote_buffer in staged:
                 remote_offset = 0

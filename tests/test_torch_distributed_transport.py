@@ -18,6 +18,7 @@ import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import pytest_asyncio
 import torch
@@ -513,7 +514,7 @@ async def test_registrations_are_cached_until_tensors_are_freed(ref, monkeypatch
 
     # Freed memory is unregistered by the next request.
     client = _client_endpoint(ref)
-    freed = td_transport._view_key(destination)
+    freed = td_transport._storage_key(destination)
     del destination
     await _put(ref, [Request.from_tensor("other", torch.zeros(8))])
     assert freed not in client._registrations
@@ -579,6 +580,118 @@ async def test_deleted_volume_tensors_are_unregistered(ref):
     assert len(volume._registrations) == len(volume.transport.memories) == 1
 
 
+def test_whole_storage_registration_covers_views(backend):
+    endpoint = td_transport._Endpoint(FakeTransport())
+    buffer = torch.zeros(8)
+    tail = endpoint.register(buffer[4:])
+    assert endpoint.register(buffer[:4]) is tail
+    assert endpoint.register(buffer) is tail
+    assert tail.offset(buffer[4:]) == 16
+    assert len(endpoint.transport.memories) == 1
+
+    del buffer
+    endpoint.sweep()
+    assert not endpoint._registrations and not endpoint.transport.memories
+    endpoint.close()
+
+
+@pytest.mark.asyncio
+async def test_read_into_views_at_offsets(backend):
+    owner = td_transport._Endpoint(FakeTransport())
+    reader = td_transport._Endpoint(FakeTransport())
+    reader.transport.connect(owner.transport.bind())
+    source = torch.arange(8.0)
+    destination = torch.zeros(8)
+    await reader.read(
+        [
+            (destination[4:6], owner.expose(source[:2])),
+            (destination[:2], owner.expose(source[6:])),
+        ]
+    )
+    assert torch.equal(destination, torch.tensor([6.0, 7, 0, 0, 0, 1, 0, 0]))
+    # Views are described by their own range of the storage.
+    whole, view = owner.expose(source), owner.expose(source[2:4])
+    assert (view.address - whole.address, view.length) == (8, 8)
+    reader.close()
+    owner.close()
+
+
+@pytest.mark.asyncio
+async def test_staged_get_into_storage_overlapping_another(ref):
+    stored = torch.arange(8.0).reshape(4, 2)
+    await _put(
+        ref,
+        [
+            Request.from_tensor("w", stored),
+            Request.from_tensor("x", torch.arange(4.0) + 100),
+        ],
+    )
+    # Two storages over one buffer, the second starting inside the first, with
+    # disjoint destination bytes.
+    array = np.zeros(16, dtype=np.float32)
+    dest = torch.from_numpy(array)[10:14].reshape(4, 1)
+    second = torch.from_numpy(array[4:8])
+    assert second.untyped_storage().data_ptr() != dest.untyped_storage().data_ptr()
+    await _get(
+        ref,
+        [
+            Request.from_any("w", dest, tensor_slice=_columns(4, 2, 1, 1)),
+            Request.from_tensor("x", second),
+        ],
+    )
+    assert torch.equal(dest, stored[:, 1:])
+    assert torch.equal(second, torch.arange(4.0) + 100)
+
+
+@pytest.mark.asyncio
+async def test_views_of_one_storage_register_once(ref, monkeypatch):
+    source = torch.arange(8.0)
+    await _put(
+        ref,
+        [Request.from_tensor("a", source[:4]), Request.from_tensor("b", source[4:])],
+    )
+    destination = torch.zeros(8)
+    await _get(
+        ref,
+        [
+            Request.from_tensor("a", destination[4:]),
+            Request.from_tensor("b", destination[:4]),
+        ],
+    )
+    assert torch.equal(destination, source.roll(4))
+    client = _client_endpoint(ref)
+    assert len(client._registrations) == len(client.transport.memories) == 2
+
+    # Row slices are views into the volume's stored tensor.
+    await _put(ref, [Request.from_tensor("w", source.reshape(4, 2))])
+    volume = _volume_endpoint(ref)
+    registered = set(volume._registrations)
+    rows = TensorSlice(
+        offsets=(2, 0),
+        coordinates=(1,),
+        global_shape=(4, 2),
+        local_shape=(2, 2),
+        mesh_shape=(2,),
+    )
+    for offset in (0, 2):
+        leading = dataclasses.replace(rows, offsets=(offset, 0))
+        (result,) = await _get(ref, [Request(key="w", tensor_slice=leading)])
+        assert torch.equal(result, source.reshape(4, 2)[offset : offset + 2])
+    assert set(volume._registrations) == registered
+    # With a staged value, row slices are written directly.
+    writes = _record_writes(monkeypatch, volume.transport)
+    row, column = await _get(
+        ref,
+        [
+            Request(key="w", tensor_slice=rows),
+            Request(key="w", tensor_slice=_columns(4, 2, 1, 1)),
+        ],
+    )
+    assert torch.equal(row, source.reshape(4, 2)[2:])
+    assert torch.equal(column, source.reshape(4, 2)[:, 1:])
+    assert [(offset, length) for offset, length, _ in writes] == [(16, 16), (0, 16)]
+
+
 def test_memory_shared_by_storages_stays_registered(backend):
     endpoint = td_transport._Endpoint(FakeTransport())
     memory = torch.zeros(4)
@@ -632,8 +745,8 @@ def test_sweep_unregisters_all_freed(backend):
 def test_moved_memory_is_registered_again(backend, monkeypatch):
     # New memory at a cached address, as after resizing a storage.
     old, new = torch.zeros(4), torch.zeros(4)
-    key = td_transport._view_key(new)
-    monkeypatch.setattr(td_transport, "_view_key", lambda *_: key)
+    key = td_transport._storage_key(new)
+    monkeypatch.setattr(td_transport, "_storage_key", lambda *_: key)
     endpoint = td_transport._Endpoint(FakeTransport())
     stale = endpoint.register(old)
     old.untyped_storage().resize_(0)
@@ -1197,7 +1310,7 @@ async def test_real_backend_roundtrip(backend_name, device, probe, caplog):
         torch.tensor(3.0, device=device),
     ]
     destinations = [torch.zeros_like(w) for w in weights]
-    # Row views of one storage.
+    # Row views register their whole storage at an offset.
     rows = torch.randn(64, 16, device=device)
     destination_rows = torch.zeros_like(rows)
     weights += [rows[8:24], rows[40:56]]
@@ -1219,6 +1332,8 @@ async def test_real_backend_roundtrip(backend_name, device, probe, caplog):
                 assert torch.equal(destination, weight)
             if step == 0:
                 registered = set(_client_endpoint(ref)._registrations)
+        # Eight whole tensors and the two row storages.
+        assert len(registered) == 10
         assert set(_client_endpoint(ref)._registrations) == registered
     finally:
         transport_context.clear()
@@ -1658,7 +1773,7 @@ async def test_failed_request_tensors_held_until_later_success(ref, monkeypatch)
     failed = torch.arange(4.0)
     with pytest.raises(RuntimeError, match="put failed"):
         await _put(ref, [Request.from_tensor("f", failed)])
-    key = td_transport._view_key(failed)
+    key = td_transport._storage_key(failed)
     held = weakref.ref(failed.untyped_storage())
     # Replacing the tensor's storage does not free held memory.
     failed.data = torch.zeros(4)
