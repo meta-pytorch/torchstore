@@ -483,6 +483,138 @@ async def test_put_get_roundtrip_with_objects_and_empty_tensors(ref):
 
 
 @pytest.mark.asyncio
+async def test_registrations_are_cached_until_tensors_are_freed(ref, monkeypatch):
+    weight = torch.arange(4, dtype=torch.float32)
+    destination = torch.zeros(4)
+    await _put(ref, [Request.from_tensor("w", weight)])
+    await _get(ref, [Request.from_tensor("w", destination)])
+    calls = []
+    register_memory = FakeTransport.register_memory
+    to_remote_buffer = FakeMemory.to_remote_buffer
+
+    def register_spy(self, tensor, **kwargs):
+        calls.append(tensor)
+        return register_memory(self, tensor, **kwargs)
+
+    def describe_spy(self, **kwargs):
+        calls.append(self)
+        return to_remote_buffer(self, **kwargs)
+
+    monkeypatch.setattr(FakeTransport, "register_memory", register_spy)
+    monkeypatch.setattr(FakeMemory, "to_remote_buffer", describe_spy)
+
+    # Weight sync updates the same buffers in place every step.
+    for _ in range(3):
+        weight.add_(1)
+        await _put(ref, [Request.from_tensor("w", weight)])
+        await _get(ref, [Request.from_tensor("w", destination)])
+        assert torch.equal(destination, weight)
+    assert not calls
+
+    # Freed memory is unregistered by the next request.
+    client = _client_endpoint(ref)
+    freed = td_transport._view_key(destination)
+    del destination
+    await _put(ref, [Request.from_tensor("other", torch.zeros(8))])
+    assert freed not in client._registrations
+    assert len(client._registrations) == len(client.transport.memories) == 2
+
+
+@pytest.mark.asyncio
+async def test_volume_staging_tensors_are_unregistered(ref):
+    await _put(ref, [Request.from_tensor("w", torch.zeros(2, 4))])
+    # A non-contiguous slice is staged in a temporary copy.
+    tensor_slice = TensorSlice(
+        offsets=(0, 1),
+        coordinates=(1,),
+        global_shape=(2, 4),
+        local_shape=(2, 2),
+        mesh_shape=(2,),
+    )
+    await _get(ref, [Request(key="w", tensor_slice=tensor_slice)])
+    volume = _volume_endpoint(ref)
+    await _put(ref, [Request.from_tensor("w", torch.ones(2, 4))])
+    assert len(volume._registrations) == len(volume.transport.memories) == 1
+
+
+@pytest.mark.asyncio
+async def test_deleted_volume_tensors_are_unregistered(ref):
+    await _put(ref, [Request.from_tensor("w", torch.zeros(4))])
+    await _put(ref, [Request.from_tensor("x", torch.zeros(8))])
+    volume = _volume_endpoint(ref)
+    assert len(volume._registrations) == len(volume.transport.memories) == 2
+
+    # Like StorageVolume.delete.
+    await ref.volume.store.delete("x")
+    ref.volume.store.transport_context.delete("x")
+    assert len(volume._registrations) == len(volume.transport.memories) == 1
+
+
+def test_memory_shared_by_storages_stays_registered(backend):
+    endpoint = td_transport._Endpoint(FakeTransport())
+    memory = torch.zeros(4)
+    first, second = _reallocate(memory), _reallocate(memory)
+    registration = endpoint.register(first)
+    assert endpoint.register(second) is registration
+    assert endpoint.register(first) is registration
+    assert len(registration.storages) == 2
+
+    # A request may still be transferring second.
+    del first
+    endpoint.sweep()
+    assert endpoint.register(second) is registration
+
+    del second
+    endpoint.sweep()
+    assert not endpoint._registrations and not endpoint.transport.memories
+    endpoint.close()
+
+
+def test_sweep_after_close_does_not_unregister(backend):
+    endpoint = td_transport._Endpoint(FakeTransport())
+    tensor = torch.zeros(4)
+    endpoint.register(tensor)
+    endpoint.close()
+    del tensor
+    # The backend fixture fails the test on any unregister of closed memory.
+    endpoint.sweep()
+
+
+def test_offset_view_stays_cached(backend):
+    endpoint = td_transport._Endpoint(FakeTransport())
+    view = torch.zeros(8)[4:]
+    registration = endpoint.register(view)
+    assert endpoint.register(view) is registration
+    assert len(endpoint.transport.memories) == 1
+    endpoint.close()
+
+
+def test_sweep_unregisters_all_freed(backend):
+    endpoint = td_transport._Endpoint(FakeTransport())
+    a, b = torch.zeros(4), torch.zeros(8)
+    endpoint.register(a)
+    endpoint.register(b)
+    del a, b
+    endpoint.sweep()
+    assert not endpoint._registrations and not endpoint.transport.memories
+    endpoint.close()
+
+
+def test_moved_memory_is_registered_again(backend, monkeypatch):
+    # New memory at a cached address, as after resizing a storage.
+    old, new = torch.zeros(4), torch.zeros(4)
+    key = td_transport._view_key(new)
+    monkeypatch.setattr(td_transport, "_view_key", lambda *_: key)
+    endpoint = td_transport._Endpoint(FakeTransport())
+    stale = endpoint.register(old)
+    old.untyped_storage().resize_(0)
+    registration = endpoint.register(new)
+    assert registration is not stale
+    assert len(endpoint.transport.memories) == 1
+    endpoint.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_requests_sharing_a_tensor(ref):
     tensor = torch.arange(4, dtype=torch.float32)
     await _put(ref, [Request.from_tensor("w", torch.zeros(4))])
@@ -501,13 +633,12 @@ async def test_concurrent_requests_sharing_a_tensor(ref):
     )
     try:
         await _until(lambda: len(entered) == 4)
-        ((_, count),) = endpoint._registrations.values()
-        assert count == 4
+        assert len(endpoint.transport.memories) == 1
     finally:
         release.set()
     await _bounded(tasks)
 
-    assert not endpoint.transport.memories
+    assert len(endpoint.transport.memories) == 1
     results = await _get(ref, [Request(key=f"w{i}") for i in range(4)])
     for result in results:
         assert torch.equal(result, tensor)
@@ -553,6 +684,11 @@ def test_request_context_state_strips_client_tensors():
     context = td_transport.TorchTransportRequestContext(tensor=torch.zeros(2))
     state = pickle.loads(pickle.dumps(context))
     assert state.tensor is None and context.tensor is not None
+
+
+def _reallocate(memory):
+    """A new storage over memory's bytes, as if freed memory were reallocated."""
+    return torch.from_numpy(memory.numpy())
 
 
 def _real_backend_params():
@@ -604,7 +740,9 @@ async def test_real_backend_roundtrip(backend_name, device, probe, caplog):
             )
             for destination, weight in zip(destinations, weights, strict=True):
                 assert torch.equal(destination, weight)
-        assert not _client_endpoint(ref)._registrations
+            if step == 0:
+                registered = set(_client_endpoint(ref)._registrations)
+        assert set(_client_endpoint(ref)._registrations) == registered
     finally:
         transport_context.clear()
         volume.store.reset()
@@ -631,7 +769,7 @@ async def test_volumes_share_one_client_endpoint(ref, monkeypatch):
         cache = _client_cache(ref)
         client = _client_endpoint(ref)
         assert binds == [client.transport]
-        assert not client.transport.memories
+        assert len(client.transport.memories) == 1
         for volume in (ref, other):
             assert _volume_cache(volume).peers == {cache.url}
         (result,) = await _get(other, [Request(key="w")])
@@ -836,7 +974,8 @@ async def test_failed_transfer_raises_and_holds_memory(ref, monkeypatch):
     with pytest.raises(RuntimeError, match="transfer failed"):
         await _put(ref, [Request.from_tensor("w", torch.ones(4))])
     assert _client_endpoint(ref).held
-    assert not volume.transport.memories
+    (stored,) = await _get(ref, [Request(key="w")])
+    assert torch.equal(stored, torch.zeros(4))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -966,9 +1105,7 @@ async def test_cancelled_get_result_held_until_next_success(ref):
     cancelled = asyncio.create_task(_get(ref, [Request(key="w")]))
     await _until(lambda: len(volume.transport.pending) == 1)
     (key,) = set(client._registrations) - registered
-    memory, _ = client._registrations[key]
-    result = weakref.ref(memory.tensor.untyped_storage())
-    del memory
+    ((result, _),) = client._registrations[key].storages
 
     cancelled.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -1007,7 +1144,10 @@ async def test_failed_request_tensors_held_until_later_success(ref, monkeypatch)
     failed = torch.arange(4.0)
     with pytest.raises(RuntimeError, match="put failed"):
         await _put(ref, [Request.from_tensor("f", failed)])
-    held = weakref.ref(failed)
+    key = td_transport._view_key(failed)
+    held = weakref.ref(failed.untyped_storage())
+    # Replacing the tensor's storage does not free held memory.
+    failed.data = torch.zeros(4)
     del failed
 
     # A request sent before the failure does not release it.
@@ -1031,9 +1171,66 @@ async def test_failed_request_tensors_held_until_later_success(ref, monkeypatch)
     assert held() is not None
 
     await _put(ref, [Request.from_tensor("g", torch.ones(4))])
+    # Unregistered on release, before a late transfer could reach reused memory.
+    assert key not in _client_endpoint(ref)._registrations
     gc.collect()
     assert held() is None
     assert not _client_endpoint(ref).held
+
+
+@pytest.mark.asyncio
+async def test_failed_request_holds_every_tensor(ref, monkeypatch):
+    put = ref.volume.put.call
+
+    async def failing(buffer, requests):
+        raise RuntimeError("put failed")
+
+    monkeypatch.setattr(ref.volume.put, "call", failing)
+    a, b = torch.arange(4.0), torch.arange(8.0)
+    with pytest.raises(RuntimeError, match="put failed"):
+        await _put(ref, [Request.from_tensor("a", a), Request.from_tensor("b", b)])
+    monkeypatch.setattr(ref.volume.put, "call", put)
+    held = [weakref.ref(a.untyped_storage()), weakref.ref(b.untyped_storage())]
+    del a, b
+    gc.collect()
+    assert all(h() is not None for h in held)
+
+    await _put(ref, [Request.from_tensor("g", torch.ones(4))])
+    gc.collect()
+    assert all(h() is None for h in held)
+
+
+@pytest.mark.asyncio
+async def test_failed_request_holds_swapped_storage(ref, monkeypatch):
+    a = torch.arange(4.0)
+    exposed = weakref.ref(a.untyped_storage())
+
+    async def failing(buffer, requests):
+        a.data = torch.zeros(4)
+        raise RuntimeError("put failed")
+
+    monkeypatch.setattr(ref.volume.put, "call", failing)
+    with pytest.raises(RuntimeError, match="put failed"):
+        await _put(ref, [Request.from_tensor("a", a)])
+    gc.collect()
+    assert exposed() is not None
+
+
+def test_failed_close_keeps_held_storages(backend, monkeypatch):
+    endpoint = td_transport._Endpoint(FakeTransport())
+    tensor = torch.arange(4.0)
+    endpoint.expose(tensor)
+    endpoint.hold(("volume", "sender"), [tensor.untyped_storage()])
+
+    def failing_close():
+        raise RuntimeError("close failed")
+
+    monkeypatch.setattr(endpoint.transport, "close", failing_close)
+    monkeypatch.setattr(td_transport, "_unclosed_held", [])
+    endpoint.close()
+    # Transfers may still use the memory, even after the endpoint is freed.
+    assert endpoint.closed and endpoint.held
+    assert td_transport._unclosed_held == [endpoint.held]
 
 
 @pytest.mark.asyncio
@@ -1083,7 +1280,7 @@ async def test_clear_keeps_held_memory_until_endpoint_closes(ref, monkeypatch):
     with pytest.raises(RuntimeError, match="put failed"):
         await _put(ref, [Request.from_tensor("f", failed)])
     monkeypatch.setattr(ref.volume.put, "call", put)
-    held = weakref.ref(failed)
+    held = weakref.ref(failed.untyped_storage())
     del failed
 
     # The volume may still read the failed request's memory while the
@@ -1104,8 +1301,10 @@ async def test_clear_keeps_held_memory_until_endpoint_closes(ref, monkeypatch):
 @pytest.mark.asyncio
 async def test_failed_request_across_client_clear(ref, monkeypatch):
     put = ref.volume.put.call
+    retired = []
 
     async def failing(buffer, requests):
+        retired.append(_client_endpoint(ref))
         ref.transport_context.clear()
         raise RuntimeError("put failed")
 
@@ -1113,6 +1312,8 @@ async def test_failed_request_across_client_clear(ref, monkeypatch):
     with pytest.raises(RuntimeError, match="put failed"):
         await _put(ref, [Request.from_tensor("f", torch.arange(4.0))])
     monkeypatch.setattr(ref.volume.put, "call", put)
+    # The retired endpoint closed once the failed request finished.
+    assert retired[0].transport.closed and not retired[0].held
 
     await _put(ref, [Request.from_tensor("g", torch.ones(4))])
     assert not _client_endpoint(ref).held
