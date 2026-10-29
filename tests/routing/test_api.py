@@ -126,8 +126,9 @@ def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
     ] == ["init"]
 
 
-def test_client_constructs_and_caches_a_routing_client(monkeypatch) -> None:
+def test_client_constructs_and_caches_a_routing_client(monkeypatch, caplog) -> None:
     """Create one rank-local routing client and reuse it for later API calls."""
+    caplog.set_level(logging.INFO, logger="torchstore.routing.coordinator")
     # 1. Supply a local coordinator handle and a known calling rank.
     strategy = object()
     coordinator = SimpleNamespace(
@@ -158,3 +159,9 @@ def test_client_constructs_and_caches_a_routing_client(monkeypatch) -> None:
     assert second is first
     spawn_coordinator.assert_awaited_once_with("routing-test", RoutingCoordinator)
     coordinator.strategy.call_one.assert_awaited_once_with()
+    # The strategy came through the adapter, which logs each call it forwards.
+    assert [
+        record.getMessage().split(" took ")[0]
+        for record in caplog.records
+        if record.name == "torchstore.routing.coordinator"
+    ] == ["routing control_plane=monarch strategy"]
