@@ -46,12 +46,19 @@ sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
 
 @pytest.fixture
 def collecting() -> Iterator[None]:
-    """Start with collection enabled, and enable collection again after."""
+    """Start with collection enabled, end with no window recorded, and enable it again."""
     assert gc.isenabled()
     try:
         yield
+        assert _gc._resuming == set()
     finally:
         gc.enable()
+
+
+def _hold_a_window(entered: threading.Event, release: threading.Event) -> None:
+    with _gc.gc_paused():
+        entered.set()
+        release.wait()
 
 
 @pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "disabled"])
@@ -76,22 +83,61 @@ def test_a_window_never_pauses_collection_at_exit(collecting: None) -> None:
     assert gc.isenabled()
 
 
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
 @pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "disabled"])
-def test_a_window_that_raises_still_closes(collecting: None, enabled: bool) -> None:
+def test_a_window_that_raises_still_closes(
+    collecting: None, enabled: bool, error_type: type[BaseException]
+) -> None:
     """Close a window that an exception leaves, inside one that stays open or as the last."""
     if not enabled:
         gc.disable()
-    error = ValueError("planning failed")
+    error = error_type("planning failed")
     with _gc.gc_paused():
-        with pytest.raises(ValueError):
+        with pytest.raises(error_type) as caught:
             with _gc.gc_paused():
                 raise error
+        assert caught.value is error
         assert not gc.isenabled()
     assert gc.isenabled() is enabled
-    with pytest.raises(ValueError):
+    with pytest.raises(error_type) as caught:
         with _gc.gc_paused():
             raise error
+    assert caught.value is error
     assert gc.isenabled() is enabled
+
+
+@pytest.mark.timeout(60)
+def test_windows_in_two_threads_record_only_a_window_that_found_collection_on(
+    collecting: None,
+) -> None:
+    """Resume collection when the window that found it on closes, inside another's window.
+
+    Only that window is recorded for the fork hook, and the other one never resumes it.
+    """
+    first_in, first_out, second_in, second_out = (threading.Event() for _ in range(4))
+    first = threading.Thread(target=_hold_a_window, args=(first_in, first_out))
+    second = threading.Thread(target=_hold_a_window, args=(second_in, second_out))
+    try:
+        first.start()
+        assert first_in.wait(10)
+        second.start()
+        assert second_in.wait(10)
+        assert not gc.isenabled() and _gc._resuming == {first.ident}
+        first_out.set()
+        first.join(10)
+        assert gc.isenabled() and _gc._resuming == set()
+        # Collection that other code turns off stays off in a child and once all close.
+        gc.disable()
+        _gc._after_fork_in_child()
+        assert not gc.isenabled()
+        second_out.set()
+        second.join(10)
+        assert not gc.isenabled()
+    finally:
+        first_out.set()
+        second_out.set()
+        first.join(10)
+        second.join(10)
 
 
 @pytest.mark.parametrize("found_enabled", [True, False], ids=["enabled", "disabled"])

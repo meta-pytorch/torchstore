@@ -152,6 +152,22 @@ if __name__ == "__main__":
 
 ```
 
+### Importing TorchStore and Monarch
+
+`import torchstore` loads no Monarch module. Monarch loads on the first TorchStore call
+that needs it, such as `ts.initialize` or `ts.client`, and reads its `HYPERACTOR_*`
+settings then, so ones you set after importing TorchStore apply to this process too.
+
+If `HYPERACTOR_CODEC_MAX_FRAME_LENGTH` is unset, importing TorchStore exports
+`910737418240` for it. A process that loads Monarch afterwards uses that limit, which
+also outranks `monarch.config.configure(codec_max_frame_length=...)`, while one that
+imported Monarch first keeps Monarch's own limit. Set the variable before importing
+TorchStore to choose the limit yourself.
+
+Monarch registers its runtime's shutdown at exit when it loads, and exit hooks run in
+reverse order of registration. So register an exit hook that calls TorchStore after the
+first TorchStore call, or import `monarch.actor` before registering it.
+
 ### SPMD Usage (torchrun / torchx)
 
 If your job is launched with `torchrun` or `torchx` rather than from inside a
@@ -339,13 +355,27 @@ await ts.client(store_name="weights", role=ts.RankRole.PUBLISHER)
 await ts.client(store_name="weights", role=ts.RankRole.REQUESTER, group=group)
 ```
 
-Initialize each routing store once per job. On the `"monarch"` plane a second
-`ts.initialize` of the same name raises, so start over with a new `store_name`, and a
-bring-your-own plane takes another `ts.initialize` only after the store's `ts.shutdown`.
+Initialize each routing store once per job. TorchStore does not check this on any plane.
+Every process keeps its cached client for a store, and on a bring-your-own plane its
+record of that plane (passed or dialed), until its own `ts.shutdown` for the store.
+`ts.reset_client` drops only the client, so the next `ts.client` reuses the recorded
+plane. To start a store over:
+
+- On the `"monarch"` plane, call `ts.initialize` again, which makes the coordinator drop
+  the publishers, strategy and layouts it held, then `ts.reset_client` in every rank
+- On a bring-your-own plane, call `ts.shutdown` in the driver and in every rank, then
+  `ts.initialize` with a plane holding fresh state, and pass that plane or its address
+  to each rank's next `ts.client`
+
 Give standard and routing stores different names on every plane, since a process keeps
 one client per store name. In one process, never overlap two `ts.initialize`,
-`ts.client` or `ts.shutdown` calls for one store, except concurrent first `ts.client`
-calls through one address, which share one client and its connection.
+`ts.client` or `ts.shutdown` calls for one store, whether from one event loop or from
+several threads. The exception is concurrent first `ts.client` calls through one address
+on one event loop, which share one client and its connection.
+
+Make no routing `ts.client` or state-dict call in the driver on either plane. Outside an
+actor every routing client gets rank 0 of its mesh, so a driver would publish as
+`publisher/0` and write into that rank's volume.
 
 `ts.initialize` and each new routing client log one INFO selection line naming the
 control plane, its address, store, rank and pid, such as
@@ -353,13 +383,16 @@ control plane, its address, store, rank and pid, such as
 The `"monarch"` plane also logs one INFO line per call with its duration, such as
 `routing control_plane=monarch init took 0.0042s`. Ranks in Monarch actors start with
 no logging handler, so call `ts.init_logging()` in each rank before its first
-`ts.client` to see these lines.
+`ts.client` to see these lines. The driver gets a handler from `import torchstore` only
+when that import exported `HYPERACTOR_CODEC_MAX_FRAME_LENGTH`, so call it there too when
+a launcher sets that variable.
 
 On the `"monarch"` plane, `ts.shutdown` cannot shut down a routing store: it looks the
 name up as a standard store's controller and raises `AttributeError`. The store's
 routing coordinator runs in the driver's process and keeps the strategy and every layout
-it collected until that process exits. This is a known limitation, so skip `ts.shutdown`
-for a routing store on that plane and stop its meshes when the job is done.
+it collected until that process exits or the next `ts.initialize` starts it over. This
+is a known limitation, so skip `ts.shutdown` for a routing store on that plane and stop
+its meshes when the job is done.
 
 A routing store's volumes outlive `ts.shutdown` on every control plane and, unlike a
 standard store's, keep every tensor published to them until `mesh` stops. Each
@@ -367,6 +400,15 @@ standard store's, keep every tensor published to them until `mesh` stops. Each
 `mesh`, or use a new one, before you initialize a routing store on it again. Publish
 each state dict under one key on every push: routing clients cannot delete, so each new
 key adds tensors to the volumes, layouts to the plane and routes to every rank for good.
+A key's layout is fixed at its first push, so keep its names, shapes, sharding and dtypes
+on every push. Routed reads neither wait for a push nor detect one, so start each pull
+after every publisher's `put_state_dict` for that push has returned, and the next push
+after every pull of the key has returned.
+
+A requester's first routed `get_state_dict` of each key turns off automatic garbage
+collection for the whole process while it plans its routes, a few seconds at 512
+publishers, and then turns it back on if it was on. Other threads see collection off in
+that window, and a change they make to it meanwhile can be undone when the window closes.
 
 ### Bring Your Own Control Plane
 
@@ -414,6 +456,10 @@ Your plane must keep these rules:
   directory or key prefix: TorchStore never clears a plane, so leftover state would hand
   ranks an earlier run's layouts or volumes
 - A rank's first layout per key wins. Registering a rank outside the publisher set raises
+- `get_layouts` keys each publisher's layout by its rank exactly as `register_layout`
+  received it
+- Put `init has not run`, `not a publisher rank` or `missing publishers: [...]` in the
+  matching error's message, since callers match errors by these texts
 - TorchStore calls the skeleton's methods, and an address's `connect()`, with no timeout,
   so give each call a deadline of your own past which it raises. `get_layouts`, which
   waits for every publisher (Monarch's coordinator waits 300 s), raises naming the
@@ -426,6 +472,9 @@ Your plane must keep these rules:
   state. Each store needs its own instance
 - Keep the skeleton's parameter names: TorchStore passes `init` and `register_layout`
   their arguments by keyword
+- TorchStore may close a plane that `connect()` returned while clients handed out
+  earlier still call it from other threads or event loops, so make those calls fail
+  rather than hang
 
 The driver passes an instance to
 `ts.initialize(..., client_type=ts.ClientType.ROUTING, control_plane=plane)`. Each rank
@@ -444,26 +493,26 @@ when a later selection replaces that record, or when the `ts.client` call that d
 it fails or finds that another call recorded the same address first. If that call is
 cancelled, TorchStore starts the close without waiting for it. Return a new plane from
 each `connect()`, one whose `close()` leaves the others working. TorchStore never closes
-a plane you passed in.
+a plane you passed in. Close it yourself only after this process's `ts.shutdown` for the
+store, since `ts.reset_client` keeps it recorded for the next `ts.client`.
 
 `ts.shutdown` raises any error from the `close()` it runs, or `TimeoutError` after 5 s,
 leaving the close running on the event loop, where `asyncio.run` cancels it as it
 returns. Give each blocking call inside `close()` a timeout of its own.
 
 Only the coordination is yours: `ts.initialize` still spawns the store's volumes as
-Monarch actors on `mesh`, and `ts.client` takes each rank's id from Monarch's
-`current_rank()`, which follows the actor's context, not the process. So make each
-rank's first `ts.client` call in an endpoint of an actor on `mesh` or on a requester
-mesh, or in an `asyncio.to_thread` call that endpoint makes, which copies the context,
-and make no `ts.client` or state-dict call for a routing store in the driver. A
-bring-your-own control plane therefore needs `torchmonarch`. TorchStore's interfaces for
-resolving volumes stay internal, so this holds for every plane you bring.
+Monarch actors on `mesh` and installs them in the strategy, and `ts.client` takes each
+rank's id from Monarch's `current_rank()`, which follows the actor's context, not the
+process. So make each rank's first `ts.client` call in an endpoint of an actor on `mesh`
+or on a requester mesh, or in an `asyncio.to_thread` call that endpoint makes, which
+copies the context. A bring-your-own control plane therefore needs `torchmonarch`.
 
 The contract tests' own bring-your-own plane, a worked example over a local directory
 rather than a plane to deploy, is
 [`tests/routing/file_store_control_plane.py`](tests/routing/file_store_control_plane.py).
 It passes the same contract tests as Monarch's coordinator
-([`tests/routing/test_coordinator.py`](tests/routing/test_coordinator.py)), and
+([`tests/routing/test_coordinator.py`](tests/routing/test_coordinator.py)), which also
+call `get_layouts` with a keyword-only `timeout_s` to bound each wait, and
 [`tests/routing/test_routed_sync.py`](tests/routing/test_routed_sync.py) syncs weights
 through it.
 
@@ -475,7 +524,7 @@ configuration is needed — the selection happens at runtime:
 | Priority | Transport | When used |
 |----------|-----------|-----------|
 | 1 | **POSIX Shared Memory** | Client and storage volume are on the same host |
-| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
+| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available in a process that loaded `monarch.actor` |
 | 3 | **TorchComms RDMA** | Cross-host, `torchcomms` installed |
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
