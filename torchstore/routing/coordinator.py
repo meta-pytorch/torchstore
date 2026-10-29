@@ -138,7 +138,8 @@ def _timed(operation: str) -> Iterator[None]:
         outcome = " cancelled"
         raise
     except BaseException as error:
-        outcome = f" failed with {type(error).__name__}"
+        # An ActorError carries the coordinator's own error, which names the failure.
+        outcome = f" failed with {type(getattr(error, 'exception', error)).__name__}"
         raise
     finally:
         elapsed = time.perf_counter() - start
@@ -150,12 +151,12 @@ def _timed(operation: str) -> Iterator[None]:
 class MonarchControlPlane(ControlPlane):
     """Adapts a ``RoutingCoordinator`` actor to the control-plane interface.
 
-    Actor errors pass through unchanged as ``ActorError``. Calls to a dead or unreachable
-    actor fail with ``SupervisionError`` at Monarch's watchdog, but nothing ends one a live
-    actor never answers.
+    Actor errors pass through as ``ActorError``, whose ``exception`` is the coordinator's
+    own error. Calls to a dead or unreachable actor fail with ``SupervisionError`` at
+    Monarch's watchdog, but nothing ends one a live actor never answers.
     """
 
-    def __init__(self, coordinator: RoutingCoordinator) -> None:
+    def __init__(self, coordinator: RoutingCoordinator, /) -> None:
         self._coordinator = coordinator
 
     async def init(

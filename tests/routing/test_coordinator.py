@@ -42,7 +42,7 @@ class TimedControlPlane(Protocol):
 
     ``timeout_s=None`` waits the plane's default and zero or less checks once. A lookup
     that times out raises ``timed out after <wait> seconds waiting for publisher layouts
-    for <key>; missing publishers: <sorted ranks>``, the wait 0 for zero or less.
+    for <key repr>; missing publishers: <sorted rank list repr>``, the wait 0 for zero or less.
     """
 
     async def init(
@@ -315,7 +315,8 @@ async def test_a_timeout_reports_the_wait_it_took(make_control_plane) -> None:
                 control_plane.get_layouts("model", timeout_s=timeout_s),
                 timeout=guard_s,
             )
-        assert loop.time() - started >= timeout_s / 2, "a positive timeout must wait"
+        # The plane's deadline starts after the call is sent, so the caller waits longer.
+        assert loop.time() - started >= timeout_s - 0.005, "it must wait its timeout"
 
 
 @pytest.mark.asyncio
@@ -326,9 +327,7 @@ async def test_a_timeout_ends_only_its_own_lookup(make_control_plane) -> None:
     )
     first, second = _registration("model/first"), _registration("model/second")
     patient = asyncio.ensure_future(patient_handle.get_layouts("model", timeout_s=30))
-    expiring = asyncio.ensure_future(
-        impatient_handle.get_layouts("model", timeout_s=1.5)
-    )
+    expiring = asyncio.ensure_future(impatient_handle.get_layouts("model", timeout_s=3))
     await _assert_still_pending(patient, expiring)
     # A check of the still-empty key while both lookups wait.
     with pytest.raises(
@@ -343,7 +342,7 @@ async def test_a_timeout_ends_only_its_own_lookup(make_control_plane) -> None:
     )
 
     message = (
-        "timed out after 1.5 seconds waiting for publisher layouts for 'model'; "
+        "timed out after 3 seconds waiting for publisher layouts for 'model'; "
         "missing publishers: ['publisher/1']"
     )
     with pytest.raises(Exception, match=re.escape(message)):
@@ -576,9 +575,10 @@ async def test_layout_lookup_requires_initialization(make_control_plane) -> None
 
 @pytest.mark.asyncio
 async def test_each_call_takes_the_interface_parameters(make_control_plane) -> None:
-    """Take each interface call's parameters, which callers pass by keyword.
+    """Take each interface call's parameter names, kinds and defaults.
 
-    The lookup adds only a keyword-only timeout.
+    TorchStore passes ``init`` and ``register_layout`` arguments by keyword. The lookup
+    adds only a keyword-only timeout.
     """
     control_plane = await make_control_plane()
     for name in sorted(ControlPlane.__abstractmethods__):
