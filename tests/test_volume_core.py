@@ -14,6 +14,7 @@ import inspect
 import pickle
 import uuid
 from functools import partial
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -21,7 +22,7 @@ import pytest
 import torch
 from torchstore.storage import InMemoryStore, StorageImpl, StorageVolumeCore
 from torchstore.strategy import StorageVolumeRef
-from torchstore.transport import create_transport_buffer, gloo, TransportType
+from torchstore.transport import create_transport_buffer, TransportType
 from torchstore.transport.buffers import (
     TransportBuffer,
     TransportCache,
@@ -125,10 +126,8 @@ async def _endpoint_shape(self) -> None:
 
 @pytest.fixture
 def volume():
-    # Gloo caches each volume's connection for the whole process, by volume id.
     core = StorageVolumeCore(f"volume-{uuid.uuid4()}")
     yield _StandInVolume(core)
-    gloo._store_addrs.pop(core.volume_id, None)
     core.store.reset()
 
 
@@ -254,6 +253,22 @@ def test_storage_volume_is_an_actor_over_a_plain_core() -> None:
     assert storage_volume.InMemoryStore is InMemoryStore
 
 
+def test_storage_volume_keeps_its_store_and_volume_id() -> None:
+    """Read and set the core's store and volume ID, as on upstream's actor."""
+    pytest.importorskip("monarch.actor")
+    from torchstore.storage_volume import StorageVolume
+
+    stand_in = SimpleNamespace(core=StorageVolumeCore("volume"))
+    store, properties = InMemoryStore(), vars(StorageVolume)
+    properties["store"].fset(stand_in, store)
+    assert stand_in.core.store is store
+    assert properties["store"].fget(stand_in) is store
+    assert properties["volume_id"].fget(stand_in) == "volume"
+    properties["volume_id"].fset(stand_in, "renamed")
+    assert stand_in.core.volume_id == "renamed"
+    assert properties["volume_id"].fget(stand_in) == "renamed"
+
+
 def test_storage_volume_endpoints_stay_serial() -> None:
     """Keep each endpoint serial, so a volume runs one call at a time."""
     actor = pytest.importorskip("monarch.actor")
@@ -293,11 +308,16 @@ async def test_storage_volume_delegates_each_endpoint_to_its_core(
         "reset": (),
     }
     assert set(calls) == set(_ENDPOINTS)
+    # Only the core produces each reply, so a dropped one cannot pass.
     replies = {
         "get_id": ("volume", "host"),
         "handshake": [True, True],
-        "get": "buffer",
+        "put": None,
+        "get": "reply-buffer",
         "get_meta": [(torch.Size([2]), torch.float32), "object"],
+        "delete": None,
+        "delete_batch": None,
+        "reset": None,
     }
     for name, reply in replies.items():
         getattr(core, name).return_value = reply
@@ -311,7 +331,7 @@ async def test_storage_volume_delegates_each_endpoint_to_its_core(
             endpoint.call_one(**dict(zip(names[1:], args))), timeout=30
         )
         method.assert_awaited_once_with(*args)
-        assert result == replies.get(name), name
+        assert result == replies[name], name
         error = RuntimeError(name)
         method.side_effect = error
         with pytest.raises(ActorError) as raised:
