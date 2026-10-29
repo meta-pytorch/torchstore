@@ -172,8 +172,13 @@ async def test_a_failed_layout_exchange_is_retried_on_the_next_sync() -> None:
 
 @pytest.mark.parametrize(
     "requested, enabled",
-    [("w", True), ("other", True), ("other", False)],
-    ids=["plans-enabled", "planning_raises-enabled", "planning_raises-disabled"],
+    [("w", True), ("w", False), ("other", True), ("other", False)],
+    ids=[
+        "plans-enabled",
+        "plans-disabled",
+        "planning_raises-enabled",
+        "planning_raises-disabled",
+    ],
 )
 @pytest.mark.asyncio
 async def test_a_requester_pauses_collection_only_while_it_plans(

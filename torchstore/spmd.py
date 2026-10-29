@@ -15,7 +15,8 @@ from typing import Any, TYPE_CHECKING
 
 from torch.distributed import TCPStore
 
-# Imported on load because tests patch StoreJob. The package loads this module lazily.
+# Imported on load: tests patch StoreJob, and three signatures here name it when this
+# module loads. The package loads this module lazily.
 try:
     from monarch.job.spmd import StoreJob
 except ImportError as e:
