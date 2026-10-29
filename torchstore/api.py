@@ -5,23 +5,22 @@
 # LICENSE file in the root directory of this source tree.
 
 from functools import partial
-from typing import Any, overload, TYPE_CHECKING
+from typing import Any, overload, TYPE_CHECKING, TypeVar
 
 import torch
-from monarch.actor import current_rank, get_or_spawn_controller, ProcMesh
 from torch.distributed.tensor import DTensor
 
 import torchstore.state_dict_utils
 from torchstore.client import ClientType, LocalClient
-from torchstore.controller import Controller, ControllerDirectory
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
-from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
 
 if TYPE_CHECKING:
+    from monarch.actor import Actor, Future, Point, ProcMesh
+
+    from torchstore.controller import Controller
     from torchstore.spmd import _SPMDSession
 
 # I need to keep this somewhere, so here we go
@@ -33,6 +32,24 @@ _local_clent_map: dict[str, LocalClient] = {}
 
 # SPMD-initialized stores register their session here
 _spmd_state_map: dict[str, "_SPMDSession"] = {}
+
+_TActor = TypeVar("_TActor", bound="Actor")
+
+
+def current_rank() -> "Point":
+    """Monarch's ``current_rank``, imported when first called."""
+    from monarch.actor import current_rank as monarch_current_rank
+
+    return monarch_current_rank()
+
+
+def get_or_spawn_controller(
+    name: str, Class: type[_TActor], *args: Any, **kwargs: Any
+) -> "Future[_TActor]":
+    """Monarch's ``get_or_spawn_controller``, imported when first called."""
+    from monarch.actor import get_or_spawn_controller as monarch_get_or_spawn_controller
+
+    return monarch_get_or_spawn_controller(name, Class, *args, **kwargs)
 
 
 def _routing_volume_id(namespace: str) -> str:
@@ -55,7 +72,7 @@ async def initialize(
     num_storage_volumes: int = 1,
     strategy: TorchStoreStrategy | None = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
-    mesh: ProcMesh | None = None,
+    mesh: "ProcMesh | None" = None,
     client_type: ClientType = ClientType.STANDARD,
 ) -> None:
     """Initialize the TorchStore distributed storage system.
@@ -92,6 +109,8 @@ async def initialize(
             "Must specify controller strategy if num_storage_volumes > 1"
         )
 
+    from torchstore.storage_volume import StorageVolume
+
     # TODO: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
     # ideally this is done in the controller.init
     if isinstance(strategy, ControllerStorageVolumes):
@@ -116,11 +135,14 @@ async def initialize(
 
 
 async def _initialize_routing(
-    mesh: ProcMesh,
+    mesh: "ProcMesh",
     strategy: TorchStoreStrategy,
     store_name: str,
 ) -> None:
     """Spawn trainer volumes and the coordinator that routing mode needs."""
+    from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
+    from torchstore.storage_volume import StorageVolume
+
     namespace = _routing_namespace(RankRole.PUBLISHER, None)
     volumes = await StorageVolume.spawn(
         1,
@@ -171,8 +193,10 @@ def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     _local_clent_map.pop(store_name, None)
 
 
-async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:
+async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> "Controller":
     """Get a controller handle for interacting with the store."""
+    from torchstore.controller import Controller
+
     session = _spmd_state_map.get(store_name)
     if session is not None:
         return session.controller
@@ -209,6 +233,11 @@ async def client(
         return _local_clent_map[store_name]
 
     if role is not None:
+        from torchstore.routing.coordinator import (
+            MonarchControlPlane,
+            RoutingCoordinator,
+        )
+
         role = RankRole(role)
         coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
         control_plane = MonarchControlPlane(coordinator)
@@ -219,6 +248,8 @@ async def client(
             await control_plane.strategy(),
         )
     else:
+        from torchstore.controller import ControllerDirectory
+
         controller = await _controller(store_name)
         controller_strategy = await controller.get_controller_strategy.call_one()
         local_client = LocalClient(
