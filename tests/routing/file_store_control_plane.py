@@ -93,8 +93,8 @@ class FileStoreControlPlane(ts.ControlPlane):
         return os.path.join(self._path, quote(key, safe=""))
 
     def _init(self, values: Mapping[str, bytes]) -> None:
-        # Only the last part, so a missing parent fails here, and only the owner may
-        # write: no earlier run's files or anyone else's land in the store.
+        # Only the last part, so a missing parent fails here, and only the owner may read
+        # or write: no earlier run's files or anyone else's land in the store.
         os.mkdir(self._path, 0o700)
         for key, value in values.items():
             self._write_once(key, value)
@@ -113,8 +113,12 @@ class FileStoreControlPlane(ts.ControlPlane):
             os.unlink(temporary)
 
     def _read(self, key: str) -> bytes:
-        if not os.path.exists(self._file(_READY)):
+        if not _exists(self._file(_READY)):
             raise RuntimeError("FileStoreControlPlane.init has not run")
+        # Values are pickled, so trust only a directory that no one else may write.
+        info = os.stat(self._path)
+        if info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise PermissionError(f"{self._path} is open to other users' writes")
         return self._load(key)
 
     def _load(self, key: str) -> bytes:
@@ -130,12 +134,19 @@ class FileStoreControlPlane(ts.ControlPlane):
         self._write_once(layout_key, value)
 
     def _missing(self, keys: Mapping[str, str]) -> list[str]:
-        return [
-            rank for rank, key in keys.items() if not os.path.exists(self._file(key))
-        ]
+        return [rank for rank, key in keys.items() if not _exists(self._file(key))]
 
     def _read_all(self, keys: list[str]) -> list[bytes]:
         return [self._load(key) for key in keys]
+
+
+def _exists(path: str) -> bool:
+    """Whether ``path`` exists. Errors other than a missing file raise."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _layout_key(key: str, rank: str) -> str:

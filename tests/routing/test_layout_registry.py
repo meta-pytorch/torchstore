@@ -146,11 +146,18 @@ async def test_errors_keep_the_coordinator_types_and_texts() -> None:
 
 @pytest.mark.asyncio
 async def test_init_takes_publishers_once() -> None:
-    """Refuse an empty publisher set and a second init: re-init is unsupported."""
+    """Refuse an empty publisher set and a second init, and accept a missing strategy.
+
+    Upstream's coordinator took one too, and ``strategy`` then said init had not run.
+    """
     registry = LayoutRegistry()
-    with pytest.raises(ValueError, match="needs at least one publisher rank"):
-        await registry.init([], object())
-    await registry.init({"publisher/0"}, object())
+    for publishers in ([], iter(())):
+        with pytest.raises(ValueError, match="needs at least one publisher rank"):
+            await registry.init(publishers, object())
+    await registry.init({"publisher/0"}, None)
+    with pytest.raises(RuntimeError) as unset:
+        await registry.strategy()
+    assert unset.value.args == (_NOT_INITIALIZED,)
     with pytest.raises(RuntimeError, match="RoutingCoordinator.init already ran"):
         await registry.init({"publisher/1"}, object())
     with pytest.raises(KeyError, match="'publisher/1' is not a publisher rank"):
@@ -236,6 +243,22 @@ async def test_lookups_that_miss_leave_no_entry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_overlapping_lookups_that_miss_leave_no_entry() -> None:
+    """Drop a missed key's entry once the last of its overlapping lookups leaves."""
+    registry = LayoutRegistry()
+    await registry.init({"publisher/0"}, object())
+    lookups = [
+        asyncio.ensure_future(registry.get_layouts("missed", timeout_s=0.01))
+        for _ in range(3)
+    ]
+    results = await asyncio.wait_for(
+        asyncio.gather(*lookups, return_exceptions=True), timeout=5
+    )
+    assert all(isinstance(result, TimeoutError) for result in results), results
+    assert registry._layouts == {}
+
+
+@pytest.mark.asyncio
 async def test_a_cancelled_or_refused_call_leaves_no_entry() -> None:
     """Leave no entry for a cancelled lookup or a registration from another rank."""
     registry = LayoutRegistry()
@@ -257,10 +280,11 @@ async def test_a_cancelled_or_refused_call_leaves_no_entry() -> None:
 def test_cancelled_lookups_leave_the_key_usable() -> None:
     """Leave a key usable when its lookups are cancelled at their shared deadline.
 
-    A host cancels every running lookup, as Monarch's cleanup does.
+    A host cancels every running lookup, as Monarch's cleanup does, at each of the loop
+    passes over which Python 3.10's timed-out waits unwind.
     """
 
-    async def cancel_at_the_deadline() -> None:
+    async def cancel_at_the_deadline(passes: int) -> bool:
         loop = asyncio.get_running_loop()
         assert isinstance(loop, _ManualClockLoop)
         registry = LayoutRegistry()
@@ -272,10 +296,8 @@ def test_cancelled_lookups_leave_the_key_usable() -> None:
         ]
         await _spin(10)
         loop.now = 2.0  # every lookup's deadline passes at once
-        # Four loop passes in, Python 3.10's timed-out waits are still unwinding.
-        await _spin(4)
+        await _spin(passes)
         running = [lookup for lookup in lookups if not lookup.done()]
-        assert running, "every lookup ended before the cancel, so nothing was checked"
         for lookup in lookups:
             lookup.cancel()
         await _spin(30)
@@ -295,15 +317,21 @@ def test_cancelled_lookups_leave_the_key_usable() -> None:
         lookup = asyncio.ensure_future(registry.get_layouts("model", timeout_s=0))
         await _spin(10)
         calls = [*later, lookup]
-        assert all(call.done() for call in calls), "the key stayed locked"
+        assert all(call.done() for call in calls), ("the key stayed locked", passes)
         assert set(lookup.result()) == publishers
+        return bool(running)
 
-    loop = _ManualClockLoop()
-    try:
-        # Closed without draining, so a wedged call fails instead of hanging.
-        loop.run_until_complete(cancel_at_the_deadline())
-    finally:
-        loop.close()
+    cancelled_running = []
+    for passes in range(9):
+        loop = _ManualClockLoop()
+        try:
+            # Closed without draining, so a wedged call fails instead of hanging.
+            cancelled_running.append(
+                loop.run_until_complete(cancel_at_the_deadline(passes))
+            )
+        finally:
+            loop.close()
+    assert any(cancelled_running), "every lookup ended before each cancel"
 
 
 @pytest.mark.asyncio
