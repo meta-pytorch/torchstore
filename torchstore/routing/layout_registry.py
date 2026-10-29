@@ -58,13 +58,15 @@ class LayoutRegistry:
     ) -> None:
         """Record the publishers and strategy, at most once.
 
-        A second call raises, since a store is never initialized again.
+        A second call raises. The Monarch coordinator starts a new registry for each.
+        A missing strategy is accepted, and ``strategy`` then says ``init`` has not run.
         """
         if self._publishers is not None:
             raise RuntimeError("RoutingCoordinator.init already ran")
-        if not publishers:
+        ranks = frozenset(publishers)
+        if not ranks:
             raise ValueError("a routing store needs at least one publisher rank")
-        self._publishers = frozenset(publishers)
+        self._publishers = ranks
         self._strategy = strategy
 
     async def strategy(self) -> TorchStoreStrategy:

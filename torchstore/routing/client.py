@@ -39,6 +39,11 @@ class RoutingClient(LocalClient):
         control_plane: ControlPlane,
         strategy: TorchStoreStrategy,
     ) -> None:
+        if not isinstance(control_plane, ControlPlane):
+            raise TypeError(
+                "control_plane must be a ControlPlane. Wrap a RoutingCoordinator actor "
+                f"as MonarchControlPlane(coordinator), got {control_plane!r}"
+            )
         directory = RoutingDirectory(rank)
         super().__init__(directory, strategy)
         self._routing_directory = directory

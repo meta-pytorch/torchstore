@@ -34,6 +34,24 @@ class StorageVolume(Actor):
     ) -> None:
         self.core = StorageVolumeCore(id_func())
 
+    @property
+    def store(self) -> InMemoryStore:
+        """The core's store. Setting it replaces the store every endpoint serves."""
+        return self.core.store
+
+    @store.setter
+    def store(self, store: InMemoryStore) -> None:
+        self.core.store = store
+
+    @property
+    def volume_id(self) -> str:
+        """The core's volume ID. Setting it changes the ID ``get_id`` reports."""
+        return self.core.volume_id
+
+    @volume_id.setter
+    def volume_id(self, volume_id: str) -> None:
+        self.core.volume_id = volume_id
+
     @classmethod
     async def spawn(
         cls,
