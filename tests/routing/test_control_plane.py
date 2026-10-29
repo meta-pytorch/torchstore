@@ -18,7 +18,7 @@ import torchstore as ts
 import torchstore.routing.control_plane as control_plane_module
 from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
 
-# The design doc's ControlPlane sketch.
+# The public interface's signatures, frozen from the design's ControlPlane sketch.
 _DESIGN = {
     "init": "(self, publishers: 'Collection[str]', strategy: 'TorchStoreStrategy') -> 'None'",
     "register_layout": "(self, rank: 'str', key: 'str', registrations: 'Mapping[str, KeyRegistration]') -> 'None'",
@@ -68,7 +68,7 @@ def test_interface_signatures_match_the_design() -> None:
 
 def test_control_plane_imports_no_backend() -> None:
     """Keep the interface a plain ABC that imports no backend itself."""
-    # Exact for TorchStore modules: any of them can load Monarch, as ``_model`` does.
+    # Exact for TorchStore modules, since one can load Monarch (the coordinator does).
     tree = ast.parse(inspect.getsource(control_plane_module))
     type_checking = [
         statement
@@ -87,6 +87,9 @@ def test_control_plane_imports_no_backend() -> None:
     assert torchstore_imports(tree.body) == {"._model"}
     assert torchstore_imports(type_checking) == {"torchstore.strategy"}
     assert torchstore_imports(ast.walk(tree)) == {"._model", "torchstore.strategy"}
+    # Everything else it imports comes from these standard modules, so no backend.
+    others = _imported(ast.walk(tree)) - torchstore_imports(ast.walk(tree))
+    assert others <= {"__future__", "abc", "collections.abc", "dataclasses", "typing"}
     assert ControlPlane.__mro__[1:] == (ABC, object)
 
 
@@ -94,6 +97,7 @@ def test_address_is_an_abstract_frozen_dataclass() -> None:
     """Name a store, connect asynchronously, and pickle and compare by value."""
     assert ts.ControlPlaneAddress is ControlPlaneAddress
     assert ts.ControlPlane is ControlPlane
+    assert {"ControlPlane", "ControlPlaneAddress"} <= set(ts.__all__)
     assert ControlPlaneAddress.__abstractmethods__ == {"connect", "__str__"}
     assert inspect.iscoroutinefunction(ControlPlaneAddress.connect)
     assert [field.name for field in dataclasses.fields(ControlPlaneAddress)] == [
