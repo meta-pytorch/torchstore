@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import gc
 from collections import Counter
 from collections.abc import Collection, Mapping
 from typing import Any
@@ -16,6 +17,8 @@ import torchstore as ts
 from torchstore.routing._model import KeyRegistration, RankRole, Registrations
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.control_plane import ControlPlane
+from torchstore.routing.plan import RoutingPlan
+from torchstore.state_dict_utils import _state_dict_storage_metadata
 from torchstore.transport import TransportType
 
 from .utils import registered_clients
@@ -165,3 +168,76 @@ async def test_a_failed_layout_exchange_is_retried_on_the_next_sync() -> None:
     assert route is not None
     [transfer] = route.transfers
     assert transfer.source == "publisher/0"
+
+
+@pytest.mark.parametrize(
+    "requested, enabled",
+    [("w", True), ("w", False), ("other", True), ("other", False)],
+    ids=[
+        "plans-enabled",
+        "plans-disabled",
+        "planning_raises-enabled",
+        "planning_raises-disabled",
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_requester_pauses_collection_only_while_it_plans(
+    monkeypatch: pytest.MonkeyPatch, requested: str, enabled: bool
+) -> None:
+    """Pause collection only while a requester plans its routes, then leave it as it was, also on a raise.
+
+    The control plane's lookup, which can wait for minutes, and every other step run
+    with collection as the caller left it.
+    """
+    assert gc.isenabled()
+    control_plane, publisher, requester = _in_memory_clients()
+    await publisher.register_layout({"w": torch.empty(4, dtype=torch.int64)}, "model")
+    seen: list[tuple[str, bool]] = []
+
+    def recorded(step: str, call: Any) -> Any:
+        def record(*args: Any, **kwargs: Any) -> Any:
+            seen.append((step, gc.isenabled()))
+            return call(*args, **kwargs)
+
+        return record
+
+    get_layouts = control_plane.get_layouts
+
+    async def lookup(key: str) -> Registrations:
+        # Recorded as the lookup runs, not when the requester creates its coroutine.
+        seen.append(("lookup", gc.isenabled()))
+        return await get_layouts(key)
+
+    directory = requester._routing_directory
+    monkeypatch.setattr(control_plane, "get_layouts", lookup)
+    monkeypatch.setattr(
+        "torchstore.routing.client._state_dict_storage_metadata",
+        recorded("metadata", _state_dict_storage_metadata),
+    )
+    monkeypatch.setattr(
+        RoutingPlan, "for_requester", recorded("plan", RoutingPlan.for_requester)
+    )
+    monkeypatch.setattr(directory, "install", recorded("install", directory.install))
+    state_dict = {requested: torch.empty(4, dtype=torch.int64)}
+    if not enabled:
+        gc.disable()
+    try:
+        if requested == "w":
+            await requester.get_layouts(state_dict, "model")
+            after = gc.isenabled()
+        else:
+            with pytest.raises(
+                KeyError, match="requester keys have no publisher"
+            ) as raised:
+                await requester.get_layouts(state_dict, "model")
+            # Read before dropping the error, so only the requester's own close passes.
+            after = gc.isenabled()
+            del raised
+    finally:
+        gc.enable()
+    steps = [("lookup", enabled), ("metadata", enabled), ("plan", False)]
+    if requested == "w":
+        steps.append(("install", enabled))
+        assert directory.routes.lookup("model/w")
+    assert seen == steps
+    assert after is enabled
