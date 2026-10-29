@@ -133,6 +133,10 @@ class TransportBuffer:
 
     Methods Called on STORAGE VOLUME (Remote Process)
     -------------------------------------------------
+    The storage volume works on a pickled copy whose `storage_volume_ref` is None, as is
+    the reply's and any copy made by pickle or the `copy` module, so these use `ctx` and
+    the fields the client set instead.
+
     - `recv_handshake`: Exchange connection info (if requires_handshake returns True)
     - `handle_put_request`: Receive tensor data and return list aligned with entries
     - `handle_get_request`: Send stored tensor data back to client
@@ -170,6 +174,7 @@ class TransportBuffer:
     ----------
     storage_volume_ref : StorageVolumeRef
         Reference to the target storage volume, including actor handle and transport context.
+        Only the client's own buffer holds it.
 
     """
 

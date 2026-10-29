@@ -21,14 +21,12 @@ from torchstore.strategy import (
     ControllerStorageVolumes,
     HostStrategy,
     LocalRankStrategy,
-    StorageVolumeRef,
     TorchStoreStrategy,
 )
-from torchstore.transport import create_transport_buffer, TransportType
-from torchstore.transport.types import Request
+from torchstore.transport import TransportType
 from torchstore.volume_host import MonarchVolumeHost, VolumeHost
 
-from .volume_meshes import VolumeMesh as _FakeMesh
+from .volume_meshes import get_through, put_through, VolumeMesh as _FakeMesh
 
 pytestmark = pytest.mark.timeout(120)
 
@@ -87,17 +85,6 @@ def _name_volume_and_host(prefix: str) -> str:
     return f"{prefix}/{os.getpid()}"
 
 
-async def _put(ref: StorageVolumeRef, key: str, value: torch.Tensor) -> None:
-    buffer = create_transport_buffer(ref)
-    await buffer.put_to_storage_volume([Request.from_tensor(key, value)])
-
-
-async def _get(ref: StorageVolumeRef, key: str) -> torch.Tensor:
-    buffer = create_transport_buffer(ref)
-    [value] = await buffer.get_from_storage_volume([Request(key=key)])
-    return value
-
-
 @pytest.mark.asyncio
 async def test_strategy_resolves_each_volume_to_its_mesh_slice() -> None:
     """Resolve each ID to its slice and verbatim host name, also from a pickled copy."""
@@ -107,6 +94,9 @@ async def test_strategy_resolves_each_volume_to_its_mesh_slice() -> None:
 
     assert isinstance(strategy.volume_host, MonarchVolumeHost)
     assert list(strategy.volume_host.volume_ids()) == ["a", "b"]
+    # Upstream's attributes stay filled for code that reads them.
+    assert strategy.volume_id_to_coord == {"a": {"procs": 0}, "b": {"procs": 1}}
+    assert strategy.volume_id_to_hostname == dict(names)
     for resolver in (strategy, pickle.loads(pickle.dumps(strategy))):
         for rank, volume_id in enumerate(["a", "b"]):
             ref = resolver.get_storage_volume(volume_id)
@@ -232,6 +222,44 @@ async def test_strategy_resolves_through_any_volume_host(monkeypatch) -> None:
     assert ref.default_transport_type is TransportType.MonarchRPC
     assert strategy.select_storage_volume().volume is endpoints_b
     assert str(strategy) == "LocalRankStrategy(storage_volume_len=2)"
+    # Setting volumes, as ts.initialize does, replaces the installed host.
+    await strategy.set_storage_volumes(_FakeMesh([("b", "host-b")]))
+    assert isinstance(strategy.volume_host, MonarchVolumeHost)
+    assert strategy.select_storage_volume().volume == ("slice", {"procs": 0})
+
+
+@pytest.mark.asyncio
+async def test_lookups_read_volumes_a_subclass_sets_itself(monkeypatch) -> None:
+    """Resolve volumes that a subclass puts on upstream's attributes without a host."""
+
+    class SelfSetStrategy(LocalRankStrategy):
+        async def set_storage_volumes(self, storage_volumes) -> None:
+            self.storage_volumes = storage_volumes
+            self.volume_id_to_coord = {"1": {"procs": 1}}
+            self.volume_id_to_hostname = {"1": "host-1"}
+
+    monkeypatch.setenv("RANK", "1")
+    strategy = SelfSetStrategy()
+    await strategy.set_storage_volumes(_FakeMesh([("0", "host-0"), ("1", "host-1")]))
+    ref = strategy.select_storage_volume()
+    assert (ref.volume, ref.volume_id, ref.volume_hostname) == (
+        ("slice", {"procs": 1}),
+        "1",
+        "host-1",
+    )
+    with pytest.raises(KeyError) as raised:
+        strategy.get_storage_volume("0")
+    assert raised.value.args == ("0",)
+
+
+def test_controller_storage_volumes_refuses_a_volume_host() -> None:
+    """Refuse a volume host, which the controller volume's lookups would never consult."""
+    strategy = ControllerStorageVolumes()
+    with pytest.raises(
+        TypeError, match="^ControllerStorageVolumes reaches its one controller volume"
+    ):
+        strategy.set_volume_host(_RecordHost({}))
+    assert strategy.volume_host is None
 
 
 @pytest.mark.asyncio
@@ -276,9 +304,9 @@ async def test_monarch_host_resolves_each_volume_of_a_real_mesh() -> None:
         copy = cloudpickle.loads(cloudpickle.dumps(strategy))
         for index, volume_id in enumerate(volume_ids):
             value = torch.full((4,), float(index))
-            await _put(strategy.get_storage_volume(volume_id), "weights", value)
+            await put_through(strategy.get_storage_volume(volume_id), "weights", value)
         copied_refs = [copy.get_storage_volume(v) for v in volume_ids]
-        fetched = [await _get(ref, "weights") for ref in copied_refs]
+        fetched = [await get_through(ref, "weights") for ref in copied_refs]
         with pytest.raises(KeyError) as missing:
             strategy.get_storage_volume(f"{prefix}/missing")
         assert missing.value.args == (f"{prefix}/missing",)
