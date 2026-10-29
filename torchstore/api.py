@@ -16,7 +16,7 @@ from torchstore.client import ClientType, LocalClient
 from torchstore.controller import Controller, ControllerDirectory
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
-from torchstore.routing.coordinator import RoutingCoordinator
+from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
@@ -132,7 +132,7 @@ async def _initialize_routing(
     publishers = {f"{namespace}/{rank}" for rank in range(mesh.size())}
 
     coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
-    await coordinator.init.call_one(
+    await MonarchControlPlane(coordinator).init(
         publishers=publishers,
         strategy=strategy,
     )
@@ -211,11 +211,12 @@ async def client(
     if role is not None:
         role = RankRole(role)
         coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
+        control_plane = MonarchControlPlane(coordinator)
         local_client = RoutingClient(
             _routing_volume_id(_routing_namespace(role, group)),
             role,
-            coordinator,
-            await coordinator.strategy.call_one(),
+            control_plane,
+            await control_plane.strategy(),
         )
     else:
         controller = await _controller(store_name)
