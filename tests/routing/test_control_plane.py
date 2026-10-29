@@ -10,7 +10,7 @@ import inspect
 
 from torchstore.routing.control_plane import ControlPlane
 
-# The design doc's ControlPlane sketch.
+# The public interface's signatures, frozen from the design's ControlPlane sketch.
 _DESIGN = {
     "init": "(self, publishers: 'Collection[str]', strategy: 'TorchStoreStrategy') -> 'None'",
     "register_layout": "(self, rank: 'str', key: 'str', registrations: 'Mapping[str, KeyRegistration]') -> 'None'",
