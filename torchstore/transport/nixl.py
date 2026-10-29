@@ -203,8 +203,9 @@ class NixlTransportBuffer(TransportBuffer):
     their memory are kept for the life of the transport context. The volume
     retires such an agent and uses a new one. Destinations of a failed
     request, including the stored value of a failed in-place PUT, hold
-    undefined data. A failed GET's leaked transfers may still overwrite its
-    destinations later, even after a later GET into them succeeds.
+    undefined data. Within the same transport context, a later GET cannot
+    republish retained storage as its NIXL destination. This does not prevent
+    late writes racing with direct access, copy-back, or another context.
     """
 
     supports_batch_puts = True
@@ -290,6 +291,25 @@ class NixlTransportBuffer(TransportBuffer):
             else []
         )
         meta_iterator = iter(meta_results)
+
+        # A concurrent request may have failed during the metadata await. Check
+        # the whole batch before registering or publishing any destination.
+        for request in requests:
+            tensor = request.tensor_val
+            if tensor is None or tensor.numel() == 0:
+                continue
+            cache = self._client_cache()
+            retired = self.storage_volume_ref.transport_context.retired(NixlAgentCache)
+            if not cache.leaked_storages and not retired:
+                break
+            storage = tensor.untyped_storage().data_ptr()
+            if storage in cache.leaked_storages or any(
+                storage in previous.leaked_storages for previous in retired
+            ):
+                raise RuntimeError(
+                    f"NIXL GET destination for key={request.key!r} shares storage "
+                    "with an unfinished transfer; use a fresh destination tensor"
+                )
 
         # 2. build contexts
         self._contexts = []

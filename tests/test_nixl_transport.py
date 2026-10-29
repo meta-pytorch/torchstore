@@ -662,6 +662,104 @@ async def test_clear_retires_cache_with_leaked_destinations(ref, ctx):
     assert ref.transport_context.get(NixlAgentCache) is not client_cache
 
 
+@pytest.fixture
+def get_rpc(ref, ctx):
+    async def get(buffer, requests):
+        volume_buffer = _storage_volume_copy(buffer)
+        await volume_buffer.handle_get_request(
+            ctx, [(request, torch.arange(4)) for request in requests]
+        )
+        return volume_buffer
+
+    rpc = AsyncMock(side_effect=get)
+    ref.volume.get = SimpleNamespace(call_one=rpc)
+    return rpc
+
+
+@pytest.mark.parametrize("retire_cache", [False, True])
+@pytest.mark.parametrize("retry_destination", ["same", "offset_view", "fresh"])
+@pytest.mark.asyncio
+async def test_get_retry_checks_destination_storage(
+    retire_cache, retry_destination, ref, get_rpc
+):
+    backing = torch.zeros(8, dtype=torch.int64)
+    destination = backing[:4]
+    request = Request.from_tensor("weight", destination)
+    FakeNixlAgent.failed_handle_ids = {0}
+    with pytest.raises(RuntimeError, match="NIXL WRITE failed"):
+        await NixlTransportBuffer(ref).get_from_storage_volume([request])
+    if retire_cache:
+        ref.transport_context.clear()
+
+    if retry_destination == "offset_view":
+        destination = backing[2:6]
+    elif retry_destination == "fresh":
+        destination = torch.zeros_like(destination)
+    # A mixed batch also verifies that no earlier entry is dispatched first.
+    requests = [
+        Request.from_any("other", None),
+        Request.from_tensor("weight", destination),
+    ]
+    ref.volume.get_meta.call_one.return_value = [(torch.Size([4]), torch.int64)]
+    get_rpc.reset_mock()
+    retry = NixlTransportBuffer(ref)
+
+    if retry_destination == "fresh":
+        results = await retry.get_from_storage_volume(requests)
+        assert results[-1] is destination
+        assert torch.equal(destination, torch.arange(4))
+        get_rpc.assert_awaited_once()
+    else:
+        with pytest.raises(RuntimeError, match="NIXL GET.*weight.*fresh"):
+            await retry.get_from_storage_volume(requests)
+        get_rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_can_reuse_destination_after_success(ref, get_rpc):
+    destination = torch.zeros(4, dtype=torch.int64)
+    request = Request.from_tensor("weight", destination)
+    for _ in range(2):
+        results = await NixlTransportBuffer(ref).get_from_storage_volume([request])
+        assert results == [destination]
+        assert torch.equal(destination, torch.arange(4))
+    assert get_rpc.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_allows_empty_view_of_pinned_storage(ref):
+    backing = torch.zeros(4)
+    ref.transport_context.get(NixlAgentCache).leak(None, [backing])
+    empty = backing[:0]
+    buffer = NixlTransportBuffer(ref)
+
+    await buffer._pre_get_hook([Request.from_tensor("empty", empty)])
+
+    assert buffer._contexts[0].tensor is empty
+    assert buffer._contexts[0].remote_descriptors is None
+    assert buffer._destinations == []
+    await buffer.drop()
+
+
+@pytest.mark.asyncio
+async def test_get_rechecks_storage_after_metadata_await(ref, get_rpc):
+    destination = torch.zeros(4, dtype=torch.int64)
+
+    async def get_meta(_requests):
+        # Another request can fail while this batch awaits its metadata.
+        ref.transport_context.get(NixlAgentCache).leak(None, [destination])
+        return [(torch.Size([4]), torch.int64)]
+
+    ref.volume.get_meta.call_one.side_effect = get_meta
+    requests = [
+        Request.from_any("other", None),
+        Request.from_tensor("weight", destination),
+    ]
+    with pytest.raises(RuntimeError, match="NIXL GET.*weight.*fresh"):
+        await NixlTransportBuffer(ref).get_from_storage_volume(requests)
+    get_rpc.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(10)
 async def test_failed_put_does_not_pin_sources(ref, ctx):
