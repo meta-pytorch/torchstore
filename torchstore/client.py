@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import random
 from collections import defaultdict
 from collections.abc import Mapping
 from enum import Enum
@@ -54,6 +55,9 @@ class LocalClient:
         self._directory = directory
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
+        # Offset into the sorted volumes where this client starts its concurrent fetches. It
+        # comes from the OS, since vLLM seeds random, numpy and torch alike in every worker.
+        self._fetch_offset = random.SystemRandom().randrange(1 << 32)
 
     async def register_layout(
         self,
@@ -313,7 +317,9 @@ class LocalClient:
                         self._expand_tensor_slices(request, storage_info, use_inplace)
                     )
 
-        return dict(volume_requests), whole_keys
+        # A volume whose stored slices all miss the request drops out, so it takes no start
+        # and no empty fetch, which batch transports such as NIXL would send as an RPC.
+        return {vid: reqs for vid, reqs in volume_requests.items() if reqs}, whole_keys
 
     def _expand_tensor_slices(
         self,
@@ -360,11 +366,19 @@ class LocalClient:
             )
             return list(zip(sub_requests, results, strict=True))
 
-        per_volume = await asyncio.gather(
-            *[_fetch_one(vid, reqs) for vid, reqs in volume_requests.items()]
+        # Clients that read the same volumes each start at their own offset into one sorted
+        # order, which spreads their first requests instead of queueing all at one volume.
+        order = sorted(volume_requests)
+        start = self._fetch_offset % len(order) if order else 0
+        order = order[start:] + order[:start]
+        results = await asyncio.gather(
+            *[_fetch_one(vid, volume_requests[vid]) for vid in order]
         )
-        # Flatten list-of-lists into a single list of (sub_request, result) pairs
-        return [pair for pairs in per_volume for pair in pairs]
+        per_volume = dict(zip(order, results, strict=True))
+        # Grouped by volume in volume_requests order, so plain gets keep the same overlapping
+        # copy from any start. In-place copies land in completion order and the last write
+        # wins when the transport copies on the client, as SharedMemory does.
+        return [pair for vid in volume_requests for pair in per_volume[vid]]
 
     def _assemble_results(
         self,
