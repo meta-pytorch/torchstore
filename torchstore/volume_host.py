@@ -4,7 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Volume lookup: from a storage volume's ID to its endpoints and host name."""
+"""Volume lookup: from a storage volume's ID to its endpoints and host name.
+
+Internal to TorchStore and subject to change.
+"""
 
 from __future__ import annotations
 
@@ -22,8 +25,8 @@ class VolumeHost(ABC):
     """Resolves storage volume IDs to handles shaped like Monarch mesh slices.
 
     Each endpoint offers ``call`` and ``call_one``, as on a one-volume slice. Clients
-    resolve volumes inline, so every lookup is synchronous and cheap. A host carried
-    inside a pickled strategy, as the Monarch host is, must pickle too.
+    resolve volumes inline, so every lookup is synchronous. A host carried inside a
+    pickled strategy, as the Monarch host is, must pickle too.
     """
 
     @abstractmethod
@@ -76,6 +79,16 @@ class MonarchVolumeHost(VolumeHost):
             coords[volume_id] = coord
             hostnames[volume_id] = hostname
         return cls(mesh, coords, hostnames)
+
+    @property
+    def coords(self) -> Mapping[str, Mapping[str, int]]:
+        """Each volume's mesh coordinates, by volume ID."""
+        return self._coords
+
+    @property
+    def hostnames(self) -> Mapping[str, str]:
+        """Each volume's host name, by volume ID."""
+        return self._hostnames
 
     def volume_ids(self) -> Collection[str]:
         return self._coords.keys()
