@@ -133,6 +133,10 @@ class TransportBuffer:
 
     Methods Called on STORAGE VOLUME (Remote Process)
     -------------------------------------------------
+    The storage volume works on a pickled copy whose `storage_volume_ref` is None, as is
+    the reply's and any copy made by pickle or the `copy` module, so these use `ctx` and
+    the fields the client set instead.
+
     - `recv_handshake`: Exchange connection info (if requires_handshake returns True)
     - `handle_put_request`: Receive tensor data and return list aligned with entries
     - `handle_get_request`: Send stored tensor data back to client
@@ -153,6 +157,7 @@ class TransportBuffer:
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
     - `recv_handshake`: StorageVolume side of the default handshake
     - `drop`: Resource cleanup (especially important for RDMA buffers)
+    - `__getstate__`: Start from `super().__getstate__()`, which leaves out the client-only volume handle
 
     Attributes
     ----------
@@ -169,6 +174,7 @@ class TransportBuffer:
     ----------
     storage_volume_ref : StorageVolumeRef
         Reference to the target storage volume, including actor handle and transport context.
+        Only the client's own buffer holds it.
 
     """
 
@@ -180,6 +186,12 @@ class TransportBuffer:
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Omit the client-only volume handle and the transport caches it holds."""
+        state = self.__dict__.copy()
+        state["storage_volume_ref"] = None
+        return state
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         """Determine if a handshake is needed before the operation.

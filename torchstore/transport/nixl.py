@@ -187,11 +187,6 @@ class NixlTransportBuffer(TransportBuffer):
         self._client_agent_name: str | None = None
         self._contexts: list[NixlRequestContext] = []
 
-    def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        state["storage_volume_ref"] = None
-        return state
-
     def _client_cache(self) -> NixlAgentCache:
         return self.storage_volume_ref.transport_context.get(NixlAgentCache)
 
