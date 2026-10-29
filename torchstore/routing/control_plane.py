@@ -36,9 +36,9 @@ class ControlPlane(ABC):
     ) -> None:
         """Fix the publisher set and the volume-resolution strategy.
 
-        Call at most once per routing store, on one instance. Until that call has run,
-        the other methods raise on every instance of the store, with ``init has not run``
-        in the message.
+        ``ts.initialize`` calls it on the driver's instance on every run. A second call
+        starts the store over, as Monarch's coordinator does, or raises. Until it has run,
+        the other methods raise on every instance of the store, with ``init has not run``.
         """
         raise NotImplementedError
 
