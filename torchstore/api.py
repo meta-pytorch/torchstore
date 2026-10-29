@@ -450,6 +450,8 @@ async def put_state_dict(
     store_name: str = DEFAULT_TORCHSTORE_NAME,
     direct_rdma: bool = False,
     transfer_dtype: "torch.dtype | None" = None,
+    *,
+    preserve_dtype_keys: frozenset[str] = frozenset(),
 ) -> None:
     """Store a PyTorch model state_dict in the distributed store.
 
@@ -468,7 +470,15 @@ async def put_state_dict(
         transfer_dtype (torch.dtype, optional): If set, cast floating-point
             weights to this dtype for transfer. Allows the source to keep
             higher-precision master weights (e.g. float32) while transferring
-            in a lower precision (e.g. bfloat16).
+            in a lower precision (e.g. bfloat16). Without ``direct_rdma``,
+            SharedMemory casts while copying into StorageVolume memory and
+            other transports cast each dispatched batch, so tensors must not
+            change until the put returns.
+        preserve_dtype_keys (frozenset[str]): Flattened state-dict keys (e.g.
+            buffers) that keep their dtype when ``transfer_dtype`` is set.
+            Ignored unless ``transfer_dtype`` is set; then raises
+            ``ValueError`` if a key is missing, and ``NotImplementedError``
+            with ``direct_rdma=True``.
 
     Example:
         >>> model = torch.nn.Linear(10, 5)
@@ -481,6 +491,7 @@ async def put_state_dict(
         key=key,
         direct_rdma=direct_rdma,
         transfer_dtype=transfer_dtype,
+        preserve_dtype_keys=preserve_dtype_keys,
     )
 
 

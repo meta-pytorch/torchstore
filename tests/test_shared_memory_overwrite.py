@@ -7,6 +7,7 @@
 """Real CPU SHM and storage with a serialized, in-process RPC boundary."""
 
 import asyncio
+import dataclasses
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
@@ -149,6 +150,42 @@ async def test_resize_and_compatible_overwrite(store_refs):
             cache = ref.transport_context.get(SharedMemoryCache)
             assert len(cache._storages) == 1
             assert not cache._key_locks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+async def test_transfer_dtype_overwrite_reuses_allocation(store_refs, device):
+    """Repeat casting puts reuse the segments allocated in the wire dtype."""
+    store, writer, reader = store_refs
+    handles = []
+    for step in range(2):
+        # A gapped view after a dense tensor exercises the strided cast.
+        tensors = {
+            "dense/0": torch.full((4, 4), 1 / 7 + step, device=device),
+            "logits/0": torch.full((4, 6), 1 / 3 + step, device=device)[:, :4],
+        }
+        requests = [
+            dataclasses.replace(
+                Request.from_tensor(key, tensor), transfer_dtype=torch.bfloat16
+            )
+            for key, tensor in tensors.items()
+        ]
+        await SharedMemoryTransportBuffer(writer).put_to_storage_volume(requests)
+        for key, tensor in tensors.items():
+            assert torch.equal(await _get(reader, key), tensor.cpu().bfloat16())
+        handles.append([_handle(store, key) for key in tensors])
+    assert handles[0] == handles[1]
 
 
 @pytest.mark.asyncio

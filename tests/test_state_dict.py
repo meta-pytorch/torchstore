@@ -25,6 +25,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
+from torchstore.transport import TransportType
 from torchstore.utils import spawn_actors
 
 from .utils import main, transport_params, transport_plus_strategy_params
@@ -204,6 +205,91 @@ async def test_state_dict(strategy_params, transport_type):
     finally:
         await ts.shutdown()
     _assert_equal_state_dict(state_dict, fetched_state_dict)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(*transport_params())
+@pytest.mark.asyncio
+async def test_state_dict_transfer_dtype(transport_type, device):
+    """Store weights in transfer_dtype and keep preserved keys in their dtype."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    class Trainer(Actor):
+        def __init__(self) -> None:
+            os.environ["LOCAL_RANK"] = str(current_rank().rank)
+
+        @endpoint
+        async def do_test(self):
+            results = []
+            # Writes and puts run on a side stream; the put must follow them.
+            stream = torch.cuda.Stream() if device == "cuda" else None
+            # The second put overwrites the tensors allocated by the first.
+            for step in range(2):
+                with torch.cuda.stream(stream):
+                    state_dict = {
+                        "weight": torch.full((4, 4), 1 / 3 + step, device=device),
+                        "buffer": torch.full((4,), 1 / 3 + step, device=device),
+                        "count": torch.full((2,), step, device=device),
+                    }
+                    await ts.put_state_dict(
+                        state_dict,
+                        "v0",
+                        transfer_dtype=torch.bfloat16,
+                        preserve_dtype_keys=frozenset({"buffer"}),
+                    )
+                results.append((state_dict, await ts.get_state_dict("v0")))
+            return results
+
+    await ts.initialize(
+        num_storage_volumes=1, strategy=ts.LocalRankStrategy(transport_type)
+    )
+    trainer = await spawn_actors(1, Trainer, "trainer")
+    try:
+        results = await trainer.do_test.call_one()
+    finally:
+        await ts.shutdown()
+
+    for state_dict, fetched in results:
+        assert fetched["weight"].dtype == torch.bfloat16
+        assert fetched["buffer"].dtype == torch.float32
+        assert fetched["count"].dtype == torch.int64
+        assert torch.equal(
+            fetched["weight"].cpu(), state_dict["weight"].cpu().bfloat16()
+        )
+        torch.testing.assert_close(fetched["buffer"].cpu(), state_dict["buffer"].cpu())
+        torch.testing.assert_close(fetched["count"].cpu(), state_dict["count"].cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.asyncio
+async def test_shared_memory_transfer_dtype_casts_per_tensor():
+    """SharedMemory casts while copying, so a put never holds a cast batch."""
+
+    class Trainer(Actor):
+        def __init__(self) -> None:
+            os.environ["LOCAL_RANK"] = str(current_rank().rank)
+
+        @endpoint
+        async def do_test(self):
+            state_dict = {f"w{i}": torch.ones(1 << 20, device="cuda") for i in range(8)}
+            torch.cuda.reset_peak_memory_stats()
+            base = torch.cuda.memory_allocated()
+            await ts.put_state_dict(state_dict, "v0", transfer_dtype=torch.bfloat16)
+            return torch.cuda.max_memory_allocated() - base
+
+    await ts.initialize(
+        num_storage_volumes=1,
+        strategy=ts.LocalRankStrategy(TransportType.SharedMemory),
+    )
+    trainer = await spawn_actors(1, Trainer, "trainer")
+    try:
+        peak = await trainer.do_test.call_one()
+    finally:
+        await ts.shutdown()
+
+    # Each bf16 copy is 2 MiB; casting the whole batch first would add 16 MiB.
+    assert peak <= 4 << 20, peak
 
 
 @pytest.mark.parametrize(*transport_params())
