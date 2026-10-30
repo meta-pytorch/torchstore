@@ -5,6 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import functools
+import os
+import re
 from collections import defaultdict
 from collections.abc import Mapping
 from enum import Enum
@@ -34,6 +37,40 @@ class ClientType(str, Enum):
 
     STANDARD = "standard"
     ROUTING = "routing"
+
+
+@functools.cache
+def _client_ordinal() -> int:
+    """Stable per-client index used to spread replicated fetches over replicas.
+
+    Every client scans a key's volumes in the same dict order, so under
+    dp_replicate they all claim each region from the SAME replica: that
+    replica's volumes end up holding one communicator and the whole fetch
+    volume for every client in the job (128 clients on 4 volumes at 32 nodes).
+    Rotating the scan by a per-client ordinal gives every volume an equal
+    share of the clients.
+
+    ``TORCHSTORE_CLIENT_ORDINAL`` overrides; otherwise the trailing integer of
+    the Monarch actor name (``generator_7`` -> 7); otherwise 0, the unrotated
+    order. It must be stable across pulls, because communicators are cached per
+    (client, volume) pair and a per-pull choice would accumulate one per volume.
+    """
+    env = os.environ.get("TORCHSTORE_CLIENT_ORDINAL")
+    if env is not None:
+        return int(env)
+    try:
+        from monarch.actor import context
+
+        instance = context().actor_instance
+        name = f"{instance.name} | {instance.actor_id}"
+        # First `<word>_<int>` token: "generator_7" whether the name is bare or
+        # in the "<...> generator_7{'hosts': 0/1, ...}" form, whose LAST int is 1.
+        match = re.search(r"[A-Za-z]_(\d+)", name)
+        ordinal = int(match.group(1)) if match else 0
+    except Exception:
+        name, ordinal = "<no actor context>", 0
+    logger.info("replica scan rotated for client %r: ordinal=%d", name, ordinal)
+    return ordinal
 
 
 class LocalClient:
@@ -297,7 +334,25 @@ class LocalClient:
                 and request.tensor_val.is_contiguous()
             )
 
-            for volume_id, storage_info in volume_map.items():
+            # Under dp_replicate the same region is offered by every replica's
+            # volume, so fetch each one exactly once.
+            claimed_regions: set[tuple] = set()
+
+            # Which replica a region is claimed from depends on where the scan
+            # starts, so rotate it per client (see _client_ordinal). Volume ids
+            # are trainer ranks and rank order is replica-major, so a rotation
+            # by the client ordinal hands each volume an equal share of clients.
+            volume_items = sorted(
+                volume_map.items(),
+                key=lambda item: (
+                    (0, int(item[0])) if item[0].isdigit() else (1, item[0])
+                ),
+            )
+            if volume_items:
+                start = _client_ordinal() % len(volume_items)
+                volume_items = volume_items[start:] + volume_items[:start]
+
+            for volume_id, storage_info in volume_items:
                 if storage_info.object_type == ObjectType.OBJECT:
                     volume_requests[volume_id].append(
                         Request(key=request.key, is_object=True)
@@ -309,9 +364,13 @@ class LocalClient:
                     whole_keys.add(request.key)
                     break
                 else:
-                    volume_requests[volume_id].extend(
-                        self._expand_tensor_slices(request, storage_info, use_inplace)
+                    sub_requests = self._expand_tensor_slices(
+                        request, storage_info, use_inplace, claimed_regions
                     )
+                    # volume_requests is a defaultdict: extend([]) would still
+                    # create the key and contact the volume with nothing to do.
+                    if sub_requests:
+                        volume_requests[volume_id].extend(sub_requests)
 
         return dict(volume_requests), whole_keys
 
@@ -320,18 +379,31 @@ class LocalClient:
         request: Request,
         storage_info,
         use_inplace: bool,
+        claimed_regions: set[tuple],
     ) -> list[Request]:
-        """Expand a single key's tensor slices into sub-requests."""
+        """Expand a single key's tensor slices into sub-requests.
+
+        ``claimed_regions`` accumulates (offsets, local_shape) across the
+        volumes of one key so a replicated region is fetched only once. Safe
+        because replicas hold identical data and assembly keys off offsets and
+        shapes, not mesh coordinates.
+        """
         sub_requests = []
         for stored_slice in storage_info.tensor_slices:
             fetch_slice = stored_slice
             if request.tensor_slice is not None:
-                # TODO: we should also continue if we have already fetched this region in a previous call
-                # and also return completely if we've already fetched all regions. This is extra inneficient
-                # in the case of DP, where we fetch all Replicate shards unnecessarily
+                # TODO: return early once every requested region is claimed.
                 fetch_slice = get_slice_intersection(stored_slice, request.tensor_slice)
                 if fetch_slice is None:
                     continue
+
+            region = (
+                tuple(fetch_slice.offsets),
+                tuple(fetch_slice.local_shape),
+            )
+            if region in claimed_regions:
+                continue
+            claimed_regions.add(region)
 
             slice_request = Request.from_tensor_slice(request.key, fetch_slice)
 
