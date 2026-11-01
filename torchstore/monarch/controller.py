@@ -1,0 +1,289 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import warnings
+from collections.abc import Mapping
+from itertools import product
+from typing import Any
+
+from monarch.actor import Actor, endpoint
+
+from torchstore.directory import ObjectType, StorageInfo, VolumeDirectory
+from torchstore.monarch.storage_volume import StorageVolume
+from torchstore.storage_utils.trie import Trie
+from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
+from torchstore.transport.types import Request
+
+
+class ControllerDirectory(VolumeDirectory):
+    """Adapts a remote controller to the shared directory interface."""
+
+    def __init__(self, controller: Any) -> None:
+        self._controller = controller
+
+    async def locate_volumes(
+        self,
+        keys: list[str],
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
+    ) -> dict[str, dict[str, StorageInfo]]:
+        try:
+            return await self._controller.locate_volumes.call_one(
+                keys,
+                missing_ok=missing_ok,
+                require_fully_committed=require_fully_committed,
+            )
+        except Exception as error:
+            raise KeyError(str(error)) from error
+
+
+class Controller(Actor):
+    def __init__(
+        self,
+    ) -> None:
+        self.keys_to_storage_volumes = Trie()
+        self.is_initialized: bool = False
+        self.strategy: TorchStoreStrategy | None = None
+        self.storage_volumes: StorageVolume | None = None
+        self.num_storage_volumes: int | None = None
+        self.strategy: TorchStoreStrategy | None = None
+
+    def assert_initialized(self) -> None:
+        assert (
+            self.is_initialized
+        ), "Please call torchstore.initialize before attempting to use store."
+
+    def _is_dtensor_fully_committed(
+        self, key: str, volume_map: dict[str, StorageInfo]
+    ) -> bool:
+        """
+        Check if all shards of a DTensor have been committed.
+
+        For a DTensor to be fully committed, we need all coordinates in the mesh
+        to have been stored. The mesh_shape tells us the total number of shards,
+        and coordinates tell us which shards we have.
+
+        Args:
+            key (str): The key to check.
+            volume_map (Dict[str, StorageInfo]): Mapping from storage volume IDs to StorageInfo.
+
+        Returns:
+            bool: True if fully committed, False if partial.
+        """
+        # Collect all tensor slices across all storage volumes
+        all_slices = set()
+        mesh_shape = None
+
+        for storage_info in volume_map.values():
+            if storage_info.object_type != ObjectType.TENSOR_SLICE:
+                return True  # Not a DTensor, so it's "fully committed"
+
+            for tensor_slice in storage_info.tensor_slices:
+                all_slices.add(tensor_slice.coordinates)
+                if mesh_shape is None:
+                    mesh_shape = tensor_slice.mesh_shape
+                else:
+                    assert (
+                        mesh_shape == tensor_slice.mesh_shape
+                    ), "Inconsistent mesh shapes in stored slices"
+
+        # Generate all expected coordinates for the mesh
+        expected_coords = set(product(*(range(s) for s in mesh_shape)))
+
+        # Check if we have all coordinates
+        return all_slices == expected_coords
+
+    @endpoint
+    async def init(
+        self,
+        strategy: TorchStoreStrategy,
+        num_storage_volumes: int,
+        storage_volumes: StorageVolume,
+    ) -> None:
+        if self.is_initialized:
+            raise RuntimeError("TorchStore is already initialized")
+
+        if isinstance(strategy, ControllerStorageVolumes):
+            warnings.warn(
+                "ControllerStorageVolumes is deprecated and will be removed in a future "
+                "release. It spawns a singleton storage volume on the controller, which "
+                "may become a bottleneck. Use LocalRankStrategy for better scalability.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        self.strategy = strategy
+        self.storage_volumes = storage_volumes
+        self.num_storage_volumes = num_storage_volumes
+
+        await self.strategy.set_storage_volumes(self.storage_volumes)
+        self.is_initialized = True
+
+    @endpoint
+    async def get_controller_strategy(self) -> TorchStoreStrategy:
+        self.assert_initialized()
+        assert self.strategy is not None, "Strategy is not set"
+        return self.strategy
+
+    @endpoint
+    async def locate_volumes(
+        self,
+        keys: list[str],
+        missing_ok: bool = False,
+        require_fully_committed: bool = True,
+    ) -> dict[str, dict[str, StorageInfo]]:
+        """Locate storage volumes containing shards of the specified keys.
+
+        Returns {<key> -> {<storage_volume_id> -> StorageInfo}} where each key maps to
+        the storage volumes holding shards of its data.
+
+        For example, if a key holds a DTensor with 3 shards, the returned map will look like:
+        {
+            "<dtensor_fqn>": {
+                "<storage_volume_id>": StorageInfo.tensor_slice=set([
+                    "<tensor_slice>",
+                    "<tensor_slice>",
+                    "<tensor_slice>",
+                ]),
+                ...
+            },
+            ...
+        }
+
+        Args:
+            keys (list[str]): The keys to locate in storage volumes.
+            missing_ok (bool): If True, omit missing keys instead of raising.
+            require_fully_committed (bool): If True, reject partially committed
+                DTensor entries.
+
+        Returns:
+            Dict[str, Dict[str, StorageInfo]]: Mapping from each key to a mapping from
+                storage volume IDs to StorageInfo objects containing metadata about
+                the stored data shards.
+
+        Raises:
+            KeyError: If any key is not found in any storage volumes and
+                missing_ok is False, or if a key is a DTensor that is only
+                partially committed and require_fully_committed is True.
+        """
+        self.assert_initialized()
+        result = {}
+        for key in keys:
+            if key not in self.keys_to_storage_volumes:
+                if missing_ok:
+                    continue
+                raise KeyError(f"Unable to locate {key} in any storage volumes.")
+            volume_map = self.keys_to_storage_volumes[key]
+            if require_fully_committed and not self._is_dtensor_fully_committed(
+                key, volume_map
+            ):
+                raise KeyError(
+                    f"DTensor '{key}' is only partially committed. "
+                    f"Not all shards have been stored yet. "
+                    f"Please ensure all ranks complete their put() operations."
+                )
+            result[key] = volume_map
+        return result
+
+    @endpoint
+    async def notify_put_batch(
+        self,
+        requests: list[Request],
+        storage_volume_id: str,
+    ) -> None:
+        """Notify the controller that data has been stored in a storage volume.
+
+        This should called after a successful put operation to
+        maintain the distributed storage index.
+
+        Args:
+            requests: List of Requests (meta-only, no tensor data).
+            storage_volume_id: ID of the storage volume where the data was stored.
+        """
+        self.assert_initialized()
+
+        for request in requests:
+            self._notify_put(request, storage_volume_id)
+
+    def _notify_put(self, request: Request, storage_volume_id: str) -> None:
+        assert (
+            request.tensor_val is None
+        ), "request should not contain tensor data, as this will significantly increase e2e latency"
+
+        key = request.key
+        if key not in self.keys_to_storage_volumes:
+            self.keys_to_storage_volumes[key] = {}
+
+        storage_info = StorageInfo(
+            object_type=ObjectType.from_request(request),
+            tensor_slices={request.tensor_slice},
+        )
+
+        if storage_volume_id not in self.keys_to_storage_volumes[key]:
+            self.keys_to_storage_volumes[key][storage_volume_id] = storage_info
+        else:
+            self.keys_to_storage_volumes[key][storage_volume_id].update(storage_info)
+
+    @endpoint
+    async def teardown(self) -> None:
+        self.is_initialized = False
+        self.keys_to_storage_volumes = Trie()
+        self.strategy = None
+        # StorageVolume in ControllerStrategy can be reused because it was spawned with get_or_spawn_controller.
+        # So we have to reset it, otherwise new TensorSlice values for the same key will get piled up in the set.
+        if self.storage_volumes is not None:
+            await self.storage_volumes.reset.call()
+        self.storage_volumes = None
+        self.num_storage_volumes = None
+
+    @endpoint
+    async def keys(self, prefix=None) -> list[str]:
+        if prefix is None:
+            return list(self.keys_to_storage_volumes.keys())
+        return self.keys_to_storage_volumes.keys().filter_by_prefix(prefix)
+
+    @endpoint
+    async def notify_delete(self, key: str, storage_volume_id: str) -> None:
+        """
+        Notify the controller that deletion of data is initiated in a storage volume.
+
+        This should called after a successful delete operation to
+        maintain the distributed storage index.
+        """
+        self.assert_initialized()
+        self._notify_delete(key, storage_volume_id)
+
+    def _notify_delete(
+        self,
+        key: str,
+        storage_volume_id: str,
+        missing_ok: bool = False,
+    ) -> None:
+        """Remove one key-to-volume mapping from the controller index."""
+        if key not in self.keys_to_storage_volumes:
+            if missing_ok:
+                return
+            raise KeyError(f"Unable to locate {key} in any storage volumes.")
+        if storage_volume_id not in self.keys_to_storage_volumes[key]:
+            if missing_ok:
+                return
+            raise KeyError(
+                f"Unable to locate {key} in storage volume {storage_volume_id}."
+            )
+        del self.keys_to_storage_volumes[key][storage_volume_id]
+        if len(self.keys_to_storage_volumes[key]) == 0:
+            del self.keys_to_storage_volumes[key]
+
+    @endpoint
+    async def notify_delete_batch(self, volume_to_keys: dict[str, list[str]]) -> None:
+        """Notify the controller about an idempotent batch delete."""
+        self.assert_initialized()
+        for storage_volume_id, keys in volume_to_keys.items():
+            for key in keys:
+                self._notify_delete(key, storage_volume_id, missing_ok=True)
+
+    def get_keys_to_storage_volumes(self) -> Mapping[str, dict[str, StorageInfo]]:
+        return self.keys_to_storage_volumes

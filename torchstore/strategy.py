@@ -14,12 +14,13 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
+from torchstore.backend import get_backend
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
 from torchstore.utils import get_local_hostname
 
 if TYPE_CHECKING:
-    from torchstore.storage_volume import StorageVolume
+    from torchstore.monarch.storage_volume import StorageVolume
 
 logger = logging.getLogger(__name__)
 
@@ -175,10 +176,8 @@ class LocalRankStrategy(TorchStoreStrategy):
 
     @classmethod
     def get_volume_id(cls):
-        from monarch.actor import current_rank
-
         # Note: this should only called at spawn, which makes this safe.
-        return str(current_rank().rank)
+        return str(get_backend("monarch").rank())
 
     @classmethod
     def get_client_id(cls):
