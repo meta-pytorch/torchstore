@@ -29,16 +29,16 @@ import pytest
 import pytest_asyncio
 import torch
 import torchstore as ts
-import torchstore.routing.coordinator as coordinator_module
+import torchstore.monarch.coordinator as coordinator_module
 from monarch.actor import (
     ActorError,
     concurrent_endpoint,
     endpoint,
     get_or_spawn_controller,
 )
+from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing._model import KeyRegistration, Registrations
 from torchstore.routing.control_plane import ControlPlane
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.transport import TransportType
 
