@@ -21,6 +21,10 @@ from torchstore.transport.shared_memory import (
     SharedMemoryTransportBuffer,
     SHM_ENABLED,
 )
+from torchstore.transport.torch_distributed import (
+    torch_transport_available,
+    TorchDistributedTransportBuffer,
+)
 from torchstore.transport.torchcomms.buffer import TorchCommsRdmaTransportBuffer
 from torchstore.transport.torchcomms.cache import (
     torchcomms_rdma_available,
@@ -46,18 +50,22 @@ class TransportType(Enum):
     Gloo = auto()
     SharedMemory = auto()  # POSIX shared memory for same-host transfers
     NIXL = auto()
+    TorchDistributed = auto()  # torch.distributed._transport backends
 
 
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
-    Prefers SharedMemory for same-host transfers, then an explicitly enabled
-    NIXL transport, TorchComms, MonarchRDMA, and Gloo, before falling back to
-    MonarchRPC.
+    Prefers SharedMemory for same-host transfers, then explicitly enabled
+    torch.distributed and NIXL transports, TorchComms, MonarchRDMA, and Gloo,
+    before falling back to MonarchRPC.
     """
     # Prefer SharedMemory for same-host transfers
     if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
         return TransportType.SharedMemory
+
+    if torch_transport_available():
+        return TransportType.TorchDistributed
 
     if nixl_available():
         return TransportType.NIXL
@@ -77,8 +85,9 @@ def _log_transport_resolution(
     storage_volume_ref: "StorageVolumeRef", transport_type: TransportType
 ) -> None:
     logger.info(
-        "[ts-transport] resolved=%s (nixl=%s, uniflow=%s, tc_rdma=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
+        "[ts-transport] resolved=%s (torch_distributed=%s, nixl=%s, uniflow=%s, tc_rdma=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
         transport_type.name,
+        torch_transport_available(),
         nixl_available(),
         torchcomms_uniflow_available(),
         torchcomms_rdma_available(),
@@ -116,6 +125,7 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
         TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
         TransportType.Gloo: GlooTransportBuffer,
         TransportType.NIXL: NixlTransportBuffer,
+        TransportType.TorchDistributed: TorchDistributedTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
     }
 
