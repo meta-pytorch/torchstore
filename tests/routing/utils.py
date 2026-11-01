@@ -23,10 +23,10 @@ from typing import Any
 
 import torchstore as ts
 from monarch.actor import get_or_spawn_controller, this_host
+from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing._model import KeyRegistration, RankRole, Registrations
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.control_plane import ControlPlane
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
@@ -135,10 +135,11 @@ class HostedRegistry(ControlPlane):
 
 
 @contextlib.asynccontextmanager
-async def registry_store() -> AsyncIterator[Callable[[], Awaitable[HostedRegistry]]]:
+async def registry_store() -> AsyncIterator[Callable[..., Awaitable[HostedRegistry]]]:
     """Host one ``LayoutRegistry`` on a thread's own event loop, without Monarch.
 
-    Exit fails if the host loop has not stopped within 10 s.
+    ``connect`` takes a ``HostedRegistry`` subclass to build. Exit fails if the host loop
+    has not stopped within 10s, unless the body already failed.
     """
     hosting: concurrent.futures.Future = concurrent.futures.Future()
 
@@ -152,13 +153,21 @@ async def registry_store() -> AsyncIterator[Callable[[], Awaitable[HostedRegistr
     loop, stop = await asyncio.wrap_future(hosting)
     registry = LayoutRegistry()
 
-    async def connect() -> HostedRegistry:
-        return HostedRegistry(registry, loop)
+    async def connect(cls: type[HostedRegistry] = HostedRegistry) -> HostedRegistry:
+        return cls(registry, loop)
 
+    failed = False
     try:
         yield connect
+    except BaseException:
+        failed = True
+        raise
     finally:
-        # ``asyncio.run`` cancels any call still running on the host loop.
-        loop.call_soon_threadsafe(stop.set)
-        await asyncio.to_thread(thread.join, 10)
-        assert not thread.is_alive(), "the registry's host loop did not stop"
+        # A failing body stays the reported failure.
+        with contextlib.suppress(Exception) if failed else contextlib.nullcontext():
+            try:
+                # ``asyncio.run`` cancels any call still running on the host loop.
+                loop.call_soon_threadsafe(stop.set)
+            finally:
+                await asyncio.to_thread(thread.join, 10)
+            assert not thread.is_alive(), "the registry's host loop did not stop"

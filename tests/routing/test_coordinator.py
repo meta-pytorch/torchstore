@@ -23,16 +23,16 @@ import pytest
 import pytest_asyncio
 import torch
 import torchstore as ts
-import torchstore.routing.coordinator as coordinator_module
+import torchstore.monarch.coordinator as coordinator_module
 from monarch.actor import (
     ActorError,
     concurrent_endpoint,
     endpoint,
     get_or_spawn_controller,
 )
+from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing._model import KeyRegistration, Registrations
 from torchstore.routing.control_plane import ControlPlane
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.transport import TransportType
 
@@ -513,18 +513,19 @@ async def test_a_handle_serves_calls_from_another_event_loop(
     waiting_here = asyncio.ensure_future(
         control_plane.get_layouts("model", timeout_s=30)
     )
-    registering: list[float] = []
+    registered: list[float] = []
     outcome: list[Any] = []
 
     async def on_another_loop() -> Registrations:
         lookup = asyncio.ensure_future(control_plane.get_layouts("model", timeout_s=30))
         await _assert_still_pending(lookup)
         for rank, registration in expected.items():
-            # The last stamp precedes the registration that completes the key.
-            registering.append(time.monotonic())
+            # A file write can stall for seconds on a loaded host.
             await asyncio.wait_for(
-                control_plane.register_layout(rank, "model", registration), timeout=1
+                control_plane.register_layout(rank, "model", registration), timeout=5
             )
+        # Stamped once the registration that completes the key has returned.
+        registered.append(time.monotonic())
         return await asyncio.wait_for(lookup, timeout=5)
 
     def run() -> None:
@@ -539,16 +540,18 @@ async def test_a_handle_serves_calls_from_another_event_loop(
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     try:
-        layouts = await asyncio.wait_for(waiting_here, timeout=10)
+        layouts = await asyncio.wait_for(waiting_here, timeout=20)
     except asyncio.TimeoutError:
         raise AssertionError(f"this loop's lookup never woke: {outcome!r}") from None
+    woke = time.monotonic()
     assert layouts == expected
-    # Only the guard's timer could wake this loop otherwise, 10 s after it slept.
-    assert time.monotonic() - registering[-1] < 5, "the plane left this loop asleep"
     deadline = time.monotonic() + 15
     while thread.is_alive() and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
     assert outcome == [expected], f"the other loop did not finish: {outcome!r}"
+    # Otherwise only the guard's timer wakes this loop, 20s after it slept, while the
+    # other loop's 0.5s check and two registrations bounded at 5s each end by 10.5s.
+    assert woke - registered[0] < 5, "the plane left this loop asleep"
     layouts = await asyncio.wait_for(
         control_plane.get_layouts("model", timeout_s=0), timeout=1
     )
