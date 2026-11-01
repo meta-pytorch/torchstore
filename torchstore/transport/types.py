@@ -99,6 +99,10 @@ class Request:
             including offsets, coordinates, and shape information.
         objects (Optional[Any]): Arbitrary Python objects that must be pickleable.
         is_object (bool): Flag indicating whether this request contains a non-tensor object.
+        transfer_dtype (Optional[torch.dtype]): If set, store tensor_val in this dtype.
+            Set by put_batch. meta_only() reports it as the stored dtype. Transports
+            with casts_on_put cast while copying; for others the base class casts
+            tensor_val and clears it before dispatch.
     """
 
     key: str = ""
@@ -107,6 +111,7 @@ class Request:
     tensor_slice: TensorSlice | None = None
     objects: Any | None = None
     is_object: bool = False
+    transfer_dtype: torch.dtype | None = None
 
     @classmethod
     def from_any(
@@ -214,7 +219,10 @@ class Request:
         """Returns a copy of this request with tensor_val set to None."""
         tensor_meta = self.tensor_meta
         if self.tensor_val is not None:
-            tensor_meta = (self.tensor_val.shape, self.tensor_val.dtype)
+            tensor_meta = (
+                self.tensor_val.shape,
+                self.transfer_dtype or self.tensor_val.dtype,
+            )
 
         return Request(
             key=self.key,

@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import Any, TYPE_CHECKING, TypeVar
@@ -112,7 +113,7 @@ class TransportBuffer:
     `_get_requests(requests)`:
       1. Runs `perform_handshake(...)` if `requires_handshake(requests)` returns True
       2. Calls `_pre_get_hook(requests)` [CLIENT] - save metadata for response handling
-      3. Sends to StorageVolume via `volume.get.call()`
+      3. Sends to StorageVolume via `_call_volume_get(meta_requests)`
       4. StorageVolume calls `handle_get_request(ctx, entries)` [STORAGE VOLUME]
       5. Client calls `_handle_storage_volume_response(requests, transport_buffer)` [CLIENT]
       6. Calls `drop()` [CLIENT] - cleanup resources
@@ -151,6 +152,7 @@ class TransportBuffer:
     - `perform_handshake`: Override for multi-step handshakes; default is one RPC
     - `_pre_put_hook`: Custom buffer allocation for puts
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
+    - `_call_volume_get`: Custom handling of the get RPC (e.g. cancellation)
     - `recv_handshake`: StorageVolume side of the default handshake
     - `drop`: Resource cleanup (especially important for RDMA buffers)
 
@@ -164,6 +166,11 @@ class TransportBuffer:
     supports_batch_gets : bool
         If True, `get_from_storage_volume` passes all requests to `_get_requests`
         in a single call. If False (default), requests are dispatched one at a time.
+    casts_on_put : bool
+        If True, the transport applies `Request.transfer_dtype` while copying put
+        data. If False (default), `_put_requests` casts each dispatched batch
+        before the transport sees it, so batched transports hold a cast copy of
+        the whole batch.
 
     Parameters
     ----------
@@ -177,6 +184,8 @@ class TransportBuffer:
     # Transitionary period. These should eventually be TRUE for all transports.
     supports_batch_puts: bool = False
     supports_batch_gets: bool = False
+
+    casts_on_put: bool = False
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
@@ -203,6 +212,8 @@ class TransportBuffer:
 
     async def _put_requests(self, requests: list[Request]) -> None:
         l = LatencyTracker("put")
+        if not self.casts_on_put:
+            requests = _apply_transfer_dtypes(requests)
         meta_requests = [r.meta_only() for r in requests]
         try:
             if self.requires_handshake(requests):
@@ -243,8 +254,7 @@ class TransportBuffer:
             l.track_step("_pre_get_hook")
 
             response = await self._handle_storage_volume_response(
-                requests,
-                await self.storage_volume_ref.volume.get.call_one(self, meta_requests),
+                requests, await self._call_volume_get(meta_requests)
             )
             l.track_step("volume.get.call")
 
@@ -255,6 +265,9 @@ class TransportBuffer:
             l.track_step("drop")
             l.track_e2e()
         return response
+
+    async def _call_volume_get(self, meta_requests: list[Request]) -> "TransportBuffer":
+        return await self.storage_volume_ref.volume.get.call_one(self, meta_requests)
 
     async def perform_handshake(
         self,
@@ -359,3 +372,23 @@ class TransportBuffer:
         assert tensor.dtype == dtype, f"{tensor.dtype} != {dtype}"
         assert tensor.shape == shape, f"{tensor.shape} != {shape}"
         assert not must_be_contiguous or tensor.is_contiguous()
+
+
+def _apply_transfer_dtypes(requests: list[Request]) -> list[Request]:
+    """Return requests whose tensor_val is already in its transfer dtype."""
+    cast_requests = []
+    cuda_devices = set()
+    for request in requests:
+        if request.transfer_dtype is None or request.tensor_val is None:
+            cast_requests.append(request)
+            continue
+        tensor = request.tensor_val.to(request.transfer_dtype)
+        if tensor.is_cuda:
+            cuda_devices.add(tensor.device)
+        cast_requests.append(
+            dataclasses.replace(request, tensor_val=tensor, transfer_dtype=None)
+        )
+    # Transports may read the cast tensors outside CUDA stream order (e.g. RDMA).
+    for device in cuda_devices:
+        torch.cuda.current_stream(device).synchronize()
+    return cast_requests

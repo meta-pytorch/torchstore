@@ -15,6 +15,8 @@ import socket
 import time
 import uuid
 import weakref
+from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
@@ -36,6 +38,12 @@ logger = logging.getLogger(__name__)
 ENV_TORCHSTORE_NIXL_BACKEND = os.environ.get("TORCHSTORE_NIXL_BACKEND", "UCX")
 ENV_TORCHSTORE_NIXL_ENABLED = os.environ.get("TORCHSTORE_NIXL_ENABLED", "0") == "1"
 ENV_TORCHSTORE_NIXL_TIMEOUT_S = int(os.environ.get("TORCHSTORE_NIXL_TIMEOUT_S", "60"))
+# Maximum size of each of the two buffers that stage non-contiguous tensors for a get.
+ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES = int(
+    os.environ.get("TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", str(32 * 1024 * 1024))
+)
+# Staged pieces start at this byte alignment so any dtype can view the buffer.
+_STAGING_ALIGNMENT = 64
 
 
 class _NixlTransferStatus(str, Enum):
@@ -68,6 +76,68 @@ def nixl_available() -> bool:
     return ENV_TORCHSTORE_NIXL_ENABLED and find_spec("nixl") is not None
 
 
+def _aligned(nbytes: int) -> int:
+    return -(-nbytes // _STAGING_ALIGNMENT) * _STAGING_ALIGNMENT
+
+
+async def _wait_terminal(tasks: list[asyncio.Task[None]]) -> None:
+    """Wait until every task is done, even if cancelled meanwhile.
+
+    Returning early could free storage while DMA may still use it.
+    """
+    cancelled = False
+    while True:
+        try:
+            await asyncio.wait(tasks)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+    for task in tasks:
+        if not task.cancelled():
+            task.exception()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+def _staging_pieces(tensor: torch.Tensor, max_bytes: int):
+    """Split a tensor into row-major pieces of at most max_bytes.
+
+    Each piece is a view covering a contiguous byte range of the tensor's
+    contiguous layout, so it maps to one destination descriptor.
+    """
+    if tensor.dim() == 0 or tensor.nbytes <= max_bytes:
+        yield tensor
+        return
+    row_bytes = tensor.nbytes // tensor.shape[0]
+    if row_bytes > max_bytes:
+        for row in tensor:
+            yield from _staging_pieces(row, max_bytes)
+        return
+    rows = max_bytes // row_bytes
+    for start in range(0, tensor.shape[0], rows):
+        yield tensor[start : start + rows]
+
+
+def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
+    storage = tensor.untyped_storage()
+    return storage.data_ptr(), storage.nbytes()
+
+
+_BACKEND_PARAMS = {
+    "UCX": {
+        # CUDA_COPY_REG_WHOLE_ALLOC: UCX otherwise registers the cuMem allocation
+        # holding a CUDA buffer's start. With expandable segments that is one 20 MiB
+        # chunk, so a buffer no longer than a chunk that crosses a chunk boundary is
+        # only partly registered; registration fails, or RDMA past it fails with a
+        # local access violation that leaves the transfer stuck. Each registration
+        # covers its whole storage.
+        # RCACHE_ENABLE: UCX otherwise keeps deregistered memory registered, which
+        # pins CUDA memory torch has since freed so the device cannot reuse it.
+        "engine_config": "CUDA_COPY_REG_WHOLE_ALLOC=off,RCACHE_ENABLE=n",
+    },
+}
+
+
 @dataclass
 class _Registration:
     """Cached NIXL descriptors tied to the lifetime of their backing tensor storage."""
@@ -90,10 +160,15 @@ class NixlAgentCache(TransportCache):
         config = nixl_agent_config(
             enable_prog_thread=True,
             enable_listen_thread=False,
-            backends=[self.backend],
+            backends=[],
         )
         self.agent = nixl_agent(name, config)
+        self.agent.create_backend(self.backend, _BACKEND_PARAMS.get(self.backend, {}))
         self._registrations: dict[tuple[int, int], _Registration] = {}
+        # Uncached registrations: storage key -> [descriptors, holders].
+        self._leases: dict[tuple[int, int], list[Any]] = {}
+        # Storage key -> cancelled gets whose storage volume may still write into it.
+        self._abandoned: Counter[tuple[int, int]] = Counter()
         self._remote_agents: dict[str, bytes] = {}
 
     def register(self, tensor: torch.Tensor) -> Any:
@@ -110,6 +185,12 @@ class NixlAgentCache(TransportCache):
         existing = self._registrations.get(key)
         if existing is not None:
             return existing.descriptors
+        # Two registrations of the same range break this agent's metadata for
+        # peers (add_remote_agent fails with NIXL_ERR_NOT_ALLOWED). Not cached:
+        # the registration ends with the lease.
+        lease = self._leases.get(key)
+        if lease is not None:
+            return lease[0]
 
         # Not kept: a tensor over the storage would keep the storage alive.
         region = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(storage)
@@ -117,6 +198,71 @@ class NixlAgentCache(TransportCache):
         storage_ref = weakref.ref(storage, lambda _ref, _key=key: self._evict(_key))
         self._registrations[key] = _Registration(descriptors, storage_ref)
         return descriptors
+
+    def acquire(self, tensor: torch.Tensor) -> tuple[int, int]:
+        """Register a tensor's storage until every ``acquire`` is released.
+
+        For CUDA get destinations: ``register`` drops registrations only when the
+        storage dies, but FSDP frees and reallocates parameter storage in place
+        with ``resize_``, which would leave a registration over freed memory.
+        Concurrent buffers of one get share a registration rather than
+        registering the storage again.
+        """
+        key = _storage_key(tensor)
+        if self._abandoned[key]:
+            raise RuntimeError(
+                "NIXL get destination is still registered for a cancelled get "
+                "the storage volume has not answered"
+            )
+        lease = self._leases.get(key)
+        if lease is not None:
+            lease[1] += 1
+            return key
+        # Two registrations of the same range break this agent's metadata for
+        # peers, and a cached one could outlive this storage's memory.
+        self._evict(key)
+        region = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+            tensor.untyped_storage()
+        )
+        descriptors = self.agent.register_memory(region, backends=[self.backend])
+        self._leases[key] = [descriptors, 1]
+        return key
+
+    def release(self, key: tuple[int, int]) -> None:
+        lease = self._leases[key]
+        lease[1] -= 1
+        if lease[1] == 0:
+            del self._leases[key]
+            self.agent.deregister_memory(lease[0])
+
+    def release_when_answered(
+        self,
+        keys: set[tuple[int, int]],
+        call: asyncio.Future[Any],
+        tensors: list[torch.Tensor],
+    ) -> None:
+        """Release a cancelled get's leases once its storage volume call finishes.
+
+        Until then the volume may still write into them, so ``acquire`` refuses
+        these storages instead of sharing a registration over memory FSDP may
+        have reallocated, and ``tensors`` stay referenced.
+        """
+        self._abandoned.update(keys)
+
+        def release(answer: asyncio.Future[Any]) -> None:
+            del tensors[:]
+            if answer.cancelled():
+                # The volume may still be writing; leak the registrations.
+                return
+            answer.exception()
+            self._abandoned.subtract(keys)
+            self._abandoned = +self._abandoned
+            # Releases every lease even if one fails.
+            with ExitStack() as stack:
+                for key in keys:
+                    stack.callback(self.release, key)
+
+        call.add_done_callback(release)
 
     def _evict(self, key: tuple[int, int]) -> None:
         registration = self._registrations.get(key)
@@ -186,16 +332,21 @@ class NixlTransportBuffer(TransportBuffer):
         self._client_metadata: bytes | None = None
         self._client_agent_name: str | None = None
         self._contexts: list[NixlRequestContext] = []
+        # Storage keys of this request's CUDA destinations acquired from the cache.
+        self._leases: set[tuple[int, int]] = set()
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state["storage_volume_ref"] = None
+        state["_leases"] = set()
         return state
 
     def _client_cache(self) -> NixlAgentCache:
         return self.storage_volume_ref.transport_context.get(NixlAgentCache)
 
-    def _register_client_tensor(self, tensor: torch.Tensor) -> NixlRequestContext:
+    def _register_client_tensor(
+        self, tensor: torch.Tensor, *, cached: bool = True
+    ) -> NixlRequestContext:
         assert tensor.is_contiguous()
         context = NixlRequestContext(
             tensor=tensor,
@@ -207,7 +358,10 @@ class NixlTransportBuffer(TransportBuffer):
             return context
 
         cache = self._client_cache()
-        cache.register(tensor)
+        if cached:
+            cache.register(tensor)
+        elif _storage_key(tensor) not in self._leases:
+            self._leases.add(cache.acquire(tensor))
         descriptors = cache.agent.get_xfer_descs(tensor)
         context.remote_descriptors = cache.agent.get_serialized_descs(descriptors)
         return context
@@ -267,7 +421,9 @@ class NixlTransportBuffer(TransportBuffer):
                     shape = request.tensor_slice.local_shape
                 tensor = torch.empty(shape, dtype=dtype, device="cpu")
 
-            self._contexts.append(self._register_client_tensor(tensor))
+            self._contexts.append(
+                self._register_client_tensor(tensor, cached=not tensor.is_cuda)
+            )
         self._publish_client_metadata()
 
     async def _transfer(
@@ -428,6 +584,7 @@ class NixlTransportBuffer(TransportBuffer):
     ) -> None:
         """Called by storage volume. Write to client's dest RdmaMemory (get)."""
         transfers: list[tuple[Request, torch.Tensor, bytes]] = []
+        staged: list[tuple[Request, torch.Tensor, bytes]] = []
 
         for (request, data), request_context in zip(
             entries, self._contexts, strict=True
@@ -443,12 +600,148 @@ class NixlTransportBuffer(TransportBuffer):
                 request_context.shape,
                 must_be_contiguous=False,
             )
-            source = data if data.is_contiguous() else data.contiguous()
             # Empty tensors have no bytes to move or NIXL descriptors to transfer.
-            if source.numel() != 0:
-                assert request_context.remote_descriptors is not None
-                transfers.append((request, source, request_context.remote_descriptors))
-        await self._transfer(ctx, _NixlTransferOperation.WRITE, transfers)
+            if data.numel() == 0:
+                continue
+            assert request_context.remote_descriptors is not None
+            if data.is_contiguous():
+                transfers.append((request, data, request_context.remote_descriptors))
+            elif data.device.type == "cpu":
+                staged.append((request, data, request_context.remote_descriptors))
+            else:
+                transfers.append(
+                    (request, data.contiguous(), request_context.remote_descriptors)
+                )
+
+        tasks = [
+            asyncio.create_task(
+                self._transfer(ctx, _NixlTransferOperation.WRITE, transfers)
+            )
+        ]
+        try:
+            # Start the direct transfer before staging.
+            await asyncio.sleep(0)
+            await self._write_staged(ctx, staged, tasks)
+            await asyncio.gather(*tasks)
+        finally:
+            await _wait_terminal(tasks)
+
+    async def _write_staged(
+        self,
+        ctx: TransportContext,
+        staged: list[tuple[Request, torch.Tensor, bytes]],
+        tasks: list[asyncio.Task[None]],
+    ) -> None:
+        """Write non-contiguous CPU tensors through two reused staging buffers.
+
+        Copying every non-contiguous tensor with .contiguous() before the transfer
+        doubles peak memory for a large batch. Instead, pack row ranges into one
+        buffer while the other buffer's transfer is in flight.
+
+        Started transfer tasks are appended to ``tasks``; the caller must wait for
+        all of them to finish, even if this raises or is cancelled.
+        """
+        if not staged:
+            return
+        if ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES < _STAGING_ALIGNMENT:
+            raise ValueError(
+                "TORCHSTORE_NIXL_STAGING_BUFFER_BYTES must be at least "
+                f"{_STAGING_ALIGNMENT}, got {ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES}"
+            )
+
+        cache = ctx.get(NixlAgentCache)
+        memory_type_names = {
+            cache.agent.nixl_mems[name]: name for name in ("DRAM", "VRAM")
+        }
+        size = min(
+            ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES,
+            sum(_aligned(tensor.nbytes) for _, tensor, _ in staged),
+        )
+        buffers: list[torch.Tensor | None] = [None, None]
+        buffer_tasks: list[asyncio.Task[None] | None] = [None, None]
+        index = 0
+        offset = 0
+        pending: list[tuple[Request, torch.Tensor, bytes]] = []
+
+        def flush() -> None:
+            task = asyncio.create_task(
+                self._transfer(ctx, _NixlTransferOperation.WRITE, pending.copy())
+            )
+            tasks.append(task)
+            buffer_tasks[index] = task
+            pending.clear()
+
+        for request, source, serialized_remote_descs in staged:
+            remote_descs = cache.agent.deserialize_descs(serialized_remote_descs)
+            assert remote_descs.descCount() == 1
+            remote_addr, _, remote_device = remote_descs[0]
+            remote_type = memory_type_names[remote_descs.getType()]
+            remote_offset = 0
+            for piece in _staging_pieces(source, size):
+                start = _aligned(offset)
+                if buffers[index] is None or start + piece.nbytes > size:
+                    if pending:
+                        flush()
+                        # Let the transfer start before filling the other buffer.
+                        await asyncio.sleep(0)
+                        index ^= 1
+                    if buffer_tasks[index] is not None:
+                        await buffer_tasks[index]
+                    if buffers[index] is None:
+                        buffers[index] = torch.empty(
+                            size, dtype=torch.uint8, device="cpu"
+                        )
+                    start = 0
+                buffer = buffers[index]
+                assert buffer is not None
+                local = buffer[start : start + piece.nbytes]
+                local.view(piece.dtype).view(piece.shape).copy_(piece)
+                remote = cache.agent.get_xfer_descs(
+                    [(remote_addr + remote_offset, piece.nbytes, remote_device)],
+                    remote_type,
+                )
+                pending.append(
+                    (request, local, cache.agent.get_serialized_descs(remote))
+                )
+                offset = start + piece.nbytes
+                remote_offset += piece.nbytes
+        flush()
+
+    @override
+    async def _call_volume_get(self, meta_requests: list[Request]) -> TransportBuffer:
+        if not self._leases:
+            return await super()._call_volume_get(meta_requests)
+        call = asyncio.ensure_future(super()._call_volume_get(meta_requests))
+        try:
+            return await asyncio.shield(call)
+        except asyncio.CancelledError:
+            await self._wait_for_volume(call)
+            raise
+
+    async def _wait_for_volume(self, call: asyncio.Future[TransportBuffer]) -> None:
+        """Keep a cancelled get's destinations registered while the volume writes.
+
+        Waits for the volume's answer so drop() deregisters them and the caller
+        reuses them only afterwards. On a timeout or another cancel, hands the
+        leases to the cache to release once the volume answers.
+        """
+        try:
+            await asyncio.wait([call], timeout=ENV_TORCHSTORE_NIXL_TIMEOUT_S)
+        finally:
+            if not call.done():
+                logger.warning(
+                    "NIXL get cancelled while the storage volume may still write "
+                    "into its destinations; they stay registered until it answers"
+                )
+                tensors = [
+                    context.tensor
+                    for context in self._contexts
+                    if context.tensor is not None
+                ]
+                leases, self._leases = self._leases, set()
+                self._client_cache().release_when_answered(leases, call, tensors)
+            elif not call.cancelled():
+                call.exception()
 
     @override
     async def _handle_storage_volume_response(
@@ -471,3 +764,11 @@ class NixlTransportBuffer(TransportBuffer):
     async def drop(self) -> None:
         self._client_metadata = None
         self._contexts = []
+        leases, self._leases = self._leases, set()
+        if not leases:
+            return
+        cache = self._client_cache()
+        # Releases every lease even if one fails.
+        with ExitStack() as stack:
+            for key in leases:
+                stack.callback(cache.release, key)

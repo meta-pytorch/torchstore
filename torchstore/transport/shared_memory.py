@@ -17,6 +17,7 @@ import asyncio
 import functools
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -54,6 +55,23 @@ SHOULD_PIN_SHM = os.environ.get("TORCHSTORE_PIN_SHM", "1") == "1"
 MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "0") == "1"
 # Disabling by default on initial release
 SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1"
+
+
+_copy_streams = threading.local()
+
+
+def _copy_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return this thread's D2H copy stream for `device`, reused across puts.
+
+    Casting copies allocate GPU temporaries on this stream, and the caching
+    allocator only reuses freed blocks on the stream that allocated them.
+    Streams are per thread so puts from different threads usually don't wait
+    on each other.
+    """
+    streams = _copy_streams.__dict__.setdefault("by_device", {})
+    if device not in streams:
+        streams[device] = torch.cuda.Stream(device=device)
+    return streams[device]
 
 
 # cudaHostRegister error codes we special-case (see CUDA runtime API docs).
@@ -393,6 +411,8 @@ class SharedMemoryTransportBuffer(TransportBuffer):
 
     supports_batch_puts = True
     supports_batch_gets = True
+    # copy_() into the SHM segment performs the transfer_dtype cast.
+    casts_on_put = True
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         super().__init__(storage_volume_ref)
@@ -447,10 +467,11 @@ class SharedMemoryTransportBuffer(TransportBuffer):
         """Build _contexts and prepare data for each request.
 
         For tensor requests: attaches to an existing SHM segment (if the SV
-        returned a descriptor) or allocates a new one, then copies data with
-        non_blocking=True. CUDA tensor copies run on request-local copy
-        streams. For object requests: captures the object directly. Waits on
-        the copy streams after all copies to ensure GPU->CPU DMA completes.
+        returned a descriptor) or allocates a new one in the request's
+        transfer dtype, then copies (and casts) data with non_blocking=True.
+        CUDA tensor copies run on this thread's per-device copy stream. For object
+        requests: captures the object directly. Waits on the copy streams after
+        all copies to ensure GPU->CPU DMA completes.
         """
         latency_tracker = LatencyTracker("post_handshake")
 
@@ -467,7 +488,9 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             tensor = request.tensor_val
             assert tensor is not None
 
-            if not tensor.is_contiguous():
+            if not tensor.is_contiguous() and (
+                not tensor.is_cuda or request.transfer_dtype is None
+            ):
                 tensor = tensor.cpu().contiguous()
 
             if descriptor is not None:
@@ -476,7 +499,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             else:
                 # Allocate new shared memory on client side
                 client_entry, descriptor = shm_cache.allocate(
-                    key, tensor.shape, tensor.dtype
+                    key, tensor.shape, request.transfer_dtype or tensor.dtype
                 )
                 self._pending_allocations.append((key, descriptor.storage_handle))
 
@@ -487,10 +510,12 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             if tensor.is_cuda:
                 copy_stream = copy_streams.get(tensor.device)
                 if copy_stream is None:
-                    copy_stream = torch.cuda.Stream(device=tensor.device)
+                    copy_stream = _copy_stream(tensor.device)
                     copy_stream.wait_stream(torch.cuda.current_stream(tensor.device))
                     copy_streams[tensor.device] = copy_stream
                 with torch.cuda.stream(copy_stream):
+                    # Casts and compacts on the copy stream, so only wire-dtype
+                    # bytes reach the host.
                     shm_tensor.copy_(tensor, non_blocking=True)
             else:
                 shm_tensor.copy_(tensor, non_blocking=True)
