@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 import torch
 
+from torchstore.backend import get_backend
 from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import get_slice_intersection, to_byte_view
 
@@ -116,8 +117,7 @@ class DirectWeightSyncSource:
         Returns a dict of serializable :class:`RDMAWeightHandle` objects
         that can be stored in TorchStore or sent to the destination actor.
         """
-        from monarch.rdma import RDMABuffer
-
+        backend = get_backend("monarch")
         handles: dict[str, RDMAWeightHandle] = {}
         num_staged = 0
 
@@ -142,7 +142,7 @@ class DirectWeightSyncSource:
             rdma_buf = (
                 None
                 if buf_tensor.numel() == 0
-                else RDMABuffer(to_byte_view(buf_tensor))
+                else backend.rdma_buffer(to_byte_view(buf_tensor))
             )
 
             handles[name] = RDMAWeightHandle(
