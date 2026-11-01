@@ -13,9 +13,9 @@ import torch
 import torchstore as ts
 from monarch.actor import Actor, endpoint
 from torchstore.logging import init_logging
+from torchstore.monarch.rdma import monarch_rdma_transport_available
 from torchstore.strategy import HostStrategy
 from torchstore.transport import TransportType
-from torchstore.transport.monarch_rdma import monarch_rdma_transport_available
 from torchstore.utils import spawn_actors
 
 from .utils import main
