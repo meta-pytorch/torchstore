@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 import torch
 import torchstore as ts
+import torchstore.routing.client as client_module
 from torchstore.routing._model import KeyRegistration, RankRole, Registrations
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.control_plane import ControlPlane
@@ -186,8 +187,8 @@ async def test_a_requester_pauses_collection_only_while_it_plans(
 ) -> None:
     """Pause collection only while a requester plans its routes, then leave it as it was, also on a raise.
 
-    The control plane's lookup, which can wait for minutes, and every other step run
-    with collection as the caller left it.
+    The pause opens just before planning and closes just after it, so every other step runs
+    with collection as the caller left it, and a repeat sync of planned entries opens none.
     """
     assert gc.isenabled()
     control_plane, publisher, requester = _in_memory_clients()
@@ -208,7 +209,33 @@ async def test_a_requester_pauses_collection_only_while_it_plans(
         seen.append(("lookup", gc.isenabled()))
         return await get_layouts(key)
 
+    class RecordedLayouts(set):
+        """The requester's planned keys, recording each addition."""
+
+        def add(self, key: str) -> None:
+            seen.append(("bookkeeping", gc.isenabled()))
+            super().add(key)
+
+    paused = client_module.call_gc_paused
+
+    def recorded_pause(fn: Any, *args: Any) -> Any:
+        seen.append(("pause", gc.isenabled()))
+        try:
+            return paused(fn, *args)
+        finally:
+            seen.append(("resume", gc.isenabled()))
+
+    monkeypatch.setattr(client_module, "call_gc_paused", recorded_pause)
     directory = requester._routing_directory
+    monkeypatch.setattr(requester, "_registered_layouts", RecordedLayouts())
+    monkeypatch.setattr(
+        client_module,
+        "flatten_state_dict",
+        recorded("flatten", client_module.flatten_state_dict),
+    )
+    monkeypatch.setattr(
+        client_module, "KeyRegistration", recorded("registration", KeyRegistration)
+    )
     monkeypatch.setattr(control_plane, "get_layouts", lookup)
     monkeypatch.setattr(
         "torchstore.routing.client._state_dict_storage_metadata",
@@ -226,18 +253,51 @@ async def test_a_requester_pauses_collection_only_while_it_plans(
             await requester.get_layouts(state_dict, "model")
             after = gc.isenabled()
         else:
-            with pytest.raises(
-                KeyError, match="requester keys have no publisher"
-            ) as raised:
+            with pytest.raises(KeyError, match="requester keys have no publisher"):
                 await requester.get_layouts(state_dict, "model")
-            # Read before dropping the error, so only the requester's own close passes.
             after = gc.isenabled()
-            del raised
     finally:
         gc.enable()
-    steps = [("lookup", enabled), ("metadata", enabled), ("plan", False)]
+    steps = [
+        ("flatten", enabled),
+        ("lookup", enabled),
+        ("metadata", enabled),
+        ("registration", enabled),
+        ("pause", enabled),
+        ("plan", False),
+        ("resume", enabled),
+    ]
     if requested == "w":
-        steps.append(("install", enabled))
+        steps += [("install", enabled), ("bookkeeping", enabled)]
         assert directory.routes.lookup("model/w")
     assert seen == steps
     assert after is enabled
+    if requested == "w":
+        seen.clear()
+        await requester.get_layouts(state_dict, "model")
+        assert seen == [("flatten", True)]
+
+
+@pytest.mark.asyncio
+async def test_a_non_strict_sync_pauses_only_for_published_new_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plan a requester-only entry without a pause, so repeat non-strict syncs never toggle collection."""
+    control_plane, publisher, requester = _in_memory_clients()
+    await publisher.register_layout({"w": torch.empty(4, dtype=torch.int64)}, "model")
+    paused = client_module.call_gc_paused
+    pauses: list[list[str]] = []
+
+    def recorded_pause(fn: Any, rank: str, registrations: Any, publishers: Any) -> Any:
+        pauses.append(sorted(registrations))
+        return paused(fn, rank, registrations, publishers)
+
+    monkeypatch.setattr(client_module, "call_gc_paused", recorded_pause)
+    state_dict = {
+        "w": torch.empty(4, dtype=torch.int64),
+        "local": torch.empty(2, dtype=torch.int64),
+    }
+    for _ in range(3):
+        await requester.get_layouts(state_dict, "model", strict=False)
+    assert pauses == [["model/w"]]
+    assert requester._routing_directory.routes.lookup("model/w")
