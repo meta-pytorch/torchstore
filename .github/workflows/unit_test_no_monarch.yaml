@@ -64,20 +64,31 @@ jobs:
               sys.exit("Expected only the torchmonarch requirement unmet:\n" + check.stdout)
 
           import torchstore
-          # Every module but the three that define Monarch actors, which fail on Monarch alone.
-          actors = {"torchstore.controller", "torchstore.routing.coordinator", "torchstore.storage_volume"}
+          # Every module but those that fail to load without Monarch. The Monarch RDMA ones load.
+          needs_monarch = {
+              "torchstore.controller",
+              "torchstore.monarch.backend",
+              "torchstore.monarch.controller",
+              "torchstore.monarch.coordinator",
+              "torchstore.monarch.spmd",
+              "torchstore.monarch.storage_volume",
+              "torchstore.routing.coordinator",
+              "torchstore.storage_volume",
+          }
           for module in pkgutil.walk_packages(torchstore.__path__, "torchstore."):
-              if module.name not in actors:
+              if module.name not in needs_monarch:
                   importlib.import_module(module.name)
-          for name in sorted(actors):
+          for name in sorted(needs_monarch):
+              # The SPMD bootstrap may import cloudpickle first, which torchmonarch brings.
+              allowed = {"monarch", "cloudpickle"} if name.endswith(".spmd") else {"monarch"}
               try:
                   importlib.import_module(name)
               except ModuleNotFoundError as error:
-                  if error.name != "monarch":
+                  if error.name not in allowed:
                       raise
               else:
                   sys.exit(f"{name} imported without torchmonarch, so walk it with the rest")
-          print(f"Imported {torchstore.__file__} and every module, the actor modules failing on Monarch")
+          print(f"Imported {torchstore.__file__} and every module, the Monarch ones failing without it")
           EOF
       - name: Install the test tools
         run: python -m pip install pytest pytest-asyncio pytest-timeout
@@ -92,9 +103,11 @@ jobs:
             tests/routing/test_layout_registry.py
             tests/routing/test_no_monarch.py
             tests/test_direct_weight_sync.py
+            tests/test_directory.py
             tests/test_monarch_rdma.py
             tests/test_nixl_transport.py
             tests/test_rdma_memory_cache.py
+            tests/test_shared_memory_overwrite.py
             tests/test_state_dict_utils.py
             tests/test_torchcomms_transport.py
             tests/test_transport_pickling.py

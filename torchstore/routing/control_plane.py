@@ -24,9 +24,9 @@ __all__ = ["ControlPlane", "ControlPlaneAddress"]
 class ControlPlane(ABC):
     """Rank coordination that happens before any tensor moves.
 
-    Errors are not normalized (Monarch raises its own, such as ``ActorError``), so
-    callers match them by the message each method names. Calls may come from any thread
-    or event loop, so hold no loop-bound state.
+    Errors are not normalized (Monarch raises its own, such as ``ActorError``), so callers match
+    them by the message each method names. Calls may come from any thread or event loop and from
+    a child forked after the plane was passed in, so hold no loop-bound state and work after fork.
     """
 
     # Names the plane in TorchStore's log lines, without whitespace. None means its class.
@@ -42,7 +42,7 @@ class ControlPlane(ABC):
 
         ``ts.initialize`` calls it on the driver's instance on every run. A second call
         starts the store over, as Monarch's coordinator does, or raises. Until it has run,
-        the other methods raise on every instance of the store, with ``init has not run``.
+        the other coordination methods raise on every instance, with ``init has not run``.
         """
         raise NotImplementedError
 
@@ -76,10 +76,11 @@ class ControlPlane(ABC):
         raise NotImplementedError
 
     async def close(self) -> None:
-        """Release what the plane holds, by default nothing.
+        """Release what the plane holds, by default nothing, also before ``init`` has run.
 
         TorchStore calls it only on a plane that a ``ControlPlaneAddress`` connected, maybe
-        while clients from other threads or loops still call it. Fail those calls, not hang.
+        while calls on any thread or loop, the caller's own included, are still in flight.
+        Fail those calls, not hang.
         """
 
 
@@ -87,8 +88,9 @@ class ControlPlane(ABC):
 class ControlPlaneAddress(ABC):
     """Where every rank connects to one routing store's control plane.
 
-    The driver hands it to each rank, so subclasses are frozen dataclasses: they
-    pickle and compare by value.
+    The driver hands it to each rank, so it pickles and compares by value. Subclass it as a frozen
+    dataclass whose fields tell two addresses apart: ``ts.client`` reuses an equal address's connection
+    and refuses a class the decorator skipped, or gave ``eq=False`` without an ``__eq__`` of its own.
     """
 
     store_name: str
@@ -97,9 +99,9 @@ class ControlPlaneAddress(ABC):
     async def connect(self) -> ControlPlane:
         """Return a new control plane connected to this address on each call.
 
-        TorchStore calls its ``close`` once a shutdown or a new selection drops its record,
-        or the ``ts.client`` call that dialed it fails or finds the address recorded. The
-        close is a task on the caller's event loop, cancelled if that loop ends.
+        TorchStore closes it when a shutdown or a new selection drops its record, or when the ``ts.client``
+        that dialed it finds the address recorded or fails before recording it, unless that coroutine was
+        closed unfinished. The close is a task on the caller's event loop and may not finish if it ends first.
         """
         raise NotImplementedError
 
