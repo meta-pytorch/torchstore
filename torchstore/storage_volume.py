@@ -4,111 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from logging import getLogger
-from typing import Any
+"""Old path of the Monarch storage volume, which lives in ``torchstore.monarch.storage_volume``."""
 
-import torch
-from monarch.actor import Actor, endpoint
-
-from torchstore.storage import InMemoryStore, StorageImpl, StorageVolumeCore
-from torchstore.transport.buffers import TransportBuffer
-from torchstore.transport.types import Request
-from torchstore.utils import spawn_actors
+from torchstore.monarch.storage_volume import (  # noqa: F401
+    FULL_TENSOR,
+    InMemoryStore,
+    logger,
+    StorageImpl,
+    StorageVolume,
+)
 
 __all__ = ["FULL_TENSOR", "InMemoryStore", "StorageImpl", "StorageVolume"]
-
-logger = getLogger(__name__)
-
-
-FULL_TENSOR = "full_tensor"
-
-
-class StorageVolume(Actor):
-    """The remote logic for storage. Recieves remote put/get requests and handles them via the storage abstraction"""
-
-    actor_name: str = "StorageVolumes"
-
-    def __init__(
-        self,
-        id_func,
-    ) -> None:
-        self.core = StorageVolumeCore(id_func())
-
-    @property
-    def store(self) -> InMemoryStore:
-        """The core's store. Setting it replaces the store every endpoint serves."""
-        return self.core.store
-
-    @store.setter
-    def store(self, store: InMemoryStore) -> None:
-        self.core.store = store
-
-    @property
-    def volume_id(self) -> str:
-        """The core's volume ID. Setting it changes the ID ``get_id`` reports."""
-        return self.core.volume_id
-
-    @volume_id.setter
-    def volume_id(self, volume_id: str) -> None:
-        self.core.volume_id = volume_id
-
-    @classmethod
-    async def spawn(
-        cls,
-        num_volumes: int,
-        mesh,
-        *init_args: Any,
-        **init_kwargs: Any,
-    ) -> "StorageVolume":
-        actors = await spawn_actors(
-            num_volumes, cls, cls.actor_name, mesh, *init_args, **init_kwargs
-        )
-
-        return actors
-
-    @endpoint
-    async def get_id(self) -> tuple[str, str]:
-        return await self.core.get_id()
-
-    @endpoint
-    async def handshake(
-        self,
-        transport_buffer: TransportBuffer,
-        requests: list[Request],
-    ) -> list[Any]:
-        return await self.core.handshake(transport_buffer, requests)
-
-    @endpoint
-    async def put(
-        self,
-        transport_buffer: TransportBuffer,
-        requests: list[Request],
-    ) -> None:
-        await self.core.put(transport_buffer, requests)
-
-    @endpoint
-    async def get(
-        self,
-        transport_buffer: TransportBuffer,
-        requests: list[Request],
-    ) -> TransportBuffer:
-        return await self.core.get(transport_buffer, requests)
-
-    @endpoint
-    async def get_meta(
-        self,
-        requests: list[Request],
-    ) -> list[tuple[torch.Size, torch.dtype] | str]:
-        return await self.core.get_meta(requests)
-
-    @endpoint
-    async def delete(self, key: str) -> None:
-        await self.core.delete(key)
-
-    @endpoint
-    async def delete_batch(self, keys: list[str]) -> None:
-        await self.core.delete_batch(keys)
-
-    @endpoint
-    async def reset(self) -> None:
-        await self.core.reset()

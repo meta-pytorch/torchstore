@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import dataclasses
 import inspect
 import pickle
 from abc import ABC
 from collections.abc import Iterable
+from types import SimpleNamespace
 
 import pytest
 import torchstore as ts
@@ -65,6 +67,10 @@ def test_interface_signatures_match_the_design() -> None:
     assert ControlPlane.kind is None
     assert inspect.iscoroutinefunction(ControlPlane.close)
     assert str(inspect.signature(ControlPlane.close)) == "(self) -> 'None'"
+    # The default close does nothing: it returns None and leaves the plane as it was.
+    plane = SimpleNamespace(state="open")
+    assert asyncio.run(ControlPlane.close(plane)) is None
+    assert vars(plane) == {"state": "open"}
 
 
 def test_control_plane_imports_no_backend() -> None:
