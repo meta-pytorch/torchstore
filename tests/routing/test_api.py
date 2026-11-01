@@ -10,21 +10,29 @@ import asyncio
 import logging
 import re
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call, MagicMock
 
 import pytest
+import torchstore as ts
 import torchstore.api as store_api
 from torchstore import RankRole
-from torchstore.client import ClientType
+from torchstore.client import ClientType, LocalClient
+from torchstore.monarch.coordinator import MonarchControlPlane
 from torchstore.routing.client import RoutingClient
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
-from torchstore.storage_volume import StorageVolume
+
+from ..backend_stub import install_backend_stub
 
 
-def test_routing_namespaces_distinguish_participant_meshes(monkeypatch) -> None:
+@pytest.fixture
+def backend(monkeypatch) -> MagicMock:
+    """A stand-in for the Monarch backend whose actors are mocks, at rank 0."""
+    return install_backend_stub(monkeypatch)
+
+
+def test_routing_namespaces_distinguish_participant_meshes(backend) -> None:
     """Qualify equal local ranks by role and requester-mesh index."""
     # Use one local rank to verify how each participant namespace is composed.
-    monkeypatch.setattr(store_api, "current_rank", lambda: SimpleNamespace(rank=3))
+    backend.rank.return_value = 3
 
     assert (
         store_api._routing_volume_id(
@@ -44,6 +52,12 @@ def test_routing_namespaces_distinguish_participant_meshes(monkeypatch) -> None:
         store_api._routing_namespace(RankRole.PUBLISHER, 0)
     with pytest.raises(ValueError, match="requesters must pass"):
         store_api._routing_namespace(RankRole.REQUESTER, None)
+
+
+def test_local_rank_strategy_names_volumes_by_the_backend_rank(backend) -> None:
+    """Name each ``LocalRankStrategy`` volume by the rank the backend reports."""
+    backend.rank.return_value = 4
+    assert ts.LocalRankStrategy.get_volume_id() == "4"
 
 
 @pytest.mark.parametrize(
@@ -67,7 +81,7 @@ def test_routing_initialization_validates_required_arguments(mesh, strategy) -> 
 
 
 def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
-    monkeypatch, caplog
+    backend, caplog
 ) -> None:
     """Initialize publisher storage and register every rank through the Monarch adapter."""
 
@@ -83,12 +97,8 @@ def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
     strategy = SimpleNamespace(set_storage_volumes=AsyncMock())
     coordinator = SimpleNamespace(init=SimpleNamespace(call_one=AsyncMock()))
     volumes = object()
-    spawn_volumes = AsyncMock(return_value=volumes)
-    spawn_coordinator = AsyncMock(return_value=coordinator)
-
-    monkeypatch.setattr(StorageVolume, "spawn", spawn_volumes)
-    monkeypatch.setattr(store_api, "get_or_spawn_controller", spawn_coordinator)
-    monkeypatch.setattr(store_api, "current_rank", lambda: SimpleNamespace(rank=0))
+    backend.spawn_volumes.return_value = volumes
+    backend.coordinator.return_value = MonarchControlPlane(coordinator)
     publisher = Mesh("publisher-mesh", 2)
     caplog.set_level(logging.INFO, logger="torchstore.routing.coordinator")
     # 2. Initialize the publisher mesh.
@@ -102,12 +112,12 @@ def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
     )
 
     # 3. Verify the publisher volume and publisher roster.
-    spawn_volumes.assert_awaited_once()
-    args, kwargs = spawn_volumes.await_args
-    assert args == (1, publisher)
-    assert kwargs["id_func"]() == "publisher/0"
+    backend.spawn_volumes.assert_awaited_once()
+    mesh, num_volumes, id_func = backend.spawn_volumes.await_args.args
+    assert (mesh, num_volumes) == (publisher, 1)
+    assert id_func() == "publisher/0"
     strategy.set_storage_volumes.assert_awaited_once_with(volumes)
-    spawn_coordinator.assert_awaited_once_with("routing-test", RoutingCoordinator)
+    backend.coordinator.assert_awaited_once_with("routing-test")
     coordinator.init.call_one.assert_awaited_once_with(
         publishers={
             "publisher/0",
@@ -126,7 +136,7 @@ def test_routing_initialization_spawns_publisher_volumes_and_coordinator(
     ] == ["init"]
 
 
-def test_client_constructs_and_caches_a_routing_client(monkeypatch, caplog) -> None:
+def test_client_constructs_and_caches_a_routing_client(backend, caplog) -> None:
     """Create one rank-local routing client and reuse it for later API calls."""
     caplog.set_level(logging.INFO, logger="torchstore.routing.coordinator")
     # 1. Supply a local coordinator handle and a known calling rank.
@@ -134,10 +144,8 @@ def test_client_constructs_and_caches_a_routing_client(monkeypatch, caplog) -> N
     coordinator = SimpleNamespace(
         strategy=SimpleNamespace(call_one=AsyncMock(return_value=strategy))
     )
-    spawn_coordinator = AsyncMock(return_value=coordinator)
-
-    monkeypatch.setattr(store_api, "get_or_spawn_controller", spawn_coordinator)
-    monkeypatch.setattr(store_api, "current_rank", lambda: SimpleNamespace(rank=2))
+    backend.coordinator.return_value = MonarchControlPlane(coordinator)
+    backend.rank.return_value = 2
 
     # 2. Request a routed client, then access the same store without role metadata.
     async def run():
@@ -154,10 +162,10 @@ def test_client_constructs_and_caches_a_routing_client(monkeypatch, caplog) -> N
     assert isinstance(first, RoutingClient)
     assert first._routing_directory.rank == "requester/1/2"
     assert first._role == RankRole.REQUESTER
-    assert isinstance(first._control_plane, MonarchControlPlane)
+    assert first._control_plane is backend.coordinator.return_value
     assert first.strategy is strategy
     assert second is first
-    spawn_coordinator.assert_awaited_once_with("routing-test", RoutingCoordinator)
+    backend.coordinator.assert_awaited_once_with("routing-test")
     coordinator.strategy.call_one.assert_awaited_once_with()
     # The strategy came through the adapter, which logs each call it forwards.
     assert [
@@ -165,3 +173,70 @@ def test_client_constructs_and_caches_a_routing_client(monkeypatch, caplog) -> N
         for record in caplog.records
         if record.name == "torchstore.routing.coordinator"
     ] == ["routing control_plane=monarch strategy"]
+
+
+def _controller(strategy: object = None) -> SimpleNamespace:
+    """A controller handle whose endpoints the standard path awaits."""
+    return SimpleNamespace(
+        init=SimpleNamespace(call=AsyncMock()),
+        teardown=SimpleNamespace(call=AsyncMock()),
+        get_controller_strategy=SimpleNamespace(
+            call_one=AsyncMock(return_value=strategy)
+        ),
+    )
+
+
+def test_standard_initialize_spawns_volumes_on_the_callers_mesh(backend) -> None:
+    """Spawn the volumes on ``mesh`` through the backend and hand them to the store's controller."""
+    controller = backend.controller.return_value = _controller()
+    strategy = ts.LocalRankStrategy()
+    mesh = object()
+
+    asyncio.run(
+        ts.initialize(
+            num_storage_volumes=2, strategy=strategy, store_name="standard", mesh=mesh
+        )
+    )
+
+    backend.spawn_volumes.assert_awaited_once_with(mesh, 2, strategy.get_volume_id)
+    backend.controller_volume.assert_not_awaited()
+    backend.controller.assert_awaited_once_with("standard")
+    controller.init.call.assert_awaited_once_with(
+        strategy=strategy,
+        num_storage_volumes=2,
+        storage_volumes=backend.spawn_volumes.return_value,
+    )
+
+
+def test_standard_initialize_reuses_the_controller_volume(backend) -> None:
+    """Find the one controller volume through the backend instead of spawning volumes."""
+    controller = backend.controller.return_value = _controller()
+    strategy = ts.ControllerStorageVolumes()
+
+    asyncio.run(ts.initialize(strategy=strategy, store_name="singleton"))
+
+    backend.controller_volume.assert_awaited_once_with(strategy.get_volume_id)
+    backend.spawn_volumes.assert_not_awaited()
+    assert (
+        controller.init.call.await_args.kwargs["storage_volumes"]
+        is backend.controller_volume.return_value
+    )
+
+
+def test_standard_client_and_shutdown_find_the_stores_own_controller(backend) -> None:
+    """Look each store's controller up by its own name for ``client`` and ``shutdown``."""
+    strategy = object()
+    controller = backend.controller.return_value = _controller(strategy)
+
+    async def run() -> LocalClient:
+        try:
+            return await ts.client("named-store")
+        finally:
+            await ts.shutdown("named-store")
+
+    client = asyncio.run(run())
+
+    assert backend.controller.await_args_list == [call("named-store")] * 2
+    assert client.strategy is strategy
+    backend.directory.assert_called_once_with(controller)
+    controller.teardown.call.assert_awaited_once_with()

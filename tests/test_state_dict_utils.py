@@ -10,7 +10,11 @@ import asyncio
 
 import pytest
 import torch
-from torchstore.state_dict_utils import _state_dict_storage_metadata, get_state_dict
+from torchstore.state_dict_utils import (
+    _state_dict_storage_metadata,
+    get_state_dict,
+    put_state_dict,
+)
 
 
 def test_state_dict_metadata() -> None:
@@ -58,5 +62,59 @@ def test_strict_state_dict_mismatch() -> None:
                 Client(),
                 "model",
                 user_state_dict={"other": torch.empty(1)},
+            )
+        )
+
+
+def test_put_state_dict_rejects_unknown_preserve_dtype_keys() -> None:
+    """A mistyped preserved key would otherwise be cast silently."""
+    with pytest.raises(ValueError, match=r"not in the state dict: \['bufer'\]"):
+        asyncio.run(
+            put_state_dict(
+                object(),
+                {"weight": torch.empty(1), "buffer": torch.empty(1)},
+                "model",
+                transfer_dtype=torch.bfloat16,
+                preserve_dtype_keys=frozenset({"bufer"}),
+            )
+        )
+
+
+def test_put_state_dict_ignores_preserve_dtype_keys_without_transfer_dtype() -> (None):
+    """Callers may pass buffer names that are absent from the state dict."""
+    calls = []
+
+    class Store:
+        async def register_layout(self, state_dict, key, **kwargs):
+            calls.append(("register_layout", kwargs))
+
+        async def put_batch(self, entries, **kwargs):
+            calls.append(("put_batch", kwargs))
+
+        async def put(self, key, value):
+            calls.append(("put", key))
+
+    asyncio.run(
+        put_state_dict(
+            Store(),
+            {"weight": torch.empty(1)},
+            "model",
+            preserve_dtype_keys=frozenset({"cache"}),
+        )
+    )
+    assert [name for name, _ in calls] == ["register_layout", "put_batch", "put"]
+    assert calls[1][1] == {}
+
+
+def test_put_state_dict_direct_rdma_rejects_preserve_dtype_keys() -> None:
+    with pytest.raises(NotImplementedError, match="direct_rdma=True"):
+        asyncio.run(
+            put_state_dict(
+                object(),
+                {"weight": torch.empty(1), "buffer": torch.empty(1)},
+                "model",
+                direct_rdma=True,
+                transfer_dtype=torch.bfloat16,
+                preserve_dtype_keys=frozenset({"buffer"}),
             )
         )

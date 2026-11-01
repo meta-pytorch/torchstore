@@ -5,12 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 from functools import partial
-from typing import Any, overload, TYPE_CHECKING, TypeVar
+from typing import Any, overload, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
 
 import torchstore.state_dict_utils
+from torchstore.backend import get_backend
 from torchstore.client import ClientType, LocalClient
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
@@ -18,10 +19,10 @@ from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
 
 if TYPE_CHECKING:
-    from monarch.actor import Actor, Future, Point, ProcMesh
+    from monarch.actor import ProcMesh
 
-    from torchstore.controller import Controller
-    from torchstore.spmd import _SPMDSession
+    from torchstore.monarch.controller import Controller
+    from torchstore.monarch.spmd import _SPMDSession
 
 # I need to keep this somewhere, so here we go
 DEFAULT_TORCHSTORE_NAME: str = "torchstore"
@@ -33,28 +34,13 @@ _local_clent_map: dict[str, LocalClient] = {}
 # SPMD-initialized stores register their session here
 _spmd_state_map: dict[str, "_SPMDSession"] = {}
 
-_TActor = TypeVar("_TActor", bound="Actor")
-
-
-def current_rank() -> "Point":
-    """Monarch's ``current_rank``, imported when first called."""
-    from monarch.actor import current_rank as monarch_current_rank
-
-    return monarch_current_rank()
-
-
-def get_or_spawn_controller(
-    name: str, Class: type[_TActor], *args: Any, **kwargs: Any
-) -> "Future[_TActor]":
-    """Monarch's ``get_or_spawn_controller``, imported when first called."""
-    from monarch.actor import get_or_spawn_controller as monarch_get_or_spawn_controller
-
-    return monarch_get_or_spawn_controller(name, Class, *args, **kwargs)
-
 
 def _routing_volume_id(namespace: str) -> str:
-    """Qualify the monarch rank with its mesh's namespace."""
-    return f"{namespace}/{current_rank().rank}"
+    """Qualify the caller's rank from the backend with its mesh's namespace.
+
+    A call made through a slice of the mesh gets the caller's position in that slice.
+    """
+    return f"{namespace}/{get_backend('monarch').rank()}"
 
 
 def _routing_namespace(role: RankRole, group: int | None) -> str:
@@ -109,21 +95,14 @@ async def initialize(
             "Must specify controller strategy if num_storage_volumes > 1"
         )
 
-    from torchstore.storage_volume import StorageVolume
-
+    backend = get_backend("monarch")
     # TODO: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
     # ideally this is done in the controller.init
     if isinstance(strategy, ControllerStorageVolumes):
-        storage_volumes = await get_or_spawn_controller(
-            "storage_volume_controller",
-            StorageVolume,
-            id_func=strategy.get_volume_id,
-        )
+        storage_volumes = await backend.controller_volume(strategy.get_volume_id)
     else:
-        storage_volumes = await StorageVolume.spawn(
-            num_volumes=num_storage_volumes,
-            mesh=mesh,
-            id_func=strategy.get_volume_id,
+        storage_volumes = await backend.spawn_volumes(
+            mesh, num_storage_volumes, strategy.get_volume_id
         )
 
     controller = await _controller(store_name)
@@ -140,21 +119,17 @@ async def _initialize_routing(
     store_name: str,
 ) -> None:
     """Spawn trainer volumes and the coordinator that routing mode needs."""
-    from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
-    from torchstore.storage_volume import StorageVolume
-
+    backend = get_backend("monarch")
     namespace = _routing_namespace(RankRole.PUBLISHER, None)
-    volumes = await StorageVolume.spawn(
-        1,
-        mesh,
-        id_func=partial(_routing_volume_id, namespace),
+    volumes = await backend.spawn_volumes(
+        mesh, 1, partial(_routing_volume_id, namespace)
     )
     await strategy.set_storage_volumes(volumes)
 
     publishers = {f"{namespace}/{rank}" for rank in range(mesh.size())}
 
-    coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
-    await MonarchControlPlane(coordinator).init(
+    control_plane = await backend.coordinator(store_name)
+    await control_plane.init(
         publishers=publishers,
         strategy=strategy,
     )
@@ -176,9 +151,12 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
         >>> await ts.shutdown()  # Shutdown default store
         >>> await ts.shutdown("my_custom_store")
     """
-    session = _spmd_state_map.get(store_name)
+    session = _spmd_state_map.pop(store_name, None)
     if session is not None:
-        await session.shutdown()
+        try:
+            await session.shutdown()
+        finally:
+            reset_client(store_name)
         return
 
     controller = await _controller(store_name)
@@ -195,12 +173,10 @@ def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
 async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> "Controller":
     """Get a controller handle for interacting with the store."""
-    from torchstore.controller import Controller
-
     session = _spmd_state_map.get(store_name)
     if session is not None:
         return session.controller
-    return await get_or_spawn_controller(store_name, Controller)
+    return await get_backend("monarch").controller(store_name)
 
 
 async def client(
@@ -233,14 +209,8 @@ async def client(
         return _local_clent_map[store_name]
 
     if role is not None:
-        from torchstore.routing.coordinator import (
-            MonarchControlPlane,
-            RoutingCoordinator,
-        )
-
         role = RankRole(role)
-        coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
-        control_plane = MonarchControlPlane(coordinator)
+        control_plane = await get_backend("monarch").coordinator(store_name)
         local_client = RoutingClient(
             _routing_volume_id(_routing_namespace(role, group)),
             role,
@@ -248,12 +218,10 @@ async def client(
             await control_plane.strategy(),
         )
     else:
-        from torchstore.controller import ControllerDirectory
-
         controller = await _controller(store_name)
         controller_strategy = await controller.get_controller_strategy.call_one()
         local_client = LocalClient(
-            directory=ControllerDirectory(controller),
+            directory=get_backend("monarch").directory(controller),
             strategy=controller_strategy,
             controller=controller,
         )
@@ -481,6 +449,8 @@ async def put_state_dict(
     store_name: str = DEFAULT_TORCHSTORE_NAME,
     direct_rdma: bool = False,
     transfer_dtype: "torch.dtype | None" = None,
+    *,
+    preserve_dtype_keys: frozenset[str] = frozenset(),
 ) -> None:
     """Store a PyTorch model state_dict in the distributed store.
 
@@ -499,7 +469,15 @@ async def put_state_dict(
         transfer_dtype (torch.dtype, optional): If set, cast floating-point
             weights to this dtype for transfer. Allows the source to keep
             higher-precision master weights (e.g. float32) while transferring
-            in a lower precision (e.g. bfloat16).
+            in a lower precision (e.g. bfloat16). Without ``direct_rdma``,
+            SharedMemory casts while copying into StorageVolume memory and
+            other transports cast each dispatched batch, so tensors must not
+            change until the put returns.
+        preserve_dtype_keys (frozenset[str]): Flattened state-dict keys (e.g.
+            buffers) that keep their dtype when ``transfer_dtype`` is set.
+            Ignored unless ``transfer_dtype`` is set; then raises
+            ``ValueError`` if a key is missing, and ``NotImplementedError``
+            with ``direct_rdma=True``.
 
     Example:
         >>> model = torch.nn.Linear(10, 5)
@@ -512,6 +490,7 @@ async def put_state_dict(
         key=key,
         direct_rdma=direct_rdma,
         transfer_dtype=transfer_dtype,
+        preserve_dtype_keys=preserve_dtype_keys,
     )
 
 
