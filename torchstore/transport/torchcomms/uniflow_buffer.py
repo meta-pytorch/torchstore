@@ -132,8 +132,7 @@ class TorchCommsTransportBuffer(TransportBuffer):
         self._remote_handshake_pending = False
 
     def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        state["storage_volume_ref"] = None
+        state = super().__getstate__()
         # Native transports are process-local; only topology and bind info cross
         # the RPC boundary during handshake calls.
         state["_connections"] = {
