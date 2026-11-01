@@ -81,11 +81,19 @@ class LocalClient:
         latency_tracker.track_e2e()
 
     @torch.no_grad
-    async def put_batch(self, entries: dict[str, torch.Tensor | Any]):
+    async def put_batch(
+        self,
+        entries: dict[str, torch.Tensor | Any],
+        *,
+        transfer_dtypes: Mapping[str, torch.dtype] | None = None,
+    ):
         """Batch put multiple key-value pairs in a single operation.
 
         Args:
             entries: Dict mapping keys to values to store.
+            transfer_dtypes: Optional dtype to store each tensor key in. The
+                transport casts during the put (see
+                TransportBuffer.casts_on_put).
         """
         assert (
             isinstance(entries, dict) and entries
@@ -97,6 +105,7 @@ class LocalClient:
         for key, value in entries.items():
             if isinstance(value, (torch.Tensor, DTensor)):
                 request = Request.from_any(key, value)
+                request.transfer_dtype = (transfer_dtypes or {}).get(key)
             else:
                 request = Request.from_objects(key, value)
             requests.append(request)

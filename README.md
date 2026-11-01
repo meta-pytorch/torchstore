@@ -329,6 +329,13 @@ configuration is needed — the selection happens at runtime:
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
 
+Setting `TORCHSTORE_TORCH_TRANSPORT_BACKEND` to a backend listed by
+`torch.distributed._transport.available_transports()` (e.g. `nixl`) enables the
+torch.distributed transport, preferred after shared memory and over NIXL. Requires
+a PyTorch build with `torch.distributed._transport`. The variable is read at import
+time. This transport registers every tensor per request, so large state dicts are
+slower than with NIXL until registrations are cached.
+
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:
 
@@ -338,6 +345,19 @@ from torchstore.transport import TransportType
 strategy = ts.LocalRankStrategy(default_transport_type=TransportType.Gloo)
 await ts.initialize(num_storage_volumes=N, strategy=strategy)
 ```
+
+A custom transport subclasses `torchstore.transport.buffers.TransportBuffer`. Clients
+pickle each buffer to its storage volume, and the base class's `__getstate__` sets
+`storage_volume_ref` to None in that copy, in the reply and in copies made with the
+`copy` module, so volume-side code reads its `ctx` argument and the fields the client set.
+A subclass hook extends `super().__getstate__()`, a copy of the instance dict. Where a
+class after `TransportBuffer` in the subclass's method resolution order defines its own
+hook, such as a mixin listed after the transport class, the base hook starts from that
+hook's state instead, copying a dict and passing anything else through unchanged, handle
+included. A subclass that keeps fields in `__slots__` adds them there and restores them in
+its own `__setstate__`. Otherwise slot fields that no hook of the subclass returns are
+lost in copies, and a `__setstate__` that unpacks the base hook's state as Python's
+(dict, slots) pair fails.
 
 ## Testing
 
