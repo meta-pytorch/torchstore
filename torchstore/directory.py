@@ -6,8 +6,6 @@
 
 """Storage-location interface and metadata shared by TorchStore clients."""
 
-from __future__ import annotations
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import auto, Enum
@@ -22,7 +20,7 @@ class ObjectType(Enum):
     TENSOR_SLICE = auto()
 
     @classmethod
-    def from_request(cls, request: Request) -> ObjectType:
+    def from_request(cls, request: Request) -> "ObjectType":
         if request.is_object:
             return cls.OBJECT
         elif request.tensor_slice is not None:
@@ -36,7 +34,7 @@ class StorageInfo:
     object_type: ObjectType
     tensor_slices: set[TensorSlice | None] = field(default_factory=set)
 
-    def update(self, other_storage_info: StorageInfo):
+    def update(self, other_storage_info: "StorageInfo"):
         assert (
             self.object_type == other_storage_info.object_type
         ), "Particularly dangerous to change storage type of an existing key, are you sure? Raise an issue if so."
