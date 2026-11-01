@@ -21,7 +21,7 @@ from torchstore.transport.buffers import TransportContext
 from torchstore.utils import get_local_hostname
 
 if TYPE_CHECKING:
-    from torchstore.storage_volume import StorageVolume
+    from torchstore.monarch.storage_volume import StorageVolume
 
 logger = logging.getLogger(__name__)
 
