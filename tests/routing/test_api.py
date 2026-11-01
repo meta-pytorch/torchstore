@@ -16,9 +16,9 @@ import pytest
 import torchstore.api as store_api
 from torchstore import RankRole
 from torchstore.client import ClientType
+from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
+from torchstore.monarch.storage_volume import StorageVolume
 from torchstore.routing.client import RoutingClient
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
-from torchstore.storage_volume import StorageVolume
 
 
 def test_routing_namespaces_distinguish_participant_meshes(monkeypatch) -> None:

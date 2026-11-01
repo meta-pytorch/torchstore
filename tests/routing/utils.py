@@ -13,9 +13,9 @@ from typing import Any
 
 import torchstore as ts
 from monarch.actor import get_or_spawn_controller, this_host
+from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 

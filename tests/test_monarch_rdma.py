@@ -18,9 +18,9 @@ import threading
 
 import pytest
 import torch
-import torchstore.transport.monarch_rdma as monarch_rdma
+import torchstore.monarch.rdma as monarch_rdma
+from torchstore.monarch.rdma import MonarchRDMATransportBuffer, RdmaContext
 from torchstore.transport.buffers import TransportContext
-from torchstore.transport.monarch_rdma import MonarchRDMATransportBuffer, RdmaContext
 from torchstore.transport.types import Request
 
 
