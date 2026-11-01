@@ -4,11 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import importlib
+import os
 from logging import getLogger
 from typing import Any, TYPE_CHECKING
 
-import torchstore.api as _api
+from torchstore import spmd
 from torchstore.api import (
     client,
     delete,
@@ -36,32 +36,32 @@ from torchstore.strategy import (
     TorchStoreStrategy,
 )
 
-logger = getLogger(__name__)
+initialize_spmd = spmd.initialize
 
+_FRAME_LENGTH = 910737418240
 # Monarch reads the frame length when it first loads, which importing TorchStore never
-# does, so a process that loads Monarch afterwards uses the default too, and one that
-# loaded Monarch first keeps its own. TorchStore's first Monarch path logs the export.
-if _api._export_frame_length_default():
-    init_logging()
+# does. Once loaded, torchstore.monarch.backend logs this export and may hand it to a
+# Monarch that loaded first, on the conditions its _apply_frame_length_default names.
+# A reload of this package keeps the first import's flag.
+if "_exported_frame_length" not in globals():
+    _exported_frame_length = os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH") is None
+    if _exported_frame_length:
+        init_logging()
+        os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = str(_FRAME_LENGTH)
 
-
-# Type checkers see these names but not __getattr__, so they still flag misspelled ones.
+# Type checkers see the logger's type but not __getattr__, which would let any name through.
 if TYPE_CHECKING:
-    from torchstore import spmd
-    from torchstore.spmd import initialize as initialize_spmd
+    from logging import Logger
+
+    logger: Logger
 else:
 
     def __getattr__(name: str) -> Any:
-        """Load ``spmd`` on first use, since it imports Monarch's job API when it loads."""
-        if name == "spmd":
-            return importlib.import_module("torchstore.spmd")
-        if name == "initialize_spmd":
-            return importlib.import_module("torchstore.spmd").initialize
+        # The package logger comes into being at its first use, so a logging config run after
+        # the import leaves it enabled for the warning the Monarch backend logs when it loads.
+        if name == "logger":
+            return getLogger(__name__)
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__() -> list[str]:
-    return sorted({*globals(), "initialize_spmd", "spmd"})
 
 
 __all__ = [

@@ -4,9 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""A storage volume's request handling, as a plain class that any host can serve."""
+"""A storage volume's request handling, as a plain class that any host can serve.
 
-from typing import Any
+Internal to TorchStore and subject to change.
+"""
+
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -18,16 +21,16 @@ __all__ = ["InMemoryStore", "StorageImpl", "StorageVolumeCore"]
 
 
 class StorageVolumeCore:
-    """Handles one storage volume's requests, for a host such as the Monarch actor.
+    """Handles one storage volume's requests, for a host such as the Monarch actor, its subclass.
 
-    Hosts run one call at a time, each to completion (a put reads, transfers and stores a tensor, and a cancel
-    does not stop Gloo's transfer threads), pass deserialized arguments (the store keeps what buffers and
-    requests carry) and reply with a copy made before the next call (replies may share stored tensors and objects).
+    Hosts run one call at a time to completion (a put transfers and stores a tensor, and a cancel does not stop
+    Gloo's threads), pass deserialized arguments, which the store keeps, and reply with a copy made before the next
+    call. The actor's endpoints shadow these methods, so call them through this class and never through ``self``.
     """
 
     def __init__(self, volume_id: str) -> None:
-        self.volume_id = volume_id
-        self.store = InMemoryStore()
+        self.volume_id: str = volume_id
+        self.store: StorageImpl = InMemoryStore()
 
     async def get_id(self) -> tuple[str, str]:
         return (self.volume_id, get_local_hostname())
@@ -113,6 +116,11 @@ class StorageImpl:
         requests: list[Request],
     ) -> list[Any]:
         raise NotImplementedError()
+
+    if TYPE_CHECKING:
+        # For type checkers only, so a store forwarding ``reset`` through ``__getattr__`` still reaches it.
+        def reset(self) -> None:
+            """Drop every stored key and clear the transport caches."""
 
 
 class InMemoryStore(StorageImpl):
