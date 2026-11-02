@@ -345,8 +345,7 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         self._succeeded = False
 
     def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        state["storage_volume_ref"] = None
+        state = super().__getstate__()
         state["_pending"] = None
         state["_endpoint"] = None
         state["_keys"] = []

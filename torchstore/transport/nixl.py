@@ -336,8 +336,7 @@ class NixlTransportBuffer(TransportBuffer):
         self._leases: set[tuple[int, int]] = set()
 
     def __getstate__(self) -> dict[str, Any]:
-        state = self.__dict__.copy()
-        state["storage_volume_ref"] = None
+        state = super().__getstate__()
         state["_leases"] = set()
         return state
 

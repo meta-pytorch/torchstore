@@ -134,6 +134,11 @@ class TransportBuffer:
 
     Methods Called on STORAGE VOLUME (Remote Process)
     -------------------------------------------------
+    The base `__getstate__` sets `storage_volume_ref` to None in the copy the storage
+    volume works on, in the reply and in any copy made by pickle or the `copy` module, so
+    these use `ctx` and the fields the client set instead. A state other than a dict, which
+    only a hook of a later base class returns, passes through unchanged.
+
     - `recv_handshake`: Exchange connection info (if requires_handshake returns True)
     - `handle_put_request`: Receive tensor data and return list aligned with entries
     - `handle_get_request`: Send stored tensor data back to client
@@ -155,6 +160,10 @@ class TransportBuffer:
     - `_call_volume_get`: Custom handling of the get RPC (e.g. cancellation)
     - `recv_handshake`: StorageVolume side of the default handshake
     - `drop`: Resource cleanup (especially important for RDMA buffers)
+    - `__getstate__`: Start from `super().__getstate__()`, a copy of the instance dict, or of the
+      dict a later base class's hook returns, with the client-only volume handle set to None. A
+      subclass that keeps fields in `__slots__` adds them there and restores them in its own
+      `__setstate__`
 
     Attributes
     ----------
@@ -176,6 +185,7 @@ class TransportBuffer:
     ----------
     storage_volume_ref : StorageVolumeRef
         Reference to the target storage volume, including actor handle and transport context.
+        Copies made through the base `__getstate__` hold None.
 
     """
 
@@ -189,6 +199,24 @@ class TransportBuffer:
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef"):
         self.storage_volume_ref = storage_volume_ref
+
+    def __getstate__(self) -> Any:
+        """Omit the client-only volume handle and the transport caches it holds.
+
+        Starts from the hook of a base class after this one in the MRO, if one defines it, else
+        from the instance dict. A dict state comes back copied, with the handle set to None if set.
+        """
+        mro = type(self).__mro__
+        later = mro[mro.index(TransportBuffer) + 1 : -1]
+        if any("__getstate__" in vars(base) for base in later):
+            state = super().__getstate__()
+        else:
+            state = self.__dict__
+        if isinstance(state, dict):
+            state = dict(state)
+            if "storage_volume_ref" in state:
+                state["storage_volume_ref"] = None
+        return state
 
     def requires_handshake(self, requests: list[Request]) -> bool:
         """Determine if a handshake is needed before the operation.
