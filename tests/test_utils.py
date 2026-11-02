@@ -133,7 +133,7 @@ def test_assemble_tensor_empty_list_assertion():
 
 
 def test_assemble_tensor_overlapping_tensors():
-    """Test that assemble_tensor raises assertion error when tensors overlap."""
+    """Test that assemble_tensor writes overlapping tensors in order, so the later one wins."""
     # Create overlapping tensors: tensor regions overlap
     _test_assemble_tensor(
         local_tensors=[

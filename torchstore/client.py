@@ -5,7 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
-import random
+import hashlib
+import os
 from collections import defaultdict
 from collections.abc import Mapping
 from enum import Enum
@@ -23,6 +24,7 @@ from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.utils import (
     assemble_tensor,
     get_destination_view,
+    get_local_hostname,
     get_slice_intersection,
     tensors_overlap_in_memory,
 )
@@ -55,9 +57,16 @@ class LocalClient:
         self._directory = directory
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
-        # Offset into the sorted volumes where this client starts its concurrent fetches. It
-        # comes from the OS, since vLLM seeds random, numpy and torch alike in every worker.
-        self._fetch_offset = random.SystemRandom().randrange(1 << 32)
+        # Offset into the sorted volumes where this client starts its concurrent fetches. Hashing the
+        # raw bytes of the host, RANK, LOCAL_RANK and CUDA_VISIBLE_DEVICES repeats it on every run,
+        # unlike the salted hash(). Processes that share all four share a start, such as Monarch
+        # procs without rank variables that inherit one CUDA_VISIBLE_DEVICES.
+        identity = [get_local_hostname()] + [
+            os.environ.get(name, "")
+            for name in ("RANK", "LOCAL_RANK", "CUDA_VISIBLE_DEVICES")
+        ]
+        digest = hashlib.sha256(b"\0".join(map(os.fsencode, identity))).digest()
+        self._fetch_offset = int.from_bytes(digest[:4], "big")
 
     async def register_layout(
         self,
@@ -317,8 +326,8 @@ class LocalClient:
                         self._expand_tensor_slices(request, storage_info, use_inplace)
                     )
 
-        # A volume whose stored slices all miss the request drops out, so it takes no start
-        # and no empty fetch, which batch transports such as NIXL would send as an RPC.
+        # A volume the get reads nothing from drops out, so it takes no start and no empty
+        # fetch, which batch transports such as NIXL would send as an RPC.
         return {vid: reqs for vid, reqs in volume_requests.items() if reqs}, whole_keys
 
     def _expand_tensor_slices(
@@ -366,18 +375,24 @@ class LocalClient:
             )
             return list(zip(sub_requests, results, strict=True))
 
-        # Clients that read the same volumes each start at their own offset into one sorted
-        # order, which spreads their first requests instead of queueing all at one volume.
-        order = sorted(volume_requests)
+        # Each client starts at its offset into the sorted volumes, so clients whose offsets differ
+        # modulo the volume count send their first requests to different volumes.
+        try:
+            order = sorted(volume_requests)
+        except TypeError:
+            # Ids that do not order, such as a mix of int and str, sort by repr. Clients agree on
+            # that order when each id has its own repr and it is the same in every process.
+            order = sorted(volume_requests, key=repr)
         start = self._fetch_offset % len(order) if order else 0
         order = order[start:] + order[:start]
         results = await asyncio.gather(
             *[_fetch_one(vid, volume_requests[vid]) for vid in order]
         )
-        per_volume = dict(zip(order, results, strict=True))
-        # Grouped by volume in volume_requests order, so plain gets keep the same overlapping
-        # copy from any start. In-place copies land in completion order and the last write
-        # wins when the transport copies on the client, as SharedMemory does.
+        per_volume = dict(zip(order, results))
+        # Grouped by volume in volume_requests order, so plain gets assemble the same from any
+        # start. In-place copies can depend on the start: in a get of one key over SharedMemory
+        # with contiguous destination views the last-started fetch's copy wins, and over the other
+        # transports that write in place the copy that lands last wins.
         return [pair for vid in volume_requests for pair in per_volume[vid]]
 
     def _assemble_results(
