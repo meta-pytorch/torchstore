@@ -346,6 +346,42 @@ strategy = ts.LocalRankStrategy(default_transport_type=TransportType.Gloo)
 await ts.initialize(num_storage_volumes=N, strategy=strategy)
 ```
 
+A put or get that fails raises its own error even when its transport's cleanup
+fails afterward, and logs that cleanup failure at WARNING. On Monarch's backend
+an error a storage volume raises reaches the caller as an `ActorError`, which is
+neither a `RuntimeError` nor a `KeyError`. For example, once a Gloo timeout has
+closed a connection to a volume, a later Gloo put over it raises the volume's
+`ActorError` where earlier versions raised the client's `RuntimeError`, so code
+that catches `RuntimeError` around such puts should catch `ActorError` too.
+
+A process keeps the Gloo connection it first opened to each volume, which a
+client or store it makes later cannot use, and `ts.shutdown()` closes the
+volume's end. So Gloo tensor puts and gets fail, as in earlier versions, after
+`ts.reset_client()`, after `ts.shutdown()` and `ts.initialize()`, or once a
+process initializes a second store name, while object puts and gets still work.
+Such a tensor put now raises the volume's `ActorError` where earlier versions
+raised the client's `KeyError`, or its `RuntimeError` in another process whose
+client outlived the shutdown, so code that catches either error there should
+catch `ActorError` too.
+
+While the process still holds the earlier client, or the first store's client
+when both stores share a volume as `ControllerStorageVolumes` stores do, a
+tensor put through the new client or store that the volume refuses, or a get
+through it whose key was deleted or turned into an object or DTensor shards
+after its metadata fetch, now waits out the Gloo timeout
+(`TORCHSTORE_GLOO_INIT_TIMEOUT`, 120s by default) before it raises or returns,
+as the tensor transfers the volume serves there already did. Gloo then closes
+the connection, so the earlier client's or store's tensor transfers fail too,
+where earlier versions raised or returned at once and kept the connection. A
+put whose tensor cannot be copied to the CPU does the same to its own
+connection when the volume refuses it. Nothing in the process reopens a closed
+connection, while a client in a new process connects anew.
+
+Every process must list the same number of interfaces in `GLOO_SOCKET_IFNAME`,
+as torch requires. Gloo transfers spread over those interfaces, so with
+`TORCH_GLOO_LAZY_INIT=1` a mismatch that earlier versions tolerated now times out
+transfers and can make Gloo abort a process.
+
 ## Testing
 
 Pytest is used for testing.

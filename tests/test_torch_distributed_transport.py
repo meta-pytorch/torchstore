@@ -26,13 +26,15 @@ from torch.distributed._transport import (
     register_transport,
     Transport,
 )
-from torchstore.storage_volume import InMemoryStore
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.torch_distributed import (
     TorchDistributedTransportBuffer,
     TorchTransportCache,
 )
 from torchstore.transport.types import Request, TensorSlice
+
+from . import utils as test_utils
+from .utils import bounded, FakeVolume, until
 
 
 class FakeWork(Work):
@@ -241,40 +243,6 @@ if "torchstore-fake" not in available_transports():
     register_transport("torchstore-unsupported", UnsupportedTransport)
 
 
-def _copy(value):
-    return pickle.loads(pickle.dumps(value))
-
-
-class FakeVolume:
-    """Runs StorageVolume endpoints in-process, pickling buffers like an RPC."""
-
-    def __init__(self) -> None:
-        self.store = InMemoryStore()
-        self.handshake = SimpleNamespace(call_one=self._handshake)
-        self.put = SimpleNamespace(call=self._put)
-        self.get = SimpleNamespace(call_one=self._get)
-        self.get_meta = SimpleNamespace(call_one=self.store.get_meta)
-        self.handshakes = 0
-        # Like an RPC, cancelling a caller does not cancel the volume's task.
-        self.tasks: list[asyncio.Task] = []
-
-    def _spawn(self, coro):
-        task = asyncio.ensure_future(coro)
-        self.tasks.append(task)
-        return asyncio.shield(task)
-
-    async def _handshake(self, buffer, requests):
-        buffer = _copy(buffer)
-        self.handshakes += 1
-        return _copy(await self._spawn(self.store.handshake(buffer, requests)))
-
-    async def _put(self, buffer, requests):
-        await self._spawn(self.store.put(_copy(buffer), requests))
-
-    async def _get(self, buffer, requests):
-        return _copy(await self._spawn(self.store.get(_copy(buffer), requests)))
-
-
 @pytest.fixture
 def probe(monkeypatch):
     td_transport.torch_transport_available.cache_clear()
@@ -321,27 +289,12 @@ def _volume_endpoints(ref):
     return ref.volume.store.transport_context.get(TorchTransportCache).peers
 
 
-_BOUND_S = 5
-
-
-async def _bounded(awaitable):
-    return await asyncio.wait_for(awaitable, timeout=_BOUND_S)
-
-
-async def _until(predicate):
-    async def poll():
-        while not predicate():
-            await asyncio.sleep(0)
-
-    await _bounded(poll())
-
-
 async def _put(ref, requests):
-    await _bounded(TorchDistributedTransportBuffer(ref).put_to_storage_volume(requests))
+    await bounded(TorchDistributedTransportBuffer(ref).put_to_storage_volume(requests))
 
 
 async def _get(ref, requests):
-    return await _bounded(
+    return await bounded(
         TorchDistributedTransportBuffer(ref).get_from_storage_volume(requests)
     )
 
@@ -417,7 +370,7 @@ async def test_put_get_roundtrip_with_objects_and_empty_tensors(ref):
 @pytest.mark.asyncio
 async def test_concurrent_requests_share_one_handshake(ref):
     tensors = [torch.full((4,), float(i)) for i in range(8)]
-    await _bounded(
+    await bounded(
         asyncio.gather(
             *(
                 _put(ref, [Request.from_tensor(f"w{i}", tensor)])
@@ -450,12 +403,12 @@ async def test_concurrent_requests_sharing_a_tensor(ref):
         *(_put(ref, [Request.from_tensor(f"w{i}", tensor)]) for i in range(4))
     )
     try:
-        await _until(lambda: len(entered) == 4)
+        await until(lambda: len(entered) == 4)
         ((_, count),) = endpoint._registrations.values()
         assert count == 4
     finally:
         release.set()
-    await _bounded(tasks)
+    await bounded(tasks)
 
     assert not endpoint.transport.memories
     results = await _get(ref, [Request(key=f"w{i}") for i in range(4)])
@@ -551,7 +504,7 @@ async def test_in_flight_request_survives_endpoint_replacement(ref):
     in_flight = asyncio.create_task(
         _put(ref, [Request.from_tensor("in-flight", in_flight_tensor)])
     )
-    await _bounded(entered.wait())
+    await bounded(entered.wait())
 
     # A descriptor conflict reconnects without waiting.
     tensor.fill_(1)
@@ -560,7 +513,7 @@ async def test_in_flight_request_survives_endpoint_replacement(ref):
     assert not old_client.transport.closed
 
     release.set()
-    await _bounded(in_flight)
+    await bounded(in_flight)
     assert old_client.transport.closed
     (result,) = await _get(ref, [Request(key="in-flight")])
     assert torch.equal(result, in_flight_tensor)
@@ -592,11 +545,11 @@ async def test_too_many_exposed_descriptors_replaces_endpoint_once(ref, monkeypa
             asyncio.create_task(_put(ref, [Request.from_tensor(key, torch.ones(4))]))
             for key in "ab"
         ]
-        await _until(lambda: len(replacing) == 2)
+        await until(lambda: len(replacing) == 2)
     finally:
         lock.release()
 
-    await _bounded(asyncio.gather(*tasks))
+    await bounded(asyncio.gather(*tasks))
     # The second request found the endpoint already replaced.
     assert ref.volume.handshakes == 2
 
@@ -687,13 +640,13 @@ async def test_failed_submission_drains_submitted_transfers(ref, monkeypatch):
             ],
         )
     )
-    await _until(lambda: old_volume.transport.pending)
+    await until(lambda: old_volume.transport.pending)
     assert not task.done()
 
     # Both sides keep memory registered until the submitted read finishes.
     _finish(old_volume.transport)
     with pytest.raises(RuntimeError, match="submission failed"):
-        await _bounded(task)
+        await bounded(task)
     assert old_client.transport.closed
 
     FakeTransport.hang = False
@@ -742,12 +695,12 @@ async def test_cancelled_volume_transfer_waits_for_drain(ref, monkeypatch):
     monkeypatch.setattr(td_transport.asyncio, "wait", spy)
     FakeTransport.hang = True
     task = asyncio.create_task(_get(ref, [Request(key="w")]))
-    await _until(lambda: old_volume.transport.pending)
+    await until(lambda: old_volume.transport.pending)
     volume_task = ref.volume.tasks[-1]
     # Each cancellation must return the volume RPC to waiting for the drain.
     for _ in range(3):
         volume_task.cancel()
-        await _bounded(waits.get())
+        await bounded(waits.get())
     # The volume RPC stays open, so the client keeps its memory.
     assert not volume_task.done()
     assert not task.done()
@@ -811,7 +764,7 @@ def _real_backend_params():
 async def test_real_backend_roundtrip(backend_name, device, probe, caplog):
     probe.setattr(td_transport, "ENV_TORCHSTORE_TORCH_TRANSPORT_BACKEND", backend_name)
     # Real backend setup can be slow on a loaded host.
-    probe.setitem(globals(), "_BOUND_S", 60)
+    probe.setattr(test_utils, "BOUND_S", 60)
     if not td_transport.torch_transport_available():
         pytest.skip(f"{backend_name} transport is unusable")
     transport_context = TransportContext()

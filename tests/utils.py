@@ -3,11 +3,14 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import asyncio
 import math
 import os
+import pickle
 import time
 from itertools import product
 from logging import getLogger
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,6 +18,7 @@ import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from torch.distributed._tensor import distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
+from torchstore.storage_volume import InMemoryStore
 from torchstore.transport import TransportType
 from torchstore.transport.torch_distributed import torch_transport_available
 from torchstore.transport.torchcomms.cache import (
@@ -183,3 +187,57 @@ class DTensorActor(Actor):
     @endpoint
     async def destroy_process_group(self):
         torch.distributed.destroy_process_group()
+
+
+# How long bounded() and until() wait before cancelling, far above how long the in-process
+# transport tests' steps take. A cancelled call's own cleanup can run past it.
+BOUND_S = 5
+
+
+def rpc_copy(value):
+    """Copy ``value`` through pickle, as an RPC does."""
+    return pickle.loads(pickle.dumps(value))
+
+
+async def bounded(awaitable):
+    return await asyncio.wait_for(awaitable, timeout=BOUND_S)
+
+
+async def until(predicate):
+    """Wait until ``predicate`` holds, failing after ``BOUND_S``."""
+
+    async def poll():
+        while not predicate():
+            await asyncio.sleep(0.001)
+
+    await bounded(poll())
+
+
+class FakeVolume:
+    """Runs StorageVolume endpoints in-process, pickling buffers like an RPC."""
+
+    def __init__(self) -> None:
+        self.store = InMemoryStore()
+        self.handshake = SimpleNamespace(call_one=self._handshake)
+        self.put = SimpleNamespace(call=self._put)
+        self.get = SimpleNamespace(call_one=self._get)
+        self.get_meta = SimpleNamespace(call_one=self.store.get_meta)
+        self.handshakes = 0
+        # Like an RPC, cancelling a caller does not cancel the volume's task.
+        self.tasks: list[asyncio.Task] = []
+
+    def _spawn(self, coro):
+        task = asyncio.ensure_future(coro)
+        self.tasks.append(task)
+        return asyncio.shield(task)
+
+    async def _handshake(self, buffer, requests):
+        buffer = rpc_copy(buffer)
+        self.handshakes += 1
+        return rpc_copy(await self._spawn(self.store.handshake(buffer, requests)))
+
+    async def _put(self, buffer, requests):
+        await self._spawn(self.store.put(rpc_copy(buffer), requests))
+
+    async def _get(self, buffer, requests):
+        return rpc_copy(await self._spawn(self.store.get(rpc_copy(buffer), requests)))
