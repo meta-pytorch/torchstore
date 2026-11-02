@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import itertools
 import socket
 import uuid
 from datetime import timedelta
@@ -29,8 +30,15 @@ logger = getLogger(__name__)
 
 # Global cache
 _store_addrs: dict[
-    str, tuple[str, int]
-] = {}  # volume_id -> (master_addr, master_port, store_key)
+    str, tuple[str, int, str, bool]
+] = {}  # volume_id -> (master_addr, master_port, store_key, tagged)
+# Gives each tensor transfer to a volume that takes tags its own Gloo tag, so transfers in flight
+# on one pair keep their own bytes. Tag 0 stays for clients and volumes before tags.
+_tags = itertools.count()
+# The largest tag torch accepts.
+_MAX_TAG = 0x7FFFFFFF
+# A volume's handshake reply when it moves each tensor on its buffer's tag.
+_TAGS = "tags"
 
 
 TORCHSTORE_GLOO_ENABLED = os.environ.get("TORCHSTORE_GLOO_ENABLED", "1") == "1"
@@ -92,6 +100,15 @@ def _gloo_factory(
     return pg
 
 
+def _log_receive_failure(receive: asyncio.Task) -> None:
+    """Log at WARNING the failure of a receive its get did not await."""
+    if not receive.cancelled():
+        try:
+            receive.result()
+        except Exception:
+            logger.warning("A Gloo receive its get did not await failed", exc_info=True)
+
+
 class GlooProcessGroupCache(TransportCache):
     """Cache for Gloo process groups, keyed by store_key."""
 
@@ -120,6 +137,9 @@ class GlooTransportBuffer(TransportBuffer):
     """
 
     supports_inplace_resharding = False
+    # The tag of the buffer's current tensor transfer, 0 for an object or a pair without tags. A class
+    # default, as buffers that clients before tags pickle carry none and move on tag 0.
+    tag: int = 0
 
     def __init__(self, storage_volume_ref: "StorageVolumeRef") -> None:
         super().__init__(storage_volume_ref)
@@ -133,9 +153,10 @@ class GlooTransportBuffer(TransportBuffer):
         self.master_port: int | None = None
         self.store_key: str | None = None  # Unique key for this connection
 
-        # Flag for object (non-tensor) transport
+        # Set by the client when it moves an object, which posts no tensor half, and by the volume
+        # when it answers a get in band in objects, which clients before tags read too.
         self.is_object: bool = False
-        self.objects: Any = None  # For object transport in GET operations
+        self.objects: Any = None  # A get's value when it comes back in band
 
         # TCPStore reference (kept alive until PG is created)
         self._tcp_store: TCPStore | None = None
@@ -224,7 +245,7 @@ class GlooTransportBuffer(TransportBuffer):
         self,
         ctx: "TransportContext",
         entries: list[tuple[Request, Any]],
-    ) -> list[None]:
+    ) -> list[str]:
         """Called on storage volume side to set up the process group.
 
         Creates TCPStore and ProcessGroup on storage side (rank 1).
@@ -267,7 +288,7 @@ class GlooTransportBuffer(TransportBuffer):
             f"Storage volume finished gloo process group setup for store_key={self.store_key}"
         )
 
-        return [None]
+        return [_TAGS]
 
     async def _post_handshake(
         self,
@@ -284,8 +305,13 @@ class GlooTransportBuffer(TransportBuffer):
         # Await the PG creation that was started in _pre_handshake
         pg = await self._pg_task
 
-        # Cache the connection info and process group
-        _store_addrs[volume_id] = (self.master_addr, self.master_port, self.store_key)
+        # Cache the connection info and process group. Volumes before tags answer [None].
+        _store_addrs[volume_id] = (
+            self.master_addr,
+            self.master_port,
+            self.store_key,
+            _TAGS in handshake_results,
+        )
         self.storage_volume_ref.transport_context.get(GlooProcessGroupCache).put(
             self.store_key, pg
         )
@@ -296,6 +322,12 @@ class GlooTransportBuffer(TransportBuffer):
 
         logger.info(f"Finished gloo handshake with StorageVolume:[{volume_id}]")
 
+    def _draw_tag(self) -> int:
+        """Return a tag of its own for a tensor transfer if the cached pair takes tags, else 0."""
+        if not _store_addrs[self.storage_volume_ref.volume_id][3]:
+            return 0
+        return next(_tags) % _MAX_TAG + 1
+
     async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Start sending tensor before put RPC.
 
@@ -305,6 +337,8 @@ class GlooTransportBuffer(TransportBuffer):
         """
         assert len(requests) == 1
         request = requests[0]
+        # Cleared for each transfer, as the volume ends a half on any tag but 0 and an object has none.
+        self.tag = 0
 
         # Check if this is an object (non-tensor) PUT
         if request.is_object:
@@ -318,12 +352,14 @@ class GlooTransportBuffer(TransportBuffer):
         tensor = request.tensor_val
         self.shape = tensor.shape
         self.dtype = tensor.dtype
+        self.tag = self._draw_tag()
 
         # Start send in background - will run concurrently with put RPC
         self._send_task = asyncio.create_task(
             self._send_tensor(
                 tensor,
                 self.storage_volume_ref.transport_context,
+                self.tag,
             )
         )
 
@@ -348,9 +384,25 @@ class GlooTransportBuffer(TransportBuffer):
             )
 
         # Receive tensor from client via gloo
-        tensor = await self._receive_tensor(tensor, ctx)
+        tensor = await self._receive_tensor(tensor, ctx, self.tag)
 
         return [tensor]
+
+    async def handle_refused_put(
+        self,
+        ctx: "TransportContext",
+        requests: list[Request],
+    ) -> None:
+        """Called by storage volume. Receive the client's tensor into scratch so its send ends.
+
+        Only for a send on a tag of its own, as on tag 0 the scratch could take another transfer's send.
+        The scratch takes the tensor's full size, since a smaller receive would abort this process.
+        """
+        if self.tag:
+            scratch = torch.empty(
+                self.shape, dtype=self.dtype, device=torch.device("cpu")
+            )
+            await self._receive_tensor(scratch, ctx, self.tag)
 
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Start receiving tensor before get RPC.
@@ -361,6 +413,8 @@ class GlooTransportBuffer(TransportBuffer):
         """
         assert len(requests) == 1
         request = requests[0]
+        # Cleared for each transfer, as the volume ends a half on any tag but 0 and an object has none.
+        self.tag = 0
         # TODO: support in place get with receiving directly to request.tensor_val
 
         # Fetch metadata from storage volume
@@ -384,6 +438,7 @@ class GlooTransportBuffer(TransportBuffer):
             self.dtype = meta[1]
 
         tensor = torch.empty(self.shape, dtype=self.dtype, device=torch.device("cpu"))
+        self.tag = self._draw_tag()
 
         # Start recv in background - will run concurrently with get RPC
         # The storage volume will send the tensor in handle_get_request
@@ -391,6 +446,7 @@ class GlooTransportBuffer(TransportBuffer):
             self._receive_tensor(
                 tensor,
                 self.storage_volume_ref.transport_context,
+                self.tag,
             )
         )
 
@@ -402,13 +458,46 @@ class GlooTransportBuffer(TransportBuffer):
         """Called by storage volume. Send tensor to client via gloo process group."""
         assert len(entries) == 1
         _, data = entries[0]
-        if not isinstance(data, torch.Tensor):
-            self.is_object = True
-            self.objects = data
-            return
+        # A get the client took for an object posted no receive, so its data goes in band.
+        if not self.is_object:
+            if (
+                isinstance(data, torch.Tensor)
+                and data.shape == self.shape
+                and data.dtype == self.dtype
+            ):
+                # Send the tensor to client via gloo
+                await self._send_tensor(data, ctx, self.tag)
+                return
+            # The data does not fit the client's receive, as when the key changed after the client's
+            # metadata fetch or a slice runs past the tensor's end, so it goes in band and an empty
+            # send ends the receive. A client before tags shares tag 0 among its transfers, so it gets
+            # that send only where earlier volumes sent the data itself.
+            if self.tag or isinstance(data, torch.Tensor):
+                try:
+                    await self._end_client_receive(ctx)
+                except Exception:
+                    logger.warning(
+                        "Ending a Gloo get's receive failed, and the get's value still goes back in band",
+                        exc_info=True,
+                    )
+        self.is_object = True
+        self.objects = data
 
-        # Send the tensor to client via gloo
-        await self._send_tensor(data, ctx)
+    async def handle_refused_get(
+        self,
+        ctx: "TransportContext",
+        requests: list[Request],
+    ) -> None:
+        """Called by storage volume. End the client's receive with an empty send.
+
+        Only for a receive on a tag of its own, as on tag 0 the send could reach another transfer's receive.
+        """
+        if self.tag:
+            await self._end_client_receive(ctx)
+
+    async def _end_client_receive(self, ctx: "TransportContext") -> None:
+        # An empty send ends a receive of any size and can never be larger than the receive it meets.
+        await self._send_tensor(torch.empty(0), ctx, self.tag)
 
     async def _handle_storage_volume_response(
         self, requests: list[Request], transport_buffer: "TransportBuffer"
@@ -422,8 +511,9 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Wait for the recv to complete
         if self._recv_task is not None:
-            tensor = await self._recv_task
-            self._recv_task = None
+            # Cleared before the await, as drop() treats a receive still set as one no get awaited.
+            receive, self._recv_task = self._recv_task, None
+            tensor = await receive
             if tensor is None:
                 raise RuntimeError(
                     f"receive_tensor returned None (is_object={self.is_object}, "
@@ -434,13 +524,14 @@ class GlooTransportBuffer(TransportBuffer):
         raise RuntimeError(f"No recv task available (is_object={self.is_object})")
 
     async def _receive_tensor(
-        self, tensor: torch.Tensor, transport_context: "TransportContext"
+        self, tensor: torch.Tensor, transport_context: "TransportContext", tag: int
     ) -> torch.Tensor:
         """Receive tensor via gloo. Waits for recv to complete before returning.
 
         Args:
             tensor: Pre-allocated destination tensor to receive into.
             transport_context: Transport context containing the process group.
+            tag: The Gloo tag of the transfer.
 
         Returns:
             The received tensor (same object as input, with data overwritten).
@@ -465,7 +556,7 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Run recv in thread and wait for completion
         def do_recv():
-            work = pg.recv([tensor], srcRank=remote_rank, tag=0)
+            work = pg.recv([tensor], srcRank=remote_rank, tag=tag)
             work.wait()
 
         await asyncio.to_thread(do_recv)
@@ -475,13 +566,14 @@ class GlooTransportBuffer(TransportBuffer):
         return tensor
 
     async def _send_tensor(
-        self, tensor: torch.Tensor, transport_context: "TransportContext"
+        self, tensor: torch.Tensor, transport_context: "TransportContext", tag: int
     ) -> None:
         """Send tensor via gloo. Waits for send to complete before returning.
 
         Args:
             tensor: Tensor to send.
             transport_context: Transport context containing the process group.
+            tag: The Gloo tag of the transfer.
         """
         # Gloo TCP transport requires CPU tensors
         if tensor.device.type != "cpu":
@@ -505,7 +597,7 @@ class GlooTransportBuffer(TransportBuffer):
 
         # Run send in thread and wait for completion
         def do_send():
-            work = pg.send([tensor], dstRank=remote_rank, tag=0)
+            work = pg.send([tensor], dstRank=remote_rank, tag=tag)
             work.wait()
 
         await asyncio.to_thread(do_send)
@@ -518,5 +610,10 @@ class GlooTransportBuffer(TransportBuffer):
         if self._send_task is not None:
             await self._send_task
             self._send_task = None
+        # A get whose call raised or was cancelled, or whose value came in band, did not await its
+        # receive, which may wait out Gloo's timeout, so the receive's failure is logged once it ends.
+        if self._recv_task is not None:
+            self._recv_task.add_done_callback(_log_receive_failure)
+            self._recv_task = None
         self.is_object = False
         self.objects = None
