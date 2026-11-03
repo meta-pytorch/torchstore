@@ -67,6 +67,7 @@ __all__ = [
     "Reject",
     "RemoteError",
     "StaleAddressError",
+    "Welcome",
 ]
 
 logger = logging.getLogger("torchstore.carrier")
@@ -227,13 +228,20 @@ class CarrierAddress(_JsonRecord):
 
 @dataclass(frozen=True)
 class Hello(_JsonRecord):
-    """A hello's or welcome's body: the server's identity and the sender's ``host:pid``."""
+    """A hello's body: the server's identity and the sender's ``host:pid``."""
 
     scope: str = field(repr=False)
     service: str
     incarnation: str
     peer: str
     version: int = PROTOCOL_VERSION
+
+
+@dataclass(frozen=True)
+class Welcome(Hello):
+    """A welcome's body: a hello's fields and how many requests a client may leave unanswered, 0 for any."""
+
+    window: int = 0
 
 
 @dataclass(frozen=True)
@@ -537,7 +545,7 @@ def _outside_dispatch_modes() -> Iterator[None]:
 # refuses real tensors, must not see the codec's own tensor ops.
 @_outside_dispatch_modes()
 def dumps(obj: Any) -> tuple[bytes, list[memoryview]]:
-    """Pickle ``obj``, with each plain tensor's own bytes as an out-of-band buffer.
+    """Pickle ``obj``, sending each plain tensor's bytes, and ``bytes`` in a ``PickleBuffer``, out of band.
 
     Buffers alias contiguous CPU tensors, but for lazy conjugate, negative and zero ones, and copy others to CPU.
     Their dtype, shape, ``requires_grad`` and attributes survive.
@@ -555,16 +563,47 @@ def dumps(obj: Any) -> tuple[bytes, list[memoryview]]:
 
 
 @_outside_dispatch_modes()
-def loads(body: bytes, buffers: Sequence[torch.Tensor] = ()) -> Any:
+def loads(body: bytes | memoryview, buffers: Sequence[torch.Tensor] = ()) -> Any:
     """Unpickle a body whose tensors become views of the received ``uint8`` buffers.
 
-    Storages in torch's own reductions load on CPU as Monarch's ``map_location`` does, failing as there for dtypes
-    such as float8 that only an untyped storage holds. Unpickling errors, such as ``AttributeError`` for a missing
-    class, propagate unchanged.
+    A ``PickleBuffer`` over ``bytes`` arrives as a read-only ``memoryview``. Typed storages load on CPU, and as in Monarch a bare
+    ``UntypedStorage`` fails here while a float8 typed one already fails to dump. Unpickling errors propagate unchanged.
     """
+    views = [byte_view(buffer) for buffer in buffers]
+    file = io.BytesIO(body) if type(body) is bytes else _BodyFile(body)
     # An object's own constructor may print its tensors.
     with _TensorRepr():
-        return _Unpickler(io.BytesIO(body), buffers=buffers).load()
+        return _Unpickler(file, buffers=views).load()
+
+
+class _BodyFile:
+    """A read-only file over a body, so unpickling a memoryview never copies all of it first."""
+
+    def __init__(self, body: bytes | memoryview) -> None:
+        self._view, self._pos = memoryview(body).cast("B"), 0
+
+    def read(self, size: int = -1) -> bytes:
+        end = len(self._view) if size < 0 else min(self._pos + size, len(self._view))
+        data, self._pos = self._view[self._pos : end].tobytes(), end
+        return data
+
+    def readinto(self, target: Any) -> int:
+        with memoryview(target) as view, view.cast("B") as out:
+            count = min(len(out), len(self._view) - self._pos)
+            out[:count] = self._view[self._pos : self._pos + count]
+        self._pos += count
+        return count
+
+    def readline(self) -> bytes:
+        start = self._pos
+        while self._pos < len(self._view):
+            chunk = self._view[self._pos : self._pos + 4096].tobytes()
+            index = chunk.find(b"\n")
+            if index >= 0:
+                self._pos += index + 1
+                break
+            self._pos += len(chunk)
+        return self._view[start : self._pos].tobytes()
 
 
 class _FieldsUnpickler(pickle.Unpickler):
@@ -641,7 +680,7 @@ def _rebuild_sparse_tensor(layout: torch.layout, data: tuple[Any, ...]) -> torch
 
 
 class _Pickler(pickle.Pickler):
-    """Pickles with protocol 5, sending plain tensors as out-of-band buffers."""
+    """Pickles with protocol 5, sending plain tensors and ``PickleBuffer``s over ``bytes`` out of band."""
 
     def __init__(self, file: io.BytesIO) -> None:
         self.buffers: list[memoryview] = []
@@ -651,6 +690,19 @@ class _Pickler(pickle.Pickler):
         super().__init__(file, protocol=5, buffer_callback=callback)
 
     def reducer_override(self, obj: Any) -> Any:  # type: ignore[override]
+        # A PickleBuffer arrives as a read-only 1-D byte memoryview, which pickle cannot send
+        # back. Other views keep pickle's TypeError, as they would arrive as flat bytes.
+        if (
+            type(obj) is memoryview
+            and obj.readonly
+            and obj.format == "B"
+            and obj.ndim == 1
+            and obj.contiguous
+        ):
+            # Out of band only over a whole bytes object itself, never a view, for the reason the
+            # tensors' ctypes arrays avoid one. A slice stays in the body.
+            whole = type(obj.obj) is bytes and obj.nbytes == len(obj.obj)
+            return memoryview, (pickle.PickleBuffer(obj.obj if whole else obj),)
         if not issubclass(type(obj), torch.Tensor):
             return NotImplemented
         # The codec's own tensor ops reach no torch function mode, dumps' _TensorRepr included.
@@ -688,9 +740,12 @@ class _Pickler(pickle.Pickler):
         # A zero tensor has no memory to view, so its zeros are materialized.
         if data._is_zerotensor():
             data = data.clone()
+        view = byte_view(data).obj
+        # A copy made here cannot change later, so a server's reply copy skips it.
+        view._private = data.data_ptr() != obj.data_ptr()  # type: ignore[attr-defined]
         # Over the ctypes array: Python 3.10 crashes collecting a cycle that holds a
         # memoryview while another memoryview, such as the frame's raw buffer, exports it.
-        buffer = pickle.PickleBuffer(byte_view(data).obj)
+        buffer = pickle.PickleBuffer(view)
         self._tensor_buffers[id(buffer)] = buffer
         state = vars(obj) or None
         args = (buffer, obj.dtype, tuple(obj.shape), obj.requires_grad, state, strides)
@@ -703,13 +758,16 @@ def _keep_in_band(
     buffer: pickle.PickleBuffer,
 ) -> bool:
     if id(buffer) not in tensor_buffers:
-        return True
+        # Bytes never change, so a reply pickled once can go to every caller uncopied.
+        with memoryview(buffer) as view:
+            if type(view.obj) is not bytes:
+                return True
     out.append(buffer.raw())
     return False
 
 
 def _rebuild_tensor(
-    data: torch.Tensor,
+    data: memoryview,
     dtype: torch.dtype,
     shape: tuple[int, ...],
     requires_grad: bool,
@@ -718,7 +776,8 @@ def _rebuild_tensor(
 ) -> torch.Tensor:
     # The codec's own tensor ops reach no torch function mode, loads' _TensorRepr included.
     with torch._C.DisableTorchFunction():
-        received = data.view(dtype)
+        # loads hands out each received tensor as its byte_view, which holds it.
+        received = data.obj._tensor.view(dtype)  # type: ignore[union-attr]
         # An expanded tensor arrives as the storage it spans, with its strides.
         if strides is None:
             tensor = received.reshape(shape)
@@ -769,7 +828,7 @@ def encode_error(error: BaseException) -> bytes:
 
 
 @_outside_dispatch_modes()
-def decode_error(body: bytes) -> Exception:
+def decode_error(body: bytes | memoryview) -> Exception:
     """Rebuild a remote ``Exception``, or return a ``RemoteError`` with its type and text.
 
     Cancellations, ``StopIteration`` and ``StopAsyncIteration``, ``BaseException`` types and errors not rebuilt intact become one.
