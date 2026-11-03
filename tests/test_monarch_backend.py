@@ -28,13 +28,18 @@ def _id_func() -> str:
 
 
 def test_get_backend_loads_the_monarch_backend_once(monkeypatch) -> None:
-    """Return one ``MonarchBackend`` for "monarch" and refuse unknown names."""
+    """Return one ``MonarchBackend`` for "monarch"."""
     monkeypatch.setattr(backend_module, "_backends", {})
     backend = backend_module.get_backend("monarch")
     assert isinstance(backend, monarch_backend.MonarchBackend)
     assert backend_module.get_backend("monarch") is backend
+
+
+def test_get_backend_refuses_an_unknown_name(monkeypatch) -> None:
+    monkeypatch.setattr(backend_module, "_backends", {})
     with pytest.raises(ValueError, match="unknown backend 'ray'"):
         backend_module.get_backend("ray")
+    assert backend_module._backends == {}
 
 
 @pytest.fixture
@@ -89,14 +94,29 @@ def test_monarch_backend_locates_keys_through_the_controller() -> None:
     assert directory._controller == "controller"
 
 
-def test_monarch_backend_forwards_spawns_spmd_and_rdma_buffers(monkeypatch) -> None:
-    """Pass every argument of ``spawn_actors``, SPMD initialization and RDMA buffers on."""
+def test_monarch_backend_forwards_spawns(monkeypatch) -> None:
+    """Pass every argument of ``spawn_actors`` on."""
     spawn_actors = AsyncMock(return_value="actors")
-    initialize_spmd = AsyncMock(return_value="session")
-    rdma_buffer = MagicMock(return_value="buffer")
     monkeypatch.setattr(monarch_backend, "spawn_actors", spawn_actors)
-    monkeypatch.setattr(monarch_backend, "initialize_spmd", initialize_spmd)
+    backend = monarch_backend.MonarchBackend()
+    actors = asyncio.run(backend.spawn_actors(2, object, "name", "mesh", flag=True))
+    assert actors == "actors"
+    spawn_actors.assert_awaited_once_with(2, object, "name", "mesh", flag=True)
+
+
+def test_monarch_backend_forwards_rdma_buffers(monkeypatch) -> None:
+    """Build each RDMA buffer from the byte view it is handed."""
+    rdma_buffer = MagicMock(return_value="buffer")
     monkeypatch.setattr(monarch_backend, "RDMABuffer", rdma_buffer)
+    view = torch.zeros(4, dtype=torch.uint8)
+    assert monarch_backend.MonarchBackend().rdma_buffer(view) == "buffer"
+    rdma_buffer.assert_called_once_with(view)
+
+
+def test_monarch_backend_forwards_spmd_initialization(monkeypatch) -> None:
+    """Pass every argument of SPMD initialization on."""
+    initialize_spmd = AsyncMock(return_value="session")
+    monkeypatch.setattr(monarch_backend, "initialize_spmd", initialize_spmd)
     backend = monarch_backend.MonarchBackend()
     strategy = HostStrategy()
     env = SPMDEnv(
@@ -130,12 +150,6 @@ def test_monarch_backend_forwards_spawns_spmd_and_rdma_buffers(monkeypatch) -> N
         monarch_port=1234,
         configure_job=print,
     )
-    actors = asyncio.run(backend.spawn_actors(2, object, "name", "mesh", flag=True))
-    assert actors == "actors"
-    spawn_actors.assert_awaited_once_with(2, object, "name", "mesh", flag=True)
-    view = torch.zeros(4, dtype=torch.uint8)
-    assert backend.rdma_buffer(view) == "buffer"
-    rdma_buffer.assert_called_once_with(view)
 
 
 class _Initialized:
