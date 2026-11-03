@@ -16,6 +16,7 @@ from contextlib import contextmanager
 
 from monarch.actor import (  # type: ignore[import-untyped]
     Actor,
+    ActorError,
     concurrent_endpoint,
     endpoint,
 )
@@ -112,8 +113,14 @@ class MonarchControlPlane(ControlPlane):
     Monarch's watchdog, but nothing ends one a live actor never answers.
     """
 
-    def __init__(self, coordinator: RoutingCoordinator, /) -> None:
+    kind = "monarch"
+
+    def __init__(
+        self, coordinator: RoutingCoordinator, /, *, store_name: str | None = None
+    ) -> None:
         self._coordinator = coordinator
+        # Named in the hint that a strategy read before init adds to its error.
+        self._store_name = store_name
 
     async def init(
         self,
@@ -127,7 +134,17 @@ class MonarchControlPlane(ControlPlane):
 
     async def strategy(self) -> TorchStoreStrategy:
         with _timed("strategy"):
-            return await self._coordinator.strategy.call_one()
+            try:
+                return await self._coordinator.strategy.call_one()
+            except ActorError as error:
+                if self._store_name is not None and "init has not run" in str(error):
+                    # ``add_note`` needs Python 3.11, and this keeps the error an ActorError.
+                    error.message = (
+                        f"{error.message} If ts.initialize gave store "
+                        f"{self._store_name!r} another control plane, pass ts.client "
+                        "that control plane (control_plane=) or its address (address=)."
+                    )
+                raise
 
     async def register_layout(
         self,

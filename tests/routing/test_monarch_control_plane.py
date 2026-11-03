@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, call
 
 import pytest
 import torchstore as ts
+from monarch.actor import ActorError
 from torchstore.monarch.coordinator import MonarchControlPlane
 from torchstore.routing.control_plane import ControlPlane
 from torchstore.transport import TransportType
@@ -130,3 +131,27 @@ def test_monarch_adapter_keeps_the_interface_signatures() -> None:
         if name == "get_layouts":
             interface = _plus_timeout(interface)
         assert inspect.signature(getattr(MonarchControlPlane, name)) == interface, name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_name", [None, "store"])
+async def test_monarch_adapter_hints_at_other_planes_only_for_a_named_store(
+    store_name,
+) -> None:
+    """Hint at another plane on a strategy read before init, only once it names a store."""
+    error = ActorError(RuntimeError("RoutingCoordinator.init has not run"))
+    message = error.message
+    coordinator = SimpleNamespace(
+        strategy=SimpleNamespace(call_one=AsyncMock(side_effect=error))
+    )
+    control_plane = MonarchControlPlane(coordinator, store_name=store_name)
+    with pytest.raises(ActorError) as raised:
+        await control_plane.strategy()
+    assert raised.value is error
+    if store_name is None:
+        assert error.message == message
+    else:
+        assert error.message == (
+            f"{message} If ts.initialize gave store 'store' another control plane, pass "
+            "ts.client that control plane (control_plane=) or its address (address=)."
+        )

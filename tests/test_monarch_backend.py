@@ -84,6 +84,7 @@ def test_monarch_backend_finds_controllers_and_coordinators_by_store(lookup) -> 
     coordinator = asyncio.run(backend.coordinator("store"))
     assert isinstance(coordinator, MonarchControlPlane)
     assert coordinator._coordinator == ("store", RoutingCoordinator, {})
+    assert coordinator._store_name == "store"
 
 
 def test_monarch_backend_locates_keys_through_the_controller() -> None:
