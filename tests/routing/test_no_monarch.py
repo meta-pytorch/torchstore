@@ -575,6 +575,13 @@ def test_type_checkers_see_the_package_logger_but_no_module_getattr() -> None:
     assert (getattrs, declared) == ([], ["logger: Logger"])
 
 
+def test_carrier_frame_cap_is_the_frame_length_default() -> None:
+    """Cap carrier frames at the frame length the package init exports for Monarch."""
+    from torchstore.carrier import codec
+
+    assert codec.MAX_FRAME_BYTES == _FRAME_LENGTH_DEFAULT
+
+
 @_monarch_installed
 @pytest.mark.parametrize(
     "frame_length",
