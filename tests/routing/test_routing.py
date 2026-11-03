@@ -282,8 +282,8 @@ async def test_non_strict_reads_plan_and_fetch_one_subset_per_call() -> None:
         await get_state_dict(
             requester, "model", {"first": torch.zeros(3)}, strict=False
         )
-    # Subsets: new, new, already planned, mixed, then planned after a get with
-    # no published keys.
+    # Subsets: new, new, passed before, mixed, then passed before after a get
+    # with no published keys. The client tests check that none is planned twice.
     for names, local_only in (
         (["first"], False),
         (["second"], False),
