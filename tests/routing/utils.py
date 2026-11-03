@@ -32,14 +32,18 @@ import torchstore as ts
 import torchstore.api as store_api
 import torchstore.monarch.backend as monarch_backend
 from monarch.actor import get_or_spawn_controller, ProcMesh, this_host
+from torchstore import carrier_volumes
 from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing._model import KeyRegistration, RankRole, Registrations
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
 from torchstore.routing.layout_registry import LayoutRegistry
-from torchstore.routing.service import CoordinatorService, ServiceControlPlane
+from torchstore.routing.service import ServiceControlPlane
+from torchstore.strategy import _installed_volume_host
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
+
+from .tcpstore_fixtures import _initialize_service
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +179,9 @@ async def make_clients(
             registered: bool = False,
         ) -> dict[str, RoutingClient]:
             nonlocal made
-            made += 1
+            # Only the Monarch arm spawns a publisher mesh: on the service backend publishers serve their own volumes.
+            if request.param == "monarch":
+                made += 1
             seen = len(lookup.call_args_list), len(constructed)
             helper = registered_clients if registered else routing_clients
             clients = await helper(publishers, requesters, request.param, exit_stack)
@@ -202,11 +208,11 @@ async def _assert_torn_down(
 ) -> None:
     """Fail on what a case's stack left: a store recorded or owned, a mesh running or never recorded, a Monarch lookup.
 
-    Each ``make_clients`` call spawns one publisher mesh. Neither the service arm nor its shutdown looks up or builds
-    Monarch's coordinator.
+    ``made`` counts the ``make_clients`` calls that spawn one publisher mesh each, those on the Monarch arm. Neither the
+    service arm nor its shutdown looks up or builds Monarch's coordinator.
     """
     assert not left, f"left recorded or owned: {sorted(left)}"
-    assert len(spawned) == made, f"{made} make calls but {len(spawned)} meshes recorded"
+    assert len(spawned) == made, f"{made} meshes due but {len(spawned)} meshes recorded"
     for mesh in spawned:
         # A stopped mesh refuses to start again, and this stops one the stack left running.
         with pytest.raises(RuntimeError):
@@ -236,7 +242,7 @@ async def routing_clients(
     if control_plane == "monarch":
         ranks = await _monarch_ranks(len(publishers), len(roles), exit_stack)
     elif control_plane == "service":
-        ranks = await _service_ranks(len(publishers), len(roles), exit_stack)
+        ranks = await _service_ranks(list(publishers), len(roles), exit_stack)
     else:
         raise ValueError(f"no routing test backend {control_plane!r}")
     clients = {}
@@ -287,7 +293,10 @@ async def _assert_volumes_answer(strategy: ts.TorchStoreStrategy) -> None:
     One that fails or stalls also has the fault log, once a ``make_clients`` case installed it, keep Monarch's
     later faults from ending the session.
     """
-    volume_ids = list(strategy.volume_id_to_coord)
+    host = _installed_volume_host(strategy)
+    volume_ids = list(
+        strategy.volume_id_to_coord if host is None else host.volume_ids()
+    )
     assert volume_ids, "the store has no volumes"
     calls = [
         strategy.get_storage_volume(i).volume.get_id.call_one() for i in volume_ids
@@ -320,22 +329,26 @@ async def _monarch_ranks(
 
 
 async def _service_ranks(
-    num_publishers: int, num_ranks: int, exit_stack: contextlib.AsyncExitStack
+    publishers: list[str], num_ranks: int, exit_stack: contextlib.AsyncExitStack
 ) -> list[_RankPlane]:
     """Give each rank its own handle from the coordinator service's address, as a rank process does.
 
-    Handles in one process share its one connection to the coordinator. Volumes are Monarch actors
-    that ``ts.initialize`` spawns on the publisher mesh. Teardown closes each handle, shuts the
-    store down, then checks it is neither recorded nor owned and each handle's close was called.
+    Handles in one process share its one connection to the coordinator. Each publisher serves its
+    volume here, as its ``ts.client`` does, with no proc mesh. Teardown checks that each volume
+    answers, closes every host and handle, then shuts the store down.
     """
     patch = exit_stack.enter_context(pytest.MonkeyPatch.context())
-    # The coordinator service advertises this host, which this process reaches.
+    # The coordinator service and the volumes advertise this host, which this process reaches.
     patch.setenv("TORCHSTORE_TCPSTORE_HOST", "127.0.0.1")
+    patch.setenv("TORCHSTORE_CARRIER_HOST", "127.0.0.1")
     # ts.shutdown records the store as released, and the stack drops this copy after it.
     patch.setattr(store_api, "_released_stores", set(store_api._released_stores))
-    mesh = this_host().spawn_procs(per_host={"procs": num_publishers})
-    store_name, address = await _initialize(mesh, "service", exit_stack)
-    assert address is not None, "ts.initialize returned no address for the service"
+    store_name = f"routing-test-{uuid.uuid4()}"
+    address = await _initialize_service(
+        store_name,
+        ts.TorchStoreStrategy(TransportType.MonarchRPC),
+        publishers=len(publishers),
+    )
     handles: list[ServiceControlPlane] = []
     exit_stack.push(functools.partial(_assert_released, store_name, handles))
     exit_stack.push_async_callback(ts.shutdown, store_name)
@@ -344,7 +357,34 @@ async def _service_ranks(
         assert type(handle) is ServiceControlPlane, type(handle)
         exit_stack.push_async_callback(handle.close)
         handles.append(handle)
-    return [(handle, await handle.strategy()) for handle in handles]
+    ranks: list[_RankPlane] = []
+    for handle in handles:
+        strategy = await handle.strategy()
+        host = _installed_volume_host(strategy)
+        assert isinstance(host, carrier_volumes.CarrierVolumeHost), type(host)
+        exit_stack.push_async_callback(host.close)
+        ranks.append((handle, strategy))
+    for volume_id, handle, (_, strategy) in zip(publishers, handles, ranks):
+        volume = await carrier_volumes.start_publisher_volume(
+            volume_id,
+            store_name=store_name,
+            selection=(handle, address),
+            register=handle.register_volume,
+        )
+        assert volume.record is not None, volume_id
+        host = _installed_volume_host(strategy)
+        assert isinstance(host, carrier_volumes.CarrierVolumeHost), type(host)
+        host.adopt(volume_id, volume.record)
+    # The driver's handle, which no rank uses, resolves every volume for the check.
+    driver = store_api._control_plane_map[store_name].control_plane
+    checking = await driver.strategy()
+    await checking._prepare_volumes(publishers)
+    host = _installed_volume_host(checking)
+    assert isinstance(host, carrier_volumes.CarrierVolumeHost), type(host)
+    exit_stack.push_async_callback(host.close)
+    # Before the store shuts down, so a volume's stall surfaces in its own case.
+    exit_stack.push_async_callback(_assert_volumes_answer, checking)
+    return ranks
 
 
 def _assert_released(
@@ -353,7 +393,7 @@ def _assert_released(
     exc_type: type[BaseException] | None,
     *_: Any,
 ) -> None:
-    """Fail if the store stays recorded or owned, or a rank's handle was never closed.
+    """Fail if the store stays recorded, owned or served, or a rank's handle was never closed.
 
     Silent once a teardown step has raised, so that step's error is the one reported.
     """
@@ -361,6 +401,12 @@ def _assert_released(
         return
     assert store_name not in store_api._control_plane_map, f"{store_name!r} recorded"
     assert store_name not in store_api._owned_service_map, f"{store_name!r} owned"
+    served = [
+        volume_id
+        for name, volume_id in carrier_volumes._publishers
+        if name == store_name
+    ]
+    assert not served, f"{store_name!r} still serves {served}"
     unclosed = sum(not handle._closed for handle in handles)
     assert not unclosed, f"{unclosed} of {len(handles)} rank handles never closed"
 
@@ -464,37 +510,3 @@ async def registry_store() -> AsyncIterator[Callable[..., Awaitable[HostedRegist
             finally:
                 await asyncio.to_thread(thread.join, 10)
             assert not thread.is_alive(), "the registry's host loop did not stop"
-
-
-@contextlib.asynccontextmanager
-async def service_store() -> AsyncIterator[
-    Callable[[], Awaitable[ServiceControlPlane]]
-]:
-    """Serve a coordinator service in this process. Handles reach it over TCP.
-
-    The first handle is the driver's, which may init, and later ones dial the address as ranks do.
-    Handles keep the lookup's keyword-only timeout, as the contract suite's calls need.
-    """
-    service = await CoordinatorService.start(
-        f"service-store-{uuid.uuid4()}", host="127.0.0.1"
-    )
-    handles: list[ServiceControlPlane] = []
-
-    async def connect() -> ServiceControlPlane:
-        dial = service.address.connect if handles else service.connect
-        handles.append(await dial())
-        return handles[-1]
-
-    try:
-        yield connect
-    finally:
-        # Handles first, so no call left waiting holds the service's close grace. Every close
-        # runs, and the first that raised is raised once all have.
-        first: BaseException | None = None
-        for close in [*(handle.close for handle in handles), service.close]:
-            try:
-                await close()
-            except BaseException as error:
-                first = first or error
-        if first is not None:
-            raise first

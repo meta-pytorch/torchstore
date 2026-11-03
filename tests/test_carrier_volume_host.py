@@ -38,7 +38,7 @@ from torchstore.carrier_volumes import (
     VolumeProxy,
 )
 from torchstore.strategy import StorageVolumeRef, TorchStoreStrategy
-from torchstore.transport import TransportType
+from torchstore.transport import gloo, TransportType
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.shared_memory import SharedMemoryTransportBuffer
 from torchstore.utils import get_local_hostname
@@ -102,6 +102,37 @@ async def resolve(volume_ids):
     return {volume_id: record(volume_id) for volume_id in volume_ids}
 
 
+async def register(volume_id, record):
+    pass
+
+
+async def start(store_name):
+    return await carrier_volumes.start_publisher_volume(
+        "publisher/0", store_name=store_name, selection=(object(), None), register=register
+    )
+
+
+# Stands in for a pair's group in Gloo's weak caches.
+class Group:
+    pass
+
+
+# A publisher volume, and the publisher lock held by a thread of its own.
+os.environ["TORCHSTORE_CARRIER_HOST"] = "127.0.0.1"
+from torchstore.transport import gloo
+
+served = asyncio.run(start("parent"))
+publisher_held, publisher_release = threading.Event(), threading.Event()
+
+
+def hold_publishers():
+    with carrier_volumes._publisher_lock:
+        publisher_held.set()
+        publisher_release.wait(30)
+
+
+threading.Thread(target=hold_publishers, daemon=True).start()
+assert publisher_held.wait(10)
 # A process can hold several hosts, so two, each with its lock held by a thread of its own.
 hosts = [CarrierVolumeHost(resolve) for _ in range(2)]
 carrier_volumes.VolumeProxy = held_proxy
@@ -113,11 +144,26 @@ for thread in adopting:
     thread.start()
 for _ in hosts:
     inside.acquire()
+# A Gloo pair in all three caches, planted after each adopt forgot unheld pairs. Only the fork
+# hook can clear them in the child.
+owner, group = gloo.GlooProcessGroupCache(), Group()
+gloo._store_addrs["publisher/0"] = ("parent", 1, "parent-pair", True)
+gloo._pair_owners["parent-pair"] = owner
+gloo._pair_groups["parent-pair"] = group
 pid = os.fork()
 if pid == 0:
     # A child stuck on a lock its parent's other threads held dies at the alarm.
     signal.alarm(30)
     try:
+        assert carrier_volumes._publishers == {}, carrier_volumes._publishers
+        assert gloo._store_addrs == {}, gloo._store_addrs
+        assert dict(gloo._pair_owners) == {} and dict(gloo._pair_groups) == {}
+        assert carrier_volumes._inherited == [served]
+        start_s = time.monotonic()
+        volume = asyncio.run(start("child"))
+        assert time.monotonic() - start_s < 5
+        assert volume is not served and volume.address.port != served.address.port
+        asyncio.run(volume.close())
         carrier_volumes.VolumeProxy = make_proxy
         for host in hosts:
             assert list(host.volume_ids()) == []
@@ -132,11 +178,16 @@ if pid == 0:
 # The parent keeps its locks, still held by the adopting threads.
 held = all(host._lock.locked() for host in hosts)
 release.set()
+publisher_release.set()
 for thread in adopting:
     thread.join()
 for host in hosts:
     asyncio.run(host.close())
 _, status = os.waitpid(pid, 0)
+assert carrier_volumes._publishers == {("parent", "publisher/0"): served}
+# The parent keeps its pair: only the child's fork hook drops it.
+assert gloo._pair_owners["parent-pair"] is owner and gloo._pair_groups["parent-pair"] is group
+asyncio.run(served.close())
 print(os.waitstatus_to_exitcode(status) if held else "parent lock replaced", flush=True)
 """
 )
@@ -807,10 +858,12 @@ async def test_a_close_as_prepare_installs_closes_the_new_proxy() -> None:
 async def test_records_that_arrive_once_close_starts_make_no_proxy(
     monkeypatch: pytest.MonkeyPatch, arrival: str
 ) -> None:
-    """Raise, and leave no connection entry, when a read's records arrive once ``close`` starts.
+    """Raise, and leave no connection entry or forgotten Gloo pair, when a read's records arrive once ``close`` starts.
 
     In the ``while_closing`` arm, they arrive while ``close`` waits on another volume's proxy.
     """
+    forgotten: list[str] = []
+    monkeypatch.setattr(gloo, "forget_unheld_pair", forgotten.append)
     record = _record("publisher/0")
     reading, release = asyncio.Event(), asyncio.Event()
     closing_held, finish_closing = asyncio.Event(), asyncio.Event()
@@ -849,6 +902,26 @@ async def test_records_that_arrive_once_close_starts_make_no_proxy(
             await preparing
     assert _address("publisher/0", record) not in _peers()
     assert list(host.volume_ids()) == []
+    assert "publisher/0" not in forgotten
+
+
+def test_an_adopt_whose_host_closes_as_it_decodes_the_record_forgets_no_gloo_pair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raise, and forget no Gloo pair, for an adopt whose host another call closes while it decodes the record."""
+    forgotten: list[str] = []
+    monkeypatch.setattr(gloo, "forget_unheld_pair", forgotten.append)
+    host = CarrierVolumeHost(_Records({}))
+    decode = carrier_volumes.decode_volume_record
+
+    def close_then_decode(volume_id: str, record: bytes) -> VolumeLocation:
+        asyncio.run(host.close())
+        return decode(volume_id, record)
+
+    monkeypatch.setattr(carrier_volumes, "decode_volume_record", close_then_decode)
+    with pytest.raises(RuntimeError, match="^this carrier volume host is closed$"):
+        host.adopt("publisher/0", _record("publisher/0"))
+    assert forgotten == [] and list(host.volume_ids()) == []
 
 
 @pytest.mark.asyncio
@@ -882,7 +955,8 @@ def test_a_fork_while_another_thread_holds_the_lock_gets_a_working_host(
 ) -> None:
     """List, prepare, adopt and close in a child forked while other threads held two hosts' locks.
 
-    Every live host's lock is fresh in the child, and the parent's stay with the threads holding them.
+    Every lock is fresh in the child, which keeps no publisher volume or cached Gloo pair of the
+    parent's and starts its own volume within 5 s. The parent's locks and pairs stay its own.
     """
     child = children.spawn(_FORK_CHILD)
     assert _read_line(child, timeout_s=90) == "0"
@@ -1099,3 +1173,64 @@ def test_a_put_and_get_through_carrier_hosts_probe_only_carried_transports(
     assert report["picked"] == ["SharedMemory", "Gloo", "MonarchRPC"]
     assert report["probed"] == []
     assert report["registered"] is report["control"] is report["monarch"]
+
+
+class _NotedLock:
+    """Gloo's pair-cache lock that sets ``waiting`` when a thread must wait for it."""
+
+    def __init__(self) -> None:
+        self.lock, self.waiting = threading.RLock(), threading.Event()
+
+    def __enter__(self) -> "_NotedLock":
+        if not self.lock.acquire(blocking=False):
+            self.waiting.set()
+            self.lock.acquire()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.lock.release()
+
+
+@pytest.mark.parametrize("install", ["adopt", "prepare"])
+def test_a_thread_holding_gloos_pair_cache_lock_lists_volumes_while_another_installs_one(
+    monkeypatch: pytest.MonkeyPatch, install: str
+) -> None:
+    """List a host's volumes on a thread that holds Gloo's pair-cache lock while another thread adopts or reads one.
+
+    reset_client may list them so from a finalizer or a signal handler. The install's forget of unheld pairs waits.
+    """
+    cache_lock = _NotedLock()
+    monkeypatch.setattr(gloo, "_cache_lock", cache_lock)
+    record = _record("publisher/0")
+    host = CarrierVolumeHost(_Records({"publisher/0": record}))
+    holding, listed = threading.Event(), []
+
+    def list_holding_the_lock() -> None:
+        with cache_lock:
+            holding.set()
+            # The installer then waits for the lock this thread holds.
+            if cache_lock.waiting.wait(30):
+                listed.append(list(host.volume_ids()))
+
+    def install_one() -> None:
+        if install == "adopt":
+            host.adopt("publisher/0", record)
+        else:
+            asyncio.run(host.prepare(["publisher/0"]))
+
+    lister = threading.Thread(target=list_holding_the_lock, daemon=True)
+    lister.start()
+    assert holding.wait(30)
+    installer = threading.Thread(target=install_one, daemon=True)
+    installer.start()
+    lister.join(30)
+    installer.join(30)
+    try:
+        assert (
+            not lister.is_alive() and not installer.is_alive()
+        ), "the two threads deadlocked"
+        # The install runs only after its forget waited for the listing thread's lock.
+        assert listed == [[]] and list(host.volume_ids()) == ["publisher/0"]
+    finally:
+        if not installer.is_alive():
+            asyncio.run(host.close())

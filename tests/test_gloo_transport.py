@@ -1470,10 +1470,10 @@ def test_a_gloo_pairing_counts_among_what_exit_waits_for_until_it_returns(monkey
     assert counted == [True] and gloo._pairings == set()
 
 
-# Forks once exit began while a thread holds Gloo's pair-cache and pairing locks and a pairing is in flight.
-# The child takes both locks, which waits on the copies it inherited unless the fork hook replaced them, and checks
-# that it inherited no pairing in flight, which its transfers would wait for forever, and can still pair. Prints its
-# exit code.
+# Forks once exit began while a thread holds Gloo's pair-cache and pairing locks and a pairing is in flight. The
+# child takes both locks, which waits on the copies it inherited unless the fork hook replaced them. It checks that
+# the hook also dropped the inherited pairs and the pairing in flight that its transfers would wait for forever, and
+# that it still pairs. Prints its exit code.
 _FORK_WITH_LOCKS_HELD = """
 import os, sys, threading
 from concurrent import futures
@@ -1497,16 +1497,29 @@ def hold():
 gloo.begin_exit()
 threading.Thread(target=hold, daemon=True).start()
 assert held.wait(30)
+
+
+# Stands in for a pair's group in Gloo's weak caches.
+class Group:
+    pass
+
+
+# A pair in each of Gloo's caches in a process that never loads the carrier volume module.
+owner, group = gloo.GlooProcessGroupCache(), Group()
+gloo._store_addrs["publisher/0"] = ("parent", 1, "parent-pair", True)
+gloo._pair_owners["parent-pair"] = owner
+gloo._pair_groups["parent-pair"] = group
 pid = os.fork()
 if pid == 0:
     fresh = gloo._cache_lock.acquire(timeout=5) and gloo._pairings_lock.acquire(timeout=5)
+    forgot = not (gloo._store_addrs or gloo._pair_owners or gloo._pair_groups)
     if fresh:
         gloo._pairings_lock.release()
     try:
         paired = fresh and gloo._counted(lambda: "group", "child pairing") == "group"
     except RuntimeError:
         paired = False
-    os._exit(0 if fresh and groups not in gloo._pairing_now and paired else 1)
+    os._exit(0 if fresh and forgot and groups not in gloo._pairing_now and paired else 1)
 release.set()
 _, status = os.waitpid(pid, 0)
 print(os.waitstatus_to_exitcode(status), flush=True)
@@ -1516,7 +1529,7 @@ print(os.waitstatus_to_exitcode(status), flush=True)
 def test_a_child_forked_while_a_thread_holds_gloos_locks_gets_fresh_ones() -> None:
     """Replace Gloo's locks and its record of pairings in flight in a forked child where their holders never run.
 
-    A child forked once its parent's exit began is a live process and pairs.
+    The child also forgets the pairs it inherited from its parent and pairs though forked once its parent's exit began.
     """
     root = str(Path(__file__).resolve().parents[1])
     child = subprocess.run(

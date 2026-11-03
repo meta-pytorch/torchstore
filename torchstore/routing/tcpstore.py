@@ -19,27 +19,24 @@ import ctypes
 import json
 import logging
 import os
-import pickle
 import socket
 import threading
 import time
 import uuid
 import weakref
-import zlib
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
-from typing import Any, Generic, NamedTuple, NoReturn, TYPE_CHECKING, TypeVar
+from typing import Any, Generic, NamedTuple, NoReturn, TypeVar
 from urllib.parse import quote
 
 from torch.distributed import DistError, DistNetworkError, PrefixStore, TCPStore
 
 from torchstore import native_calls
 from torchstore.routing.volume_records import VolumeRecords
-
-if TYPE_CHECKING:
-    from torchstore.strategy import TorchStoreStrategy
+from torchstore.strategy import TorchStoreStrategy
+from torchstore.transport import TransportType
 
 __all__ = ["TCPStoreAddress", "TCPStoreRendezvous"]
 
@@ -51,8 +48,6 @@ _HOST_ENV = "TORCHSTORE_TCPSTORE_HOST"
 # The libuv server closes the connection on a longer wire key or a larger value.
 _MAX_KEY_BYTES = 8 * 1024
 _MAX_VALUE_BYTES = 8 * 1024 * 1024
-# Readers stop inflating a strategy past this, so no small value takes unbounded memory.
-_MAX_STRATEGY_BYTES = 256 * 1024 * 1024
 # Reads go in chunks of at most 16 keys, so a reply holds at most 16 records, and a
 # chunk's request (9 bytes, plus 8 and the wire key per key) stays within the server's
 # 4 KiB read buffer unless the chunk is one longer key alone. The client still sends
@@ -102,18 +97,19 @@ if "_live_calls" not in globals():
     _handed_off_ports: set[int] = set()
 
 _PUBLISHERS = "publishers"
-_STRATEGY = "strategy"
+_CONFIG = "config"
 _COORDINATOR = "coordinator"
 _READY = "ready"
 # The value of each publisher's own key. Registration reads only whether the key exists.
 _MEMBER = b"1"
-# Stores of this schema hold those keys. Calls refuse any other schema at the ready check.
-_SCHEMA_VERSION = b"2"
+# Stores of this schema hold those keys and the config in place of a pickled strategy. Calls refuse
+# any other schema at the ready check.
+_SCHEMA_VERSION = b"3"
+_CONFIG_VERSION = 1
+# A config has one brace, and on Python 3.10 json's scanner nests as deep as the recursion limit.
+_MAX_CONFIG_BRACKETS = 64
 # What keeps a published value under the value limit, for the near-limit WARNING.
-_SMALLER_VALUE = {
-    _PUBLISHERS: "fewer or shorter publisher names",
-    _STRATEGY: "a smaller strategy",
-}
+_SMALLER_VALUE = {_PUBLISHERS: "fewer or shorter publisher names"}
 
 
 class _QuietNetworkError(DistNetworkError):
@@ -128,25 +124,54 @@ def _decode_publishers(data: bytes) -> frozenset[str]:
     return frozenset(json.loads(data))
 
 
-def _encode_strategy(strategy: TorchStoreStrategy) -> bytes:
-    # @lint-ignore PYTHONPICKLEISBAD Volume handles must reach other processes.
-    pickled = pickle.dumps(strategy)
-    if len(pickled) > _MAX_STRATEGY_BYTES:
-        raise ValueError(
-            f"the strategy pickles to {len(pickled)} bytes "
-            f"(the limit is {_MAX_STRATEGY_BYTES})"
+def _encode_config(strategy: TorchStoreStrategy) -> bytes:
+    """Encode only a plain strategy's transport as versioned JSON.
+
+    Raises TypeError for any other strategy class and ValueError for a transport that is
+    not a ``TransportType``. Which transports a store takes is its service's to check.
+    """
+    if type(strategy) is not TorchStoreStrategy:
+        raise TypeError(
+            "a config holds only a plain TorchStoreStrategy, not"
+            f" {type(strategy).__qualname__}"
         )
-    # Its volume handles repeat each volume's ids, so this shrinks it about 14 times.
-    return zlib.compress(pickled)
+    transport_type = strategy.default_transport_type
+    if not isinstance(transport_type, TransportType):
+        raise ValueError(f"a config names a TransportType, not {transport_type!r:.64}")
+    fields = {"v": _CONFIG_VERSION, "transport": transport_type.name}
+    return json.dumps(fields, sort_keys=True).encode()
 
 
-def _decode_strategy(data: bytes) -> TorchStoreStrategy:
-    inflate = zlib.decompressobj()
-    pickled = inflate.decompress(data, _MAX_STRATEGY_BYTES + 1)
-    if len(pickled) > _MAX_STRATEGY_BYTES:
-        raise ValueError(f"the strategy inflates past {_MAX_STRATEGY_BYTES} bytes")
-    # @lint-ignore PYTHONPICKLEISBAD Volume handles must reach other processes.
-    return pickle.loads(pickled)
+def _decode_config(data: bytes) -> TorchStoreStrategy:
+    """Rebuild the strategy ``_encode_config`` wrote. Anything else raises ValueError.
+
+    Over 64 brackets fails before parsing, whatever the version. Otherwise the version is
+    checked first, so a later format is reported as such. Errors quote at most 64 characters
+    of what they read, since a value can be 8 MiB.
+    """
+    if (
+        isinstance(data, (bytes, bytearray))
+        and data.count(b"[") + data.count(b"{") > _MAX_CONFIG_BRACKETS
+    ):
+        raise ValueError(
+            f"malformed config {data!r:.64}: over {_MAX_CONFIG_BRACKETS} brackets"
+        )
+    try:
+        fields = json.loads(data)
+        version = fields["v"]
+    except (ValueError, TypeError, KeyError, RecursionError) as e:
+        raise ValueError(f"malformed config {data!r:.64}: {type(e).__name__}") from e
+    if type(version) is not int or version != _CONFIG_VERSION:
+        raise ValueError(f"config version {version!r:.64}, not {_CONFIG_VERSION}")
+    if fields.keys() != {"v", "transport"}:
+        raise ValueError(
+            f"malformed config {data!r:.64}: its fields are not v and transport"
+        )
+    try:
+        return TorchStoreStrategy(TransportType[fields["transport"]])
+    except (TypeError, KeyError) as e:
+        # Not chained: an unknown name's KeyError holds all of it.
+        raise ValueError(f"malformed config {data!r:.64}: {type(e).__name__}") from None
 
 
 @dataclass(frozen=True)
@@ -716,7 +741,7 @@ async def _open(
 class TCPStoreRendezvous(VolumeRecords):
     """One connection to a routing store's keys on a TCPStore.
 
-    The driver calls ``serve`` and publishes the publisher ranks, the strategy and a key per publisher once. Other
+    The driver calls ``serve`` and publishes the publisher ranks, the config and a key per publisher once. Other
     ranks ``connect`` to its address to read them back and to register and read volume records. ``timeout_s`` bounds
     a whole call, 60 s if None. TimeoutError and ConnectionError name the server.
     """
@@ -892,11 +917,11 @@ class TCPStoreRendezvous(VolumeRecords):
         coordinator: str | None = None,
         timeout_s: float | None = None,
     ) -> None:
-        """Write the publisher ranks, the strategy, any coordinator and a key per publisher, then ``ready``.
+        """Write the publisher ranks, config, any coordinator and a key per publisher, then ``ready``.
 
-        Raises:
-            ValueError: If a key or value is over its limit or UTF-8 cannot encode a publisher id. Nothing is written.
-            RuntimeError: If the store was already published with other content.
+        Raises TypeError or ValueError before any write if a config cannot hold the strategy, a key or
+        value is over its limit, or UTF-8 cannot encode a publisher id. Raises RuntimeError if the store
+        already holds other published content.
         """
         prepared = self.prepare_publish(publishers, strategy, coordinator=coordinator)
         await self.publish_prepared(prepared, timeout_s=timeout_s)
@@ -917,7 +942,7 @@ class TCPStoreRendezvous(VolumeRecords):
         publishers = list(publishers)
         values = {
             _PUBLISHERS: _encode_publishers(publishers),
-            _STRATEGY: _encode_strategy(strategy),
+            _CONFIG: _encode_config(strategy),
         }
         if coordinator is not None:
             values[_COORDINATOR] = coordinator.encode()
@@ -942,41 +967,52 @@ class TCPStoreRendezvous(VolumeRecords):
         *,
         timeout_s: float | None = None,
     ) -> tuple[frozenset[str], TorchStoreStrategy]:
-        """Return the published publisher ranks and unpickled strategy, without waiting.
+        """Return the publisher ranks and the config's bare strategy, without waiting.
 
         Raises:
-            RuntimeError: If this address has no complete publish under this schema.
-            ValueError: If the published strategy inflates past its size limit.
+            RuntimeError: If this address has no complete publish under this schema, or
+                its config is malformed or of a later version.
         """
         timeout_s = _DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
         await self._require_ready(deadline)
-        rest = [_PUBLISHERS, _STRATEGY]
+        rest = [_PUBLISHERS, _CONFIG]
         # Written before ready, so these are missing only from a malformed store.
         if not await self._check(rest, deadline):
-            raise self._error("marked ready without its publishers or strategy")
-        publishers, strategy = await self._multi_get(rest, deadline)
-        return _decode_publishers(publishers), _decode_strategy(strategy)
+            raise self._error("marked ready without its publishers or config")
+        publishers, config = await self._multi_get(rest, deadline)
+        try:
+            strategy = _decode_config(config)
+        except ValueError as e:
+            raise self._error(str(e)) from e
+        return _decode_publishers(publishers), strategy
 
     async def read_strategy(
         self,
         *,
         timeout_s: float | None = None,
+        check: Callable[[TorchStoreStrategy], None] | None = None,
     ) -> TorchStoreStrategy:
-        """Return the published strategy alone, unpickled, without waiting or reading the publisher ranks.
+        """Return the config's bare strategy alone, without waiting or reading the publisher ranks.
 
         Raises:
-            RuntimeError: If this address has no ready marker under this schema, or no strategy.
-            ValueError: If the published strategy inflates past its size limit.
+            RuntimeError: If this address has no complete publish under this schema, its config is
+                malformed or of a later version, or ``check`` refuses its strategy with ValueError.
         """
         timeout_s = _DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
         await self._require_ready(deadline)
         # Written before ready, so it is missing only from a malformed store.
-        if not await self._check([_STRATEGY], deadline):
-            raise self._error("marked ready without its strategy")
-        (strategy,) = await self._multi_get([_STRATEGY], deadline)
-        return _decode_strategy(strategy)
+        if not await self._check([_CONFIG], deadline):
+            raise self._error("marked ready without its config")
+        (config,) = await self._multi_get([_CONFIG], deadline)
+        try:
+            strategy = _decode_config(config)
+            if check is not None:
+                check(strategy)
+        except ValueError as e:
+            raise self._error(str(e)) from e
+        return strategy
 
     async def read_coordinator(
         self,
