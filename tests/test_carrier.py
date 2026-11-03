@@ -3961,7 +3961,8 @@ async def test_a_client_that_stops_reading_holds_no_writer_thread(
     server = await _serve(_Sink(size), "get")
     # The first stalled reply is on the I/O thread, so the second one goes to the writer.
     async with _stalled_get(server), _stalled_get(server) as (stalled, _):
-        assert len(server._runtime.writers.threads) == 1
+        # The second setup can return before its reply's writer thread has started.
+        await _until(lambda: len(server._runtime.writers.threads) == 1)
         await _until(lambda: stalled.job is None)
         reply = await CarrierClient(server.address).call("get", timeout_s=30)
         assert reply.numel() == size and bool((reply == 1).all())
