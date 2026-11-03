@@ -27,6 +27,7 @@ from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
 from torchstore.utils import same_slice_geometry
+from ._gc import call_gc_paused
 from ._model import KeyRegistration, RankRole
 from .control_plane import ControlPlane
 from .directory import RoutingDirectory
@@ -159,9 +160,15 @@ class RoutingClient(LocalClient):
             for name, tensor_slice in slices.items()
         }
         rank = self._routing_directory.rank
-        self._routing_directory.install(
-            RoutingPlan.for_requester(rank, registrations, publishers)
-        )
+        if registrations:
+            # Planning allocates objects for every publisher's slice of every key, and
+            # generational collections would keep walking the growing plan.
+            plan = call_gc_paused(
+                RoutingPlan.for_requester, rank, registrations, publishers
+            )
+        else:
+            plan = RoutingPlan.for_requester(rank, registrations, publishers)
+        self._routing_directory.install(plan)
         # Unpublished keys stay unplanned so a strict get still rejects them.
         requested.update(slices)
         self._registered_layouts.add(key)

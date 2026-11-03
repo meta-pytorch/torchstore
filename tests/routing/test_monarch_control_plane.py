@@ -16,9 +16,9 @@ from unittest.mock import AsyncMock, call
 
 import pytest
 import torchstore as ts
-import torchstore.routing.coordinator as coordinator_module
+from monarch.actor import ActorError
+from torchstore.monarch.coordinator import MonarchControlPlane
 from torchstore.routing.control_plane import ControlPlane
-from torchstore.routing.coordinator import MonarchControlPlane
 from torchstore.transport import TransportType
 
 from .test_coordinator import _plus_timeout, _registration
@@ -26,6 +26,8 @@ from .test_coordinator import _plus_timeout, _registration
 pytestmark = pytest.mark.timeout(60)
 
 _TIMING_LINE = re.compile(r"routing control_plane=monarch (.+) took (\d+\.\d+)s$")
+# The coordinator's logger, under ``torchstore.routing`` as before its module moved.
+_COORDINATOR_LOGGER = "torchstore.routing.coordinator"
 
 
 def _timing_lines(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
@@ -34,7 +36,7 @@ def _timing_lines(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str]]:
     for record in caplog.records:
         if match := _TIMING_LINE.search(record.getMessage()):
             assert (record.name, record.levelno) == (
-                coordinator_module.__name__,
+                _COORDINATOR_LOGGER,
                 logging.INFO,
             )
             lines.append(match.groups())
@@ -65,7 +67,7 @@ async def test_monarch_adapter_forwards_each_call_and_logs_it(caplog) -> None:
             **{name: SimpleNamespace(call_one=mock) for name, mock in endpoints.items()}
         )
     )
-    caplog.set_level(logging.INFO, logger=coordinator_module.__name__)
+    caplog.set_level(logging.INFO, logger=_COORDINATOR_LOGGER)
 
     await control_plane.init(publishers, strategy)
     assert await control_plane.strategy() is strategy
@@ -129,3 +131,27 @@ def test_monarch_adapter_keeps_the_interface_signatures() -> None:
         if name == "get_layouts":
             interface = _plus_timeout(interface)
         assert inspect.signature(getattr(MonarchControlPlane, name)) == interface, name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("store_name", [None, "store"])
+async def test_monarch_adapter_hints_at_other_planes_only_for_a_named_store(
+    store_name,
+) -> None:
+    """Hint at another plane on a strategy read before init, only once it names a store."""
+    error = ActorError(RuntimeError("RoutingCoordinator.init has not run"))
+    message = error.message
+    coordinator = SimpleNamespace(
+        strategy=SimpleNamespace(call_one=AsyncMock(side_effect=error))
+    )
+    control_plane = MonarchControlPlane(coordinator, store_name=store_name)
+    with pytest.raises(ActorError) as raised:
+        await control_plane.strategy()
+    assert raised.value is error
+    if store_name is None:
+        assert error.message == message
+    else:
+        assert error.message == (
+            f"{message} If ts.initialize gave store 'store' another control plane, pass "
+            "ts.client that control plane (control_plane=) or its address (address=)."
+        )
