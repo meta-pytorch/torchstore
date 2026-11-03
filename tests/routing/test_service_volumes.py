@@ -25,6 +25,7 @@ import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Callable, Collection, Coroutine, Iterator
+from functools import partial
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -32,6 +33,7 @@ from unittest import mock
 import pytest
 import torchstore as ts
 import torchstore.api as store_api
+import torchstore.utils as store_utils
 from torchstore import carrier_volumes
 from torchstore.carrier import (
     CarrierAddress,
@@ -92,7 +94,6 @@ _TIMING_LINE = re.compile(r"routing control_plane=service ([a-z_]+)( key=[^ ]+)?
 # lines. argv: the tree's root, modules to block, the role, the store name, role arguments.
 _RANK = """
 import asyncio, json, os, sys, threading, traceback
-from types import SimpleNamespace
 
 root, blocked, role, store_name, *rest = sys.argv[1:]
 blocked = set(filter(None, blocked.split(",")))
@@ -115,22 +116,12 @@ sys.path.insert(0, root)
 import torch
 import torchstore as ts
 import torchstore.api as store_api
-import torchstore.backend as backend_module
 from torch.distributed.tensor import DTensor
 from torchstore.carrier import runtime
 from torchstore.routing.service import ServiceAddress
 from torchstore.storage import InMemoryStore
 from torchstore.transport import TransportType
 from tests.routing import routed_sync_data as data
-
-
-async def lookup(*args, **kwargs):
-    raise AssertionError("looked up a Monarch actor")
-
-
-# A stand-in for the Monarch backend: each client sets its rank, and actor lookups fail.
-monarch = SimpleNamespace(rank=lambda: 0, controller=lookup, coordinator=lookup)
-backend_module._backends["monarch"] = monarch
 
 
 def reply(**fields):
@@ -178,9 +169,8 @@ async def driver(transport, publishers):
 
 
 async def client(rank, **kwargs):
-    monarch.rank = lambda: rank
     address = ServiceAddress(*json.loads(sys.stdin.readline()))
-    await ts.client(store_name, address=address, **kwargs)
+    await ts.client(store_name, address=address, rank=rank, **kwargs)
     return address
 
 
@@ -263,7 +253,7 @@ async def requester(group, rank):
     async def reset():
         # A new client, with a new strategy and volume host, as a re-created rank makes.
         ts.reset_client(store_name)
-        await ts.client(store_name, role=role, group=group, address=address)
+        await ts.client(store_name, role=role, group=group, rank=rank, address=address)
         reply(reset=True)
 
     async def shutdown():
@@ -1337,6 +1327,10 @@ def _free(*locks: Any) -> bool:
         ("publisher_lock", "record"),
         ("publisher_lock", "address"),
         ("selection_lock", "record"),
+        # A build through an address also marks the store. The GC's close leaves it marked as attempted.
+        ("selection_lock", "address"),
+        # A build without rank= gives back the rank it took from Monarch without waiting too.
+        ("selection_lock", "monarch-rank"),
     ],
 )
 @pytest.mark.asyncio
@@ -1366,13 +1360,17 @@ async def test_a_build_abandoned_as_its_volume_starts_leaves_the_next_build_serv
     store_name = _store_name()
     async with contextlib.AsyncExitStack() as stack:
         kwargs: dict[str, Any] = {}
-        if via == "record":
-            await _initialize_service(store_name)
-        else:
+        if via == "address":
             other = await stack.enter_async_context(
                 _other_service(store_name, ts.TorchStoreStrategy())
             )
             kwargs = {"address": other.address}
+        else:
+            await _initialize_service(store_name)
+        abandoned = partial(rank_client, store_name, role=RankRole.PUBLISHER, **kwargs)
+        if via == "monarch-rank":
+            monkeypatch.setattr(store_api, "_actor_rank", lambda: 0)
+            abandoned = partial(ts.client, store_name, role=RankRole.PUBLISHER)
         building: list[Any] = []
         try:
             monkeypatch.setattr(ServiceControlPlane, "register_volume", hold)
@@ -1381,11 +1379,7 @@ async def test_a_build_abandoned_as_its_volume_starts_leaves_the_next_build_serv
             runner.start()
             try:
                 # Kept: only the locked collection below can free the abandoned build.
-                building.append(
-                    asyncio.run_coroutine_threadsafe(
-                        rank_client(store_name, role=RankRole.PUBLISHER, **kwargs), loop
-                    )
-                )
+                building.append(asyncio.run_coroutine_threadsafe(abandoned(), loop))
                 assert await asyncio.to_thread(entered.wait, 30)
             finally:
                 # Stopped and closed on every outcome. A loop thread blocked in a call keeps
@@ -1414,6 +1408,8 @@ async def test_a_build_abandoned_as_its_volume_starts_leaves_the_next_build_serv
                 assert await asyncio.to_thread(
                     collected.wait, 30
                 ), "the collector deadlocked"
+                # It gives its rank back once that lock frees, if not at once.
+                await _until(lambda: store_name not in store_api._building_ranks)
                 # Its close is still held: nothing but the abandon stopped it.
                 assert volume.started.done() and not volume.current()
                 assert closes == [volume] and volume._server is not None
@@ -1521,9 +1517,10 @@ def test_an_abandoned_volumes_close_runs_on_a_thread_that_logs_a_failure(
         raise OSError("volume close failed")
 
     monkeypatch.setattr(volume, "close", failing_close)
-    monkeypatch.setattr(carrier_volumes, "threading", SimpleNamespace(Thread=thread))
+    # carrier_volumes starts the thread through the shared helper in torchstore.utils.
+    monkeypatch.setattr(store_utils, "threading", SimpleNamespace(Thread=thread))
     finalizing_sys = SimpleNamespace(is_finalizing=lambda: finalizing)
-    monkeypatch.setattr(carrier_volumes, "sys", finalizing_sys)
+    monkeypatch.setattr(store_utils, "sys", finalizing_sys)
     carrier_volumes._close_on_thread(volume)
     for closer in started:
         closer.join(30)
@@ -1556,10 +1553,10 @@ def test_an_abandoned_volumes_close_whose_thread_is_refused_returns_quietly(
     """Return without raising when the close's thread cannot start since the exit hook closes every served volume."""
     volume = PublisherVolume("publisher/0", _store_name(), (object(), None))
     monkeypatch.setattr(
-        carrier_volumes, "threading", SimpleNamespace(Thread=_RefusedThread)
+        store_utils, "threading", SimpleNamespace(Thread=_RefusedThread)
     )
     monkeypatch.setattr(
-        carrier_volumes, "sys", SimpleNamespace(is_finalizing=lambda: False)
+        store_utils, "sys", SimpleNamespace(is_finalizing=lambda: False)
     )
     carrier_volumes._close_on_thread(volume)
 
@@ -2347,8 +2344,8 @@ async def test_ranks_sync_with_no_actor_cloudpickle_or_coordinator_module(
 ) -> None:
     """Sync twice, bitwise, across processes that block cloudpickle and volume actors.
 
-    Monarch's lookup raises in each, and none loads Monarch's runtime or a coordinator module,
-    nor does the requester's shutdown.
+    None loads Monarch's runtime, its backend, or a coordinator module, nor does the requester's
+    shutdown.
     """
     store_name = _store_name()
     blocked = "cloudpickle,torchstore.monarch.storage_volume"
@@ -2688,7 +2685,7 @@ import torchstore.backend as backend_module
 from torchstore.carrier_volumes import CarrierVolumeHost
 from torchstore.routing.volume_records import VolumeRecords
 
-backend_module._backends["monarch"] = SimpleNamespace(rank=lambda: 0)
+backend_module._backends["monarch"] = SimpleNamespace(actor_rank=lambda: 0)
 
 
 class Plane(ts.ControlPlane, VolumeRecords):

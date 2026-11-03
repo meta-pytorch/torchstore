@@ -22,5 +22,6 @@ def install_backend_stub(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """
     stub = create_autospec(Backend, instance=True)
     stub.rank.return_value = 0
+    stub.actor_rank.return_value = 0
     monkeypatch.setitem(backend_module._backends, "monarch", stub)
     return stub

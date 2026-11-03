@@ -93,7 +93,7 @@ def _joins_its_native_calls() -> Iterator[None]:
     assert not tcpstore._live_calls - _earlier_calls, "finished calls stayed registered"
 
 
-def _stop(process: subprocess.Popen[bytes]) -> None:
+def _stop(process: subprocess.Popen[Any]) -> None:
     """Stop the server and wait until the kernel reports it stopped."""
     process.send_signal(signal.SIGSTOP)
     os.waitpid(process.pid, os.WUNTRACED)
@@ -183,7 +183,9 @@ async def _close_each(
 
 @contextlib.asynccontextmanager
 async def _other_service(
-    store_name: str, strategy: ts.TorchStoreStrategy
+    store_name: str,
+    strategy: ts.TorchStoreStrategy,
+    publishers: Collection[str] = ("publisher/0",),
 ) -> AsyncIterator[CoordinatorService]:
     """Serve another initialized coordinator for a store, outside this process's records."""
     service = await CoordinatorService.start(store_name, host=_LOCALHOST)
@@ -191,7 +193,7 @@ async def _other_service(
     try:
         driver = await service.connect()
         closes.insert(0, driver.close)
-        await driver.init(publishers={"publisher/0"}, strategy=strategy)
+        await driver.init(publishers=set(publishers), strategy=strategy)
         yield service
     finally:
         # Every close runs, and a failing case's own error stays the one reported.

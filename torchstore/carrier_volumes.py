@@ -17,7 +17,6 @@ import collections
 import itertools
 import logging
 import os
-import sys
 import threading
 import time
 import uuid
@@ -45,7 +44,7 @@ from torchstore.transport import (
     SharedMemoryTransportBuffer,
     TransportType,
 )
-from torchstore.utils import _off_task, _store_address
+from torchstore.utils import _off_task, _store_address, start_daemon_thread
 from torchstore.volume_host import VolumeHost
 
 if TYPE_CHECKING:
@@ -61,6 +60,7 @@ __all__ = [
     "forget_context_pairs",
     "PublisherVolume",
     "serve_volume",
+    "serves_another_publisher",
     "start_publisher_volume",
     "stop_publisher_volumes",
     "VOLUME_ENDPOINTS",
@@ -812,16 +812,7 @@ def _close_on_thread(volume: PublisherVolume) -> None:
             )
 
     # A finalizing interpreter starts no thread, and the exit hook closed every served volume.
-    if not sys.is_finalizing():
-        try:
-            threading.Thread(
-                target=close,
-                name=f"torchstore-volume-close {volume.volume_id}",
-                daemon=True,
-            ).start()
-        except RuntimeError:
-            # Python 3.12 and later refuse new threads at interpreter shutdown.
-            pass
+    start_daemon_thread(close, f"torchstore-volume-close {volume.volume_id}")
 
 
 async def start_publisher_volume(
@@ -830,14 +821,23 @@ async def start_publisher_volume(
     store_name: str,
     selection: tuple[Any, Any],
     register: Callable[[str, bytes], Awaitable[None]],
+    sole: bool = False,
 ) -> PublisherVolume:
     """Serve this process's volume ``volume_id`` for one store, registered through ``register``.
 
     ``selection``, a (control plane, address) pair, names the store. Another store's volume of that
-    name stops first. Callers on any thread share one start, and one that fails closes its volume.
+    name stops first, and with ``sole`` one of another ID under the store's name raises ValueError.
+    Callers on any thread share one start, and one that fails closes its volume.
     """
     key = (store_name, volume_id)
     with _publisher_lock:
+        # The service backend passes sole: a process registers as one publisher rank of a store.
+        other = _other_publisher(store_name, volume_id) if sole else None
+        if other is not None:
+            raise ValueError(
+                f"this process serves volume {other.volume_id} of routing store"
+                f" {store_name!r}, so it cannot serve {volume_id} too. Call ts.shutdown first"
+            )
         volume, stale = _publishers.get(key), None
         if volume is not None and volume._stopped:
             # A start the GC closed in a locked step stopped it without taking it out.
@@ -868,6 +868,28 @@ async def start_publisher_volume(
         if failure is not None:
             raise RuntimeError(failure)
     return volume
+
+
+def serves_another_publisher(store_name: str, volume_id: str) -> bool:
+    """Whether this process serves a publisher volume of ``store_name`` other than ``volume_id``."""
+    with _publisher_lock:
+        return _other_publisher(store_name, volume_id) is not None
+
+
+def _other_publisher(store_name: str, volume_id: str) -> PublisherVolume | None:
+    """A volume of the store's name other than ``volume_id`` that no stop took. Hold the lock.
+
+    ``ts.client`` and ``ts.shutdown`` take a store by its name. So a volume of the store started
+    over at another address counts too.
+    """
+    return next(
+        (
+            held
+            for (name, held_id), held in _publishers.items()
+            if name == store_name and held_id != volume_id and not held._stopped
+        ),
+        None,
+    )
 
 
 def stop_publisher_volumes(store_name: str) -> list[PublisherVolume]:

@@ -12,6 +12,7 @@ from datetime import timedelta
 from typing import Any
 
 import torch
+from monarch._src.actor import actor_mesh
 from monarch.actor import current_rank, get_or_spawn_controller
 from monarch.config import configure, get_global_config
 
@@ -83,6 +84,14 @@ class MonarchBackend(Backend):
         Inside one, the position in the mesh or slice that the current message went to.
         """
         return current_rank().rank
+
+    def actor_rank(self) -> int | None:
+        # current_rank() would start Monarch's root client where no context is current, and a
+        # driver task that used Monarch holds that root client's context, which is no actor's.
+        context = actor_mesh._context.get()
+        if context is None or context is actor_mesh._client_context.try_get():
+            return None
+        return context.message_rank.rank
 
     async def spawn_volumes(
         self, mesh: Any, num_volumes: int, id_func: Callable[[], str], /
