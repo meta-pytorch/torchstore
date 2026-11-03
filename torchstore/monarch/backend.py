@@ -62,7 +62,8 @@ def _apply_frame_length_default() -> None:
         )
 
 
-# A reload of this module keeps the flag, so the step runs once per process.
+# A reload of this module keeps the flag and so skips the step. An import after the module
+# left sys.modules starts without the flag and runs it again.
 if not globals().get("_frame_length_default_applied", False):
     _frame_length_default_applied = True
     _apply_frame_length_default()

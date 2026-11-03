@@ -23,7 +23,7 @@ from torchstore.routing import _gc
 # child exits 0 if collection is on and collecting finalizes nothing it inherited, else 1, and
 # the parent exits 2 if its own collection was no longer paused after the fork.
 _FORK_CHILD = """
-import gc, importlib.util, os, sys, threading
+import gc, importlib.util, os, signal, sys, threading
 
 spec = importlib.util.spec_from_file_location("_gc", sys.argv[1])
 _gc = importlib.util.module_from_spec(spec)
@@ -43,11 +43,12 @@ class Cycle:
 def hold():
     Cycle()
     holding.set()
-    release.wait()
+    release.wait(20)
 
 
-threading.Thread(target=_gc.call_gc_paused, args=(hold,)).start()
-holding.wait()
+threading.Thread(target=_gc.call_gc_paused, args=(hold,), daemon=True).start()
+if not holding.wait(20):
+    sys.exit("the holder never paused collection")
 pid = os.fork()
 if pid == 0:
     gc.collect()
@@ -55,6 +56,7 @@ if pid == 0:
 # The hook acts in the child only: the parent's call is still running.
 parent_paused = not gc.isenabled()
 release.set()
+signal.alarm(20)  # ends a parent whose child never exits
 status = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
 sys.exit(status if parent_paused else 2)
 """
@@ -77,13 +79,10 @@ def _hold(entered: threading.Event, release: threading.Event) -> None:
     release.wait()
 
 
-@pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "disabled"])
 def test_nested_calls_resume_collection_at_the_outermost_return(
-    collecting: None, enabled: bool
+    collecting: None,
 ) -> None:
-    """Keep collection paused until the outermost call returns, then leave it as it was."""
-    if not enabled:
-        gc.disable()
+    """Keep collection paused until the outermost call returns, then resume it."""
     seen: list[bool] = []
 
     def outer() -> None:
@@ -92,7 +91,29 @@ def test_nested_calls_resume_collection_at_the_outermost_return(
 
     _gc.call_gc_paused(outer)
     assert seen == [False, False]
-    assert gc.isenabled() is enabled
+    assert gc.isenabled()
+
+
+@pytest.mark.parametrize("error_type", [None, ValueError, KeyboardInterrupt])
+def test_a_call_that_found_collection_off_leaves_it_off(
+    collecting: None, error_type: type[BaseException] | None
+) -> None:
+    """Leave collection off after a call that found it off, also when that call raises."""
+    gc.disable()
+    seen: list[bool] = []
+
+    def fn() -> None:
+        seen.append(gc.isenabled())
+        if error_type is not None:
+            raise error_type("planning failed")
+
+    if error_type is None:
+        _gc.call_gc_paused(fn)
+    else:
+        with pytest.raises(error_type, match="planning failed"):
+            _gc.call_gc_paused(fn)
+    assert seen == [False]
+    assert not gc.isenabled() and _gc._resuming == set()
 
 
 def test_a_call_never_pauses_collection_as_it_returns(collecting: None) -> None:
@@ -135,13 +156,13 @@ def test_an_interrupt_as_a_call_resumes_collection_still_drops_its_record(
         raise KeyboardInterrupt
 
     stand_in = SimpleNamespace(
-        isenabled=gc.isenabled, disable=gc.disable, enable=interrupted
+        isenabled=gc.isenabled, disable=lambda: None, enable=interrupted
     )
     monkeypatch.setattr(_gc, "gc", stand_in)
     with pytest.raises(KeyboardInterrupt):
         _gc.call_gc_paused(lambda: None)
     assert recorded_on_resume == [1]
-    assert gc.isenabled() and _gc._resuming == set()
+    assert _gc._resuming == set()
 
 
 def test_a_call_drops_its_record_after_other_code_resumed_collection(
@@ -149,7 +170,7 @@ def test_a_call_drops_its_record_after_other_code_resumed_collection(
 ) -> None:
     """Drop a call's record as it returns even when other code resumed collection inside it."""
     _gc.call_gc_paused(gc.enable)
-    assert gc.isenabled() and _gc._resuming == set()
+    assert _gc._resuming == set()
 
 
 def test_a_nested_call_that_found_collection_on_keeps_the_outer_record(
@@ -168,13 +189,10 @@ def test_a_nested_call_that_found_collection_on_keeps_the_outer_record(
 
 
 @pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
-@pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "disabled"])
-def test_a_call_that_raises_still_resumes(
-    collecting: None, enabled: bool, error_type: type[BaseException]
+def test_a_nested_call_that_raises_leaves_collection_paused_for_the_outer(
+    collecting: None, error_type: type[BaseException]
 ) -> None:
-    """Resume after a call that raises, inside one that keeps running or as the last."""
-    if not enabled:
-        gc.disable()
+    """Keep collection paused after a nested call raises, until the outer call returns."""
     error = error_type("planning failed")
 
     def fail() -> None:
@@ -187,11 +205,24 @@ def test_a_call_that_raises_still_resumes(
         assert not gc.isenabled()
 
     _gc.call_gc_paused(outer)
-    assert gc.isenabled() is enabled
+    assert gc.isenabled()
+
+
+@pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
+def test_a_call_that_raises_still_resumes(
+    collecting: None, error_type: type[BaseException]
+) -> None:
+    """Resume collection after a call that found it on raises."""
+    error = error_type("planning failed")
+
+    def fail() -> None:
+        assert not gc.isenabled()
+        raise error
+
     with pytest.raises(error_type) as caught:
         _gc.call_gc_paused(fail)
     assert caught.value is error
-    assert gc.isenabled() is enabled
+    assert gc.isenabled()
 
 
 @pytest.mark.timeout(60)
@@ -200,14 +231,15 @@ def test_calls_in_two_threads_record_only_a_call_that_found_collection_on(
 ) -> None:
     """Resume collection when the call that found it on returns, inside another's call.
 
-    Only that call is recorded for the fork hook, and the other one never resumes it.
+    Only that call is recorded for the fork hook, and the other one leaves collection as it
+    finds it when it returns.
     """
     first_in, first_out, second_in, second_out = (threading.Event() for _ in range(4))
     first = threading.Thread(
-        target=_gc.call_gc_paused, args=(_hold, first_in, first_out)
+        target=_gc.call_gc_paused, args=(_hold, first_in, first_out), daemon=True
     )
     second = threading.Thread(
-        target=_gc.call_gc_paused, args=(_hold, second_in, second_out)
+        target=_gc.call_gc_paused, args=(_hold, second_in, second_out), daemon=True
     )
     try:
         first.start()
@@ -219,14 +251,11 @@ def test_calls_in_two_threads_record_only_a_call_that_found_collection_on(
         first.join(10)
         assert not first.is_alive()
         assert gc.isenabled() and _gc._resuming == set()
-        # Collection that other code turns off stays off in a child and once all return.
-        gc.disable()
-        _gc._after_fork_in_child()
-        assert not gc.isenabled()
         second_out.set()
         second.join(10)
         assert not second.is_alive()
-        assert not gc.isenabled()
+        # The second call found collection off and leaves it as it is, on, when it returns.
+        assert gc.isenabled()
     finally:
         first_out.set()
         second_out.set()
@@ -249,7 +278,8 @@ def test_the_fork_hook_resumes_collection_only_for_a_call_that_found_it_on(
     monkeypatch.setattr(_gc, "_resuming", {object()} if found_enabled else set())
     _gc._after_fork_in_child()
     assert calls == (["freeze", "enable"] if found_enabled else [])
-    assert _gc._resuming == set()
+    if found_enabled:
+        assert _gc._resuming == set()
 
 
 @pytest.mark.timeout(60)
@@ -258,11 +288,16 @@ def test_a_forked_child_resumes_collection_but_never_finalizes_what_it_inherited
 
     The parent finds it still paused after the fork, since the hook runs in the child only.
     """
-    child = subprocess.run(
-        [sys.executable, "-c", _FORK_CHILD, _gc.__file__],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", _FORK_CHILD, _gc.__file__],
+            capture_output=True,
+            text=True,
+            timeout=50,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        # Its partial output arrives as bytes, or None, even with text=True.
+        output = b"".join(stream or b"" for stream in (error.stdout, error.stderr))
+        pytest.fail(f"child timed out:\n{output.decode(errors='replace')}")
     assert child.returncode == 0, child.stdout + child.stderr

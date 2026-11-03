@@ -74,7 +74,7 @@ def test_a_second_host_replaces_the_first() -> None:
 
 
 def test_an_installed_host_travels_with_a_pickled_strategy() -> None:
-    """Resolve through the host of a strategy's pickled copy, as the strategy's readers do."""
+    """Resolve through the host of a strategy's pickled copy as readers that receive a copy do."""
     strategy = TorchStoreStrategy()
     strategy.set_volume_host(_RecordHost({"a": ("handle-a", "host-a")}))
 
@@ -82,29 +82,62 @@ def test_an_installed_host_travels_with_a_pickled_strategy() -> None:
     assert (ref.volume, ref.volume_hostname) == ("handle-a", "host-a")
 
 
-def test_a_host_must_implement_every_lookup() -> None:
-    """Refuse to build a host that leaves a lookup abstract."""
+_LOOKUPS = {
+    "volume_ids": lambda self: (),
+    "endpoints": lambda self, volume_id: "handle",
+    "hostname": lambda self, volume_id: "host",
+}
 
-    class NoEndpoints(VolumeHost):
-        def volume_ids(self) -> Collection[str]:
-            return ()
 
-        def hostname(self, volume_id: str) -> str:
-            return "host"
-
-    with pytest.raises(TypeError, match="abstract"):
-        NoEndpoints()
+@pytest.mark.parametrize("missing", sorted(_LOOKUPS))
+def test_a_host_must_implement_every_lookup(missing: str) -> None:
+    """Refuse to build a host that leaves any one lookup abstract."""
+    lookups = {name: lookup for name, lookup in _LOOKUPS.items() if name != missing}
+    with pytest.raises(TypeError, match=f"abstract.*{missing}"):
+        type("Partial", (VolumeHost,), lookups)()
 
 
 @pytest.mark.asyncio
 async def test_selection_checks_the_installed_hosts_ids(monkeypatch) -> None:
-    """Select the client's volume among the host's IDs, refusing one only the attributes know."""
+    """Select the client's volume among the host's IDs."""
     strategy = LocalRankStrategy()
     await strategy.set_storage_volumes(VolumeMesh([("0", "host-0")]))
     strategy.set_volume_host(_RecordHost({"1": ("handle-1", "host-1")}))
 
     monkeypatch.setenv("RANK", "1")
     assert strategy.select_storage_volume().volume == "handle-1"
+
+
+@pytest.mark.asyncio
+async def test_selection_refuses_an_id_only_the_attributes_know(monkeypatch) -> None:
+    """Refuse a client ID the attributes hold but the installed host lacks."""
+    strategy = LocalRankStrategy()
+    await strategy.set_storage_volumes(VolumeMesh([("0", "host-0")]))
+    strategy.set_volume_host(_RecordHost({"1": ("handle-1", "host-1")}))
+
+    monkeypatch.setenv("RANK", "0")
+    with pytest.raises(KeyError, match="found for 0 in the volume host"):
+        strategy.select_storage_volume()
+
+
+class _SizedHost(_RecordHost):
+    """A host whose length makes an empty one read as false."""
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_host_that_reads_as_false_still_resolves(monkeypatch) -> None:
+    """Resolve through an installed host that reads as false, never through the attributes."""
+    strategy = LocalRankStrategy()
+    await strategy.set_storage_volumes(VolumeMesh([("0", "host-0")]))
+    host = _SizedHost({})
+    assert not host
+    strategy.set_volume_host(host)
+
+    with pytest.raises(KeyError, match="^'0'$"):
+        strategy.get_storage_volume("0")
     monkeypatch.setenv("RANK", "0")
     with pytest.raises(KeyError, match="found for 0 in the volume host"):
         strategy.select_storage_volume()
@@ -178,14 +211,28 @@ class _OwnLookup(TorchStoreStrategy):
         return super().get_storage_volume(volume_id)
 
 
+# Each inherits its overrides from a parent class.
+class _InheritsLookup(_OwnLookup):
+    pass
+
+
+class _InheritsController(ControllerStorageVolumes):
+    pass
+
+
 @pytest.mark.parametrize(
     "strategy_cls, overridden",
     [
         (_OwnSet, "set_storage_volumes"),
         (_OwnSelect, "select_storage_volume"),
         (_OwnLookup, "get_storage_volume"),
+        (_InheritsLookup, "get_storage_volume"),
         (
             ControllerStorageVolumes,
+            "set_storage_volumes, select_storage_volume, get_storage_volume",
+        ),
+        (
+            _InheritsController,
             "set_storage_volumes, select_storage_volume, get_storage_volume",
         ),
     ],
@@ -200,15 +247,15 @@ def test_a_strategy_that_overrides_a_host_method_refuses_a_host(
     assert vars(strategy).keys() == vars(strategy_cls()).keys()
 
 
-def test_type_hints_of_every_strategy_class_resolve() -> None:
+@pytest.mark.parametrize(
+    "strategy_cls",
+    [TorchStoreStrategy, LocalRankStrategy, HostStrategy, ControllerStorageVolumes],
+)
+def test_type_hints_of_every_strategy_class_resolve(
+    strategy_cls: type[TorchStoreStrategy],
+) -> None:
     """Resolve each strategy class's hints at run time, as on main."""
-    for strategy_cls in (
-        TorchStoreStrategy,
-        LocalRankStrategy,
-        HostStrategy,
-        ControllerStorageVolumes,
-    ):
-        assert typing.get_type_hints(strategy_cls) == {}
+    assert typing.get_type_hints(strategy_cls) == {}
 
 
 @pytest.mark.asyncio
