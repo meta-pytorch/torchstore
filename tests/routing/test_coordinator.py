@@ -38,7 +38,7 @@ from torchstore.transport import TransportType
 
 from ..volume_meshes import VolumeMesh
 from .file_store_control_plane import FileStoreControlPlane
-from .utils import registry_store, tensor_slice
+from .utils import registry_store, service_store, tensor_slice
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -110,6 +110,7 @@ async def _file_store() -> AsyncIterator[Callable[[], Awaitable[TimedControlPlan
     params=[
         pytest.param(_monarch_store, id="monarch"),
         pytest.param(registry_store, id="registry"),
+        pytest.param(service_store, id="service"),
         pytest.param(_file_store, id="filestore"),
     ]
 )
