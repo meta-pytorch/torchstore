@@ -16,17 +16,20 @@ from torchstore.api import (
     get,
     get_batch,
     get_state_dict,
+    get_state_dict_delta,
     initialize,
     keys,
     put,
     put_batch,
     put_state_dict,
+    put_state_dict_delta,
     reset_client,
     shutdown,
 )
 from torchstore.client import ClientType
 from torchstore.logging import init_logging
 from torchstore.routing._model import RankRole
+from torchstore.routing.delta import StateDictDelta
 from torchstore.strategy import (
     ControllerStorageVolumes,
     HostStrategy,
@@ -68,6 +71,9 @@ __all__ = [
     "ControllerStorageVolumes",
     "put_state_dict",
     "get_state_dict",
+    "StateDictDelta",
+    "put_state_dict_delta",
+    "get_state_dict_delta",
     "reset_client",
     "spmd",
 ]

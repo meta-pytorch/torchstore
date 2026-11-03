@@ -11,12 +11,14 @@ import torch
 from monarch.actor import current_rank, get_or_spawn_controller, ProcMesh
 from torch.distributed.tensor import DTensor
 
+import torchstore.routing.delta
 import torchstore.state_dict_utils
 from torchstore.client import ClientType, LocalClient
 from torchstore.controller import Controller, ControllerDirectory
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
+from torchstore.routing.delta import StateDictDelta
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
@@ -524,4 +526,64 @@ async def get_state_dict(
     cl = await client(store_name)
     return await torchstore.state_dict_utils.get_state_dict(
         cl, key, user_state_dict, strict, direct_rdma=direct_rdma
+    )
+
+
+async def put_state_dict_delta(
+    delta: StateDictDelta,
+    state_dict: dict[str, Any],
+    key: str,
+    *,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+) -> None:
+    """Put a new version of the state dict ``key``: in full, then its changes.
+
+    Requires a routing client. Requesters read the full tensors whose changes
+    do not fit. Once ``key`` has deltas, put every version through this, and
+    do not overlap it with ``get_state_dict_delta`` of ``key``.
+
+    Args:
+        delta (StateDictDelta): Encoder built from a template of ``state_dict``.
+        state_dict (dict): The new version.
+        key (str): Unique identifier of the state_dict.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Example:
+        >>> delta = StateDictDelta(model.state_dict(), max_fraction=0.05)
+        >>> await put_state_dict_delta(delta, model.state_dict(), "model")
+    """
+    cl = await client(store_name)
+    await torchstore.routing.delta.put_state_dict_delta(cl, delta, state_dict, key)
+
+
+async def get_state_dict_delta(
+    key: str,
+    user_state_dict: dict[str, Any],
+    *,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
+    strict: bool = True,
+) -> dict[str, Any]:
+    """Update ``user_state_dict`` in place to the latest version of ``key``.
+
+    Requires a routing client. Applies only the changed elements to tensors
+    that hold the previous version, as written by the previous call and not
+    modified since, and reads the rest in full. A tensor holds the previous
+    version if its storage and version counter are unchanged, so pass the same
+    tensors every call. Blocks until the first ``put_state_dict_delta`` of
+    ``key``, up to the layout timeout, and must not overlap a put of ``key``.
+
+    Args:
+        key (str): Unique identifier of the state_dict.
+        user_state_dict (dict): Destination tensors, as written by the previous call.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+        strict (bool): Raise on keys that no publisher has, instead of leaving
+            them unchanged. Tensors without local elements are skipped.
+            Defaults to True.
+
+    Returns:
+        dict: ``user_state_dict``.
+    """
+    cl = await client(store_name)
+    return await torchstore.routing.delta.get_state_dict_delta(
+        cl, key, user_state_dict, strict=strict
     )

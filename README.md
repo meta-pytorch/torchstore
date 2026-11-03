@@ -316,6 +316,29 @@ await ts.get_state_dict("policy", user_state_dict=model.state_dict(), direct_rdm
 `transfer_dtype` can cast weights for transfer (e.g. float32 master weights
 transferred as bfloat16).
 
+#### Delta State Dict Sync
+
+With a routing client, publishers can also put the elements that changed since
+the previous version, next to the full state dict. Requesters read and apply
+only those in place, and read tensors in full when their changes do not fit or
+they missed a version.
+
+```python
+# Learner: build once, then put every version with put_state_dict_delta.
+delta = ts.StateDictDelta(model.state_dict(), max_fraction=0.05)
+await ts.put_state_dict_delta(delta, model.state_dict(), "policy")
+
+# Generator: same destination tensors every call.
+await ts.get_state_dict_delta("policy", user_state_dict=buffers)
+```
+
+Each get reads about `max_fraction * (itemsize + 4) / itemsize` of the bytes of
+the publisher shards overlapping its tensors, and at least 8 elements plus a
+32-byte header per shard. The publisher keeps a copy of the
+previous version in the wire dtype in host memory and compares against it on
+every put, on the tensors' device. Puts and gets of one key must not overlap. A
+restarted publisher must use the same template, `max_fraction`, `transfer_dtype` and `preserve_dtype_keys`.
+
 ## Transport Backends
 
 TorchStore automatically selects the best available transport for each transfer. No

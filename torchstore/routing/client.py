@@ -27,7 +27,7 @@ from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
 from torchstore.utils import same_slice_geometry
-from ._model import KeyRegistration, RankRole
+from ._model import KeyRegistration, RankRole, Registrations
 from .control_plane import ControlPlane
 from .directory import RoutingDirectory
 from .plan import RoutingPlan
@@ -58,7 +58,7 @@ class RoutingClient(LocalClient):
         self._registered_layouts: set[str] = set()
         # Requester: state dict key -> publisher layouts and storage keys planned so
         # far, so later gets can plan keys earlier gets did not pass.
-        self._publisher_layouts: dict[str, Any] = {}
+        self._publisher_layouts: dict[str, Registrations] = {}
         self._requested_keys: dict[str, set[str]] = {}
 
     @torch.no_grad()
@@ -85,6 +85,12 @@ class RoutingClient(LocalClient):
             name: KeyRegistration(tensor_slice, dtype=dtypes[name])
             for name, tensor_slice in slices.items()
         }
+        await self._register_publisher(key, registrations)
+
+    async def _register_publisher(
+        self, key: str, registrations: Mapping[str, KeyRegistration]
+    ) -> None:
+        """Install and publish this rank's storage keys for ``key``."""
         rank = self._routing_directory.rank
         self._routing_directory.install(RoutingPlan.for_publisher(rank, registrations))
         await self._control_plane.register_layout(
@@ -126,22 +132,8 @@ class RoutingClient(LocalClient):
         if not new_state_dict:
             return
 
-        publishers = self._publisher_layouts.get(key)
-        if publishers is None:
-            publishers = await self._control_plane.get_layouts(key)
-            self._publisher_layouts[key] = publishers
+        publishers = await self._publisher_registrations(key)
         slices, dtypes, _mapping = _state_dict_storage_metadata(new_state_dict, key)
-        new_keys = set(slices)
-        # Plan against only these keys' publisher entries so each incremental get
-        # costs its own subset, not the whole state dict.
-        publishers = {
-            publisher: {
-                name: publisher_registrations[name]
-                for name in new_keys
-                if name in publisher_registrations
-            }
-            for publisher, publisher_registrations in publishers.items()
-        }
         if not strict:
             published_keys = {
                 name
@@ -153,17 +145,52 @@ class RoutingClient(LocalClient):
                 for name, tensor_slice in slices.items()
                 if name in published_keys
             }
-            dtypes = {name: dtype for name, dtype in dtypes.items() if name in slices}
-        registrations = {
-            name: KeyRegistration(tensor_slice, dtype=dtypes[name])
-            for name, tensor_slice in slices.items()
+        # Unpublished keys stay unplanned so a strict get still rejects them.
+        self._install_requester_plan(
+            key,
+            {
+                name: KeyRegistration(tensor_slice, dtype=dtypes[name])
+                for name, tensor_slice in slices.items()
+            },
+        )
+
+    async def _publisher_registrations(self, key: str) -> Registrations:
+        """Every publisher's layout for ``key``, fetched once per state dict."""
+        publishers = self._publisher_layouts.get(key)
+        if publishers is None:
+            publishers = await self._control_plane.get_layouts(key)
+            self._publisher_layouts[key] = publishers
+        return publishers
+
+    def _install_requester_plan(
+        self,
+        key: str,
+        registrations: Mapping[str, KeyRegistration],
+        *,
+        publishers: Registrations | None = None,
+    ) -> None:
+        """Plan and install routes for storage keys of ``key`` not yet planned.
+
+        Plans against ``publishers``, by default the layouts fetched by
+        ``_publisher_registrations(key)``, which must have run.
+        """
+        if publishers is None:
+            publishers = self._publisher_layouts[key]
+        # Plan against only these keys' publisher entries so each incremental get
+        # costs its own subset, not the whole state dict.
+        publishers = {
+            publisher: {
+                name: publisher_registrations[name]
+                for name in registrations
+                if name in publisher_registrations
+            }
+            for publisher, publisher_registrations in publishers.items()
         }
         rank = self._routing_directory.rank
         self._routing_directory.install(
             RoutingPlan.for_requester(rank, registrations, publishers)
         )
-        # Unpublished keys stay unplanned so a strict get still rejects them.
-        requested.update(slices)
+        self._requested_keys.setdefault(key, set()).update(registrations)
         self._registered_layouts.add(key)
 
     @torch.no_grad()
