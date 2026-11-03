@@ -28,6 +28,7 @@ from torchstore.routing._model import KeyRegistration, RankRole, Registrations
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.control_plane import ControlPlane
 from torchstore.routing.layout_registry import LayoutRegistry
+from torchstore.routing.service import CoordinatorService, ServiceControlPlane
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 
@@ -171,3 +172,37 @@ async def registry_store() -> AsyncIterator[Callable[..., Awaitable[HostedRegist
             finally:
                 await asyncio.to_thread(thread.join, 10)
             assert not thread.is_alive(), "the registry's host loop did not stop"
+
+
+@contextlib.asynccontextmanager
+async def service_store() -> AsyncIterator[
+    Callable[[], Awaitable[ServiceControlPlane]]
+]:
+    """Serve a coordinator service in this process. Handles reach it over TCP.
+
+    The first handle is the driver's, which may init, and later ones dial the address as ranks do.
+    Handles keep the lookup's keyword-only timeout, as the contract suite's calls need.
+    """
+    service = await CoordinatorService.start(
+        f"service-store-{uuid.uuid4()}", host="127.0.0.1"
+    )
+    handles: list[ServiceControlPlane] = []
+
+    async def connect() -> ServiceControlPlane:
+        dial = service.address.connect if handles else service.connect
+        handles.append(await dial())
+        return handles[-1]
+
+    try:
+        yield connect
+    finally:
+        # Handles first, so no call left waiting holds the service's close grace. Every close
+        # runs, and the first that raised is raised once all have.
+        first: BaseException | None = None
+        for close in [*(handle.close for handle in handles), service.close]:
+            try:
+                await close()
+            except BaseException as error:
+                first = first or error
+        if first is not None:
+            raise first
