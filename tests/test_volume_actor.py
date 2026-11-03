@@ -10,7 +10,7 @@ import asyncio
 import inspect
 import uuid
 from functools import partial
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import AsyncMock
 
 import pytest
 import torchstore.storage
@@ -26,7 +26,7 @@ from torchstore.monarch.storage_volume import StorageVolume
 from torchstore.storage import InMemoryStore, StorageImpl, StorageVolumeCore
 from torchstore.transport.types import Request
 
-from .test_volume_core import _ENDPOINTS
+from .volume_meshes import VOLUME_ENDPOINTS
 
 pytestmark = pytest.mark.timeout(120)
 
@@ -51,9 +51,12 @@ def test_storage_volume_is_an_actor_over_its_plain_core() -> None:
     assert issubclass(StorageVolume, StorageVolumeCore)
     assert not issubclass(StorageVolumeCore, Actor)
     methods = {name for name in vars(StorageVolumeCore) if not name.startswith("_")}
-    assert methods == set(_ENDPOINTS)
-    assert _actor_endpoints() == set(_ENDPOINTS)
-    # The volume module re-exports the store classes, and lists them in its ``__all__``.
+    assert methods == set(VOLUME_ENDPOINTS)
+    assert _actor_endpoints() == set(VOLUME_ENDPOINTS)
+
+
+def test_storage_volume_module_reexports_the_store_classes() -> None:
+    """Re-export the store classes from the volume module and list them in its ``__all__``."""
     assert storage_volume.StorageImpl is StorageImpl
     assert storage_volume.InMemoryStore is InMemoryStore
     assert storage_volume.__all__ == [
@@ -68,13 +71,14 @@ def test_storage_volume_endpoints_stay_serial() -> None:
     """Keep each endpoint serial, so a volume runs one call at a time."""
     serial = type(endpoint(_endpoint_shape))
     assert serial is not type(concurrent_endpoint(_endpoint_shape))
-    for name in _ENDPOINTS:
+    for name in VOLUME_ENDPOINTS:
         assert type(StorageVolume.__dict__[name]) is serial, name
 
 
 def test_storage_volume_keeps_plain_store_and_volume_id() -> None:
-    """Keep ``store`` and ``volume_id`` plain instance attributes, as main's actor did."""
+    """Keep the core's state, ``store`` and ``volume_id``, plain instance attributes as main did."""
     volume = StorageVolume(partial(str, "volume"))
+    assert set(vars(volume)) == set(vars(StorageVolumeCore("volume")))
     assert sorted(vars(volume)) == ["store", "volume_id"]
     assert isinstance(volume.store, InMemoryStore)
     assert volume.volume_id == "volume"
@@ -112,10 +116,10 @@ async def test_storage_volume_delegates_each_endpoint_to_its_core(
     """Forward each endpoint's arguments, by the core's parameter names, its reply and its error."""
     signatures = {
         name: list(inspect.signature(vars(StorageVolumeCore)[name]).parameters)
-        for name in _ENDPOINTS
+        for name in VOLUME_ENDPOINTS
     }
     # The volume actor runs in this process, so it calls these stand-ins.
-    core = {name: AsyncMock(return_value=f"{name}-reply") for name in _ENDPOINTS}
+    core = {name: AsyncMock(return_value=f"{name}-reply") for name in VOLUME_ENDPOINTS}
     for name, method in core.items():
         monkeypatch.setattr(StorageVolumeCore, name, method)
     volume = await get_or_spawn_controller(
@@ -139,7 +143,14 @@ async def test_storage_volume_delegates_each_endpoint_to_its_core(
         # Arguments and replies cross the actor as copies, so they match by value.
         keywords = dict(zip(signatures[name][1:], args))
         result = await asyncio.wait_for(endpoint_.call_one(**keywords), timeout=30)
-        method.assert_awaited_once_with(ANY, *args)
+        method.assert_awaited_once()
+        awaited = method.await_args
+        assert awaited is not None
+        received = dict(zip(signatures[name], awaited.args))
+        received.update(awaited.kwargs)
+        # The actor in this process runs the core on itself, not on another core.
+        assert isinstance(received.pop("self"), StorageVolume), name
+        assert received == keywords, name
         assert result == f"{name}-reply", name
         error = RuntimeError(name)
         method.side_effect = error
