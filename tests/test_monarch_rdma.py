@@ -13,13 +13,18 @@ between the registered byte views. That keeps the batching orchestration
 without an ibverbs backend.
 """
 
+import logging
 import pickle
+import re
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torchstore.monarch.rdma as monarch_rdma
+from torchstore import transport
 from torchstore.monarch.rdma import MonarchRDMATransportBuffer, RdmaContext
+from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.types import Request
 
@@ -386,3 +391,95 @@ class TestRdmaContext:
         assert state["rdma_buffer"] is not None
         assert state["shape"] == t.shape
         assert state["dtype"] == t.dtype
+
+
+@pytest.fixture
+def selection(monkeypatch):
+    """Transport selection with an empty registry, Gloo as the only built-in left."""
+    monkeypatch.setattr(transport, "_backend_transports", {})
+    monkeypatch.setattr(transport, "SHM_ENABLED", False)
+    for name in ("torch_transport", "nixl", "torchcomms_uniflow", "torchcomms_rdma"):
+        monkeypatch.setattr(transport, f"{name}_available", lambda: False)
+    monkeypatch.setattr(transport, "gloo_available", lambda: True)
+
+
+# The entry ``torchstore.monarch.rdma`` registered when this file imported it.
+_REGISTERED_ON_LOAD = dict(transport._backend_transports)
+
+
+class _PatchedRDMABuffer(MonarchRDMATransportBuffer):
+    """A buffer class patched over the RDMA module's own."""
+
+
+def test_selection_reads_the_rdma_modules_probe_and_buffer_when_it_runs(
+    selection, monkeypatch
+):
+    """Steer selection and buffer creation by patching the RDMA module's names."""
+    monkeypatch.setitem(
+        transport._backend_transports,
+        TransportType.MonarchRDMA,
+        _REGISTERED_ON_LOAD[TransportType.MonarchRDMA],
+    )
+    unset = SimpleNamespace(default_transport_type=TransportType.Unset)
+    forced = SimpleNamespace(default_transport_type=TransportType.MonarchRDMA)
+    for usable, chosen in (
+        (True, TransportType.MonarchRDMA),
+        (False, TransportType.Gloo),
+    ):
+        monkeypatch.setattr(
+            monarch_rdma, "monarch_rdma_transport_available", lambda: usable
+        )
+        assert transport.get_available_transport(unset) is chosen
+    monkeypatch.setattr(monarch_rdma, "MonarchRDMATransportBuffer", _PatchedRDMABuffer)
+    assert type(transport.create_transport_buffer(forced)) is _PatchedRDMABuffer
+
+
+def test_selection_takes_monarch_rdma_only_once_registered_and_usable(
+    selection, caplog
+):
+    """Pick Monarch RDMA for an unset transport only while it is registered and usable."""
+    caplog.set_level(logging.INFO, logger="torchstore.transport")
+    unset = SimpleNamespace(default_transport_type=TransportType.Unset)
+    forced = SimpleNamespace(default_transport_type=TransportType.MonarchRDMA)
+    with pytest.raises(RuntimeError, match="Monarch RDMA transport is not registered"):
+        transport.create_transport_buffer(forced)
+    assert transport.get_available_transport(unset) is TransportType.Gloo
+
+    def register(usable: bool) -> None:
+        transport.register_backend_transport(
+            TransportType.MonarchRDMA, MonarchRDMATransportBuffer, lambda: usable
+        )
+
+    register(True)
+    assert type(transport.create_transport_buffer(unset)) is MonarchRDMATransportBuffer
+    register(False)
+    assert transport.get_available_transport(unset) is TransportType.Gloo
+    assert type(transport.create_transport_buffer(forced)) is MonarchRDMATransportBuffer
+    # The resolution log reports the registered probe's answer each time.
+    assert [
+        re.search(r"monarch_rdma=(\w+)", record.getMessage()).group(1)
+        for record in caplog.records
+        if "[ts-transport]" in record.getMessage()
+    ] == ["False", "True", "False"]
+
+
+@pytest.mark.parametrize("torchcomms", ["torchcomms_uniflow", "torchcomms_rdma"])
+def test_selection_prefers_torchcomms_to_a_usable_monarch_rdma(
+    selection, monkeypatch, torchcomms
+):
+    """Pick TorchComms ahead of a registered, usable Monarch RDMA, as the README's order says."""
+    monkeypatch.setattr(transport, f"{torchcomms}_available", lambda: True)
+    transport.register_backend_transport(
+        TransportType.MonarchRDMA, MonarchRDMATransportBuffer, lambda: True
+    )
+    unset = SimpleNamespace(default_transport_type=TransportType.Unset)
+    assert transport.get_available_transport(unset) is TransportType.TorchComms
+
+
+def test_registry_takes_only_transports_selection_has_a_place_for(selection):
+    """Refuse a transport type that selection would never ask the registry for."""
+    with pytest.raises(ValueError, match="no place for TransportType.Gloo"):
+        transport.register_backend_transport(
+            TransportType.Gloo, MonarchRDMATransportBuffer, lambda: True
+        )
+    assert transport._backend_transports == {}

@@ -5,15 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+from collections.abc import Callable
 from enum import auto, Enum
-from typing import TYPE_CHECKING
+from typing import NamedTuple, TYPE_CHECKING
 
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.gloo import gloo_available, GlooTransportBuffer
-from torchstore.transport.monarch_rdma import (
-    monarch_rdma_transport_available,
-    MonarchRDMATransportBuffer,
-)
 from torchstore.transport.monarch_rpc import MonarchRPCTransportBuffer
 from torchstore.transport.nixl import nixl_available, NixlTransportBuffer
 from torchstore.transport.shared_memory import (
@@ -53,6 +50,41 @@ class TransportType(Enum):
     TorchDistributed = auto()  # torch.distributed._transport backends
 
 
+class _BackendTransport(NamedTuple):
+    buffer: Callable[["StorageVolumeRef"], TransportBuffer]
+    available: Callable[[], bool]
+
+
+# Transports that the module providing them registers when it loads, which selection asks
+# for at their place in its order. Only Monarch RDMA has such a place.
+_BACKEND_TRANSPORT_TYPES = (TransportType.MonarchRDMA,)
+_backend_transports: dict[TransportType, _BackendTransport] = {}
+
+
+def register_backend_transport(
+    transport_type: TransportType,
+    buffer: Callable[["StorageVolumeRef"], TransportBuffer],
+    available: Callable[[], bool],
+    /,
+) -> None:
+    """Build ``buffer(ref)`` for ``transport_type``, which selection offers where ``available()``.
+
+    Internal to TorchStore and subject to change: ``torchstore.monarch.rdma`` registers Monarch
+    RDMA when it loads. Raises ``ValueError`` for a type that selection has no place for.
+    """
+    if transport_type not in _BACKEND_TRANSPORT_TYPES:
+        raise ValueError(
+            f"transport selection has no place for {transport_type}, only for "
+            f"{', '.join(str(t) for t in _BACKEND_TRANSPORT_TYPES)}"
+        )
+    _backend_transports[transport_type] = _BackendTransport(buffer, available)
+
+
+def _backend_transport_available(transport_type: TransportType) -> bool:
+    entry = _backend_transports.get(transport_type)
+    return entry is not None and entry.available()
+
+
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
@@ -73,7 +105,7 @@ def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> Transport
     # Fall back to RDMA if available (prefer TorchComms over Monarch RDMA)
     if torchcomms_uniflow_available() or torchcomms_rdma_available():
         return TransportType.TorchComms
-    elif monarch_rdma_transport_available():
+    elif _backend_transport_available(TransportType.MonarchRDMA):
         return TransportType.MonarchRDMA
     elif gloo_available():
         return TransportType.Gloo
@@ -91,7 +123,7 @@ def _log_transport_resolution(
         nixl_available(),
         torchcomms_uniflow_available(),
         torchcomms_rdma_available(),
-        monarch_rdma_transport_available(),
+        _backend_transport_available(TransportType.MonarchRDMA),
         gloo_available(),
         SHM_ENABLED and is_local_to_volume(storage_volume_ref),
     )
@@ -122,12 +154,19 @@ def create_transport_buffer(storage_volume_ref: "StorageVolumeRef") -> Transport
 
     transport_map = {
         TransportType.MonarchRPC: MonarchRPCTransportBuffer,
-        TransportType.MonarchRDMA: MonarchRDMATransportBuffer,
         TransportType.Gloo: GlooTransportBuffer,
         TransportType.NIXL: NixlTransportBuffer,
         TransportType.TorchDistributed: TorchDistributedTransportBuffer,
         TransportType.SharedMemory: SharedMemoryTransportBuffer,
+        **{type_: entry.buffer for type_, entry in _backend_transports.items()},
     }
+    if transport_type not in transport_map:
+        # Only Monarch RDMA, unregistered, is missing.
+        raise RuntimeError(
+            "Monarch RDMA transport is not registered in this process. TorchStore's Monarch "
+            "backend registers it when it loads, as does importing torchstore.monarch.rdma "
+            "or torchstore.transport.monarch_rdma."
+        )
 
     return transport_map[transport_type](storage_volume_ref)
 

@@ -8,21 +8,21 @@ from functools import partial
 from typing import Any, overload, TYPE_CHECKING
 
 import torch
-from monarch.actor import current_rank, get_or_spawn_controller, ProcMesh
 from torch.distributed.tensor import DTensor
 
 import torchstore.state_dict_utils
+from torchstore.backend import get_backend
 from torchstore.client import ClientType, LocalClient
-from torchstore.controller import Controller, ControllerDirectory
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
-from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
 
 if TYPE_CHECKING:
-    from torchstore.spmd import _SPMDSession
+    from monarch.actor import ProcMesh
+
+    from torchstore.monarch.controller import Controller
+    from torchstore.monarch.spmd import _SPMDSession
 
 # I need to keep this somewhere, so here we go
 DEFAULT_TORCHSTORE_NAME: str = "torchstore"
@@ -36,8 +36,11 @@ _spmd_state_map: dict[str, "_SPMDSession"] = {}
 
 
 def _routing_volume_id(namespace: str) -> str:
-    """Qualify the monarch rank with its mesh's namespace."""
-    return f"{namespace}/{current_rank().rank}"
+    """Qualify the caller's rank from the backend with its mesh's namespace.
+
+    A call made through a slice of the mesh gets the caller's position in that slice.
+    """
+    return f"{namespace}/{get_backend('monarch').rank()}"
 
 
 def _routing_namespace(role: RankRole, group: int | None) -> str:
@@ -55,7 +58,7 @@ async def initialize(
     num_storage_volumes: int = 1,
     strategy: TorchStoreStrategy | None = None,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
-    mesh: ProcMesh | None = None,
+    mesh: "ProcMesh | None" = None,
     client_type: ClientType = ClientType.STANDARD,
 ) -> None:
     """Initialize the TorchStore distributed storage system.
@@ -92,19 +95,14 @@ async def initialize(
             "Must specify controller strategy if num_storage_volumes > 1"
         )
 
+    backend = get_backend("monarch")
     # TODO: monarch doesn't support nested actors yet, so we need to spawn storage volumes here
     # ideally this is done in the controller.init
     if isinstance(strategy, ControllerStorageVolumes):
-        storage_volumes = await get_or_spawn_controller(
-            "storage_volume_controller",
-            StorageVolume,
-            id_func=strategy.get_volume_id,
-        )
+        storage_volumes = await backend.controller_volume(strategy.get_volume_id)
     else:
-        storage_volumes = await StorageVolume.spawn(
-            num_volumes=num_storage_volumes,
-            mesh=mesh,
-            id_func=strategy.get_volume_id,
+        storage_volumes = await backend.spawn_volumes(
+            mesh, num_storage_volumes, strategy.get_volume_id
         )
 
     controller = await _controller(store_name)
@@ -116,23 +114,22 @@ async def initialize(
 
 
 async def _initialize_routing(
-    mesh: ProcMesh,
+    mesh: "ProcMesh",
     strategy: TorchStoreStrategy,
     store_name: str,
 ) -> None:
     """Spawn trainer volumes and the coordinator that routing mode needs."""
+    backend = get_backend("monarch")
     namespace = _routing_namespace(RankRole.PUBLISHER, None)
-    volumes = await StorageVolume.spawn(
-        1,
-        mesh,
-        id_func=partial(_routing_volume_id, namespace),
+    volumes = await backend.spawn_volumes(
+        mesh, 1, partial(_routing_volume_id, namespace)
     )
     await strategy.set_storage_volumes(volumes)
 
     publishers = {f"{namespace}/{rank}" for rank in range(mesh.size())}
 
-    coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
-    await MonarchControlPlane(coordinator).init(
+    control_plane = await backend.coordinator(store_name)
+    await control_plane.init(
         publishers=publishers,
         strategy=strategy,
     )
@@ -154,9 +151,12 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
         >>> await ts.shutdown()  # Shutdown default store
         >>> await ts.shutdown("my_custom_store")
     """
-    session = _spmd_state_map.get(store_name)
+    session = _spmd_state_map.pop(store_name, None)
     if session is not None:
-        await session.shutdown()
+        try:
+            await session.shutdown()
+        finally:
+            reset_client(store_name)
         return
 
     controller = await _controller(store_name)
@@ -171,12 +171,12 @@ def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     _local_clent_map.pop(store_name, None)
 
 
-async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:
+async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> "Controller":
     """Get a controller handle for interacting with the store."""
     session = _spmd_state_map.get(store_name)
     if session is not None:
         return session.controller
-    return await get_or_spawn_controller(store_name, Controller)
+    return await get_backend("monarch").controller(store_name)
 
 
 async def client(
@@ -210,8 +210,7 @@ async def client(
 
     if role is not None:
         role = RankRole(role)
-        coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
-        control_plane = MonarchControlPlane(coordinator)
+        control_plane = await get_backend("monarch").coordinator(store_name)
         local_client = RoutingClient(
             _routing_volume_id(_routing_namespace(role, group)),
             role,
@@ -222,7 +221,7 @@ async def client(
         controller = await _controller(store_name)
         controller_strategy = await controller.get_controller_strategy.call_one()
         local_client = LocalClient(
-            directory=ControllerDirectory(controller),
+            directory=get_backend("monarch").directory(controller),
             strategy=controller_strategy,
             controller=controller,
         )
