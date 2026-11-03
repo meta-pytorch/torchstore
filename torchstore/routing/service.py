@@ -6,7 +6,8 @@
 
 """The routing coordinator served over the carrier, beside its store's TCPStore rendezvous.
 
-Internal and may change.
+Internal and may change: users never import it. They reach it through ``ControlPlane``, the ``initialize`` and
+``client`` keywords, ``shutdown`` and the address ``initialize`` returns, whose unpickling imports it.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from collections.abc import Callable, Collection, Mapping
 from concurrent import futures
 from dataclasses import dataclass, field
 from typing import Any, cast, NoReturn, TYPE_CHECKING
+
+from torchstore.backend import register_backend, ServiceBackend
 
 from torchstore.carrier import (
     CarrierAddress,
@@ -44,7 +47,12 @@ if TYPE_CHECKING:
     from torchstore.strategy import TorchStoreStrategy
     from ._model import KeyRegistration, Registrations
 
-__all__ = ["CoordinatorService", "ServiceAddress", "ServiceControlPlane"]
+__all__ = [
+    "CarrierServiceBackend",
+    "CoordinatorService",
+    "ServiceAddress",
+    "ServiceControlPlane",
+]
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -579,6 +587,18 @@ def _start_thread(target: Callable[[], object]) -> None:
     ).start()
 
 
+class CarrierServiceBackend(ServiceBackend):
+    """The service backend, which ``torchstore.backend.get_backend("service")`` returns."""
+
+    async def start_coordinator(self, store_name: str) -> CoordinatorService:
+        return await CoordinatorService.start(store_name)
+
+    def service_address(self, control_plane: object) -> ServiceAddress | None:
+        if isinstance(control_plane, ServiceControlPlane):
+            return control_plane.address
+        return None
+
+
 def _after_fork_in_child() -> None:
     """Replace locks that a parent thread may hold, and drop inherited handles' TCPStore connections.
 
@@ -595,3 +615,5 @@ def _after_fork_in_child() -> None:
 
 
 os.register_at_fork(after_in_child=_after_fork_in_child)
+# Last, so a load still running has not registered the backend yet.
+register_backend("service", CarrierServiceBackend())

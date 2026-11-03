@@ -10,13 +10,13 @@ import threading
 from collections.abc import Awaitable, Callable
 from functools import partial
 from logging import getLogger
-from typing import Any, NamedTuple, overload, TYPE_CHECKING
+from typing import Any, Literal, NamedTuple, overload, TYPE_CHECKING
 
 import torch
 from torch.distributed.tensor import DTensor
 
 import torchstore.state_dict_utils
-from torchstore.backend import get_backend
+from torchstore.backend import get_backend, loaded_backend
 from torchstore.client import ClientType, LocalClient
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
     from torchstore.monarch.controller import Controller
     from torchstore.monarch.spmd import _SPMDSession
+    from torchstore.routing.service import CoordinatorService
 
 logger = getLogger(__name__)
 
@@ -54,10 +55,13 @@ class _SelectedControlPlane(NamedTuple):
 # reset_client, and stores selected with control_plane="monarch" never enter it.
 _control_plane_map: dict[str, _SelectedControlPlane] = {}
 
-# Held while initialize, client and shutdown update the record with the client cache, for a
-# client build's lone cache write, and across fork. Other reads and reset_client rely on the
-# overlaps their docstrings allow. Never held across an await: a dialed connection closes
-# after it is released.
+# Coordinator services that ts.initialize started here, until shut down.
+_owned_service_map: dict[str, "CoordinatorService"] = {}
+
+# Held while initialize, client and shutdown update the control-plane records, owned services,
+# fork markers and released stores with the client cache, for a client build's lone cache write,
+# and across fork. Other reads and reset_client rely on the overlaps their docstrings allow. Never
+# held across an await: dialed connections and services close after it is released.
 _selection_lock = threading.Lock()
 
 # Stores whose record ts.shutdown released here, until a routing initialize on Monarch's
@@ -97,15 +101,19 @@ def _routing_namespace(role: RankRole, group: int | None) -> str:
     return f"{role.value}/{group}"
 
 
-def _caller_control_plane(control_plane: str | ControlPlane) -> ControlPlane | None:
-    """The caller's own control plane, or None to keep Monarch's coordinator."""
+def _caller_control_plane(
+    control_plane: str | ControlPlane,
+) -> ControlPlane | Literal["service"] | None:
+    """The caller's own control plane, ``"service"``, or None to keep Monarch's coordinator."""
     if isinstance(control_plane, ControlPlane):
         return control_plane
     if control_plane == "monarch":
         return None
+    if control_plane == "service":
+        return "service"
     error = ValueError if isinstance(control_plane, str) else TypeError
     raise error(
-        "control_plane must be 'monarch' or a ControlPlane instance, "
+        "control_plane must be 'monarch', 'service' or a ControlPlane instance, "
         f"got {control_plane!r}"
     )
 
@@ -268,13 +276,29 @@ async def _close_dialed_quietly(selected: _SelectedControlPlane) -> None:
 
 
 async def _close_quietly(
-    dialed: _SelectedControlPlane | None, kept: _SelectedControlPlane | None
+    dialed: _SelectedControlPlane | None,
+    kept: _SelectedControlPlane | None,
+    service: "CoordinatorService | None" = None,
 ) -> None:
-    """Close ``dialed`` unless ``kept`` holds its connection, logging a failure."""
-    if dialed is not None and (
-        kept is None or dialed.control_plane is not kept.control_plane
-    ):
-        await _close_dialed_quietly(dialed)
+    """Close ``dialed`` unless ``kept`` holds its connection, then stop ``service``.
+
+    Failures only log, so the caller's selection, or its own error, stands.
+    """
+    try:
+        if dialed is not None and (
+            kept is None or dialed.control_plane is not kept.control_plane
+        ):
+            await _close_dialed_quietly(dialed)
+    finally:
+        if service is not None:
+            try:
+                await service.close()
+            except Exception:
+                logger.warning(
+                    "stopping the coordinator service on %s failed",
+                    service.address,
+                    exc_info=True,
+                )
 
 
 def _log_control_plane(
@@ -299,7 +323,7 @@ async def initialize(
     client_type: ClientType = ClientType.STANDARD,
     *,
     control_plane: str | ControlPlane = "monarch",
-) -> None:
+) -> ControlPlaneAddress | None:
     """Initialize the TorchStore distributed storage system.
 
     Sets up storage volumes and controller. Must be called before any put/get operations.
@@ -307,10 +331,16 @@ async def initialize(
     as Monarch's coordinator does, dropping this process's cached client and closing a
     connection it dialed for the store, unless that connection is the plane passed in.
     If the plane refuses, this call raises and keeps both.
-    Initialize other stores again only after ``shutdown``.
+    Initialize other stores, and a store running a coordinator service, again only after ``shutdown``.
     Never overlap it with another ``initialize``, ``client`` or ``shutdown`` call for the
     same store in this process, or with an ``initialize`` or ``client`` given the same
     control plane.
+
+    With ``control_plane="service"`` ranks dial ``$TORCHSTORE_TCPSTORE_HOST``, else this
+    host's name. Like TCPStore, the coordinator listens on every interface without
+    authentication: any TCPStore client can read the nonce and incarnation that its JSON
+    hello checks before unpickling a request, and can rewrite the strategy every rank
+    unpickles, so the job's network must be trusted.
 
     Args:
         num_storage_volumes (int): Number of storage volumes to create. Defaults to 1.
@@ -321,16 +351,27 @@ async def initialize(
         client_type: Client implementation to initialize. Routing clients lazily
             exchange state-dict layouts and construct routes.
         control_plane: Where a routing store's ranks share publishers and layouts.
-            ``"monarch"`` spawns the routing coordinator actor, which ``client`` then
-            finds with no ``control_plane``. A ``ControlPlane`` instance, which serves
-            only this store, is initialized here instead for later clients in this
-            process. Log lines name it by ``kind`` or class name.
+            ``"monarch"`` spawns the coordinator actor, which ``client`` then finds
+            with no ``control_plane``, and ``"service"`` serves it from this process
+            beside a TCPStore. An instance, which serves only this store, is
+            initialized here for later clients in this process, and log lines name
+            it by ``kind`` or class name.
+
+    Returns:
+        For ``"service"`` the address that every rank passes to ``ts.client``,
+        otherwise None.
 
     Raises:
-        RuntimeError: If num_storage_volumes > 1 but no strategy is provided.
+        RuntimeError: If num_storage_volumes > 1 but no strategy is provided, or, for a
+            routing initialize in the process whose earlier call started it, the store still
+            runs that coordinator service (checked before anything spawns and as it records).
+            Also once the volumes spawned, if control_plane is a plane dialed from a service's address.
+        ConnectionError: If the service's advertised host does not answer, about
+            60 s in.
         TypeError: If control_plane is neither a string nor a ``ControlPlane``.
-        ValueError: If control_plane is a string other than ``"monarch"``, or an
-            instance for a standard store or one that serves another store.
+        ValueError: If control_plane is a string other than ``"monarch"`` or
+            ``"service"``, anything but ``"monarch"`` for a standard store, or an
+            instance that serves another store.
 
     Example:
         >>> import torchstore as ts
@@ -341,8 +382,9 @@ async def initialize(
     if client_type == ClientType.ROUTING:
         if strategy is None or mesh is None:
             raise RuntimeError("routing mode requires both mesh and strategy")
-        await _initialize_routing(mesh, strategy, store_name, caller_control_plane)
-        return
+        return await _initialize_routing(
+            mesh, strategy, store_name, caller_control_plane
+        )
     if caller_control_plane is not None:
         raise ValueError("standard stores take only control_plane='monarch'")
 
@@ -373,18 +415,21 @@ async def initialize(
         # Client and shutdown reach this controller, unless a routing record of the name stays.
         _released_stores.discard(store_name)
         _forked_stores.pop(store_name, None)
+    return None
 
 
 async def _initialize_routing(
     mesh: "ProcMesh",
     strategy: TorchStoreStrategy,
     store_name: str,
-    control_plane: ControlPlane | None,
-) -> None:
-    """Spawn trainer volumes, then initialize the given control plane or Monarch's."""
+    control_plane: ControlPlane | Literal["service"] | None,
+) -> ControlPlaneAddress | None:
+    """Spawn trainer volumes, then initialize the chosen control plane or Monarch's."""
     backend = get_backend("monarch")
-    if control_plane is not None:
-        with _selection_lock:
+    with _selection_lock:
+        if store_name in _owned_service_map:
+            raise _service_still_runs(store_name)
+        if isinstance(control_plane, ControlPlane):
             _check_one_store(store_name, control_plane)
     namespace = _routing_namespace(RankRole.PUBLISHER, None)
     volumes = await backend.spawn_volumes(
@@ -395,7 +440,11 @@ async def _initialize_routing(
     publishers = {f"{namespace}/{rank}" for rank in range(mesh.size())}
 
     selected: _SelectedControlPlane | None = None
-    if control_plane is None:
+    service: "CoordinatorService | None" = None
+    if isinstance(control_plane, str):
+        selected, service = await _start_service(store_name, publishers, strategy)
+        kind = "service"
+    elif control_plane is None:
         coordinator = await backend.coordinator(store_name)
         await coordinator.init(
             publishers=publishers,
@@ -405,16 +454,53 @@ async def _initialize_routing(
     else:
         await control_plane.init(publishers=publishers, strategy=strategy)
         kind = _control_plane_kind(control_plane)
+    address = None if selected is None else selected.address
+    replaced: _SelectedControlPlane | None = None
     with _selection_lock:
-        if control_plane is not None:
-            selected = _given(store_name, control_plane)
-        replaced = _select_control_plane(store_name, selected)
-        # The store starts over, so a client cached on its old state goes too.
-        reset_client(store_name)
+        # Only an initialize overlapping a service initialize of the store, which the docstring forbids, finds one.
+        overlapped = store_name in _owned_service_map
+        if not overlapped:
+            if isinstance(control_plane, ControlPlane):
+                selected = _given(store_name, control_plane)
+            replaced = _select_control_plane(store_name, selected)
+            if service is not None:
+                _owned_service_map[store_name] = service
+            # The store starts over, so a client cached on its old state goes too.
+            reset_client(store_name)
+    if overlapped:
+        await _close_quietly(selected, None, service)
+        raise _service_still_runs(store_name)
     _log_control_plane(
         kind, None if selected is None else selected.address, store_name, "-"
     )
     await _close_quietly(replaced, selected)
+    return address
+
+
+def _service_still_runs(store_name: str) -> RuntimeError:
+    return RuntimeError(
+        f"routing store {store_name!r} still runs its coordinator service:"
+        f" call ts.shutdown({store_name!r}) before initializing it again"
+    )
+
+
+async def _start_service(
+    store_name: str, publishers: set[str], strategy: TorchStoreStrategy
+) -> tuple[_SelectedControlPlane, "CoordinatorService"]:
+    """Start a coordinator service and initialize it through this process's own handle.
+
+    A failure, cancellation included, closes both and leaves every record unchanged.
+    """
+    service = await get_backend("service").start_coordinator(store_name)
+    selected = None
+    try:
+        handle = await service.connect()
+        selected = _SelectedControlPlane(handle, service.address)
+        await handle.init(publishers=publishers, strategy=strategy)
+    except BaseException:
+        await _close_quietly(selected, None, service)
+        raise
+    return selected, service
 
 
 async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
@@ -427,11 +513,11 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
     For a routing store whose control plane this process initialized, was given
     or connected to, or whose dialed record a fork dropped, it drops only that record
-    and the client, and closes a connection made through an address. Another shutdown
-    then drops only a client, unless an SPMD session of the name tears its store down. A
-    caller's control plane stays open, and the store's volumes stay with their mesh. Never
-    overlap it with another ``initialize``, ``client`` or ``shutdown`` call for the same store
-    in this process.
+    and the client, closes a connection made through an address and stops a service
+    ``initialize`` started here. Another shutdown then drops only a client, unless an SPMD
+    session of the name tears its store down. A caller's control plane stays open, and the
+    store's volumes stay with their mesh. Never overlap it with another ``initialize``,
+    ``client`` or ``shutdown`` call for the same store in this process.
 
     Args:
         store_name (str): Name of the store to shutdown. Defaults to DEFAULT_TORCHSTORE_NAME.
@@ -441,7 +527,8 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
             5s. The record and client are dropped by then, and the close runs on as a
             task of this event loop.
         RuntimeError: If that close ends cancelled or in ``GeneratorExit``, after the same drop.
-        Exception: Whatever that connection's ``close`` raises, after the same drop.
+        Exception: Whatever that connection's ``close`` raises, after the same drop,
+            or stopping the store's coordinator service, after its 5s grace.
 
     Example:
         >>> import torchstore as ts
@@ -471,7 +558,7 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
 
 async def _shutdown_selected(store_name: str) -> bool:
-    """Release a store's record and client, then close a connection it dialed.
+    """Release a store's record, client and owned service, then close what they hold.
 
     Returns False if there was nothing to release. A close's error propagates.
     """
@@ -480,10 +567,16 @@ async def _shutdown_selected(store_name: str) -> bool:
         forked = _forked_stores.pop(store_name, None)
         if selected is None and forked is None:
             return False
+        # Owned only beside a record of the store, which no step removes while the service stays.
+        service = _owned_service_map.pop(store_name, None)
         _released_stores.add(store_name)
         reset_client(store_name)
-    if selected is not None:
-        await _close_dialed(selected)
+    try:
+        if selected is not None:
+            await _close_dialed(selected)
+    finally:
+        if service is not None:
+            await service.close()
     return True
 
 
@@ -492,23 +585,32 @@ def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     _local_clent_map.pop(store_name, None)
 
 
-# What the hook below drops in a forked child, kept alive so that no finalizer runs on
-# the parent's connections from a child that exits through os._exit, as multiprocessing's do.
+# What the hook below drops in a forked child, kept alive until the child exits so that the
+# rendezvous module's hook (which runs after it) still finds each served TCPStore and keeps it.
+# The service module's hook still frees each handle's TCPStore connection, which leaves the
+# parent's connection working.
 _inherited: list[object] = []
 
 
 def _after_fork_in_child(lock: threading.Lock) -> None:
-    """Free the selection lock the fork held, and drop dialed records.
+    """Free the selection lock the fork held, and drop dialed records, service handles' records and owned services.
 
-    The parent's connections stay the parent's, so the child dials its own. A caller's
-    own plane stays recorded, so the child shares it and its cached client.
+    The parent's stay the parent's. Until a selection, a standard initialize or a shutdown of such a store, ``client``
+    raises for it without ``address`` or ``control_plane``. Other planes a caller passed stay recorded with their clients.
     """
     lock.release()
+    # None before the service backend loads: no handle exists yet.
+    service = loaded_backend("service")
     for store_name, selected in list(_control_plane_map.items()):
-        if selected.address is not None:
+        address = selected.address
+        if address is None and service is not None:
+            address = service.service_address(selected.control_plane)
+        if address is not None:
             del _control_plane_map[store_name]
             _inherited.append((selected, _local_clent_map.pop(store_name, None)))
-            _forked_stores[store_name] = selected.address
+            _forked_stores[store_name] = address
+    _inherited.extend(_owned_service_map.values())
+    _owned_service_map.clear()
 
 
 # Hold the lock across fork so a child copies no half-made update unless a signal handler raises
@@ -611,12 +713,13 @@ async def client(
         if cached is not None:
             _check_cached_client(store_name, address, control_plane)
             return cached
+        if role is None:
+            _check_unrecorded(store_name)
 
     if role is not None:
         return await _routing_client(
             store_name, RankRole(role), group, address, control_plane
         )
-    _check_unrecorded(store_name)
     controller = await _controller(store_name)
     controller_strategy = await controller.get_controller_strategy.call_one()
     local_client = LocalClient(
@@ -630,7 +733,10 @@ async def client(
 
 
 def _check_unrecorded(store_name: str) -> None:
-    """Refuse a role-less first client for a store whose plane this process selected."""
+    """Refuse a role-less first client for a store whose plane this process selected.
+
+    The caller holds ``_selection_lock``.
+    """
     _check_not_forked(store_name)
     released = store_name in _released_stores and store_name not in _spmd_state_map
     if store_name in _control_plane_map or released:
@@ -640,7 +746,10 @@ def _check_unrecorded(store_name: str) -> None:
 
 
 def _check_not_forked(store_name: str) -> None:
-    """Refuse a store whose dialed record a fork dropped, before any Monarch lookup."""
+    """Refuse a store whose dialed record a fork dropped, before any Monarch lookup.
+
+    The caller holds ``_selection_lock``.
+    """
     address = _forked_stores.get(store_name)
     if address is not None:
         raise RuntimeError(
@@ -678,14 +787,18 @@ async def _routing_client(
     control_plane: ControlPlane | None,
 ) -> LocalClient:
     """Build and cache a routing client on the first plane in ``client``'s order."""
-    recorded = _control_plane_map.get(store_name)
+    with _selection_lock:
+        recorded = _control_plane_map.get(store_name)
+        # Checked in the read's locked step: a selection drops the marker as it records the store.
+        if control_plane is None and address is None and recorded is None:
+            _check_not_forked(store_name)
+        given = None if control_plane is None else _given(store_name, control_plane)
     if control_plane is None and address is None and recorded is None:
-        _check_not_forked(store_name)
         return await _monarch_routing_client(store_name, role, group)
     # Check role and group first, so a bad call dials nothing.
     rank = _routing_volume_id(_routing_namespace(role, group))
-    if control_plane is not None:
-        selected = _given(store_name, control_plane)
+    if given is not None:
+        selected = given
     elif address is not None and (recorded is None or recorded.address != address):
         dialed = await address.connect()
         if not isinstance(dialed, ControlPlane):

@@ -28,12 +28,12 @@ def _id_func() -> str:
     return "volume"
 
 
-def test_get_backend_loads_the_monarch_backend_once(monkeypatch) -> None:
-    """Return one ``MonarchBackend`` for "monarch"."""
-    monkeypatch.setattr(backend_module, "_backends", {})
+def test_get_backend_loads_the_monarch_backend_once() -> None:
+    """Return the one ``MonarchBackend`` its module registers for "monarch"."""
     backend = backend_module.get_backend("monarch")
     assert isinstance(backend, monarch_backend.MonarchBackend)
     assert backend_module.get_backend("monarch") is backend
+    assert backend_module.loaded_backend("monarch") is backend
 
 
 def test_get_backend_refuses_an_unknown_name(monkeypatch) -> None:

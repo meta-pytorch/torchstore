@@ -24,7 +24,7 @@ import torchstore.routing.coordinator  # noqa: F401
 import torchstore.storage_volume  # noqa: F401
 import torchstore.transport.monarch_rdma  # noqa: F401
 
-from torchstore.backend import Backend
+from torchstore.backend import Backend, register_backend
 from torchstore.directory import VolumeDirectory
 from torchstore.monarch.controller import Controller, ControllerDirectory
 from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
@@ -142,3 +142,6 @@ class MonarchBackend(Backend):
         Where ``monarch.rdma`` fails to import, the stand-in raises ``NotImplementedError``.
         """
         return RDMABuffer(data)
+
+
+register_backend("monarch", MonarchBackend())

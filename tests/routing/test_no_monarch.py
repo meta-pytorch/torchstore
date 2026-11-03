@@ -12,6 +12,7 @@ import ast
 import importlib.util
 import json
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -348,6 +349,49 @@ with open(out, "w") as f:
 """
 )
 
+_SERVICE_FORK_CHILD = """
+import json, os, sys
+
+root, out = sys.argv[1:]
+sys.path.insert(0, root)
+import torchstore
+import torchstore.api as store_api
+
+# Only a store that selects the coordinator service needs these.
+stack = ("torchstore.routing.service", "torchstore.routing.tcpstore", "torchstore.carrier")
+# A record without an address and a cached client, which the API's fork hook skips.
+store_api._control_plane_map["plain"] = store_api._SelectedControlPlane(object(), None)
+store_api._local_clent_map["plain"] = object()
+# A raising at-fork hook only reports through sys.unraisablehook, so count its reports.
+hook_errors = []
+sys.unraisablehook = hook_errors.append
+pid = os.fork()
+if pid == 0:
+    os._exit(int(any(name in sys.modules for name in stack)) + 2 * len(hook_errors))
+_, status = os.waitpid(pid, 0)
+report = {
+    "loaded": [name for name in stack if name in sys.modules],
+    "child_exit": os.waitstatus_to_exitcode(status),
+}
+with open(out, "w") as f:
+    json.dump(report, f)
+"""
+
+_LOADED_CHILD = """
+import json, pickle, sys
+
+root, out, pickled = sys.argv[1:]
+sys.path.insert(0, root)
+from torchstore.backend import loaded_backend
+
+report = {"before": repr(loaded_backend("service"))}
+report["imported"] = "torchstore.routing.service" in sys.modules
+pickle.loads(bytes.fromhex(pickled))
+report["after"] = type(loaded_backend("service")).__name__
+with open(out, "w") as f:
+    json.dump(report, f)
+"""
+
 _monarch_installed = pytest.mark.skipif(
     importlib.util.find_spec("monarch") is None, reason="Monarch is not installed"
 )
@@ -573,6 +617,31 @@ def test_type_checkers_see_the_package_logger_but_no_module_getattr() -> None:
     ]
     declared = [ast.unparse(n) for n in seen if isinstance(n, ast.AnnAssign)]
     assert (getattrs, declared) == ([], ["logger: Logger"])
+
+
+def test_import_and_fork_leave_the_service_stack_unloaded(tmp_path: Path) -> None:
+    """Load no coordinator service, TCPStore or carrier module on import, nor in a forked child.
+
+    The child's fork hook skips a record without an address and a cached client, raising nothing.
+    """
+    report = _run_child(_SERVICE_FORK_CHILD, tmp_path / "report.json")
+    assert report == {"loaded": [], "child_exit": 0}
+
+
+def test_loaded_backend_imports_nothing_and_sees_any_load_of_the_service(
+    tmp_path: Path,
+) -> None:
+    """Report no service backend until its module loads, as unpickling its address does."""
+    from torchstore.routing.service import ServiceAddress
+
+    address = ServiceAddress("store", "127.0.0.1", 1, "nonce")
+    pickled = pickle.dumps(address).hex()
+    report = _run_child(_LOADED_CHILD, tmp_path / "report.json", pickled)
+    assert report == {
+        "before": "None",
+        "imported": False,
+        "after": "CarrierServiceBackend",
+    }
 
 
 def test_carrier_frame_cap_is_the_frame_length_default() -> None:
