@@ -269,6 +269,7 @@ def _storage_volume_ref(
         transport_context=TransportContext(),
         default_transport_type=default_transport_type,
         volume_hostname=volume_hostname,
+        transports=None,
     )
 
 

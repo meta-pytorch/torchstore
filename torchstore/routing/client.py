@@ -103,13 +103,18 @@ class RoutingClient(LocalClient):
         *,
         strict: bool = True,
     ) -> None:
-        """Fetch publisher layouts and plan the keys of ``state_dict`` not yet planned.
+        """Fetch publisher layouts, load their volumes for lookups, and plan the keys of ``state_dict`` not yet planned.
 
         Each get may pass a different subset of the state dict, e.g. one group of
         parameters at a time; each key is planned the first time it is passed.
         """
         if self._role != RankRole.REQUESTER:
             raise RuntimeError("only requester clients get layouts")
+        loaded = self._publisher_layouts.get(key)
+        if loaded is not None:
+            # On every later get too: a host closed since the first then fails here with its own error,
+            # where get_state_dict's mapping read would report it as a missing push.
+            await self.strategy._prepare_volumes(loaded)
         if state_dict is None:
             if key in self._registered_layouts:
                 return
@@ -130,6 +135,7 @@ class RoutingClient(LocalClient):
         publishers = self._publisher_layouts.get(key)
         if publishers is None:
             publishers = await self._control_plane.get_layouts(key)
+            await self.strategy._prepare_volumes(publishers)
             self._publisher_layouts[key] = publishers
         slices, dtypes, _mapping = _state_dict_storage_metadata(new_state_dict, key)
         new_keys = set(slices)

@@ -23,7 +23,8 @@ from torchstore.state_dict_utils import _state_dict_storage_metadata
 from torchstore.transport import TransportType
 
 from . import utils
-from .utils import MakeClients, shard
+from .routed_sync_data import shard
+from .utils import MakeClients
 
 pytestmark = pytest.mark.timeout(120)
 

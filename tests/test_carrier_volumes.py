@@ -73,6 +73,7 @@ from torchstore.transport.shared_memory import (
 from torchstore.transport.types import Request, TensorSlice
 
 from . import test_carrier
+from .routing.routed_sync_data import assert_bitwise_equal
 from .test_carrier import (
     _assert_blocks_in_park,
     _Children,
@@ -289,13 +290,6 @@ def volumes(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Volumes]:
 def _capture_warnings(caplog: pytest.LogCaptureFixture) -> None:
     # The log asserts hold whatever level TORCHSTORE_LOG_LEVEL gives the root logger.
     caplog.set_level(logging.WARNING)
-
-
-def _assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    assert (actual.dtype, actual.shape) == (expected.dtype, expected.shape)
-    assert torch.equal(
-        actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
-    )
 
 
 def _serve_in_child(children: _Children) -> tuple[subprocess.Popen, str, bytes]:
@@ -519,7 +513,7 @@ async def test_a_volume_dialed_at_an_ip_address_still_uses_sharedmemory(
     assert transport.get_available_transport(ref) is TransportType.SharedMemory
     source = torch.arange(6.0)
     await _put(ref, "weights", source)
-    _assert_bitwise_equal(await _get(ref, "weights"), source)
+    assert_bitwise_equal(await _get(ref, "weights"), source)
     assert core.names() == _TRANSPORT_CALLS[TransportType.SharedMemory]
 
 
@@ -636,7 +630,7 @@ async def test_each_carrier_transport_moves_tensors_slices_and_objects(
     ref = volumes.ref(record, core.volume_id, transport_type)
     source = torch.arange(12, dtype=torch.float32).view(3, 4)
     await _put(ref, "weights", source)
-    _assert_bitwise_equal(await _get(ref, "weights"), source)
+    assert_bitwise_equal(await _get(ref, "weights"), source)
     assert core.names() == _TRANSPORT_CALLS[transport_type]
     assert server.stats()["calls"] == len(_TRANSPORT_CALLS[transport_type])
     # The volume keeps its own copy of what it stores.
@@ -652,7 +646,7 @@ async def test_each_carrier_transport_moves_tensors_slices_and_objects(
     [fetched] = await buffer.get_from_storage_volume(
         [Request.from_tensor_slice("sharded", shard)]
     )
-    _assert_bitwise_equal(fetched, local)
+    assert_bitwise_equal(fetched, local)
     buffer = transport.create_transport_buffer(ref)
     await buffer.put_to_storage_volume([Request.from_objects("config", {"lr": 0.5})])
     assert await _get(ref, "config") == {"lr": 0.5}
@@ -685,11 +679,11 @@ async def test_payloads_and_sharedmemory_gloo_rpc_buffers_rebuild_remotely() -> 
     assert (received["request"].key, received["request"].is_object) == ("k", False)
     assert received["request"].tensor_slice == tensor_slice
     assert isinstance(received["request"].tensor_slice.coordinates, tuple)
-    _assert_bitwise_equal(received["request"].tensor_val, tensor)
+    assert_bitwise_equal(received["request"].tensor_val, tensor)
     assert received["descriptor"] == descriptor
     assert received["shm"]._contexts == shm._contexts
     assert vars(received["pair"]) == vars(pair)
-    _assert_bitwise_equal(received["rpc"].data, rpc.data)
+    assert_bitwise_equal(received["rpc"].data, rpc.data)
 
 
 @pytest.mark.asyncio
@@ -753,7 +747,7 @@ async def test_a_volume_runs_one_call_at_a_time_and_a_connections_calls_in_send_
     for thread in range(3):
         for i in range(5):
             stored = core.store.kv[f"{thread}/{i}"]
-            _assert_bitwise_equal(stored, torch.full((4,), thread * 10 + i))
+            assert_bitwise_equal(stored, torch.full((4,), thread * 10 + i))
 
 
 @pytest.mark.asyncio
@@ -776,7 +770,7 @@ async def test_a_reply_waiting_to_be_sent_keeps_its_values_through_an_in_place_p
         assert core.store.kv["weights"] is stored and torch.equal(stored, new)
     finally:
         await server._set_sending(True)
-    _assert_bitwise_equal(await reading, old)
+    assert_bitwise_equal(await reading, old)
     await writing
 
 
@@ -933,7 +927,7 @@ async def test_a_gloo_get_after_a_cancelled_one_pairs_anew_and_gets_its_own_byte
         again = await _get(ref, "second")
         # On a new pair, whose tags the stranded receive never matches either.
         assert not stranded[0].done()
-        _assert_bitwise_equal(again, second)
+        assert_bitwise_equal(again, second)
 
     monkeypatch.setattr(
         GlooTransportBuffer, "_pre_get_hook", hold_once_the_receive_posted
@@ -1139,7 +1133,7 @@ async def test_overlapping_gloo_transfers_of_one_client_keep_one_pair_through_fa
         values = [torch.full((8,), float(round_ * 4 + i)) for i in range(4)]
         await asyncio.gather(*(_put(ref, f"k{i}", v) for i, v in enumerate(values)))
         for i, value in enumerate(values):
-            _assert_bitwise_equal(core.store.kv[f"k{i}"], value)
+            assert_bitwise_equal(core.store.kv[f"k{i}"], value)
         if round_ < 2:
             # The volume drains the refused put's send and the proxy still forgets the pair it
             # used. The next round pairs anew.
@@ -1185,7 +1179,7 @@ async def test_a_refused_or_keyword_transfer_cleans_up_as_a_failed_one(
         with pytest.raises(KeyError, match="Key 'missing' not found"):
             await get(transport_buffer=buffer, requests=[Request(key="missing")])
     assert core.volume_id not in gloo._store_addrs
-    _assert_bitwise_equal(await _get(pair, "kept"), torch.ones(4))
+    assert_bitwise_equal(await _get(pair, "kept"), torch.ones(4))
     assert core.names().count("handshake") == 2
     shm = volumes.ref(record, core.volume_id, TransportType.SharedMemory)
     mapped = shm.transport_context.get(SharedMemoryCache)
@@ -1228,7 +1222,7 @@ async def test_a_failed_call_on_another_pair_or_transport_keeps_the_gloo_pair(
     with pytest.raises(KeyError, match="Key 'missing' not found"):
         await pair.volume.get.call_one(older, [Request(key="missing")])
     assert gloo._store_addrs[core.volume_id] == cached
-    _assert_bitwise_equal(await _get(pair, "kept"), torch.ones(4))
+    assert_bitwise_equal(await _get(pair, "kept"), torch.ones(4))
     assert core.names().count("handshake") == 1
     assert len(pair.transport_context.get(GlooProcessGroupCache)._process_groups) == 1
 
@@ -1243,7 +1237,7 @@ async def test_a_gloo_transfer_pairs_anew_when_its_context_lost_the_cached_pair(
     await _put(ref, "weights", torch.ones(4))
     cached = gloo._store_addrs[core.volume_id]
     assert ref.transport_context.get(GlooProcessGroupCache).pop(cached[2]) is not None
-    _assert_bitwise_equal(await _get(ref, "weights"), torch.ones(4))
+    assert_bitwise_equal(await _get(ref, "weights"), torch.ones(4))
     assert core.names().count("handshake") == 2
     assert gloo._store_addrs[core.volume_id] != cached
 
@@ -1269,7 +1263,7 @@ async def test_a_second_live_gloo_client_of_a_volume_id_raises_and_strands_no_pa
         await _put(refs[0], "weights", torch.full((4,), float(round_)))
         with pytest.raises(gloo.GlooPairInUseError, match=_IN_USE):
             await _put(refs[1], "weights", torch.ones(4))
-    _assert_bitwise_equal(await _get(refs[0], "weights"), torch.full((4,), 2.0))
+    assert_bitwise_equal(await _get(refs[0], "weights"), torch.full((4,), 2.0))
     clients = [
         len(ref.transport_context.get(GlooProcessGroupCache)._process_groups)
         for ref in refs
@@ -1324,7 +1318,7 @@ async def test_a_second_live_gloo_client_moves_objects_and_its_failed_ones_keep_
     with pytest.raises(ValueError, match="failed this transfer"):
         await get("config")
     assert gloo._store_addrs[core.volume_id] == cached
-    _assert_bitwise_equal(await _get(first, "weights"), torch.ones(4))
+    assert_bitwise_equal(await _get(first, "weights"), torch.ones(4))
     assert core.names().count("handshake") == 1
     assert second.transport_context.get(GlooProcessGroupCache)._process_groups == {}
 
@@ -1415,7 +1409,7 @@ async def test_successive_gloo_clients_of_one_volume_leave_it_one_half(
         del client, groups, group
         # The executor thread that ran the put's send can let go of its group a little after the put returns.
         assert await asyncio.to_thread(collected.wait, 30)
-    _assert_bitwise_equal(core.store.kv["weights"], torch.full((4,), 2.0))
+    assert_bitwise_equal(core.store.kv["weights"], torch.full((4,), 2.0))
     assert core.names().count("handshake") == 3
     assert core.halves_at_handshake == [0, 0, 0]
     gloo._forget_pairs(core.volume_id)
@@ -1533,7 +1527,7 @@ async def test_a_gloo_transfer_reuses_a_pair_another_thread_forgets_after_its_re
     await _put(ref, "weights", torch.ones(4))
     pairs = {core.volume_id: gloo._store_addrs.pop(core.volume_id)}
     monkeypatch.setattr(gloo, "_store_addrs", _ForgottenAfterRead(pairs))
-    _assert_bitwise_equal(await _get(ref, "weights"), torch.ones(4))
+    assert_bitwise_equal(await _get(ref, "weights"), torch.ones(4))
     assert core.names().count("handshake") == 1
 
 
@@ -1544,7 +1538,9 @@ def test_queued_retired_keys_wait_for_a_bounded_number_of_servers_and_none_in_a_
 
     A process that re-makes stores leaves keys toward servers it never calls again.
     """
-    # Restore every global the fork hook replaces after the test.
+    # Restore every global the fork hook replaces and each live host's lock after the test.
+    for host in list(carrier_volumes._hosts):
+        monkeypatch.setattr(host, "_lock", host._lock)
     monkeypatch.setattr(carrier_volumes, "_retired_lock", threading.Lock())
     monkeypatch.setattr(carrier_volumes, "_retired", {})
     monkeypatch.setattr(carrier_volumes, "_retiring", collections.deque())
@@ -1874,7 +1870,7 @@ async def test_a_failed_gloo_put_keeps_its_own_error_and_pairs_anew(
     # The abandoned put never ran, and the next one pairs anew.
     assert core.keys("put") == ["first"]
     await _put(ref, "second", torch.ones(64))
-    _assert_bitwise_equal(await _get(ref, "second"), torch.ones(64))
+    assert_bitwise_equal(await _get(ref, "second"), torch.ones(64))
     assert core.names().count("handshake") == 2
     assert len(ref.transport_context.get(GlooProcessGroupCache)._process_groups) == 1
 
@@ -1913,7 +1909,7 @@ async def test_a_gloo_put_the_volume_refused_raises_its_error_once_drained_and_p
     assert "drop() failed" not in caplog.text
     assert core.volume_id not in gloo._store_addrs
     await _put(ref, "other", torch.full((2,), 1.0))
-    _assert_bitwise_equal(core.store.kv["other"], torch.full((2,), 1.0))
+    assert_bitwise_equal(core.store.kv["other"], torch.full((2,), 1.0))
     assert core.names().count("handshake") == 2
 
 
@@ -1996,7 +1992,7 @@ async def test_a_failed_gloo_handshake_raises_at_once_and_pairs_anew(
     )
     halves.clear()
     await _put(ref, "second", torch.arange(8.0))
-    _assert_bitwise_equal(await _get(ref, "second"), torch.arange(8.0))
+    assert_bitwise_equal(await _get(ref, "second"), torch.arange(8.0))
     assert core.names().count("handshake") == (1 if queued else 2)
     assert len(ref.transport_context.get(GlooProcessGroupCache)._process_groups) == 1
     # The volume drops the warm-up pair and the failed one, also after a cancel that came once
@@ -2111,8 +2107,8 @@ async def test_a_sharedmemory_put_the_volume_dropped_leaves_no_segment_mapped(
     await _release(server, core, holders)
     assert not {"weights", "bias"} & set(core.store.kv)
     await transport.create_transport_buffer(ref).put_to_storage_volume(_batch(2.0))
-    _assert_bitwise_equal(await _get(ref, "weights"), torch.full((8,), 2.0))
-    _assert_bitwise_equal(await _get(ref, "bias"), torch.full((4,), 2.0))
+    assert_bitwise_equal(await _get(ref, "weights"), torch.full((8,), 2.0))
+    assert_bitwise_equal(await _get(ref, "bias"), torch.full((4,), 2.0))
     assert sorted(key for key, _ in mapped) == ["bias", "weights"]
     assert core.keys("put") == ["weights"]
 
@@ -2173,7 +2169,7 @@ async def test_a_sharedmemory_put_of_held_keys_writes_the_volumes_segments_in_pl
     assert {key: tensor.data_ptr() for key, tensor in core.store.kv.items()} == stored
     assert set(mapped) == segments and len(segments) == 2
     for key, size in (("weights", 8), ("bias", 4)):
-        _assert_bitwise_equal(await _get(ref, key), torch.full((size,), 2.0))
+        assert_bitwise_equal(await _get(ref, key), torch.full((size,), 2.0))
     assert core.names() == ["handshake", "put", "handshake", "put", "get", "get"]
 
 
@@ -2424,7 +2420,7 @@ def test_the_volume_exit_hook_waits_for_a_running_handler_until_gloos_exit_deadl
             core.release.set()
         if ends:
             # The handler finished its put after the closed volume had already failed the call.
-            _assert_bitwise_equal(core.store.kv["k"], torch.ones(4))
+            assert_bitwise_equal(core.store.kv["k"], torch.ones(4))
         with pytest.raises(PeerLostError, match="volume closed"):
             loop.run_until_complete(putting)
     finally:

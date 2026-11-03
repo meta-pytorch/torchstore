@@ -729,6 +729,8 @@ Your plane must keep these rules:
 - TorchStore may close a plane that `connect()` returned while calls on any thread or
   event loop, the caller's own included, are still in flight, so make those calls fail
   rather than hang
+- Return a `ts.TorchStoreStrategy` or a subclass of it from `strategy()`: a requester's first
+  routed get calls a private method that a stand-in strategy lacks
 
 The driver passes an instance to
 `ts.initialize(..., client_type=ts.ClientType.ROUTING, control_plane=plane)`. Each rank
@@ -814,6 +816,12 @@ from torchstore.transport import TransportType
 strategy = ts.LocalRankStrategy(default_transport_type=TransportType.Gloo)
 await ts.initialize(num_storage_volumes=N, strategy=strategy)
 ```
+
+Each transfer logs its transport at INFO on the `torchstore.transport` logger as
+`[ts-transport] resolved=<transport> (<probe>=<result>, ...)`. Its probes reach the record
+as one argument: read the line with `record.getMessage()` rather than `record.args`.
+Selection probes every transport where a volume reference's `transports` attribute is None
+and otherwise only the ones it names. A stand-in reference therefore needs `transports=None`.
 
 Because TorchStore selects only its built-in transports, the rules below are for a transport
 added to TorchStore and for buffer subclasses that code builds itself, all of which
