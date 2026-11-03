@@ -151,5 +151,7 @@ async def test_monarch_adapter_hints_at_other_planes_only_for_a_named_store(
     if store_name is None:
         assert error.message == message
     else:
-        assert error.message.startswith(message)
-        assert "store 'store' another control plane" in error.message
+        assert error.message == (
+            f"{message} If ts.initialize gave store 'store' another control plane, pass "
+            "ts.client that control plane (control_plane=) or its address (address=)."
+        )
