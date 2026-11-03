@@ -21,9 +21,10 @@ from .test_control_plane import _imported
 _PACKAGE = Path(torchstore.__file__).parent
 # Main's check whether nixl is installed, which predates the rule against such checks.
 _NIXL_PROBE = "torchstore.transport.nixl"
-# The coordinator service's modules, which register exit and fork hooks when they load.
+# The service backend's modules, which register exit or fork hooks when they load.
 _SERVICE_STACK = (
     "torchstore.carrier",
+    "torchstore.carrier_volumes",
     "torchstore.routing.service",
     "torchstore.routing.tcpstore",
 )

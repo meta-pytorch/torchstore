@@ -73,7 +73,8 @@ _UNSENT_BYTES_PER_CONNECTION = 256 << 20
 _STATS_INTERVAL_S = 60.0
 # How long a caller or a closing server waits on the I/O or a dispatcher thread.
 _RELEASE_WAIT_S = 5.0
-# How long exit waits for a close or loop thread already freeing a served object, as a free always ends.
+# How long exit waits for a thread it must not cut off: a close or loop thread already freeing a
+# served object, as a free always ends, or a dispatcher it parks once the dispatcher's callback ends.
 _EXIT_FREE_WAIT_S = 300.0
 # When exit logs a WARNING naming a thread it still waits for.
 _EXIT_FREE_WARN_S = 30.0
@@ -132,7 +133,7 @@ class _LoopThread:
 
     def __init__(self, name: str) -> None:
         self.stopped: futures.Future[None] = futures.Future()
-        # Set by another exit hook that blocked this thread for good, so the carrier's neither stops nor joins it.
+        # Set once park() blocks this thread for good, so the carrier's exit hook neither stops nor joins it.
         self.parked = False
         started: futures.Future[asyncio.AbstractEventLoop] = futures.Future()
         self.thread = threading.Thread(
@@ -178,6 +179,38 @@ class _LoopThread:
                     _freeing.discard(thread)
                     _loop_threads.discard(self)
                 self.stopped.set_result(None)
+
+    def park(self) -> bool:
+        """Block this thread for good once its running callback ends, so it never returns into finalization.
+
+        Waits up to ``_EXIT_FREE_WAIT_S``, with a WARNING naming the thread after ``_EXIT_FREE_WARN_S``. Returns
+        whether the thread now blocks. A thread whose loop closed ends instead, which also ends the wait.
+        """
+        if self.parked:
+            return True
+        blocked: futures.Future[None] = futures.Future()
+
+        def block() -> None:
+            self.parked = True
+            blocked.set_result(None)
+            threading.Event().wait()
+
+        _post(self.loop, block)
+        waits = (blocked, self.stopped)
+        if not futures.wait(waits, _EXIT_FREE_WARN_S, futures.FIRST_COMPLETED)[0]:
+            logger.warning(
+                "Exit has waited %g s for %s to end its callback",
+                _EXIT_FREE_WARN_S,
+                self.thread.name,
+            )
+            wait_s = max(_EXIT_FREE_WAIT_S - _EXIT_FREE_WARN_S, 0.0)
+            if not futures.wait(waits, wait_s, futures.FIRST_COMPLETED)[0]:
+                logger.warning(
+                    "Exit stopped waiting for %s after %g s",
+                    self.thread.name,
+                    _EXIT_FREE_WAIT_S,
+                )
+        return blocked.done()
 
 
 # Running loop threads, stopped at exit: a daemon thread that returns from torch into a
@@ -2044,7 +2077,7 @@ class CarrierServer:
     def dispatcher(self) -> _LoopThread:
         """This server's dispatcher, with its ``thread``, its ``loop`` and a ``stopped`` future.
 
-        Another exit hook that blocks that thread for good sets its ``parked``, so the carrier's exit hook skips it.
+        Its ``park()`` blocks that thread for good once its running callback ends, and the carrier's exit hook then skips it.
         """
         return self._dispatcher
 

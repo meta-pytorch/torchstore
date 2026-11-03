@@ -39,6 +39,7 @@ import pytest
 import torchstore as ts
 from monarch.actor import Actor, endpoint, this_host
 from torch.distributed import DistNetworkError, DistStoreError, TCPStore
+from torchstore import native_calls
 from torchstore.monarch.storage_volume import StorageVolume
 from torchstore.routing import tcpstore
 from torchstore.routing.tcpstore import TCPStoreAddress, TCPStoreRendezvous
@@ -139,6 +140,7 @@ _SERVE_WITHOUT_CLOUDPICKLE = _IMPORT_ALONE + (
 # the parent's own read. argv[1] is the root.
 _FORK_CASES = _IMPORT_ALONE + (
     "import asyncio, gc, json, os, socket, threading, time\n"
+    "from torchstore import native_calls\n"
     "from torchstore.routing.tcpstore import TCPStoreRendezvous\n"
     "# Under a default timeout, wrapping a descriptor turns it non-blocking in both processes.\n"
     "socket.setdefaulttimeout(30)\n"
@@ -201,10 +203,10 @@ _FORK_CASES = _IMPORT_ALONE + (
     "# 3. After close(), as a call's result lands: only that call's PrefixStore holds the server.\n"
     "closing = asyncio.run(TCPStoreRendezvous.serve('closing', host='127.0.0.1'))\n"
     "closing_port = closing.address.port\n"
-    "settle = tcpstore._settle\n"
+    "settle = native_calls.settle\n"
     "def fork_as_the_result_lands(future, result, error):\n"
     "    settle(future, result, error)\n"
-    "    tcpstore._settle = settle\n"
+    "    native_calls.settle = settle\n"
     "    pid = os.fork()\n"
     "    if pid == 0:\n"
     "        raise SystemExit(kept(closing_port))  # through the loop and finalization\n"
@@ -220,7 +222,7 @@ _FORK_CASES = _IMPORT_ALONE + (
     "        await asyncio.sleep(0.01)\n"
     "    await closing.close()\n"
     "    gc.collect()\n"
-    "    tcpstore._settle = fork_as_the_result_lands\n"
+    "    native_calls.settle = fork_as_the_result_lands\n"
     "    closed.set()\n"
     "    await call\n"
     "asyncio.run(call_through_close())\n"
@@ -1071,7 +1073,7 @@ def test_a_call_waiting_for_its_turn_polls_in_slices_instead_of_spinning() -> No
         expired = lane._admit(
             tcpstore._NativeCall(lambda: None), time.monotonic() + 0.3, "waiting"
         )
-    assert expired is tcpstore._EXPIRED and 1 < len(acquires) <= 8, acquires
+    assert expired is native_calls.EXPIRED and 1 < len(acquires) <= 8, acquires
     assert max(acquires) <= tcpstore._WAIT_OUT_POLL_S == 0.05, acquires
 
 
@@ -1176,17 +1178,17 @@ async def test_a_call_returning_after_its_deadline_did_not_finish(monkeypatch) -
             finally:
                 returned.set()
 
-    settle = tcpstore._settle
+    settle = native_calls.settle
 
     def return_at_the_deadline(
         future: asyncio.Future[object], result: object, error: Exception | None
     ) -> None:
         settle(future, result, error)
-        if result is tcpstore._EXPIRED:
+        if result is native_calls.EXPIRED:
             release.set()
             assert returned.wait(30)  # before its caller sees the deadline pass
 
-    monkeypatch.setattr(tcpstore, "_settle", return_at_the_deadline)
+    monkeypatch.setattr(native_calls, "settle", return_at_the_deadline)
     try:
         with pytest.raises(TimeoutError, match="late did not finish"):
             await tcpstore._Lane().run(
@@ -1213,7 +1215,7 @@ def test_a_call_waiting_its_turn_stops_at_its_deadline_on_its_own() -> None:
         )
         waiting.start()
         waiting.join(10)
-    assert admitted == [tcpstore._EXPIRED] and not call.started
+    assert admitted == [native_calls.EXPIRED] and not call.started
 
 
 @pytest.mark.asyncio
@@ -2435,7 +2437,7 @@ async def test_a_serve_cancelled_as_its_store_opens_keeps_no_server(
     """Stop a cancelled serve's server, even while its CancelledError is kept."""
     serving: list[asyncio.Task[TCPStoreRendezvous]] = []
     opened: list[int] = []
-    settle = tcpstore._settle
+    settle = native_calls.settle
 
     def settle_then_cancel(
         future: asyncio.Future[object], result: object, error: Exception | None
@@ -2445,7 +2447,7 @@ async def test_a_serve_cancelled_as_its_store_opens_keeps_no_server(
             opened.append(result.port)
             serving[0].cancel()
 
-    monkeypatch.setattr(tcpstore, "_settle", settle_then_cancel)
+    monkeypatch.setattr(native_calls, "settle", settle_then_cancel)
     gc.disable()
     try:
         serving.append(
@@ -2585,12 +2587,12 @@ def test_a_forked_child_keeps_no_copy_of_a_served_listener() -> None:
     assert answered == "False", child.stderr[-2000:]
 
 
-# Reloads the module and prints whether it kept each name its state guard keeps and the deadline sentinel,
+# Reloads the module and prints whether it kept each name its state guard keeps,
 # forks under an alarm that ends a deadlocked fork and prints the child's status, then leaves a call
 # running so each exit drain logs. _exiting holds a marker a reload would replace. argv[1] is the root.
 _RELOAD = _IMPORT_ALONE + (
     "import importlib, os, signal, threading\n"
-    "names = ('_EXPIRED', '_live_calls', '_live_calls_lock', '_exiting', '_masters', '_connect_lanes',\n"
+    "names = ('_live_calls', '_live_calls_lock', '_exiting', '_masters', '_connect_lanes',\n"
     "         '_connect_lanes_lock', '_probe_listeners', '_probe_listeners_lock', '_handed_off_ports')\n"
     "tcpstore._exiting = object()\n"
     "state = [getattr(tcpstore, name) for name in names]\n"
