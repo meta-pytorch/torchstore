@@ -67,7 +67,7 @@ class MonarchBackend(Backend):
 
     async def coordinator(self, store_name: str, /) -> ControlPlane:
         coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
-        return MonarchControlPlane(coordinator)
+        return MonarchControlPlane(coordinator, store_name=store_name)
 
     async def spawn_actors(
         self,
