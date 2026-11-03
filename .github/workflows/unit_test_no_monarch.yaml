@@ -108,6 +108,7 @@ jobs:
             tests/routing/test_routed_sync_mp.py
             tests/routing/test_service.py
             tests/routing/test_service_paths.py
+            tests/routing/test_service_records_reply.py
             tests/routing/test_service_volumes.py
             tests/routing/test_tcpstore.py
             tests/routing/test_volume_records.py

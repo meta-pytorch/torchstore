@@ -38,7 +38,7 @@ from torchstore.routing.volume_records import VolumeRecords
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import TransportType
 
-__all__ = ["TCPStoreAddress", "TCPStoreRendezvous"]
+__all__ = ["ExitingError", "TCPStoreAddress", "TCPStoreRendezvous"]
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -102,14 +102,18 @@ _COORDINATOR = "coordinator"
 _READY = "ready"
 # The value of each publisher's own key. Registration reads only whether the key exists.
 _MEMBER = b"1"
-# Stores of this schema hold those keys and the config in place of a pickled strategy. Calls refuse
-# any other schema at the ready check.
-_SCHEMA_VERSION = b"3"
+# Stores of this schema hold those keys and the config in place of a pickled strategy, and their coordinator's
+# replies carry volume records. Calls refuse any other schema at the ready check.
+_SCHEMA_VERSION = b"4"
 _CONFIG_VERSION = 1
 # A config has one brace, and on Python 3.10 json's scanner nests as deep as the recursion limit.
 _MAX_CONFIG_BRACKETS = 64
 # What keeps a published value under the value limit, for the near-limit WARNING.
 _SMALLER_VALUE = {_PUBLISHERS: "fewer or shorter publisher names"}
+
+
+class ExitingError(RuntimeError):
+    """Refuses a store call that would start once this process's exit has begun."""
 
 
 class _QuietNetworkError(DistNetworkError):
@@ -273,7 +277,7 @@ def _start_store_call(what: str, deadline: float, given_up: Callable[[], bool]) 
     if given_up():
         raise RuntimeError(f"{what} was not started: its caller gave up")
     if _exiting:
-        raise RuntimeError(f"{what} was not started: exiting")
+        raise ExitingError(f"{what} was not started: exiting")
 
 
 def _read_records(
@@ -281,11 +285,13 @@ def _read_records(
     chunks: Sequence[list[str]],
     start: Callable[[str], None],
     store: PrefixStore,
+    *,
+    existing_under: str | None = None,
 ) -> tuple[list[str], dict[str, bytes]]:
-    """Return the ids under ``chunks``' keys without a record, ``_NAMED_MISSING`` at most, or else every record.
+    """Return the ids under ``chunks``' keys that have no record and the records fetched by id.
 
-    Checks the chunks in turn and each key of a failed chunk right after it, and stops at that many missing ids.
-    Fetches only once every key has a record. Calls ``start`` with each store call's name before making it.
+    Checks each chunk and each key of a failed chunk right after it, calling ``start`` with each call's name first.
+    Stops at ``_NAMED_MISSING`` missing ids and fetches once all exist, or with ``existing_under`` fetches what exists.
     """
 
     def exists(keys: list[str]) -> bool:
@@ -298,10 +304,16 @@ def _read_records(
             for key in chunk:
                 if not exists([key]):
                     missing.append(ids[key])
-                    if len(missing) >= _NAMED_MISSING:
+                    # A KeyError names this many at most. A read for the records that exist, under their
+                    # prefix ``existing_under``, checks every key.
+                    if existing_under is None and len(missing) >= _NAMED_MISSING:
                         return missing, {}
     if missing:
-        return missing, {}
+        if existing_under is None:
+            return missing, {}
+        absent = set(missing)
+        present = [key for chunk in chunks for key in chunk if ids[key] not in absent]
+        chunks = _read_chunks(existing_under, present)
     records: dict[str, bytes] = {}
     for chunk in chunks:
         # multi_get blocks on a missing key. Records are never deleted.
@@ -638,7 +650,7 @@ class _Lane:
             # Counted only once it holds the gate, so exit never waits for a queued call.
             with _live_calls_lock:
                 if _exiting:
-                    raise RuntimeError(f"{what} was not started: exiting")
+                    raise ExitingError(f"{what} was not started: exiting")
                 _live_calls.add(current)
             try:
                 return call()
@@ -907,6 +919,33 @@ class TCPStoreRendezvous(VolumeRecords):
             raise KeyError(
                 self._named(f"no volume record for {sorted(missing)}{first}")
             )
+        return records
+
+    async def existing_volume_records(
+        self,
+        volume_ids: Collection[str],
+        /,
+        *,
+        timeout_s: float | None = None,
+    ) -> dict[str, bytes]:
+        """Return the records among ``volume_ids`` and leave out ids without one. ``timeout_s=None`` means 60 s.
+
+        Reads through ``volume_records``' reader with the same size checks and store calls in one native call
+        after the ready check, but fetches the records that exist in chunks cut afresh from their keys.
+        """
+        ids = {_volume_key(volume_id): volume_id for volume_id in volume_ids}
+        if not ids:
+            return {}
+        prefix = _prefix(self.address)
+        chunks = _read_chunks(prefix, list(ids))
+        timeout_s = _DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout_s
+        await self._require_ready(deadline)
+        _, records = await self._steps(
+            f"reading {len(ids)} volume records",
+            partial(_read_records, ids, chunks, existing_under=prefix),
+            deadline,
+        )
         return records
 
     async def publish(
