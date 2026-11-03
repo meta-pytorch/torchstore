@@ -9,6 +9,7 @@ import copy
 import math
 import os
 import tempfile
+import uuid
 from logging import getLogger
 
 import pytest
@@ -24,7 +25,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import distribute_tensor, DTensor, Shard
 from torchstore.transport import TransportType
 from torchstore.utils import spawn_actors
 
@@ -290,6 +291,72 @@ async def test_shared_memory_transfer_dtype_casts_per_tensor():
 
     # Each bf16 copy is 2 MiB; casting the whole batch first would add 16 MiB.
     assert peak <= 4 << 20, peak
+
+
+class ShardedReader(Actor):
+    """Reads a stored state dict into DTensor targets sharded over the ranks of its two-rank mesh."""
+
+    def __init__(self, store_name: str, file_store_name: str) -> None:
+        self.store_name = store_name
+        self.file_store_name = file_store_name
+        self.rank = current_rank().rank
+
+    @endpoint
+    async def read(self, key: str, shape: tuple[int, ...]) -> torch.Tensor:
+        torch.distributed.init_process_group(
+            backend="gloo",
+            rank=self.rank,
+            world_size=2,
+            init_method=f"file://{self.file_store_name}",
+        )
+        try:
+            mesh = init_device_mesh("cpu", (2,))
+            target = {"w": distribute_tensor(torch.zeros(shape), mesh, [Shard(0)])}
+            await ts.get_state_dict(
+                key, user_state_dict=target, store_name=self.store_name
+            )
+            return target["w"].to_local()
+        finally:
+            torch.distributed.destroy_process_group()
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.asyncio
+async def test_gloo_get_state_dict_reads_whole_tensors_into_dtensors_on_new_ranks(
+    monkeypatch,
+):
+    """Read a state dict of whole tensors over Gloo into DTensors sharded over two processes new to the volume.
+
+    Each reader's first transfer is the mapping (an object that pairs nothing) so its first sliced get pairs.
+    """
+    store_name = f"sd_gloo_{uuid.uuid4().hex[:8]}"
+    weight = torch.arange(64.0).reshape(8, 8)
+    # The strategy puts to the volume this process's LOCAL_RANK names, and the store has volume 0 alone.
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    async with contextlib.AsyncExitStack() as cleanup:
+        await ts.initialize(
+            strategy=ts.LocalRankStrategy(TransportType.Gloo), store_name=store_name
+        )
+        cleanup.push_async_callback(ts.shutdown, store_name)
+        await ts.put_state_dict({"w": weight}, "sd", store_name=store_name)
+        procs = this_host().spawn_procs(per_host={"gpus": 2})
+        cleanup.push_async_callback(procs.stop)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            readers = await spawn_actors(
+                2,
+                ShardedReader,
+                "readers",
+                mesh=procs,
+                store_name=store_name,
+                file_store_name=os.path.join(tmpdir, "pg"),
+            )
+            shards = {
+                coord.rank: shard
+                for coord, shard in await readers.read.call("sd", tuple(weight.shape))
+            }
+    assert shards.keys() == {0, 1}
+    for rank, shard in shards.items():
+        assert torch.equal(shard, weight.chunk(2)[rank])
 
 
 @pytest.mark.parametrize(*transport_params())
