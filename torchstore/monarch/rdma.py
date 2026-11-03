@@ -34,6 +34,7 @@ except ImportError:
         )
 
 
+from torchstore.transport import register_backend_transport, TransportType
 from torchstore.transport.buffers import TransportBuffer
 from torchstore.transport.types import Request
 from torchstore.utils import to_byte_view
@@ -262,3 +263,11 @@ class MonarchRDMATransportBuffer(TransportBuffer):
             except Exception as e:
                 logging.warning(f"Failed to drop RDMA buffer during cleanup: {e}")
         self._contexts = []
+
+
+# Selection looks both names up here when it runs, so a patch of either in this module steers it.
+register_backend_transport(
+    TransportType.MonarchRDMA,
+    lambda storage_volume_ref: MonarchRDMATransportBuffer(storage_volume_ref),
+    lambda: monarch_rdma_transport_available(),
+)

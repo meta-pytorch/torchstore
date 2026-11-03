@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 import torch
+import torchstore.monarch.rdma  # noqa: F401
 import torchstore.transport.nixl as nixl_transport
 import torchstore.transport.torch_distributed as torch_distributed_transport
 import torchstore.transport.torchcomms.cache as torchcomms_cache
@@ -48,7 +49,7 @@ MAX_PICKLE_BYTES = 4 * 1024
 
 
 def _buffer_classes() -> list[type[TransportBuffer]]:
-    # Importing torchstore.transport loads every transport module.
+    # Importing torchstore.transport and torchstore.monarch.rdma loads every transport module.
     found: set[type[TransportBuffer]] = set()
     pending = [TransportBuffer]
     while pending:

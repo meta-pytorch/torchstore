@@ -4,21 +4,41 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import uuid
 from logging import getLogger
 from typing import Any
 
 import torch
-from monarch.actor import Actor, endpoint
+from monarch.actor import Actor, endpoint, this_host
 
+# Registers Monarch RDMA wherever a volume handle loads, such as in a worker handed a
+# controller, so transport selection offers it there.
+import torchstore.monarch.rdma  # noqa: F401
 from torchstore.transport.buffers import TransportBuffer, TransportContext
 from torchstore.transport.types import Request, TensorSlice
-from torchstore.utils import get_local_hostname, get_slice_intersection, spawn_actors
+from torchstore.utils import get_local_hostname, get_slice_intersection
 
-# The old module's logger, which ``torchstore.storage_volume`` still re-exports.
+# The old module's logger, which ``torchstore.storage_volume`` still re-exports, and the
+# logger main's ``spawn_actors`` used in ``torchstore.utils``.
 logger = getLogger("torchstore.storage_volume")
+_spawn_logger = getLogger("torchstore.utils")
 
 
 FULL_TENSOR = "full_tensor"
+
+
+async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
+    """Actors are essentially processes wrapped in a class."""
+
+    if mesh is None:
+        _spawn_logger.debug("Spawning actors on the local host")
+        mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
+
+    assert hasattr(mesh, "spawn")
+    await mesh.initialized
+    actors = mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
+
+    return actors
 
 
 class StorageVolume(Actor):

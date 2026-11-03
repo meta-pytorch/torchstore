@@ -152,6 +152,100 @@ if __name__ == "__main__":
 
 ```
 
+### Importing TorchStore and Monarch
+
+`import torchstore` loads no Monarch module. TorchStore's Monarch backend loads Monarch
+on the first call that goes through it, such as `ts.initialize`, `ts.initialize_spmd` or
+a process's first `ts.client`, which data calls such as `ts.put` make. Volumes of
+`LocalRankStrategy` and of routing stores load it as they start, to read their rank, and
+so does direct weight sync's RDMA registration. A worker that builds a `LocalClient` from
+a controller it was handed loads Monarch when it unpickles the controller, but not the
+backend.
+
+Monarch reads its `HYPERACTOR_*` settings when it loads, and others such as `MONARCH_*`
+and `OTEL_PYTHON_CONTEXT`. So in a process that has not imported Monarch yet, settings you
+set after importing TorchStore apply too. Monarch also sets `HYPERACTOR_EXECUTION_ID`
+when it loads, so start child processes that must share it after that first call. On
+ROCm, torchmonarch 0.7.0 preloads Triton's library when it loads to keep Triton from
+crashing, which works only before Triton loads, so there import Monarch first.
+
+If `HYPERACTOR_CODEC_MAX_FRAME_LENGTH` is unset, importing TorchStore exports
+`910737418240` for it. A process that loads Monarch afterwards uses that limit, which
+also outranks `monarch.config.configure(codec_max_frame_length=...)`, while one that
+imported Monarch first keeps Monarch's own limit. Set the variable before importing
+either one to choose the limit yourself.
+
+Monarch shuts down at exit through exit hooks, one registered when it loads and one at its
+first use outside an actor, such as `this_host()`, `current_rank()` or TorchStore's first
+call that starts actors, as `ts.initialize` does. Exit hooks run in reverse order of
+registration, so register one that calls TorchStore after `ts.initialize` returns. In a
+process that loads Monarch before exit, a hook registered before Monarch loads (such as
+right after `import torchstore`) runs after Monarch's shutdown. Its TorchStore calls then
+raise pyo3's `PanicException`, which derives from `BaseException` and so escapes
+`except Exception`. A hook that makes the process's first TorchStore call loads Monarch
+during exit instead. Python runs no exit hook registered that late. Monarch then never
+shuts down at exit and the hook's calls work as on main.
+
+Monarch code that core modules held now lives under `torchstore.monarch`, such as the
+controller, storage volume and routing coordinator modules, Monarch RDMA and
+`torchstore.spmd`'s bootstrap. Its log records keep the logger names they had, such as
+`torchstore.routing.coordinator`, and the old module paths, such as
+`torchstore.storage_volume`, still re-export every name the old modules defined except
+the coordinator's `_Layouts` and `_LAYOUT_REGISTRATION_TIMEOUT_S`, which moved to
+`torchstore.routing.layout_registry`. Code that used those modules changes in three ways:
+
+- Import each name from the module that defines it, or a Monarch name from Monarch. The
+  old paths no longer offer names their modules only imported, such as `spawn_actors`
+  and Monarch's `Actor` and `endpoint` on `torchstore.storage_volume`. `torchstore.api`,
+  `torchstore.spmd`, `torchstore.strategy`, `torchstore.transport` and
+  `torchstore.utils` no longer offer the names that went with their Monarch code, such
+  as `torchstore.api`'s actor classes and `torchstore.spmd`'s bootstrap. A star import
+  of `torchstore.controller`, `torchstore.storage_volume` or
+  `torchstore.transport.monarch_rdma` now gives only the names in its `__all__`
+- Patch a moved name in the module whose code reads it, such as
+  `torchstore.monarch.rdma.monarch_rdma_available` instead of
+  `torchstore.transport.monarch_rdma.monarch_rdma_available`, since a patch through an
+  old path no longer reaches that code. Patching an attribute of a moved class, such as
+  a method of `InMemoryStore`, still works through either path
+- `import torchstore` no longer loads the old paths or `torchstore.storage_utils`.
+  TorchStore's Monarch backend loads them when it loads, so before that, or in a process
+  that never loads it, import a module, as in `import torchstore.transport.monarch_rdma`,
+  before reading it as an attribute
+
+`typing.get_type_hints` on `ts.initialize` and `ts.initialize_spmd` needs `ProcMesh` from
+`monarch.actor` and `StoreJob` from `torchstore.monarch.spmd` in `localns`, since their
+annotations name these only for type checkers.
+
+Monarch RDMA joins transport selection once `torchstore.monarch.rdma` has loaded, which
+happens wherever a storage volume handle loads, such as when the Monarch backend loads or
+a worker unpickles a controller. Selection then looks up `monarch_rdma_transport_available`
+and `MonarchRDMATransportBuffer` in that module each time it runs, so patch them there.
+
+Because Monarch and TorchStore's Monarch modules now load later, these things that happened
+at `import torchstore` happen then instead:
+
+- A `logging.config.dictConfig` or `fileConfig` run in between no longer disables the
+  loggers of TorchStore's Monarch modules, so their records reach your handlers. Monarch's
+  job loggers, such as `monarch._src.job.job`, get Monarch's own level, stderr handler and
+  `propagate=False` when the backend loads them, which replaces a level or `propagate` you
+  set on them before that, so configure them after it
+- TorchStore's Monarch backend binds `monarch.actor.get_or_spawn_controller` and
+  `current_rank` when it loads. It takes `monarch.rdma.RDMABuffer` from
+  `torchstore.monarch.rdma`, which binds it as that module loads. That happens with the
+  backend or earlier through an old path, the storage volume module or an unpickled
+  handle. A patch of one of these names that is active at its binding stays bound after
+  the patch ends. A patch made afterwards does not reach the backend
+- Monarch's import-time warning filters, such as showing its RDMA fallback warning once,
+  now take precedence over filters you set for those warnings after `import torchstore`,
+  and a `warnings.catch_warnings` block around the call that loads Monarch drops them when
+  it exits. Set such filters after that call
+- The RDMA fallback warning that direct weight sync's registration raises now names
+  `torchstore.monarch.backend` as its module, so a filter on module
+  `torchstore.direct_weight_sync` must name `torchstore.monarch.backend` instead
+- Monarch's import runs on the first call's thread, so that call blocks its event loop
+  while Monarch imports, where `import torchstore` took that time on main. To keep that
+  pause out of a running loop, `import torchstore.monarch.backend` before starting it
+
 ### SPMD Usage (torchrun / torchx)
 
 If your job is launched with `torchrun` or `torchx` rather than from inside a
@@ -324,8 +418,8 @@ configuration is needed — the selection happens at runtime:
 | Priority | Transport | When used |
 |----------|-----------|-----------|
 | 1 | **POSIX Shared Memory** | Client and storage volume are on the same host |
-| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
-| 3 | **TorchComms RDMA** | Cross-host, `torchcomms` installed |
+| 2 | **TorchComms RDMA** | Cross-host, RDMA supported by Uniflow or `torchcomms`, `USE_TORCHCOMMS` and `USE_TORCHCOMMS_RDMA` unset or `1` |
+| 3 | **Monarch RDMA** | Cross-host, ibverbs available to `monarch.rdma`, `TORCHSTORE_RDMA_ENABLED` unset or `1`, `torchstore.monarch.rdma` loaded |
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
 
