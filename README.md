@@ -556,6 +556,13 @@ inherited, even through `gc.collect()`, and `gc.get_objects()` and `gc.get_refer
 leave those objects out. So a `subprocess` `preexec_fn` that runs in it finds collection
 on but finalizes none of the garbage cycles the parent left, and a leak hunt or reference
 walk in such a child calls `gc.unfreeze()` first.
+The coordinator service pauses collection the same way while it decodes layouts: in the
+driver's process for each layout a publisher registers, at times the publishers choose,
+and in a requester's process for each reply. Keep code that turns collection off and later
+restores what it found, as vLLM does around CUDA graph capture, from overlapping these
+windows. Begun inside one that closes before it ends, it finds collection off and leaves
+it off for good, and a window begun before it that closes inside it turns collection back
+on early.
 
 ### Bring Your Own Control Plane
 

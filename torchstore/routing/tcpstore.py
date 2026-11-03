@@ -88,6 +88,7 @@ if "_live_calls" not in globals():
 
 _PUBLISHERS = "publishers"
 _STRATEGY = "strategy"
+_COORDINATOR = "coordinator"
 _READY = "ready"
 _SCHEMA_VERSION = b"1"
 # What keeps a published value under the value limit, for the near-limit WARNING.
@@ -729,9 +730,10 @@ class TCPStoreRendezvous:
         publishers: Collection[str],
         strategy: TorchStoreStrategy,
         *,
+        coordinator: str | None = None,
         timeout_s: float | None = None,
     ) -> None:
-        """Write the publisher ranks, then the strategy, then the ready marker.
+        """Write the publisher ranks, the strategy and any coordinator, then ``ready``.
 
         Raises:
             ValueError: If a key or value is over its size limit. Nothing is written.
@@ -742,8 +744,10 @@ class TCPStoreRendezvous:
         values = {
             _PUBLISHERS: _encode_publishers(publishers),
             _STRATEGY: _encode_strategy(strategy),
-            _READY: _SCHEMA_VERSION,
         }
+        if coordinator is not None:
+            values[_COORDINATOR] = coordinator.encode()
+        values[_READY] = _SCHEMA_VERSION
         for key, value in values.items():
             _check_sizes(_prefix(self.address), key, value)
         for key, value in values.items():
@@ -790,6 +794,24 @@ class TCPStoreRendezvous:
             raise self._error("marked ready without its strategy")
         (strategy,) = await self._multi_get([_STRATEGY], deadline)
         return _decode_strategy(strategy)
+
+    async def read_coordinator(
+        self,
+        *,
+        timeout_s: float | None = None,
+    ) -> str:
+        """Return the published coordinator address, without waiting.
+
+        Raises:
+            RuntimeError: If this address has no ready marker under this schema, or no coordinator address.
+        """
+        timeout_s = _DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout_s
+        await self._require_ready(deadline)
+        if not await self._check([_COORDINATOR], deadline):
+            raise self._error("marked ready without a coordinator")
+        (coordinator,) = await self._multi_get([_COORDINATOR], deadline)
+        return coordinator.decode()
 
     async def close(self) -> None:
         """Drop this connection. A served TCPStore stops with its last handle."""
