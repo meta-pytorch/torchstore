@@ -14,8 +14,7 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor
 
-from torchstore.controller import ObjectType
-from torchstore.directory import VolumeDirectory
+from torchstore.directory import ObjectType, VolumeDirectory
 from torchstore.logging import LatencyTracker
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer, Request, TensorSlice
