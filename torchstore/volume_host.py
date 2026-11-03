@@ -21,9 +21,9 @@ __all__ = ["VolumeHost"]
 class VolumeHost(ABC):
     """Resolves storage volume IDs for a strategy, in place of its Monarch volume mesh.
 
-    ``volume_ids`` lists exactly the IDs ``endpoints`` and ``hostname`` resolve. Clients look
-    volumes up inline, so every lookup is synchronous, and a host installed on a strategy
-    travels with it, so it pickles.
+    ``volume_ids`` lists exactly the IDs ``endpoints`` and ``hostname`` resolve. Lookups are synchronous
+    since clients look volumes up inline, and a host pickles since it travels with its strategy. As
+    transports cache connections by ID, each ID must name one volume in every host and mesh of a process.
     """
 
     @abstractmethod

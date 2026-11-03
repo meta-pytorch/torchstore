@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import collections
 import dataclasses
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -135,9 +136,11 @@ class TransportBuffer:
     Methods Called on STORAGE VOLUME (Remote Process)
     -------------------------------------------------
     The base `__getstate__` sets `storage_volume_ref` to None in the copy the storage
-    volume works on, in the reply and in any copy made by pickle or the `copy` module, so
-    these use `ctx` and the fields the client set instead. A state other than a dict, which
-    only a hook of a later base class returns, passes through unchanged.
+    volume works on, in the reply and in any copy that pickle or the `copy` module makes
+    through it. These methods use `ctx` and the fields the client set instead. A class in the
+    MRO with its own `__reduce__`, `__reduce_ex__`, `__copy__` or `__deepcopy__` can bypass it and
+    keep the handle. A state other than a dict, which only a hook of a later base class returns,
+    passes through unchanged with the handle.
 
     - `recv_handshake`: Exchange connection info (if requires_handshake returns True)
     - `handle_put_request`: Receive tensor data and return list aligned with entries
@@ -160,10 +163,10 @@ class TransportBuffer:
     - `_call_volume_get`: Custom handling of the get RPC (e.g. cancellation)
     - `recv_handshake`: StorageVolume side of the default handshake
     - `drop`: Resource cleanup (especially important for RDMA buffers)
-    - `__getstate__`: Start from `super().__getstate__()`, a copy of the instance dict, or of the
-      dict a later base class's hook returns, with the client-only volume handle set to None. A
-      subclass that keeps fields in `__slots__` adds them there and restores them in its own
-      `__setstate__`
+    - `__getstate__`: Start from `super().__getstate__()`, a copy of the instance dict, or of a dict
+      the hook of a class between `TransportBuffer` and `object` returns, with the client-only volume
+      handle set to None. That hook's other state comes back as it built it, handle included. A
+      subclass that keeps fields in `__slots__` adds them there and restores them in its own `__setstate__`
 
     Attributes
     ----------
@@ -185,7 +188,7 @@ class TransportBuffer:
     ----------
     storage_volume_ref : StorageVolumeRef
         Reference to the target storage volume, including actor handle and transport context.
-        Copies made through the base `__getstate__` hold None.
+        Copies the base `__getstate__` makes from a dict state hold None.
 
     """
 
@@ -201,19 +204,26 @@ class TransportBuffer:
         self.storage_volume_ref = storage_volume_ref
 
     def __getstate__(self) -> Any:
-        """Omit the client-only volume handle and the transport caches it holds.
+        """Omit the client-only volume handle and the transport caches it holds from a dict state.
 
-        Starts from the hook of a base class after this one in the MRO, if one defines it, else
-        from the instance dict. A dict state comes back copied, with the handle set to None if set.
+        Starts from the hook of a base class between this one and ``object`` in the MRO if one defines it,
+        else from the instance dict. A dict state comes back as a copy with the handle set to None if set:
+        an ``OrderedDict`` or ``defaultdict`` as one again and any other dict as a plain dict. Other states pass through.
         """
         mro = type(self).__mro__
-        later = mro[mro.index(TransportBuffer) + 1 : -1]
+        # The defining class comes from its cell because a reload of this module rebinds the global.
+        later = mro[mro.index(__class__) + 1 : -1]  # type: ignore[name-defined]
         if any("__getstate__" in vars(base) for base in later):
             state = super().__getstate__()
         else:
             state = self.__dict__
         if isinstance(state, dict):
-            state = dict(state)
+            if isinstance(state, collections.OrderedDict):
+                state = collections.OrderedDict(state)
+            elif isinstance(state, collections.defaultdict):
+                state = collections.defaultdict(state.default_factory, state)
+            else:
+                state = dict(state)
             if "storage_volume_ref" in state:
                 state["storage_volume_ref"] = None
         return state
