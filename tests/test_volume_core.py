@@ -29,7 +29,7 @@ from torchstore.transport.buffers import (
     TransportCache,
     TransportContext,
 )
-from torchstore.transport.types import Request
+from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import get_local_hostname
 
 pytestmark = pytest.mark.timeout(120)
@@ -188,6 +188,47 @@ async def test_handshake_answers_every_request_in_order(volume) -> None:
     probe = _HandshakeProbe(_ref(volume, TransportType.SharedMemory))
     existing = await volume.core.handshake(probe, [Request(key="b"), Request(key="d")])
     assert existing == [True, False]
+
+
+@pytest.mark.parametrize(
+    ("offsets", "local_shape"),
+    [((3,), (3,)), ((-1,), (2,)), ((0, 0), (2, 1))],
+    ids=["past_its_end", "before_its_start", "in_a_dim_it_lacks"],
+)
+@pytest.mark.asyncio
+async def test_a_get_of_a_slice_outside_its_stored_tensor_raises_value_error(
+    volume, offsets, local_shape
+) -> None:
+    """Refuse a slice outside the stored tensor, which indexing would clip, wrap or fail on with IndexError."""
+    ref = _ref(volume, TransportType.MonarchRPC)
+    outside = TensorSlice(
+        offsets=offsets,
+        coordinates=(),
+        global_shape=(4,) * len(offsets),
+        local_shape=local_shape,
+        mesh_shape=(),
+    )
+    await _put(ref, "s", torch.arange(4.0))
+    buffer = create_transport_buffer(ref)
+    with pytest.raises(
+        ValueError, match=r"falls outside the stored tensor of shape \(4,\)"
+    ):
+        await buffer.get_from_storage_volume([Request(key="s", tensor_slice=outside)])
+
+
+@pytest.mark.asyncio
+async def test_a_get_of_a_slice_that_ends_at_its_stored_tensors_end_returns_that_part(
+    volume,
+) -> None:
+    """Return a slice that ends at the stored tensor's own end since the bound check takes that end."""
+    ref = _ref(volume, TransportType.MonarchRPC)
+    last = TensorSlice(
+        offsets=(2,), coordinates=(), global_shape=(4,), local_shape=(2,), mesh_shape=()
+    )
+    await _put(ref, "s", torch.arange(4.0))
+    buffer = create_transport_buffer(ref)
+    [part] = await buffer.get_from_storage_volume([Request(key="s", tensor_slice=last)])
+    assert torch.equal(part, torch.tensor([2.0, 3.0]))
 
 
 @pytest.mark.asyncio

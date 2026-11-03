@@ -506,8 +506,8 @@ threads, never overlap a `ts.initialize` or `ts.shutdown` with another call for 
 nor a first `ts.client` given `address` or `control_plane` with another `ts.client` for
 the store. The exception is concurrent first `ts.client` calls through one address on one
 event loop, which share its first connection and that connection's client, or a new client
-on it when a `ts.reset_client` drops that client in between. Concurrent data calls and
-role-less first clients for one store still work as before.
+on it when a `ts.reset_client` drops that client in between. Concurrent data calls still
+work as before, and concurrent role-less first clients for one store share one client.
 
 Make no routing `ts.client` or state-dict call in the driver on either plane. Outside an
 actor every routing client gets rank 0 of its mesh, so a driver would publish as
@@ -831,6 +831,43 @@ place of a lambda or have the hook return a plain dict. A subclass that keeps fi
 `__slots__` adds them there and restores them in its own `__setstate__`. Otherwise slot
 fields that no hook of the subclass returns are lost in copies, and a `__setstate__` that
 unpacks the base hook's state as Python's (dict, slots) pair fails.
+
+A put or get that fails raises its own error even when its transport's cleanup
+fails afterward, and logs that cleanup failure at WARNING. On Monarch's backend
+an error a storage volume raises reaches the caller as an `ActorError`, which is
+neither a `RuntimeError` nor a `KeyError`. For example, once a Gloo timeout has
+closed a connection to a volume, a later Gloo put over it raises the volume's
+`ActorError` where earlier versions raised the client's `RuntimeError`, so code
+that catches `RuntimeError` around such puts should catch `ActorError` too.
+
+A process keeps one Gloo connection per volume ID, for the live client that opened
+it. Tensor puts and gets through another client of that volume ID in the process
+raise `GlooPairInUseError`, a `RuntimeError` from `torchstore.transport.gloo`, while
+object puts and gets still work. On Monarch's backend such a client is one made after
+`ts.reset_client()` while the first is still referenced, or a second store's client
+where both stores use one volume ID as every store on `ControllerStorageVolumes` does.
+Earlier versions failed such tensor transfers with `KeyError` or a Gloo timeout. Once
+nothing refers to the first client, errors kept from its calls included, the next
+tensor transfer connects anew. On Monarch's backend a client also counts as live while
+one of its Gloo transfers still waits, as a get's receive that a failed call left behind
+does until the Gloo timeout (`TORCHSTORE_GLOO_INIT_TIMEOUT`, 120s by default). A tensor
+transfer to a volume served over the carrier whose handshake, put or get call fails
+drops its connection instead and another client may then connect anew. A get that fails
+at its metadata lookup keeps its connection. On Monarch's backend the volume keeps its
+end of the connection that a new one replaced until it resets, as at `ts.shutdown()`.
+
+A storage volume gives up connecting to a client whose TCPStore stops answering
+after 4 Gloo timeouts and 10s more and raises `TimeoutError`, where earlier versions
+waited with no bound. Importing TorchStore registers an exit hook that then refuses
+new connections in that process's volumes and waits up to 5s for those still being
+made, and a fork hook. A connection still being made after that wait can abort the
+process if it returns while the interpreter finalizes, where earlier versions waited
+for it at exit with no bound.
+
+Every process must list the same number of interfaces in `GLOO_SOCKET_IFNAME`,
+as torch requires. Gloo transfers spread over those interfaces, so with
+`TORCH_GLOO_LAZY_INIT=1` a mismatch that earlier versions tolerated now times out
+transfers and can make Gloo abort a process.
 
 ## Testing
 

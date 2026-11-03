@@ -7,6 +7,7 @@
 import math
 import time
 import uuid
+from collections.abc import Iterator
 from logging import getLogger
 
 import pytest
@@ -16,11 +17,14 @@ from monarch.actor import Actor, endpoint
 from torchstore.carrier import CarrierClient, CarrierServer, close_all
 from torchstore.logging import init_logging
 from torchstore.monarch.rdma import monarch_rdma_transport_available
+from torchstore.storage import StorageVolumeCore
 from torchstore.strategy import HostStrategy
 from torchstore.transport import TransportType
 from torchstore.utils import spawn_actors
 
+from .test_carrier_volumes import _Volumes
 from .utils import main
+from .volume_meshes import get_through as _get, put_through as _put
 
 init_logging()
 logger = getLogger(__name__)
@@ -149,6 +153,35 @@ async def test_carrier_echoes_a_tensor_over_4_gib() -> None:
         assert echoed.shape == tensor.shape and torch.equal(echoed, tensor)
     finally:
         await close_all()
+
+
+@pytest.fixture
+def volumes() -> Iterator[_Volumes]:
+    # A close in teardown reports its failure beside the case's own instead of replacing it.
+    volumes = _Volumes()
+    yield volumes
+    volumes.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(900)
+async def test_carrier_volume_proxy_moves_a_tensor_over_4_gib(
+    volumes: _Volumes,
+) -> None:
+    """Put and get a tensor over 4 GiB in band through a carrier volume's proxy, over MonarchRPC."""
+    tensor = torch.randint(0, 256, ((4 << 30) + 4097,), dtype=torch.uint8)
+    core, _, record = await volumes.serve(
+        StorageVolumeCore(f"large-{uuid.uuid4().hex}")
+    )
+    ref = volumes.ref(record, core.volume_id, TransportType.MonarchRPC)
+    start = time.perf_counter()
+    await _put(ref, "large", tensor)
+    fetched = await _get(ref, "large")
+    logger.info(
+        f"Carrier volume put and get of {tensor.nbytes} bytes took"
+        f" {time.perf_counter() - start:.2f} s"
+    )
+    assert fetched.shape == tensor.shape and torch.equal(fetched, tensor)
 
 
 if __name__ == "__main__":
