@@ -12,6 +12,7 @@ multiple storage volumes. Strategies map client processes to storage volumes.
 
 import logging
 import os
+from collections.abc import Collection, Iterable
 from typing import TYPE_CHECKING
 
 from torchstore.backend import get_backend
@@ -35,6 +36,7 @@ _HOST_METHODS = (
     "set_storage_volumes",
     "select_storage_volume",
     "get_storage_volume",
+    "_prepare_volumes",
     "__getattribute__",
     "__getstate__",
     "__setstate__",
@@ -52,6 +54,7 @@ class StorageVolumeRef:
         "transport_context",
         "default_transport_type",
         "volume_hostname",
+        "transports",
     )
 
     def __init__(
@@ -61,6 +64,8 @@ class StorageVolumeRef:
         transport_context: TransportContext,
         default_transport_type: TransportType,
         volume_hostname: str | None = None,
+        *,
+        transports: Collection[TransportType] | None = None,
     ):
         self.volume = volume
         self.volume_id = volume_id
@@ -68,19 +73,25 @@ class StorageVolumeRef:
         self.transport_context = transport_context
         self.default_transport_type = default_transport_type
         self.volume_hostname = volume_hostname
+        # The transports that reach the volume, or None where any may. Automatic selection
+        # and the transport log run only their probes.
+        self.transports = transports
 
 
 def _host_ref(
     strategy: "TorchStoreStrategy", host: VolumeHost, volume_id: str
 ) -> StorageVolumeRef:
-    """Resolve ``volume_id`` through ``host`` with the strategy's transport settings."""
-    return StorageVolumeRef(
+    """Resolve ``volume_id`` through ``host`` with the strategy's transport settings and the host's transport."""
+    ref = StorageVolumeRef(
         host.endpoints(volume_id),
         volume_id,
         strategy.transport_context,
         strategy.default_transport_type,
         volume_hostname=host.hostname(volume_id),
+        transports=host.transports,
     )
+    ref.default_transport_type = host.resolve_transport(ref)
+    return ref
 
 
 def _mesh_ref(strategy: "TorchStoreStrategy", volume_id: str) -> StorageVolumeRef:
@@ -151,7 +162,8 @@ class TorchStoreStrategy:
     async def set_storage_volumes(self, storage_volumes):
         """Configure the storage volumes and build ID-to-coordinate mapping.
 
-        Lookups then resolve these volumes, not a host installed before or while this runs.
+        Lookups then resolve these volumes, not a host installed before or while this runs. That host
+        is left unclosed.
 
         Args:
             storage_volumes: Actor mesh of storage volume actors.
@@ -173,7 +185,8 @@ class TorchStoreStrategy:
 
         Internal and subject to change, for TorchStore's own volume hosts. Because transports cache
         their connection to a volume by its ID (Gloo for the whole process), ``host`` must resolve
-        each ID to the volume that ID names everywhere else in this process.
+        each ID to the volume that ID names everywhere else in this process. A host this replaces
+        is left unclosed. Close one that holds connections first.
 
         Raises:
             TypeError: If ``host`` is no ``VolumeHost``, or this strategy's instance, its class or a
@@ -189,6 +202,36 @@ class TorchStoreStrategy:
                 " cannot tell whether that honors a volume host"
             )
         vars(self)[_VOLUME_HOST] = host
+
+    async def _prepare_volumes(self, volume_ids: Iterable[str], /) -> None:
+        """Let the host load what looking up ``volume_ids`` needs. Without one, return.
+
+        Internal and subject to change, for TorchStore's own volume hosts.
+
+        Raises:
+            TypeError: If ``volume_ids`` is one str rather than an iterable of IDs.
+            ValueError: If this strategy names a transport outside the host's ``transports``.
+        """
+        if isinstance(volume_ids, str):
+            raise TypeError(
+                f"need an iterable of volume IDs, not the str {volume_ids!r}"
+            )
+        host = vars(self).get(_VOLUME_HOST)
+        if host is None:
+            return
+        transports = host.transports
+        requested = self.default_transport_type
+        if not (
+            requested is TransportType.Unset
+            or transports is None
+            or requested in transports
+        ):
+            names = " or ".join(sorted(transport.name for transport in transports))
+            raise ValueError(
+                f"{type(host).__name__} reaches its volumes only through {names},"
+                f" not {requested.name}"
+            )
+        await host.prepare(volume_ids)
 
     def select_storage_volume(self) -> StorageVolumeRef:
         """Select the storage volume for the current client process.
@@ -228,7 +271,11 @@ class TorchStoreStrategy:
 
         Returns:
             StorageVolumeRef: Reference whose ``volume`` is the volume's slice of the mesh, or
-            the installed host's handle for it.
+            the installed host's handle for it with that host's transport.
+
+        Raises:
+            ValueError: If the volume's host refuses this strategy's transport.
+            RuntimeError: If the volume's host is a closed carrier volume host.
         """
         host = vars(self).get(_VOLUME_HOST)
         if host is not None:

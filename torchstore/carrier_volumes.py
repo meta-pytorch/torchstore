@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Storage volumes served over the carrier, and the handles that reach them from clients.
+"""Storage volumes served over the carrier, and the host and handles that reach them from clients.
 
 Internal and may change.
 """
@@ -20,10 +20,11 @@ import os
 import threading
 import time
 import weakref
-from collections.abc import Awaitable, Callable, Collection, Iterable
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, NoReturn, TYPE_CHECKING
 
+from torchstore import transport
 from torchstore.carrier import (
     CarrierAddress,
     CarrierClient,
@@ -38,12 +39,15 @@ from torchstore.transport import (
     SharedMemoryTransportBuffer,
     TransportType,
 )
+from torchstore.volume_host import VolumeHost
 
 if TYPE_CHECKING:
     from torchstore.storage import StorageVolumeCore
+    from torchstore.strategy import StorageVolumeRef
 
 __all__ = [
     "CARRIER_TRANSPORTS",
+    "CarrierVolumeHost",
     "decode_volume_record",
     "encode_volume_record",
     "serve_volume",
@@ -83,6 +87,8 @@ _CARRIED_BUFFERS = tuple(_CARRIED.values())
 _RECORD_VERSION = 1
 # Served volumes for the exit hook, held weakly so a dropped one frees its core and tensors.
 _served: weakref.WeakSet[CarrierServer] = weakref.WeakSet()
+# Carrier volume hosts for the fork hook, held weakly so a dropped one frees its proxies.
+_hosts: weakref.WeakSet[CarrierVolumeHost] = weakref.WeakSet()
 # Store keys of pairs that a proxy's handshake made and this process gave up, by the volume server
 # holding their half, each with its age, oldest server first. The next call there drops those halves.
 _retired: dict[CarrierAddress, list[tuple[int, str]]] = {}
@@ -394,10 +400,177 @@ class VolumeProxy:
         await self._client.close()
 
 
+class _Entry(NamedTuple):
+    """A volume this host resolves: its decoded record and its one handle."""
+
+    location: VolumeLocation
+    proxy: VolumeProxy
+
+
+class CarrierVolumeHost(VolumeHost):
+    """Resolves carrier volumes to ``VolumeProxy`` handles from their records.
+
+    ``prepare`` reads the records it lacks with one ``resolver`` call on the sorted lacking ids,
+    such as ``VolumeRecords.volume_records``, which must return each or raise. A volume's first
+    record wins. Its handles hold connections. It never pickles, and only ``close`` closes them.
+    """
+
+    def __init__(
+        self, resolver: Callable[[Collection[str]], Awaitable[Mapping[str, bytes]]], /
+    ) -> None:
+        self._resolver = resolver
+        # Guards the fields below and is never held across an await.
+        self._lock = threading.Lock()
+        self._entries: dict[str, _Entry] = {}
+        # Proxies taken by close. Every close closes them, so one that starts while
+        # another runs never returns with a handle still open.
+        self._retired: tuple[VolumeProxy, ...] = ()
+        self._closed = False
+        _hosts.add(self)
+
+    def __repr__(self) -> str:
+        state = "closed" if self._closed else f"volumes={len(self._entries)}"
+        return f"CarrierVolumeHost({state})"
+
+    def __reduce_ex__(self, protocol: Any) -> NoReturn:
+        raise TypeError(
+            "a carrier volume host does not pickle: each process builds its own"
+        )
+
+    def adopt(self, volume_id: str, record: bytes) -> None:
+        """Resolve ``volume_id`` through a record this process holds, with no resolver call.
+
+        A closed host raises RuntimeError whatever the record. Another volume's record raises
+        CarrierProtocolError, and a record differing from the one held ValueError.
+        """
+        # Unlocked so that an adopt takes the lock once. A close racing past here fails ``_install``.
+        self._check_open()
+        location = decode_volume_record(volume_id, record)
+        with self._lock:
+            held = self._entries.get(volume_id)
+            if held is not None and held.location != location:
+                raise ValueError(
+                    f"volume {volume_id!r} already resolves through another record"
+                )
+            self._install({volume_id: location})
+
+    async def prepare(self, volume_ids: Iterable[str], /) -> None:
+        """Read the records this host lacks among ``volume_ids``, all in one resolver call.
+
+        A closed host raises RuntimeError first, a bare str TypeError, a missing record KeyError, a malformed or
+        misfiled one CarrierProtocolError, and a host closed before the records arrive RuntimeError.
+        """
+        # Unlocked as in adopt. The locked check below catches a close racing past here.
+        self._check_open()
+        if isinstance(volume_ids, str):
+            raise TypeError(
+                f"need an iterable of volume IDs, not the str {volume_ids!r}"
+            )
+        # Read first: a lazy iterable that reads this host would wait on its lock forever.
+        wanted = set(volume_ids)
+        with self._lock:
+            self._check_open()
+            lacking = sorted(wanted.difference(self._entries))
+        if not lacking:
+            return
+        records = await self._resolver(lacking)
+        missing = [volume_id for volume_id in lacking if volume_id not in records]
+        if missing:
+            raise KeyError(f"no volume record for {missing}")
+        locations = {
+            volume_id: decode_volume_record(volume_id, records[volume_id])
+            for volume_id in lacking
+        }
+        with self._lock:
+            self._install(locations)
+
+    def volume_ids(self) -> Collection[str]:
+        with self._lock:
+            return list(self._entries)
+
+    def endpoints(self, volume_id: str) -> VolumeProxy:
+        return self._entry(volume_id).proxy
+
+    def hostname(self, volume_id: str) -> str:
+        return self._entry(volume_id).location.hostname
+
+    @property
+    def transports(self) -> Collection[TransportType]:
+        return CARRIER_TRANSPORTS
+
+    def resolve_transport(self, ref: StorageVolumeRef, /) -> TransportType:
+        """Keep SharedMemory, Gloo or MonarchRPC and choose among them when none is set. Another raises ValueError.
+
+        ``ref`` must name this host's ``transports`` (``CARRIER_TRANSPORTS``) as a strategy's lookup does. Automatic
+        selection then takes the first of them whose probe passes in the transport package's order, else MonarchRPC.
+        """
+        requested = ref.default_transport_type
+        if requested in CARRIER_TRANSPORTS:
+            return requested
+        if requested is not TransportType.Unset:
+            raise ValueError(
+                f"volume {ref.volume_id!r} is served over the carrier, which carries"
+                f" SharedMemory, Gloo and MonarchRPC, not {requested.name}"
+            )
+        return transport.get_available_transport(ref)
+
+    async def close(self) -> None:
+        """Close every handle and refuse later use.
+
+        The host then lists no volumes, and ``endpoints``, ``hostname``, ``adopt`` and ``prepare``
+        raise RuntimeError. Handles close together and a stuck carrier I/O thread delays this by
+        one bounded wait. A cancel ends that wait at once with every handle closed.
+        """
+        with self._lock:
+            self._closed = True
+            self._retired += tuple(entry.proxy for entry in self._entries.values())
+            self._entries = {}
+            proxies = self._retired
+        # A task's first step closes its handle before a cancel can wake this coroutine.
+        # Cancelling the tasks below then only ends their waits on the I/O thread.
+        closing = [asyncio.ensure_future(proxy.close()) for proxy in proxies]
+        if not closing:
+            return
+        try:
+            await asyncio.wait(closing)
+        except asyncio.CancelledError:
+            for task in closing:
+                task.cancel()
+            await asyncio.wait(closing)
+            raise
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("this carrier volume host is closed")
+
+    def _install(self, locations: Mapping[str, VolumeLocation]) -> None:
+        """Give each new volume its one handle. Call with the lock held."""
+        self._check_open()
+        for volume_id, location in locations.items():
+            if volume_id not in self._entries:
+                proxy = VolumeProxy(location.address)
+                self._entries[volume_id] = _Entry(location, proxy)
+
+    def _entry(self, volume_id: str) -> _Entry:
+        entry = self._entries.get(volume_id)
+        if self._closed:
+            raise RuntimeError(
+                f"volume {volume_id!r} has no handle: its carrier volume host is closed"
+            )
+        if entry is None:
+            raise KeyError(
+                f"volume {volume_id!r} has no record here. Records load once a"
+                " requester's first layouts return"
+            )
+        return entry
+
+
 def _after_fork_in_child() -> None:
-    # A thread that held the lock at the fork never releases the child's copy, and the parent's
-    # pairs are not the child's to retire.
+    # A thread that held a host's lock or the retired keys' lock at the fork never releases the
+    # child's copy, and the parent's pairs are not the child's to retire.
     global _retired_lock, _retired, _retiring, _pair_servers
+    for host in list(_hosts):
+        host._lock = threading.Lock()
     _retired_lock = threading.Lock()
     _retired, _retiring, _pair_servers = {}, collections.deque(), {}
 

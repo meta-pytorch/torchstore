@@ -9,7 +9,7 @@
 import asyncio
 import pickle
 import typing
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -43,6 +43,141 @@ class _RecordHost(VolumeHost):
 
     def hostname(self, volume_id: str) -> str:
         return self._records[volume_id][1]
+
+
+@pytest.mark.asyncio
+async def test_hosts_prepare_nothing_and_keep_the_strategys_transport_by_default() -> None:
+    """Prepare without yielding, and keep every transport a strategy names, by default.
+
+    A strategy installs a host without a mesh, and one on a Monarch mesh holds no host.
+    Such a host names no ``transports``, nor do its references.
+    """
+    endpoints = object()
+    host = _RecordHost({"a": (endpoints, "host-a")})
+    assert host.transports is None
+    # A coroutine that never yields to the event loop finishes on its first step.
+    with pytest.raises(StopIteration):
+        host.prepare(["a", "unknown"]).send(None)
+    for transport_type in TransportType:
+        strategy = TorchStoreStrategy(transport_type)
+        strategy.set_volume_host(host)
+        ref = strategy.get_storage_volume("a")
+        assert (ref.volume, ref.volume_id, ref.volume_hostname) == (
+            endpoints,
+            "a",
+            "host-a",
+        )
+        assert ref.default_transport_type is transport_type
+        assert ref.transports is None
+        assert host.resolve_transport(ref) is transport_type
+        monarch = TorchStoreStrategy(transport_type)
+        await monarch.set_storage_volumes(VolumeMesh([("a", "host-a")]))
+        assert monarch.get_storage_volume("a").default_transport_type is transport_type
+
+
+@pytest.mark.asyncio
+async def test_prepare_volumes_returns_at_once_without_a_host_that_loads() -> None:
+    """Return without yielding when there is no host (as on a Monarch mesh). Otherwise await the host's prepare.
+
+    The reference then takes the transport the host resolves.
+    """
+    monarch = TorchStoreStrategy()
+    await monarch.set_storage_volumes(VolumeMesh([("a", "host-a")]))
+    for strategy in (TorchStoreStrategy(), monarch, ControllerStorageVolumes()):
+        with pytest.raises(StopIteration):
+            strategy._prepare_volumes(["a", "unknown"]).send(None)
+
+    class _LoadingHost(_RecordHost):
+        """Loads on ``prepare``, and reaches every volume over Gloo."""
+
+        def __init__(self) -> None:
+            super().__init__({"a": (object(), "host-a")})
+            self.prepared: list[list[str]] = []
+
+        async def prepare(self, volume_ids: Iterable[str]) -> None:
+            await asyncio.sleep(0)
+            self.prepared.append(sorted(volume_ids))
+
+        def resolve_transport(self, ref: StorageVolumeRef) -> TransportType:
+            return TransportType.Gloo
+
+    host = _LoadingHost()
+    strategy = TorchStoreStrategy(TransportType.MonarchRPC)
+    strategy.set_volume_host(host)
+    # Routing passes the layouts it got, keyed by the publishers' volume IDs.
+    await strategy._prepare_volumes({"b": {}, "a": {}})
+    assert host.prepared == [["a", "b"]]
+    assert strategy.get_storage_volume("a").default_transport_type is TransportType.Gloo
+
+
+class _Prepared(_RecordHost):
+    """Records each ``prepare`` and names ``reach`` as its ``transports`` (None for any transport)."""
+
+    def __init__(self, reach: Collection[TransportType] | None = None) -> None:
+        super().__init__({})
+        self.reach = reach
+        self.prepared: list[list[str]] = []
+
+    @property
+    def transports(self) -> Collection[TransportType] | None:
+        return self.reach
+
+    async def prepare(self, volume_ids: Iterable[str], /) -> None:
+        self.prepared.append(sorted(volume_ids))
+
+
+@pytest.mark.parametrize("transport_type", list(TransportType), ids=str)
+@pytest.mark.asyncio
+async def test_prepare_volumes_refuses_a_transport_its_host_leaves_out(
+    transport_type: TransportType,
+) -> None:
+    """Raise ValueError naming a transport outside the host's ``transports`` and prepare nothing.
+
+    ``Unset`` prepares on every host. So do a member of the host's ``transports`` and any transport on a host
+    naming none.
+    """
+    narrow = _Prepared(frozenset((TransportType.MonarchRPC, TransportType.Gloo)))
+    wide = _Prepared()
+    refused = transport_type not in {
+        TransportType.Unset,
+        TransportType.MonarchRPC,
+        TransportType.Gloo,
+    }
+    for host in (narrow, wide):
+        strategy = TorchStoreStrategy(transport_type)
+        strategy.set_volume_host(host)
+        if host is narrow and refused:
+            with pytest.raises(
+                ValueError,
+                match=(
+                    "^_Prepared reaches its volumes only through Gloo or MonarchRPC,"
+                    f" not {transport_type.name}$"
+                ),
+            ):
+                await strategy._prepare_volumes(["a"])
+        else:
+            await strategy._prepare_volumes(["a"])
+    assert narrow.prepared == ([] if refused else [["a"]])
+    assert wide.prepared == [["a"]]
+
+
+@pytest.mark.asyncio
+async def test_prepare_volumes_refuses_one_volume_id_passed_as_a_str() -> None:
+    """Raise TypeError for a bare str, with or without a host, and never call the host."""
+    prepared: list[list[str]] = []
+
+    class _CountingHost(_RecordHost):
+        async def prepare(self, volume_ids: Iterable[str]) -> None:
+            prepared.append(list(volume_ids))
+
+    hosted = TorchStoreStrategy()
+    hosted.set_volume_host(_CountingHost({}))
+    for strategy in (TorchStoreStrategy(), hosted):
+        with pytest.raises(
+            TypeError, match="^need an iterable of volume IDs, not the str 'a/10'$"
+        ):
+            await strategy._prepare_volumes("a/10")
+    assert prepared == []
 
 
 @pytest.mark.asyncio
@@ -399,6 +534,11 @@ class _OwnLookup(TorchStoreStrategy):
         return super().get_storage_volume(volume_id)
 
 
+class _OwnPrepare(TorchStoreStrategy):
+    async def _prepare_volumes(self, volume_ids: Iterable[str], /) -> None:
+        await super()._prepare_volumes(volume_ids)
+
+
 # Each inherits its overrides from a parent class.
 class _InheritsLookup(_OwnLookup):
     pass
@@ -414,6 +554,7 @@ class _InheritsController(ControllerStorageVolumes):
         (_OwnSet, "set_storage_volumes"),
         (_OwnSelect, "select_storage_volume"),
         (_OwnLookup, "get_storage_volume"),
+        (_OwnPrepare, "_prepare_volumes"),
         (_InheritsLookup, "get_storage_volume"),
         (
             ControllerStorageVolumes,
