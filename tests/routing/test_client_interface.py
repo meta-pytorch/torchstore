@@ -13,10 +13,10 @@ from typing import Any
 import pytest
 import torch
 import torchstore as ts
+from torchstore.monarch.coordinator import MonarchControlPlane
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.control_plane import ControlPlane
-from torchstore.routing.coordinator import MonarchControlPlane
 
 
 class _Reached(Exception):
