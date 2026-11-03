@@ -10,17 +10,21 @@ Clients pickle each buffer to its storage volume, so the copy must not carry
 the client's volume handle or the transport caches that handle holds.
 """
 
+import collections
 import copy
 import functools
 import pickle
 import threading
+import types
 from typing import Any
 
 import pytest
 import torch
+import torchstore.monarch.rdma  # noqa: F401
 import torchstore.transport.nixl as nixl_transport
 import torchstore.transport.torch_distributed as torch_distributed_transport
 import torchstore.transport.torchcomms.cache as torchcomms_cache
+from torch.fx.immutable_collections import immutable_dict
 from torchstore.strategy import StorageVolumeRef
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import (
@@ -48,7 +52,7 @@ MAX_PICKLE_BYTES = 4 * 1024
 
 
 def _buffer_classes() -> list[type[TransportBuffer]]:
-    # Importing torchstore.transport loads every transport module.
+    # Importing torchstore.transport and torchstore.monarch.rdma loads every transport module.
     found: set[type[TransportBuffer]] = set()
     pending = [TransportBuffer]
     while pending:
@@ -194,6 +198,19 @@ def test_pickle_applies_rules_added_to_the_base_hook(buffer_cls, monkeypatch):
     assert buffer.client_only == "client"
 
 
+@pytest.mark.parametrize("buffer_cls", BUFFERS, ids=lambda cls: cls.__name__)
+def test_pickle_survives_a_reload_of_the_buffers_module(buffer_cls, monkeypatch):
+    """Pickle a buffer built before a reload of the buffers module rebinds ``TransportBuffer``."""
+    ref = _volume_ref(object())
+    buffer = buffer_cls(ref)
+    monkeypatch.setattr(
+        "torchstore.transport.buffers.TransportBuffer", type("TransportBuffer", (), {})
+    )
+
+    assert _wire(buffer).storage_volume_ref is None
+    assert buffer.storage_volume_ref is ref
+
+
 class _DropsLock:
     """A pickling hook from a base class listed after a transport buffer class."""
 
@@ -214,11 +231,79 @@ class _VersionedState:
     """A later base's hook whose state is a (fields, version) pair."""
 
     def __getstate__(self) -> tuple:
-        return (self.__dict__.copy(), 1)
+        return (self.__dict__.copy(), 7)
 
     def __setstate__(self, state: tuple) -> None:
-        fields, _version = state
-        self.__dict__.update(fields)
+        fields, version = state
+        self.__dict__.update(fields, version=version)
+
+
+class _ObjectState:
+    """A later base's hook whose state is an object that is neither a dict nor a container."""
+
+    def __getstate__(self) -> types.SimpleNamespace:
+        return types.SimpleNamespace(fields=self.__dict__.copy(), version=7)
+
+    def __setstate__(self, state: types.SimpleNamespace) -> None:
+        self.__dict__.update(state.fields, version=state.version)
+
+
+class _OrderedState:
+    """A later base's hook whose ``OrderedDict`` state its restore relies on."""
+
+    def __getstate__(self) -> collections.OrderedDict:
+        return collections.OrderedDict(self.__dict__)
+
+    def __setstate__(self, state: collections.OrderedDict) -> None:
+        state.move_to_end("storage_volume_ref")
+        self.__dict__.update(state)
+
+
+class _OrderedSubclass(collections.OrderedDict):
+    """An ``OrderedDict`` subclass a later base's hook may return."""
+
+
+class _OrderedSubclassState(_OrderedState):
+    """A later base's hook whose state is an ``OrderedDict`` subclass."""
+
+    def __getstate__(self) -> collections.OrderedDict:
+        return _OrderedSubclass(self.__dict__)
+
+
+def _unseen() -> str:
+    """The default factory of the ``defaultdict`` states below, which no other code uses."""
+    return "unseen"
+
+
+class _DefaultState:
+    """A later base's hook whose ``defaultdict`` state its restore relies on and whose factory it records."""
+
+    def __getstate__(self) -> collections.defaultdict:
+        return collections.defaultdict(_unseen, self.__dict__)
+
+    def __setstate__(self, state: collections.defaultdict) -> None:
+        self.__dict__.update(state, seen=state["seen"], factory=state.default_factory)
+
+
+class _DefaultSubclass(collections.defaultdict):
+    """A ``defaultdict`` subclass a later base's hook may return."""
+
+
+class _DefaultSubclassState(_DefaultState):
+    """A later base's hook whose state is a ``defaultdict`` subclass."""
+
+    def __getstate__(self) -> collections.defaultdict:
+        return _DefaultSubclass(_unseen, self.__dict__)
+
+
+class _FrozenState:
+    """A later base's hook whose state is ``torch.fx``'s immutable dict and whose restore records its type."""
+
+    def __getstate__(self) -> immutable_dict:
+        return immutable_dict(self.__dict__)
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state, state_type=type(state))
 
 
 def _with_later_hook(buffer_cls: type, hook: type) -> Any:
@@ -229,9 +314,20 @@ def _with_later_hook(buffer_cls: type, hook: type) -> Any:
     return mixed
 
 
-_DROPS_LOCK_BUFFERS = [
-    _with_later_hook(cls, _DropsLock) for cls in [TransportBuffer, *BUFFERS]
-]
+_DROPS_LOCK_BUFFERS = [_with_later_hook(cls, _DropsLock) for cls in BUFFERS]
+_LATER_HOOK_BUFFERS = {
+    hook: _with_later_hook(TransportBuffer, hook)
+    for hook in (
+        _InstanceDictState,
+        _VersionedState,
+        _ObjectState,
+        _OrderedState,
+        _OrderedSubclassState,
+        _DefaultState,
+        _DefaultSubclassState,
+        _FrozenState,
+    )
+}
 
 
 @pytest.mark.parametrize("send", list(_SENDS.values()), ids=list(_SENDS))
@@ -252,20 +348,111 @@ def test_copies_start_from_a_later_base_hook(buffer_cls, send):
 def test_a_later_base_hooks_dict_is_copied_before_the_handle_drops():
     """Leave the client's own handle in place when a later base's hook returns its dict."""
     ref = _volume_ref(object())
-    buffer = _with_later_hook(TransportBuffer, _InstanceDictState)(ref)
+    buffer = _LATER_HOOK_BUFFERS[_InstanceDictState](ref)
 
     assert _wire(buffer).storage_volume_ref is None
     assert buffer.storage_volume_ref is ref
 
 
-def test_a_later_base_hooks_state_other_than_a_dict_passes_through():
+@pytest.mark.parametrize(
+    "dict_type",
+    [collections.OrderedDict, functools.partial(collections.defaultdict, None)],
+    ids=["OrderedDict", "defaultdict"],
+)
+def test_a_later_base_hooks_dict_subclass_is_copied_before_the_handle_drops(dict_type):
+    """Leave the client's own handle in place when that dict is an ``OrderedDict`` or ``defaultdict``."""
+    ref = _volume_ref(object())
+    buffer = _LATER_HOOK_BUFFERS[_InstanceDictState](ref)
+    buffer.__dict__ = dict_type(vars(buffer))
+
+    assert _wire(buffer).storage_volume_ref is None
+    assert buffer.storage_volume_ref is ref
+
+
+@pytest.mark.parametrize(
+    "hook", [_VersionedState, _ObjectState], ids=["pair", "object"]
+)
+def test_a_later_base_hooks_state_other_than_a_dict_passes_through(hook):
     """Hand a state that is not a dict to the later base's restore as that hook built it."""
-    buffer = _with_later_hook(TransportBuffer, _VersionedState)(_volume_ref(object()))
+    buffer = _LATER_HOOK_BUFFERS[hook](_volume_ref(object()))
     buffer.field = "client"
 
     copied = vars(_wire(buffer))
-    assert copied["field"] == "client"
+    assert (copied["field"], copied["version"]) == ("client", 7)
     assert copied["storage_volume_ref"].volume_id == "volume-0"
+
+
+@pytest.mark.parametrize("send", list(_SENDS.values()), ids=list(_SENDS))
+@pytest.mark.parametrize(
+    "hook",
+    [_OrderedState, _OrderedSubclassState, _DefaultState, _DefaultSubclassState],
+    ids=["OrderedDict", "OrderedDict-subclass", "defaultdict", "defaultdict-subclass"],
+)
+def test_a_later_base_hooks_dict_keeps_its_type(hook, send):
+    """Hand a later base's restore an ``OrderedDict`` or ``defaultdict`` state as one again with the handle dropped."""
+    ref = _volume_ref(object())
+    buffer = _LATER_HOOK_BUFFERS[hook](ref)
+
+    assert send(buffer).storage_volume_ref is None
+    assert buffer.storage_volume_ref is ref
+
+
+@pytest.mark.parametrize("send", list(_SENDS.values()), ids=list(_SENDS))
+@pytest.mark.parametrize(
+    "hook",
+    [_DefaultState, _DefaultSubclassState],
+    ids=["defaultdict", "defaultdict-subclass"],
+)
+def test_a_later_base_hooks_defaultdict_keeps_its_default_factory(hook, send):
+    """Hand a later base's restore its ``defaultdict`` with the default factory that hook gave it."""
+    copied = send(_LATER_HOOK_BUFFERS[hook](_volume_ref(object())))
+    assert (copied.factory, copied.seen) == (_unseen, "unseen")
+
+
+@pytest.mark.parametrize("send", list(_SENDS.values()), ids=list(_SENDS))
+def test_a_later_base_hooks_other_dict_type_comes_back_as_a_plain_dict(send):
+    """Hand a later base's restore its state of another dict type as a plain dict with the handle dropped."""
+    ref = _volume_ref(object())
+    buffer = _LATER_HOOK_BUFFERS[_FrozenState](ref)
+
+    copied = send(buffer)
+    assert (copied.state_type, copied.storage_volume_ref) == (dict, None)
+    assert buffer.storage_volume_ref is ref
+
+
+class _Slotted(TransportBuffer):
+    """A subclass that keeps a field in ``__slots__`` and has no pickling hook of its own."""
+
+    __slots__ = ("seq",)
+
+
+@pytest.mark.parametrize("send", list(_SENDS.values()), ids=list(_SENDS))
+def test_a_slotted_subclass_drops_the_handle_and_its_slot(send):
+    """Copy a slotted subclass from its instance dict alone, the handle set to None."""
+    ref = _volume_ref(object())
+    buffer = _Slotted(ref)
+    buffer.seq = 2
+
+    copied = send(buffer)
+    assert copied.storage_volume_ref is None
+    assert not hasattr(copied, "seq")
+    assert (buffer.seq, buffer.storage_volume_ref) == (2, ref)
+
+
+class _EmptyRestored(TransportBuffer):
+    """A subclass whose constructor sets nothing and whose restore records its state."""
+
+    def __init__(self) -> None:
+        pass
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state, restored_from=dict(state))
+
+
+@pytest.mark.parametrize("send", list(_SENDS.values()), ids=list(_SENDS))
+def test_an_empty_instance_dict_restores_from_an_empty_state(send):
+    """Hand the restore of an instance with an empty dict the empty state, where Python handed none."""
+    assert vars(send(_EmptyRestored())) == {"restored_from": {}}
 
 
 class _NoHandle(TransportBuffer):
