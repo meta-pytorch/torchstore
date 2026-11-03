@@ -34,6 +34,8 @@ from typing import Any, Generic, NoReturn, TYPE_CHECKING, TypeVar
 
 from torch.distributed import DistError, DistNetworkError, PrefixStore, TCPStore
 
+from torchstore import native_calls
+
 if TYPE_CHECKING:
     from torchstore.strategy import TorchStoreStrategy
 
@@ -63,8 +65,6 @@ _MAX_RETRY_S = 8.0
 _WAIT_OUT_POLL_S = 0.05
 # A reload keeps the first load's state, which the hooks that load registered go on using.
 if "_live_calls" not in globals():
-    # The sentinel a deadline timer settles with, which a call in flight across a reload still compares.
-    _EXPIRED = object()
     # Threads running a lane's call (a c10d call or a name lookup), added once they hold its turn.
     # At exit _drain_native_calls sets _exiting under the lock so that no call starts later, then joins them.
     _live_calls: set[threading.Thread] = set()
@@ -398,32 +398,6 @@ if not globals().get("_hooks_registered", False):
     )
 
 
-def _settle(future: asyncio.Future[Any], result: Any, error: Exception | None) -> None:
-    if future.done():
-        return
-    if error is None:
-        future.set_result(result)
-    else:
-        future.set_exception(error)
-
-
-def _run_native(
-    loop: asyncio.AbstractEventLoop,
-    future: asyncio.Future[Any],
-    fn: Callable[[], Any],
-) -> None:
-    try:
-        outcome = (fn(), None)
-    except Exception as error:
-        # Its traceback would tie this frame, and so the store, into a cycle.
-        outcome = (None, error.with_traceback(None))
-    try:
-        loop.call_soon_threadsafe(_settle, future, *outcome)
-    except RuntimeError:
-        # The loop closed after a cancel or the deadline. Nothing awaits this call.
-        pass
-
-
 async def _run_with_deadline(fn: Callable[[], _T], deadline: float, what: str) -> _T:
     """Run one blocking TCPStore call on a daemon thread, bounded by ``deadline``.
 
@@ -431,36 +405,13 @@ async def _run_with_deadline(fn: Callable[[], _T], deadline: float, what: str) -
     giving them ``_EXIT_DRAIN_S`` to return: before Python 3.14 a c10d call that returns in
     finalization aborts the process, while a name lookup ends quietly.
     """
-    timeout = deadline - time.monotonic()
-    # Written so that a NaN deadline is refused too.
-    if not timeout > 0:
-        raise TimeoutError(f"{what} was not started: its deadline had passed")
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[Any] = loop.create_future()
-    threading.Thread(
-        target=_run_native,
-        args=(loop, future, fn),
-        name=f"torchstore-tcpstore {what}",
-        daemon=True,
-    ).start()
-
-    # loop.time() is time.monotonic(), so the timer fires at the deadline. It
-    # settles the future instead of cancelling it, so any CancelledError here
-    # is the caller's and propagates.
-    timer = loop.call_at(deadline, _settle, future, _EXPIRED, None)
     try:
-        result = await future
+        return await native_calls.run_with_deadline(
+            fn, deadline, what, f"torchstore-tcpstore {what}"
+        )
     except DistError as error:
         detail = str(error).splitlines()[0] if str(error) else type(error).__name__
         raise ConnectionError(f"{what} failed: {detail}") from error
-    finally:
-        timer.cancel()
-        # A kept error holds this frame. The future can hold the TCPStore serve or
-        # connect opened, and its error's traceback would make a cycle through here.
-        del future
-    if result is _EXPIRED:
-        raise TimeoutError(f"{what} did not finish within {timeout:.1f} s")
-    return result
 
 
 class _NativeCall(Generic[_T]):
@@ -542,7 +493,7 @@ class _Lane:
             if self._gate.acquire(timeout=wait):
                 break
             if call.given_up or not deadline - time.monotonic() > 0:
-                return _EXPIRED
+                return native_calls.EXPIRED
         try:
             self._last = call
             current = threading.current_thread()

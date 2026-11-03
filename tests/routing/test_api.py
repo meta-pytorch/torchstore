@@ -2145,6 +2145,39 @@ def test_racing_first_clients_on_one_address_share_one_connection(
 
 
 @pytest.mark.timeout(60)
+def test_racing_first_clients_without_a_role_share_one_client(monkeypatch) -> None:
+    """Give racing first calls without a role the client cached first, as later calls get.
+
+    A process's Gloo pair to a volume ID serves one live client, so a second one's tensor transfers would be refused.
+    """
+    actors = _patch_actors(monkeypatch)
+    controller = _mock_controller()
+    actors.lookup.side_effect = None
+    actors.lookup.return_value = controller
+    store_name = _store_name()
+
+    async def run() -> None:
+        strategy = controller.get_controller_strategy.call_one
+        asked, both_asked = [], asyncio.Event()
+
+        async def strategy_once_both_asked() -> Any:
+            asked.append(None)
+            if len(asked) == 2:
+                both_asked.set()
+            await both_asked.wait()
+            return await strategy()
+
+        controller.get_controller_strategy.call_one = strategy_once_both_asked
+        first, second = await asyncio.wait_for(
+            asyncio.gather(ts.client(store_name), ts.client(store_name)), timeout=30
+        )
+        assert first is second
+        assert await ts.client(store_name) is first
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("reset", ["before", "between"])
 def test_racing_clients_around_a_reset_share_the_recorded_connection(
     monkeypatch, reset

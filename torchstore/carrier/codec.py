@@ -55,6 +55,7 @@ __all__ = [
     "FrameHeader",
     "HEADER_SIZE",
     "Hello",
+    "JsonRecord",
     "Kind",
     "LENGTH_SIZE",
     "loads",
@@ -163,7 +164,7 @@ def check_record_brackets(text: str) -> None:
         raise ValueError(f"over {_MAX_RECORD_BRACKETS} brackets")
 
 
-_TRecord = TypeVar("_TRecord", bound="_JsonRecord")
+_TRecord = TypeVar("_TRecord", bound="JsonRecord")
 
 
 @cache
@@ -171,7 +172,7 @@ def _field_types(cls: type) -> dict[str, Any]:
     return get_type_hints(cls)
 
 
-class _JsonRecord:
+class JsonRecord:
     """Base of frozen dataclasses of ``str`` and ``int`` fields sent as JSON objects."""
 
     def to_json(self) -> str:
@@ -213,7 +214,7 @@ class _JsonRecord:
 
 
 @dataclass(frozen=True)
-class CarrierAddress(_JsonRecord):
+class CarrierAddress(JsonRecord):
     """Where a server listens, and the service, scope and incarnation it serves.
 
     The scope, ``{store_name}/{nonce}``, stays out of the repr and so out of logs.
@@ -227,7 +228,7 @@ class CarrierAddress(_JsonRecord):
 
 
 @dataclass(frozen=True)
-class Hello(_JsonRecord):
+class Hello(JsonRecord):
     """A hello's body: the server's identity and the sender's ``host:pid``."""
 
     scope: str = field(repr=False)
@@ -245,7 +246,7 @@ class Welcome(Hello):
 
 
 @dataclass(frozen=True)
-class Reject(_JsonRecord):
+class Reject(JsonRecord):
     """The body of a reject: why the server refused a hello."""
 
     reason: str

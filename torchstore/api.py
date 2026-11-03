@@ -647,6 +647,7 @@ async def client(
     process, nor a first call with ``address`` or ``control_plane`` with another ``client``
     call for the store unless both pass one address and neither passes ``control_plane``:
     those share one connection, and its client unless ``reset_client`` drops it in between.
+    Concurrent first calls without a role share one client.
 
     Args:
         store_name (str): Name of the store to get a client for. Defaults to DEFAULT_TORCHSTORE_NAME.
@@ -728,7 +729,9 @@ async def client(
         controller=controller,
     )
     with _selection_lock:
-        _local_clent_map[store_name] = local_client
+        # Racing first calls share the client cached first: a process's Gloo pair to a volume ID
+        # serves one live client, so a second would be refused its tensor transfers.
+        local_client = _local_clent_map.setdefault(store_name, local_client)
     return local_client
 
 

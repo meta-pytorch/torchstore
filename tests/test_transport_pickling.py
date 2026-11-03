@@ -126,7 +126,7 @@ _connection = functools.partial(UniflowConnectionState, b"topology", b"bind-info
 _RESET_ON_PICKLE = {
     "GlooTransportBuffer": {
         name: lambda: ("process-local", None)
-        for name in ("_tcp_store", "_pg_task", "_send_task", "_recv_task")
+        for name in ("_tcp_store", "_pg_task", "_send_task", "_recv_task", "_pg")
     },
     "MonarchRPCTransportBuffer": {"inplace_tensor": lambda: ("process-local", None)},
     "NixlTransportBuffer": {"_leases": lambda: ({"process-local"}, set())},

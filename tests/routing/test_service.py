@@ -63,6 +63,8 @@ from torchstore.routing.tcpstore import TCPStoreAddress, TCPStoreRendezvous
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 
+from ..test_carrier import _Children
+
 pytestmark = [
     pytest.mark.timeout(120),
     # A native-call or carrier thread that raises fails its test.
@@ -538,14 +540,6 @@ def _joins_its_native_calls() -> Iterator[None]:
     assert not tcpstore._live_calls - earlier, "finished calls stayed registered"
 
 
-@pytest.fixture
-def children() -> Iterator[list[_Child]]:
-    started: list[_Child] = []
-    yield started
-    for child in started:
-        child.kill()
-
-
 @pytest.fixture(scope="module")
 def shared_service() -> Iterator[_ChildService]:
     """A child service for cases that only read it or use keys of their own."""
@@ -556,9 +550,9 @@ def shared_service() -> Iterator[_ChildService]:
         child.kill()
 
 
-def _service_child(children: list[_Child], grace_s: float = 1.0) -> _ChildService:
+def _service_child(children: _Children, grace_s: float = 1.0) -> _ChildService:
     child = _ChildService(grace_s)
-    children.append(child)
+    children.processes.append(child.process)
     return child
 
 
@@ -2538,7 +2532,7 @@ async def test_the_fork_hooks_sets_keep_nothing_alive() -> None:
 
 @pytest.mark.asyncio
 async def test_a_killed_service_fails_lookups_reads_and_connects(
-    children: list[_Child], monkeypatch: pytest.MonkeyPatch
+    children: _Children, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Fail a waiting lookup within 10 s of a SIGKILL, then reads and connects naming host:port."""
     child = _service_child(children)
@@ -2565,7 +2559,7 @@ async def test_a_killed_service_fails_lookups_reads_and_connects(
 
 
 @pytest.mark.asyncio
-async def test_an_exited_service_fails_waiting_lookups(children: list[_Child]) -> None:
+async def test_an_exited_service_fails_waiting_lookups(children: _Children) -> None:
     """Fail a waiting lookup naming the coordinator once the service's process exits, closing nothing first."""
     child = _service_child(children)
     address, key = child.address, _key()
@@ -2581,7 +2575,7 @@ async def test_an_exited_service_fails_waiting_lookups(children: list[_Child]) -
 
 @pytest.mark.asyncio
 async def test_a_stopped_service_times_out_lookups_registrations_and_reads(
-    children: list[_Child], monkeypatch: pytest.MonkeyPatch
+    children: _Children, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Time out lookups at their wait plus margin, registrations and reads at their deadlines."""
     # A lookup's deadline is its wait plus 60 s by default. This case shortens that.
@@ -2621,7 +2615,7 @@ async def test_a_stopped_service_times_out_lookups_registrations_and_reads(
 
 @pytest.mark.asyncio
 async def test_a_stopped_tcpstore_leaves_resolved_handles_working(
-    children: list[_Child], monkeypatch: pytest.MonkeyPatch
+    children: _Children, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Keep resolved handles registering and looking up. Fail store reads naming host:port."""
     child = _service_child(children)
@@ -2645,7 +2639,7 @@ async def test_a_stopped_tcpstore_leaves_resolved_handles_working(
 
 @pytest.mark.asyncio
 async def test_closing_a_service_fails_its_callers_and_new_connects(
-    children: list[_Child], monkeypatch: pytest.MonkeyPatch
+    children: _Children, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Fail a waiting lookup within the grace, later calls at once and connects naming host:port."""
     child = _service_child(children, grace_s=1)

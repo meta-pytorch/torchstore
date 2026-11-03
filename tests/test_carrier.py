@@ -730,6 +730,21 @@ def _task_errors(caplog: pytest.LogCaptureFixture, coroutine: str) -> list[str]:
     ]
 
 
+def _stop_and_join(loop_thread: Any) -> None:
+    thread = loop_thread.thread
+    runtime._stop_loop(loop_thread.loop)
+    thread.join(10)
+    assert not thread.is_alive(), f"{thread.name} outlived its test"
+
+
+def _stop_unparked_loop_threads() -> None:
+    """Stop and join each loop thread but a parked one, though stopping another raises, and fail on one still alive."""
+    with contextlib.ExitStack() as stack:
+        for loop_thread in list(runtime._loop_threads):
+            if not loop_thread.parked:
+                stack.callback(_stop_and_join, loop_thread)
+
+
 @pytest.fixture
 def fresh_runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Give the test a runtime and exit state of its own, so an exit hook it runs stops only its threads."""
@@ -747,11 +762,10 @@ def fresh_runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ):
         monkeypatch.setattr(runtime, name, value)
     yield
-    # Then no thread of that runtime outlives the test.
-    _in_thread(close_all(grace_s=0))
-    for loop_thread in list(runtime._loop_threads):
-        runtime._stop_loop(loop_thread.loop)
-        loop_thread.thread.join(10)
+    # Then stop each thread of that runtime but one parked for good, even after a step raises, and fail on one left alive.
+    with contextlib.ExitStack() as stack:
+        stack.callback(_stop_unparked_loop_threads)
+        _in_thread(close_all(grace_s=0))
 
 
 @pytest.fixture(autouse=True)
@@ -765,13 +779,6 @@ def target() -> Iterator[_Target]:
     target = _Target()
     yield target
     target.release.set()
-
-
-@pytest.fixture
-def children() -> Iterator[_Children]:
-    children = _Children()
-    yield children
-    children.kill_all()
 
 
 @pytest.mark.asyncio
@@ -4992,6 +4999,114 @@ async def test_exit_lets_started_closes_finish_then_stops_every_loop_not_parked(
         runtime._stop_loop(parked.loop)
         parked.thread.join(10)
     await closing
+
+
+def _carrier_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.name.startswith("torchstore.carrier")
+    ]
+
+
+class _RecordingFutures:
+    """Stands in for ``concurrent.futures`` in the carrier runtime and notes the timeouts of this thread's waits."""
+
+    def __init__(self) -> None:
+        self.thread = threading.current_thread()
+        self.timeouts: list[float | None] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(concurrent.futures, name)
+
+    def wait(
+        self,
+        fs: Any,
+        timeout: float | None = None,
+        return_when: str = concurrent.futures.ALL_COMPLETED,
+    ) -> Any:
+        if threading.current_thread() is self.thread:
+            self.timeouts.append(timeout)
+        return concurrent.futures.wait(fs, timeout, return_when)
+
+
+def _assert_blocks_in_park(loop_thread: Any) -> None:
+    """Fail unless ``loop_thread`` parks within 10s and then runs no callback posted to its loop for 2s.
+
+    A park whose block returned after a while, such as 1s, would let its loop run that callback.
+    """
+    deadline = time.monotonic() + 10
+    while not loop_thread.parked:
+        assert time.monotonic() < deadline, f"{loop_thread.thread.name} did not park"
+        time.sleep(0.01)
+    ran = threading.Event()
+    assert runtime._post(loop_thread.loop, ran.set)
+    assert not ran.wait(2), f"{loop_thread.thread.name} ran a callback after it parked"
+
+
+def test_park_names_a_loop_thread_whose_running_callback_outlives_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fresh_runtime: None,
+) -> None:
+    """Name the thread at WARNING after 30s and when the wait stops at 300s in all, and report it unparked.
+
+    The park still queued then blocks the thread for good once its callback ends.
+    """
+    caplog.set_level(logging.WARNING, logger="torchstore.carrier")
+    monkeypatch.setattr(runtime, "_EXIT_FREE_WARN_S", 0.05)
+    monkeypatch.setattr(runtime, "_EXIT_FREE_WAIT_S", 0.1)
+    waits = _RecordingFutures()
+    busy = runtime._LoopThread("torchstore-carrier test-outlives")
+    release = threading.Event()
+    runtime._post(busy.loop, release.wait, 30)
+    monkeypatch.setattr(runtime, "futures", waits)
+    try:
+        assert not busy.park() and not busy.parked
+    finally:
+        release.set()
+    warnings = _carrier_warnings(caplog)
+    assert len(warnings) == 2 and all(busy.thread.name in w for w in warnings), warnings
+    # The second wait runs only to the cap that the second WARNING names.
+    assert waits.timeouts == pytest.approx([0.05, 0.05])
+    _assert_blocks_in_park(busy)
+
+
+def test_park_blocks_a_loop_thread_for_good_once_its_running_callback_ends(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fresh_runtime: None,
+) -> None:
+    """Park a loop thread once its running callback returns, and park it again at once after that.
+
+    The parked thread stays in this process.
+    """
+    caplog.set_level(logging.WARNING, logger="torchstore.carrier")
+    # Far past the release below: only a second park that waits again runs it out.
+    monkeypatch.setattr(runtime, "_EXIT_FREE_WARN_S", 10.0)
+    monkeypatch.setattr(runtime, "_EXIT_FREE_WAIT_S", 20.0)
+    busy = runtime._LoopThread("torchstore-carrier test-busy")
+    release = threading.Event()
+    runtime._post(busy.loop, release.wait, 30)
+    parked: list[bool] = []
+    parking = threading.Thread(target=lambda: parked.append(busy.park()))
+    parking.start()
+    release.set()
+    parking.join(10)
+    assert parked == [True] and busy.parked and busy.thread.is_alive()
+    _assert_blocks_in_park(busy)
+    assert busy.park() and not _carrier_warnings(caplog)
+
+
+def test_park_ends_its_wait_for_a_loop_thread_whose_loop_stopped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """End the wait at once for a thread whose loop stopped, which ends instead of parking."""
+    caplog.set_level(logging.WARNING, logger="torchstore.carrier")
+    stopped = runtime._LoopThread("torchstore-carrier test-stopped")
+    runtime._stop_loop(stopped.loop)
+    stopped.thread.join(10)
+    assert not stopped.park() and not stopped.parked and not _carrier_warnings(caplog)
 
 
 @pytest.mark.asyncio
