@@ -22,13 +22,22 @@ from torchstore.routing.plan import RoutingPlan
 from torchstore.state_dict_utils import _state_dict_storage_metadata
 from torchstore.transport import TransportType
 
-from .utils import registered_clients
+from . import utils
+from .utils import MakeClients, shard
+
+pytestmark = pytest.mark.timeout(120)
+
+# The shared fixture, which pytest finds here under this name.
+make_clients = utils.make_clients
 
 
-async def _publisher_and_requester_clients():
-    return await registered_clients(
+async def _publisher_and_requester_clients(
+    make_clients: MakeClients,
+) -> dict[str, RoutingClient]:
+    return await make_clients(
         publishers={"publisher/0": {"w": torch.empty(4, dtype=torch.int64)}},
         requesters={"requester/0/0": {"w": torch.empty(4, dtype=torch.int64)}},
+        registered=True,
     )
 
 
@@ -75,27 +84,36 @@ def _in_memory_clients() -> tuple[_InMemoryControlPlane, RoutingClient, RoutingC
 @pytest.mark.asyncio
 async def test_publisher_rejects_unknown_keys_and_wrong_shapes() -> None:
     """Reject tensors that do not match the publisher's installed plan."""
-    publisher = (await _publisher_and_requester_clients())["publisher/0"]
+    _, publisher, _ = _in_memory_clients()
+    rows = torch.arange(8)
+    await publisher.register_layout({"w": shard(rows, 0, 0, 2)}, "model")
 
     with pytest.raises(KeyError, match="does not store"):
         await publisher.put_batch({"other": torch.empty(4)})
     with pytest.raises(ValueError, match="has shape .* expected"):
         await publisher.put_batch({"model/w": torch.empty(3)})
+    # The other rank's rows have the plan's shapes but not its offsets.
+    with pytest.raises(ValueError, match="does not match the routing plan"):
+        await publisher.put_batch({"model/w": shard(rows, 0, 1, 2)})
 
 
 @pytest.mark.asyncio
-async def test_requester_rejects_a_wrong_destination_shape() -> None:
+async def test_requester_rejects_a_wrong_destination_shape(
+    make_clients: MakeClients,
+) -> None:
     """Reject an in-place buffer that cannot hold the planned requester slice."""
-    requester = (await _publisher_and_requester_clients())["requester/0/0"]
+    requester = (await _publisher_and_requester_clients(make_clients))["requester/0/0"]
 
     with pytest.raises(ValueError, match="destination .* has shape .* expected"):
         await requester.get("model/w", torch.empty(3))
 
 
 @pytest.mark.asyncio
-async def test_requester_rejects_an_unplanned_tensor_key() -> None:
+async def test_requester_rejects_an_unplanned_tensor_key(
+    make_clients: MakeClients,
+) -> None:
     """Do not misclassify a tensor missing from the route table as an object."""
-    requester = (await _publisher_and_requester_clients())["requester/0/0"]
+    requester = (await _publisher_and_requester_clients(make_clients))["requester/0/0"]
 
     with pytest.raises(KeyError, match="has no tensor route"):
         await requester.get("model/other")
@@ -105,7 +123,7 @@ async def test_requester_rejects_an_unplanned_tensor_key() -> None:
 @pytest.mark.asyncio
 async def test_unsupported_operations_fail_explicitly(operation: str) -> None:
     """Expose unsupported mutable-store operations consistently."""
-    client = (await _publisher_and_requester_clients())["requester/0/0"]
+    _, _, client = _in_memory_clients()
     arguments = {
         "keys": (),
         "delete": ("key",),
@@ -118,9 +136,11 @@ async def test_unsupported_operations_fail_explicitly(operation: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_registration_methods_install_local_plans() -> None:
+async def test_registration_methods_install_local_plans(
+    make_clients: MakeClients,
+) -> None:
     """Send local metadata to the coordinator and install the returned plan."""
-    requester = (await _publisher_and_requester_clients())["requester/0/0"]
+    requester = (await _publisher_and_requester_clients(make_clients))["requester/0/0"]
 
     assert requester._routing_directory.routes.lookup("model/w")
 
