@@ -472,10 +472,7 @@ await ts.client(store_name="weights", role=ts.RankRole.REQUESTER, group=group)
 ```
 
 Initialize each routing store once per job unless you start it over as described below.
-TorchStore checks this only for some repeats on the coordinator service. While a store's
-service runs, the process that started it refuses any routing `ts.initialize` of the store
-before spawning volumes. Any process refuses a plane dialed from a service's address once
-the volumes spawned. It does so even after that service stopped.
+TorchStore checks this only for some repeats on the `"service"` plane (below).
 Every process keeps its cached client for a store, and on a bring-your-own plane its
 record of that plane (passed or dialed), until its own `ts.shutdown` for the store. A
 routing `ts.initialize` of the store also drops the client cached in the process that
@@ -490,9 +487,18 @@ role (and group) again, reuses the recorded plane. To start a store over:
   process. Then call `ts.reset_client` in every rank, and `ts.client` with its role (and
   group) before its next state-dict call, which otherwise looks the store up as a
   standard store and raises `AttributeError`
-- On a bring-your-own plane, call `ts.shutdown` in the driver and in every rank, then
-  `ts.initialize` with a plane holding fresh state, and pass that plane or its address
-  to each rank's next `ts.client`
+- On `"service"`, call `ts.shutdown` in the driver and in every rank that made a client of
+  the store, then `ts.initialize` again, and pass the address it returns to each rank's
+  next `ts.client`
+- On a bring-your-own plane, call `ts.shutdown` in the driver and in every rank that made a
+  client of the store, then `ts.initialize` with a plane holding fresh state, and pass that
+  plane or its address to each rank's next `ts.client`
+
+A `ts.shutdown` of a service or bring-your-own store in a process that never made a client
+or record of it, never shut it down before and did not inherit its record across fork
+looks the name up as a standard store. Unless a Monarch actor already holds the name, that
+spawns a standard controller under it, which a later `"monarch"` routing `ts.initialize` of
+the name finds in place of its coordinator and then fails with a `TypeError`.
 
 Give standard and routing stores different names on every plane, since a process keeps
 one client per store name. In one process, whether from one event loop or from several
@@ -566,6 +572,91 @@ restores what it found, as vLLM does around CUDA graph capture, from overlapping
 windows. Begun inside one that closes before it ends, it finds collection off and leaves
 it off for good, and a window begun before it that closes inside it turns collection back
 on early.
+
+### Coordinator Service
+
+With `control_plane="service"`, the driver's process serves the routing coordinator over
+TorchStore's own request/reply layer, beside a TCPStore through which ranks find it. No
+Monarch coordinator actor is spawned or looked up, and only routing stores take this
+value. `ts.initialize` then returns a `ts.ControlPlaneAddress`, and each rank below passes
+it to `ts.client`:
+
+```python
+# Driver: the call above with control_plane="service"
+address = await ts.initialize(
+    mesh=trainer_mesh,
+    strategy=ts.TorchStoreStrategy(),
+    client_type=ts.ClientType.ROUTING,
+    store_name="weights",
+    control_plane="service",
+)
+# Each trainer rank, given the address as an argument of its actor endpoint
+await ts.client(store_name="weights", role=ts.RankRole.PUBLISHER, address=address)
+# Each generator rank, given it the same way
+await ts.client(
+    store_name="weights", role=ts.RankRole.REQUESTER, group=group, address=address
+)
+```
+
+`"monarch"` returns None, which `ts.client` takes as no address. So code that forwards
+what `ts.initialize` returned, and calls `ts.shutdown` only for a result that is not None,
+switches between `"monarch"` and `"service"` with the `control_plane` argument alone when
+every rank reaches the driver's host and the strategy reaches every rank through Python's
+`pickle` (both below). To start the store over it then
+follows the list above for each plane: for a result that is not None it calls
+`ts.shutdown` on the driver and on every rank with a client, and for None it calls
+`ts.reset_client` in every rank before each rank's next `ts.client`. Actor calls can carry
+the address since it is a frozen dataclass that pickles. It names the store and prints as
+the `host:port` of the driver's selection line
+`routing control_plane=service address=trainer-0:43521 store=weights rank=- pid=1234`.
+A rank's first `ts.client` connects to it and logs the same address, and later clients
+in its process reuse that connection. The snippet's ranks run in actors outside the
+driver's process, and one whose first `ts.client` omits `address=` gets Monarch's
+coordinator for that name instead. That fails with `init has not run`, serves the layouts
+that an earlier `"monarch"` store of that name left in that coordinator (above), or reaches
+the standard controller that a client-less process's `ts.shutdown` spawned (above). The
+`"service"` plane also logs one INFO timing line per call in the process that makes it
+(such as the driver's `routing control_plane=service init took 0.0042s`) through the root
+logger rather than the `torchstore` loggers of the lines above.
+
+Ranks dial the host that `TORCHSTORE_TCPSTORE_HOST` names in the driver's environment
+when `ts.initialize` runs, else the driver's hostname, so set it to a name or address at
+which every rank reaches the driver. They dial two ports there, both picked by the
+operating system: the TCPStore's, which the address holds, and the coordinator's, which
+they read from the TCPStore. Like TCPStore, the service has no authentication. Both
+servers listen on every interface. The coordinator unpickles every request on a
+connection whose JSON hello it accepted, and that hello checks only values that any
+TCPStore client can read. Each rank also unpickles the strategy it reads from the
+TCPStore and every reply of the coordinator whose address it reads there, and any
+TCPStore client can overwrite both. So choose `"service"` only on a trusted network.
+
+Volumes stay Monarch actors on `mesh`, each rank's id still comes from Monarch's
+`current_rank()`, and the strategy, which holds the volumes' Monarch handles, reaches
+ranks through the TCPStore pickled with Python's `pickle`. So this plane still needs
+`torchmonarch`, and each rank's first `ts.client` must run in an actor's context, as the
+next section explains. Each publisher compresses its layout with zlib before it sends
+it, and a requester gets every publisher's layout for a key in one reply. The
+`"monarch"` plane sends layouts uncompressed.
+
+In the driver's process, a store whose service runs refuses another routing
+`ts.initialize` (on any plane and before spawning anything) until that process's
+`ts.shutdown` for the store. Elsewhere (and in the driver once that service stopped) a
+routing `ts.initialize` given a plane dialed from a service's address raises because only the
+driver's own handle initializes it. It raises only after spawning volumes on `mesh`, which
+keeps them until it stops. Another process can still start a second service under the same
+name, and a standard `ts.initialize` of that name runs as well. Start such a store over as
+the list above says.
+
+On the driver, `ts.shutdown` stops the coordinator, giving calls already running 5 s, and
+then the TCPStore. Ranks' calls to the service then fail naming its `host:port`, though
+keys whose layouts a rank already registered or fetched keep syncing from the volumes. On
+a rank, `ts.shutdown` closes the connection the rank made and drops its client.
+
+This plane's TCPStore client and request/reply layer register exit hooks of their own when
+they load, at the driver's `ts.initialize` and when a rank unpickles the address. Exit hooks
+run in reverse order so register one that calls TorchStore on this plane after that: in
+the driver after `ts.initialize` returns (as for Monarch's hooks above) and in a rank
+after it unpickles the address. Importing `monarch.actor` first covers neither.
 
 ### Bring Your Own Control Plane
 

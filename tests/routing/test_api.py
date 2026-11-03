@@ -4631,6 +4631,30 @@ def test_an_initialize_recording_after_an_overlapping_service_initialize_is_refu
 
 
 @pytest.mark.timeout(60)
+def test_a_service_initialize_raises_the_refusal_of_a_strategy_class_defined_in_a_function(
+    monkeypatch, service_strategy, started_services
+) -> None:
+    """Raise the TCPStore rendezvous's refusal of a strategy class without an importable name, and keep no service."""
+    _patch_actors(monkeypatch)
+    store_name = _store_name()
+
+    class LocalStrategy(ts.TorchStoreStrategy):
+        pass
+
+    async def run() -> None:
+        refused: tuple[type[Exception], ...] = (AttributeError, pickle.PicklingError)
+        with pytest.raises(refused, match="local"):
+            await _initialize(
+                store_name, "service", strategy=LocalStrategy(TransportType.MonarchRPC)
+            )
+        [service] = started_services
+        assert (service._server, service._rendezvous) == (None, None)
+        assert store_api._control_plane_map == store_api._owned_service_map == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize(
     "failure",
     ["interrupted", "cancelled", "connect-fails", "handle-close-fails", "stop-fails"],
