@@ -22,7 +22,10 @@ VOLUME_ENDPOINTS = (
 
 
 class _GetId:
-    """A mesh's ``get_id``, answering for one volume per rank as Monarch's ``call`` does."""
+    """A mesh's ``get_id``, answering one (coordinates, (ID, host name)) pair per volume.
+
+    Coordinates come as plain dicts, where Monarch's ``call`` gives its ``Point``s.
+    """
 
     def __init__(self, volumes: list[tuple[str, str]]) -> None:
         self._volumes = volumes

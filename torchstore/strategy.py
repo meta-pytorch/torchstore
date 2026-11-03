@@ -21,8 +21,14 @@ from torchstore.utils import get_local_hostname
 
 if TYPE_CHECKING:
     from torchstore.monarch.storage_volume import StorageVolume
+    from torchstore.volume_host import VolumeHost
 
 logger = logging.getLogger(__name__)
+
+# The instance-dict key of an installed volume host, mangled so that no subclass attribute shares it.
+_VOLUME_HOST = "_TorchStoreStrategy__volume_host"
+# The methods that read or drop an installed host, so a subclass overriding one would ignore it.
+_HOST_METHODS = ("set_storage_volumes", "select_storage_volume", "get_storage_volume")
 
 
 class StorageVolumeRef:
@@ -97,15 +103,38 @@ class TorchStoreStrategy:
     async def set_storage_volumes(self, storage_volumes):
         """Configure the storage volumes and build ID-to-coordinate mapping.
 
+        Lookups then resolve these volumes, not a host installed before.
+
         Args:
             storage_volumes: Actor mesh of storage volume actors.
         """
+        vars(self).pop(_VOLUME_HOST, None)
         self.storage_volumes = storage_volumes
         self.volume_id_to_coord = {}
         self.volume_id_to_hostname = {}
         for coord, (volume_id, hostname) in await self.storage_volumes.get_id.call():
             self.volume_id_to_coord[volume_id] = coord
             self.volume_id_to_hostname[volume_id] = hostname
+
+    def set_volume_host(self, host: "VolumeHost") -> None:
+        """Resolve every volume ID through ``host`` until ``set_storage_volumes`` runs again.
+
+        Internal and subject to change, for TorchStore's own volume hosts.
+
+        Raises:
+            TypeError: If this strategy's class overrides a method that reads or drops the host.
+        """
+        overridden = [
+            name
+            for name in _HOST_METHODS
+            if getattr(type(self), name) is not getattr(TorchStoreStrategy, name)
+        ]
+        if overridden:
+            raise TypeError(
+                f"{type(self).__name__} overrides {', '.join(overridden)}, which would"
+                " ignore a volume host"
+            )
+        vars(self)[_VOLUME_HOST] = host
 
     def select_storage_volume(self) -> StorageVolumeRef:
         """Select the storage volume for the current client process.
@@ -115,22 +144,40 @@ class TorchStoreStrategy:
         """
         # client_id == volume_id for this strategy
         client_id = self.get_client_id()
-        if client_id not in self.volume_id_to_coord:
+        host = vars(self).get(_VOLUME_HOST)
+        if host is None:
+            if client_id not in self.volume_id_to_coord:
+                raise KeyError(
+                    f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
+                )
+        elif client_id not in host.volume_ids():
             raise KeyError(
-                f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
+                f"No corresponding storage volume found for {client_id} in the volume host"
             )
 
         return self.get_storage_volume(client_id)
 
     def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
-        """Retrieves storage volume actor for a given volume ID.
+        """Return the reference to the storage volume with a given ID.
+
+        A volume host, once installed, resolves the ID instead of the attributes.
 
         Args:
             volume_id (str): The volume ID to look up.
 
         Returns:
-            StorageVolumeRef: Reference to the storage volume actor.
+            StorageVolumeRef: Reference whose ``volume`` is the volume's slice of the mesh, or
+            the installed host's handle for it.
         """
+        host = vars(self).get(_VOLUME_HOST)
+        if host is not None:
+            return StorageVolumeRef(
+                host.endpoints(volume_id),
+                volume_id,
+                self.transport_context,
+                self.default_transport_type,
+                volume_hostname=host.hostname(volume_id),
+            )
         volume_coord = self.volume_id_to_coord[volume_id]
 
         return StorageVolumeRef(
