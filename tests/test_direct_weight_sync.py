@@ -21,6 +21,8 @@ from torchstore.direct_weight_sync import (
 from torchstore.transport.types import TensorSlice
 from torchstore.utils import to_byte_view
 
+from .backend_stub import install_backend_stub
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -255,37 +257,23 @@ async def test_refresh():
     assert torch.equal(dest2, torch.full((10, 5), 99.0))
 
 
-async def test_transfer_dtype():
+async def test_transfer_dtype(monkeypatch):
     """Source is float32, transfer_dtype=bfloat16 → staging casts, dest gets bfloat16."""
+    install_backend_stub(monkeypatch).rdma_buffer.side_effect = MockRDMABuffer
     source = DirectWeightSyncSource()
 
     # Float32 source tensor (simulates model param)
     original = torch.arange(100, dtype=torch.float32).reshape(10, 10)
 
-    # Set up staging with bfloat16 cast (simulates register(transfer_dtype=bfloat16))
-    # Mock RDMABuffer by patching — register() calls RDMABuffer internally,
-    # so we need to test via the staging + mock handle approach instead.
-    staging_buf = original.to(torch.bfloat16).contiguous()
-    source._staging["weight"] = (staging_buf, original)
-
-    # Create mock handle pointing at the bfloat16 staging buffer
-    mock_buf = MockRDMABuffer(to_byte_view(staging_buf))
-    handle = RDMAWeightHandle(
-        rdma_buffer=mock_buf,
-        tensor_slice=TensorSlice(
-            offsets=(0, 0),
-            coordinates=(0,),
-            global_shape=(10, 10),
-            local_shape=(10, 10),
-            mesh_shape=(1,),
-        ),
-        source_rank=0,
+    # register() stages a bfloat16 cast and registers that staging buffer.
+    handles = source.register(
+        {"weight": original}, rank=0, transfer_dtype=torch.bfloat16
     )
 
     # Pull into bfloat16 dest (matching transfer dtype)
     dest = torch.zeros(10, 10, dtype=torch.bfloat16)
     sync = DirectWeightSyncDest()
-    await sync.pull({"weight": [handle]}, {"weight": dest})
+    await sync.pull({"weight": [handles["weight"]]}, {"weight": dest})
 
     # Values should match (float32 → bfloat16 → bfloat16)
     expected = original.to(torch.bfloat16)
@@ -299,10 +287,45 @@ async def test_transfer_dtype():
 
     # Refresh re-casts float32 → bfloat16 into staging buffer
     source.refresh()
+    staging_buf, _ = source._staging["weight"]
     assert torch.equal(staging_buf, torch.full((10, 10), 42.0, dtype=torch.bfloat16))
 
     # Second pull sees updated values
     dest2 = torch.zeros(10, 10, dtype=torch.bfloat16)
     sync2 = DirectWeightSyncDest()
-    await sync2.pull({"weight": [handle]}, {"weight": dest2})
+    await sync2.pull({"weight": [handles["weight"]]}, {"weight": dest2})
     assert torch.equal(dest2, torch.full((10, 10), 42.0, dtype=torch.bfloat16))
+
+
+async def test_register_takes_rdma_buffers_from_the_backend(monkeypatch):
+    """Register each nonempty parameter through the backend's RDMA buffers."""
+    backend = install_backend_stub(monkeypatch)
+    backend.rdma_buffer.side_effect = MockRDMABuffer
+    weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    handles = DirectWeightSyncSource().register(
+        {"weight": weight, "empty": torch.empty(0)}, rank=1
+    )
+
+    backend.rdma_buffer.assert_called_once()
+    assert handles["empty"].rdma_buffer is None
+    assert handles["weight"].source_rank == 1
+    dest = torch.zeros(2, 3)
+    await DirectWeightSyncDest().pull({"weight": [handles["weight"]]}, {"weight": dest})
+    assert torch.equal(dest, weight)
+
+
+async def test_register_without_rdma_raises_after_staging(monkeypatch):
+    """Raise the backend's ``NotImplementedError`` at the first nonempty parameter, staged."""
+    backend = install_backend_stub(monkeypatch)
+    backend.rdma_buffer.side_effect = NotImplementedError("no RDMA here")
+    source = DirectWeightSyncSource()
+
+    with pytest.raises(NotImplementedError, match="no RDMA here"):
+        source.register(
+            {"empty": torch.empty(0), "weight": torch.ones(2), "bias": torch.ones(2)},
+            rank=0,
+            transfer_dtype=torch.bfloat16,
+        )
+
+    assert list(source._staging) == ["empty", "weight"]

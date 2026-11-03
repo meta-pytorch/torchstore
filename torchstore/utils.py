@@ -4,22 +4,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 import math
 import os
 import socket
-import uuid
-from logging import getLogger
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
-from monarch.actor import this_host
+
+from torchstore.backend import get_backend
 
 if TYPE_CHECKING:
     from torch._prims_common import ShapeType
 
     from torchstore.transport import TensorSlice
-
-logger = getLogger(__name__)
 
 
 def to_byte_view(tensor: torch.Tensor) -> torch.Tensor:
@@ -135,16 +133,9 @@ def get_local_hostname() -> str:
 
 async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
     """Actors are essentially processes wrapped in a class."""
-
-    if mesh is None:
-        logger.debug("Spawning actors on the local host")
-        mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
-
-    assert hasattr(mesh, "spawn")
-    await mesh.initialized
-    actors = mesh.spawn(f"{name}_{str(uuid.uuid4())[:8]}", actor_cls, **init_args)
-
-    return actors
+    return await get_backend("monarch").spawn_actors(
+        num_processes, actor_cls, name, mesh, **init_args
+    )
 
 
 def get_local_tensor(
@@ -339,3 +330,19 @@ def slice_covers(container: "TensorSlice", contained: "TensorSlice") -> bool:
     """Return whether container completely covers contained in global space."""
     intersection = get_slice_intersection(container, contained)
     return intersection is not None and same_slice_geometry(intersection, contained)
+
+
+def _off_task(task: "asyncio.Task[Any] | None") -> bool:
+    """Whether a cleanup runs outside the task that started its call (the GC closing that call is one case)."""
+    try:
+        return asyncio.current_task() is not task
+    except RuntimeError:
+        return True
+
+
+def _store_address(control_plane: object, address: Any) -> Any:
+    """The address naming a selection's store: its own, else any ``address`` attribute of its plane.
+
+    A ``ServiceControlPlane`` has one. The API and the carrier volume module both name stores by this rule.
+    """
+    return address if address is not None else getattr(control_plane, "address", None)

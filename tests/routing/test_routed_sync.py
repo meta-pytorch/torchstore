@@ -7,14 +7,19 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import uuid
+from pathlib import Path
 
 import monarch.actor as monarch_actor
 import pytest
 import torch
 import torchstore as ts
+import torchstore.api as store_api
 from monarch.actor import Actor, concurrent_endpoint, current_rank, this_host
 from torchstore.transport import TransportType
+
+from .file_store_control_plane import FileStoreControlPlane
 
 _KEY = "model_state_dict"
 _PUBLISHER_RANKS = 2
@@ -45,16 +50,47 @@ def _raise_first(results: list[object]) -> None:
             raise result
 
 
-class _Publisher(Actor):
+def _control_plane(path: str | None) -> FileStoreControlPlane | None:
+    """The test's own control plane on ``path``, or None for Monarch's coordinator."""
+    return None if path is None else FileStoreControlPlane(path)
+
+
+class _Participant(Actor):
+    """A rank that reaches the store through Monarch's coordinator, its own plane or an address."""
+
+    def __init__(self, store_name: str, plane_path: str | None) -> None:
+        self._store_name = store_name
+        self._plane_path = plane_path
+
+    async def _client(
+        self,
+        role: ts.RankRole,
+        group: int | None,
+        address: ts.ControlPlaneAddress | None,
+    ) -> tuple[ts.ControlPlaneAddress, str] | None:
+        """Make this process's client and return the address it got, as itself and printed."""
+        await ts.client(
+            self._store_name,
+            role=role,
+            group=group,
+            address=address,
+            control_plane=_control_plane(self._plane_path),
+        )
+        return None if address is None else (address, str(address))
+
+
+class _Publisher(_Participant):
     """A trainer rank that publishes the way TitanRL's trainer does."""
 
-    def __init__(self, store_name: str) -> None:
-        self._store_name = store_name
+    def __init__(self, store_name: str, plane_path: str | None) -> None:
+        super().__init__(store_name, plane_path)
         self._rank = current_rank().rank
 
     @concurrent_endpoint
-    async def initialize_client(self) -> None:
-        await ts.client(self._store_name, role=ts.RankRole.PUBLISHER)
+    async def initialize_client(
+        self, address: ts.ControlPlaneAddress | None
+    ) -> tuple[ts.ControlPlaneAddress, str] | None:
+        return await self._client(ts.RankRole.PUBLISHER, None, address)
 
     @concurrent_endpoint
     async def push(self, round_: int) -> None:
@@ -67,18 +103,20 @@ class _Publisher(Actor):
         )
 
 
-class _Requester(Actor):
+class _Requester(_Participant):
     """A generator rank that reads into the same buffers every round."""
 
-    def __init__(self, store_name: str) -> None:
-        self._store_name = store_name
+    def __init__(self, store_name: str, plane_path: str | None) -> None:
+        super().__init__(store_name, plane_path)
         self._destination = {
             name: torch.zeros_like(tensor) for name, tensor in _weights(0).items()
         }
 
     @concurrent_endpoint
-    async def initialize_client(self) -> None:
-        await ts.client(self._store_name, role=ts.RankRole.REQUESTER, group=0)
+    async def initialize_client(
+        self, address: ts.ControlPlaneAddress | None
+    ) -> tuple[ts.ControlPlaneAddress, str] | None:
+        return await self._client(ts.RankRole.REQUESTER, 0, address)
 
     @concurrent_endpoint
     async def pull(self) -> dict[str, torch.Tensor]:
@@ -90,38 +128,69 @@ class _Requester(Actor):
 
 @pytest.mark.timeout(120)
 @pytest.mark.asyncio
+@pytest.mark.parametrize("control_plane", ["monarch", "bring_your_own", "service"])
 async def test_routed_weight_sync_across_actor_meshes(
-    monkeypatch: pytest.MonkeyPatch,
+    control_plane: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Sync publishers that push from worker threads into a requester mesh."""
+    """Sync publishers that push from worker threads into a requester mesh.
+
+    The bring-your-own arm initializes only a control plane the test wrote, which every
+    process opens on its own, and service processes get the driver's address as TitanRL
+    forwards it, so a rank that fell back to Monarch's would fail.
+    """
     # Monarch's default fault hook interrupts the whole session, so record this
     # test's mesh faults instead. monkeypatch restores the hook after any outcome.
     faults: list[monarch_actor.MeshFailure] = []
     monkeypatch.setattr(monarch_actor, "unhandled_fault_hook", faults.append)
     store_name = f"routed-sync-test-{uuid.uuid4()}"
+    bring_your_own = control_plane == "bring_your_own"
+    plane_path = str(tmp_path / "control_plane") if bring_your_own else None
+    plane = _control_plane(plane_path)
+    # The coordinator service advertises this host, which every actor here reaches.
+    monkeypatch.setenv("TORCHSTORE_TCPSTORE_HOST", "127.0.0.1")
+    # Imported here, so actor processes never load it through this module.
+    from torchstore.routing.service import ServiceAddress
+
     publisher_mesh = this_host().spawn_procs(per_host={"procs": _PUBLISHER_RANKS})
     requester_mesh = this_host().spawn_procs(per_host={"procs": _REQUESTER_RANKS})
+    address: ts.ControlPlaneAddress | None = None
 
     async def sync() -> None:
-        await ts.initialize(
+        nonlocal address
+        address = await ts.initialize(
             mesh=publisher_mesh,
             strategy=ts.TorchStoreStrategy(TransportType.MonarchRPC),
             client_type=ts.ClientType.ROUTING,
             store_name=store_name,
+            control_plane=control_plane if plane is None else plane,
         )
-        publishers = publisher_mesh.spawn("publisher", _Publisher, store_name)
-        requesters = requester_mesh.spawn("requester", _Requester, store_name)
+        if control_plane == "service":
+            assert isinstance(address, ServiceAddress)
+            assert str(address) == f"127.0.0.1:{address.port}"
+        else:
+            assert address is None
+        publishers = publisher_mesh.spawn(
+            "publisher", _Publisher, store_name, plane_path
+        )
+        requesters = requester_mesh.spawn(
+            "requester", _Requester, store_name, plane_path
+        )
         # Let every lookup settle before raising a failed one, since stopping a mesh
         # mid-lookup can break Monarch's controller lookups for the session. A hang
         # still reaches the deadline with lookups in flight.
-        _raise_first(
-            await asyncio.gather(
-                publishers.initialize_client.call(),
-                requesters.initialize_client.call(),
-                return_exceptions=True,
-            )
+        results = await asyncio.gather(
+            publishers.initialize_client.call(address),
+            requesters.initialize_client.call(address),
+            return_exceptions=True,
         )
-        for round_ in range(_ROUNDS):
+        _raise_first(results)
+        forwarded = None if address is None else (address, str(address))
+        for result in results:
+            # Each rank got its own copy of the address, equal to the driver's.
+            for point, received in result.items():
+                assert received == forwarded, point
+
+        async def sync_round(round_: int) -> None:
             # Each read follows the push, as one that starts first can miss the mapping.
             await publishers.push.call(round_)
             pulled = await requesters.pull.call()
@@ -132,11 +201,28 @@ async def test_routed_weight_sync_across_actor_meshes(
                 atol=0,
             )
 
+        for round_ in range(_ROUNDS):
+            await sync_round(round_)
+        if isinstance(address, ServiceAddress):
+            server = store_api._owned_service_map[store_name]._server
+            assert server is not None
+            # With the driver's coordinator and TCPStore stopped, the planned key syncs
+            # from the volumes alone.
+            await ts.shutdown(store_name)
+            for port in (address.port, server.address.port):
+                with pytest.raises(ConnectionRefusedError):
+                    socket.create_connection(("127.0.0.1", port)).close()
+            await sync_round(_ROUNDS)
+
     try:
         await asyncio.wait_for(sync(), _DEADLINE_S)
     finally:
-        stopped = await asyncio.gather(
-            requester_mesh.stop(), publisher_mesh.stop(), return_exceptions=True
-        )
+        try:
+            if address is not None:
+                await ts.shutdown(store_name)
+        finally:
+            stopped = await asyncio.gather(
+                requester_mesh.stop(), publisher_mesh.stop(), return_exceptions=True
+            )
     assert not faults, [fault.report() for fault in faults]
     _raise_first(stopped)
