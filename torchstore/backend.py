@@ -13,18 +13,20 @@ from __future__ import annotations
 
 import importlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import timedelta
 from typing import Any, Literal, overload, TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch
 
+    from torchstore.carrier_volumes import CarrierVolumeHost, PublisherVolume
     from torchstore.directory import VolumeDirectory
     from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
     from torchstore.routing.service import CoordinatorService
     from torchstore.spmd import SPMDEnv
     from torchstore.strategy import TorchStoreStrategy
+    from torchstore.transport.buffers import TransportContext
 
 __all__ = [
     "Backend",
@@ -129,7 +131,7 @@ class Backend(ABC):
 
 
 class ServiceBackend(ABC):
-    """Serves routing stores' coordinators over the carrier, beside a TCPStore rendezvous.
+    """Serves routing stores' coordinators and publishers' volumes over the carrier, beside a TCPStore.
 
     Its modules register exit and fork hooks when they load, so it loads with the first call
     that needs it, or when unpickling one of its addresses imports it.
@@ -142,6 +144,38 @@ class ServiceBackend(ABC):
     @abstractmethod
     def service_address(self, control_plane: object) -> ControlPlaneAddress | None:
         """Return the address of the service ``control_plane`` is a handle to, else None."""
+
+    @abstractmethod
+    def check_strategy(self, strategy: TorchStoreStrategy) -> None:
+        """Refuse a strategy that the volumes publishers serve cannot honor."""
+
+    @abstractmethod
+    def volume_host(self, strategy: object) -> CarrierVolumeHost | None:
+        """Return ``strategy``'s carrier volume host, if it resolves volumes through one."""
+
+    @abstractmethod
+    def forget_context_pairs(
+        self, volume_ids: Iterable[str], transport_context: TransportContext
+    ) -> None:
+        """Forget the Gloo pairs to these carrier volumes whose groups ``transport_context`` holds."""
+
+    @abstractmethod
+    async def start_publisher_volume(
+        self,
+        volume_id: str,
+        *,
+        store_name: str,
+        selection: tuple[Any, Any],
+        register: Callable[[str, bytes], Awaitable[None]],
+    ) -> PublisherVolume:
+        """Serve this process's publisher volume of ``store_name``, registered through ``register``.
+
+        ``selection`` is the (control plane, address) pair that names the store.
+        """
+
+    @abstractmethod
+    def stop_publisher_volumes(self, store_name: str) -> list[PublisherVolume]:
+        """Withdraw this process's publisher volumes of ``store_name``. The caller closes each."""
 
 
 # The module of each backend, which registers it as it loads. No other core code names them.

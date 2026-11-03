@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
+import gc
 import importlib.util
 import inspect
 import logging
@@ -20,6 +22,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -32,7 +35,7 @@ from collections.abc import (
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NoReturn
+from typing import Any, cast, NoReturn
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
@@ -42,9 +45,10 @@ import torchstore.api as store_api
 import torchstore.backend as backend_module
 import torchstore.monarch.backend as monarch_backend
 from monarch.actor import ActorError
-from torchstore import RankRole
+from torchstore import carrier_volumes, RankRole
 from torchstore.backend import ServiceBackend
 from torchstore.carrier import CarrierAddress, PeerLostError
+from torchstore.carrier_volumes import CarrierVolumeHost
 from torchstore.client import ClientType, LocalClient
 from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.monarch.storage_volume import StorageVolume
@@ -57,10 +61,12 @@ from torchstore.routing.service import (
     ServiceAddress,
     ServiceControlPlane,
 )
+from torchstore.strategy import _installed_volume_host
 from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 
 from ..backend_stub import install_backend_stub
+from .tcpstore_fixtures import _initialize_service, _Mesh, _other_service
 from .utils import HostedRegistry, registry_store
 
 # Each child process imports the tree that pytest imported.
@@ -74,9 +80,10 @@ _HOSTS: dict[str, Callable[..., Awaitable[HostedRegistry]]] = {}
 
 @pytest.fixture(autouse=True)
 def _fresh_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Start every test with no cached client, recorded or released store, owned service, forked store or close.
+    """Start every test with no cached or dropped client, recorded or released store, owned service, forked store, close or volume.
 
-    Coordinator services and handles that a failed test left in this process's records are closed after it.
+    Publisher volumes, coordinator services, handles and dropped clients' volume hosts that a test
+    left in this process's records are closed after it.
     """
     monkeypatch.setattr(store_api, "_local_clent_map", {})
     monkeypatch.setattr(store_api, "_control_plane_map", {})
@@ -84,13 +91,21 @@ def _fresh_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(store_api, "_owned_service_map", {})
     monkeypatch.setattr(store_api, "_forked_stores", {})
     monkeypatch.setattr(store_api, "_closing", set())
+    monkeypatch.setattr(store_api, "_dropped_carriers", {})
+    monkeypatch.setattr(carrier_volumes, "_publishers", {})
     yield
     left = [
+        *carrier_volumes._publishers.values(),
         *store_api._owned_service_map.values(),
         *(
             selected.control_plane
             for selected in store_api._control_plane_map.values()
             if isinstance(selected.control_plane, ServiceControlPlane)
+        ),
+        *(
+            host
+            for carriers in store_api._dropped_carriers.values()
+            for _, host in carriers
         ),
     ]
     if left:
@@ -374,14 +389,6 @@ async def _hosted_registry() -> AsyncIterator[str]:
             _HOSTS.pop(host, None)
 
 
-class _Mesh:
-    def __init__(self, size: int) -> None:
-        self._size = size
-
-    def size(self) -> int:
-        return self._size
-
-
 def _store_name() -> str:
     return f"routing-test-{uuid.uuid4()}"
 
@@ -425,17 +432,24 @@ def _mock_controller() -> SimpleNamespace:
     )
 
 
-def _patch_actors(monkeypatch: pytest.MonkeyPatch, rank: int = 0) -> SimpleNamespace:
-    """Stub volume spawning and the rank, and fail any Monarch actor lookup."""
+def _patch_actors(
+    monkeypatch: pytest.MonkeyPatch, rank: int | None = 0
+) -> SimpleNamespace:
+    """Stub volume spawning and Monarch's rank, and fail any Monarch actor lookup.
+
+    Cases that build clients only on the service backend pass ``rank=None``: their ranks
+    come from ``rank_client`` alone.
+    """
     actors = SimpleNamespace(
         spawn=AsyncMock(return_value=object()),
         lookup=AsyncMock(side_effect=AssertionError("looked up a Monarch actor")),
     )
     monkeypatch.setattr(StorageVolume, "spawn", actors.spawn)
     monkeypatch.setattr(monarch_backend, "get_or_spawn_controller", actors.lookup)
-    monkeypatch.setattr(
-        monarch_backend, "current_rank", lambda: SimpleNamespace(rank=rank)
-    )
+    if rank is not None:
+        monkeypatch.setattr(
+            monarch_backend, "current_rank", lambda: SimpleNamespace(rank=rank)
+        )
     return actors
 
 
@@ -2180,14 +2194,14 @@ def test_racing_first_clients_without_a_role_share_one_client(monkeypatch) -> No
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("reset", ["before", "between"])
 def test_racing_clients_around_a_reset_share_the_recorded_connection(
-    monkeypatch, reset
+    monkeypatch, caplog, reset
 ) -> None:
     """Share the recorded connection when ``reset_client`` comes before or between races.
 
-    Before: both calls reuse the record, and the second takes the first's client.
-    Between: the second fresh dial closes itself and builds a new client on the first's
-    connection, since the reset dropped the first's client.
+    Before: both calls reuse the record, and the second takes the first's client and logs nothing.
+    Between: the reset drops the first's client. The second closes its dial and builds one on the first's connection.
     """
+    caplog.set_level(logging.WARNING, logger=store_api.__name__)
     actors = _patch_actors(monkeypatch)
     store_name = _store_name()
     dialed: list[ControlPlane] = []
@@ -2209,7 +2223,8 @@ def test_racing_clients_around_a_reset_share_the_recorded_connection(
                     if len(entered) == 2:
                         both_entered.set()
                     await opened.wait()
-                    return await strategy()
+                    # Each read returns its own copy like an actor call. A call sharing a client discards it.
+                    return copy.copy(await strategy())
 
                 connection.strategy = gated
 
@@ -2234,6 +2249,10 @@ def test_racing_clients_around_a_reset_share_the_recorded_connection(
                     gates[0].set()
                     clients = await asyncio.wait_for(asyncio.gather(*calls), timeout=30)
                     assert clients[0] is clients[1] and len(dialed) == 1
+                    # The losing call's strategy has no carrier host and closing it logs nothing.
+                    assert not [
+                        r for r in caplog.records if r.name == store_api.__name__
+                    ]
                     return
                 gates[0].set()
                 done, pending = await asyncio.wait(
@@ -2963,12 +2982,9 @@ _LAYOUT = TensorSlice(
 
 @pytest.fixture
 def service_strategy(monkeypatch: pytest.MonkeyPatch) -> ts.TorchStoreStrategy:
-    """A strategy the coordinator service can pickle, served on localhost.
-
-    Volume setup is stubbed on the class, since ``_patch_actors`` spawns no volume.
-    """
-    monkeypatch.setattr(ts.TorchStoreStrategy, "set_storage_volumes", AsyncMock())
+    """A strategy the coordinator service takes, served on localhost with publishers' volumes."""
     monkeypatch.setenv("TORCHSTORE_TCPSTORE_HOST", _LOCALHOST)
+    monkeypatch.setenv("TORCHSTORE_CARRIER_HOST", _LOCALHOST)
     return ts.TorchStoreStrategy(TransportType.MonarchRPC)
 
 
@@ -3018,17 +3034,6 @@ async def _until_set(event: asyncio.Event, call: asyncio.Future[Any]) -> None:
     assert event.is_set(), call
 
 
-async def _initialize_service(
-    store_name: str, strategy: ts.TorchStoreStrategy, *, publishers: int = 1
-) -> ServiceAddress:
-    """Initialize a routing store on the coordinator service and return its address."""
-    address = await _initialize(
-        store_name, "service", publishers=publishers, strategy=strategy
-    )
-    assert isinstance(address, ServiceAddress)
-    return address
-
-
 def _layout() -> dict[str, KeyRegistration]:
     return {"w": KeyRegistration(_LAYOUT, dtype=torch.float32)}
 
@@ -3041,7 +3046,7 @@ def _service_handle(store_name: str) -> ServiceControlPlane:
 
 
 async def _release(store_name: str) -> None:
-    """Shut a store down if this process still records or owns anything for it.
+    """Shut a store down if this process still records, owns or serves anything for it.
 
     A deadlocked test leaves the selection lock held, so this fails rather than wait on it.
     """
@@ -3051,6 +3056,7 @@ async def _release(store_name: str) -> None:
     if (
         store_name in store_api._control_plane_map
         or store_name in store_api._owned_service_map
+        or any(name == store_name for name, _ in carrier_volumes._publishers)
     ):
         await ts.shutdown(store_name)
 
@@ -3065,22 +3071,6 @@ def _controller_stub() -> SimpleNamespace:
         ),
         teardown=SimpleNamespace(call=AsyncMock()),
     )
-
-
-@contextlib.asynccontextmanager
-async def _other_service(
-    store_name: str, strategy: ts.TorchStoreStrategy
-) -> AsyncIterator[CoordinatorService]:
-    """Serve another initialized coordinator for a store, outside this process's records."""
-    service = await CoordinatorService.start(store_name, host=_LOCALHOST)
-    driver = None
-    try:
-        driver = await service.connect()
-        await driver.init(publishers={"publisher/0"}, strategy=strategy)
-        yield service
-    finally:
-        closing = [] if driver is None else [driver.close]
-        await _clean_up(*closing, service.close)
 
 
 class _Dials:
@@ -3166,10 +3156,13 @@ async def _connect_and_read(address: ServiceAddress) -> None:
 def test_service_initialize_serves_the_coordinator_without_an_actor(
     monkeypatch, caplog, service_strategy
 ) -> None:
-    """Spawn the volumes once, serve the coordinator here, record it and return its address."""
+    """Spawn no volume, serve the coordinator here, record it and return its address."""
     caplog.set_level(logging.INFO)
     actors = _patch_actors(monkeypatch)
     store_name = _store_name()
+    # Publishers serve their own volumes, so the driver sets up none on the strategy it publishes.
+    set_storage_volumes = AsyncMock()
+    monkeypatch.setattr(service_strategy, "set_storage_volumes", set_storage_volumes)
 
     async def run() -> ServiceAddress:
         address = await _initialize_service(store_name, service_strategy, publishers=2)
@@ -3180,10 +3173,11 @@ def test_service_initialize_serves_the_coordinator_without_an_actor(
             assert type(selected.control_plane) is ServiceControlPlane
             assert selected.address == selected.control_plane.address == address
             assert store_api._owned_service_map[store_name].address == address
-            # Ranks read the pickled strategy and wait on both publishers.
+            # Ranks read the config, find volumes through records and wait on both publishers.
             strategy = await selected.control_plane.strategy()
             assert type(strategy) is ts.TorchStoreStrategy
             assert strategy.default_transport_type == TransportType.MonarchRPC
+            assert isinstance(_installed_volume_host(strategy), CarrierVolumeHost)
             missing = r"missing publishers: \['publisher/0', 'publisher/1'\]"
             with pytest.raises(TimeoutError, match=missing):
                 await selected.control_plane.get_layouts("model", timeout_s=0)
@@ -3192,11 +3186,8 @@ def test_service_initialize_serves_the_coordinator_without_an_actor(
             await _clean_up(lambda: _release(store_name))
 
     address = asyncio.run(run())
-    actors.spawn.assert_awaited_once()
-    assert actors.spawn.await_args.args[0] == 1
-    set_storage_volumes = ts.TorchStoreStrategy.set_storage_volumes
-    assert isinstance(set_storage_volumes, AsyncMock)
-    set_storage_volumes.assert_awaited_once_with(actors.spawn.return_value)
+    actors.spawn.assert_not_called()
+    set_storage_volumes.assert_not_called()
     actors.lookup.assert_not_called()
     pid = str(os.getpid())
     assert _selection_lines(caplog) == [("service", str(address), store_name, "-", pid)]
@@ -3287,7 +3278,7 @@ def test_calls_to_a_stopped_service_fail_naming_its_address(
 
     They fail at once, or new connects within the TCPStore deadline, each naming host:port.
     """
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     monkeypatch.setattr(tcpstore, "_DEFAULT_TIMEOUT_S", 2)
     monkeypatch.setattr(service_module, "_CLOSE_GRACE_S", 1)
     store_name = _store_name()
@@ -3448,14 +3439,14 @@ def test_initialize_given_a_coordinator_handle_returns_none_and_never_closes_it(
 
 @pytest.mark.timeout(60)
 def test_shutdown_while_replaced_and_redundant_connections_close(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Shut down while a replaced handle and a redundant dial wait in their closes.
 
     No record, cached client or owned service remains, and each connection and the
     service close exactly once.
     """
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
     dials = _Dials(monkeypatch)
 
@@ -3472,7 +3463,7 @@ def test_shutdown_while_replaced_and_redundant_connections_close(
                 # One racing call replaces the driver's record and the other adopts that dial.
                 racing = [
                     asyncio.ensure_future(
-                        ts.client(
+                        rank_client(
                             store_name, role=RankRole.PUBLISHER, address=other.address
                         )
                     )
@@ -3524,17 +3515,17 @@ class _ShutdownOnRecord(dict):
 
 @pytest.mark.timeout(60)
 def test_a_shutdown_due_right_after_a_dialed_selection_leaves_nothing(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Leave no record or cached client, and close the dial, when shutdown follows its step."""
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
     records = _ShutdownOnRecord()
     monkeypatch.setattr(store_api, "_control_plane_map", records)
 
     async def run() -> None:
         async with _other_service(store_name, service_strategy) as other:
-            client = await ts.client(
+            client = await rank_client(
                 store_name, role=RankRole.PUBLISHER, address=other.address
             )
             assert records.task is not None
@@ -3547,11 +3538,212 @@ def test_a_shutdown_due_right_after_a_dialed_selection_leaves_nothing(
 
 
 @pytest.mark.timeout(60)
+def test_a_client_built_on_a_racing_calls_record_reads_records_through_that_record(
+    monkeypatch, service_strategy, rank_client
+) -> None:
+    """Rebind the volume host of a client built on a racing call's record to that record.
+
+    Two requesters race through one address, and ``reset_client`` drops the first's client before
+    the second records. The second closes its own dial, so a record read through it would fail
+    on a closed plane. Through the record, the read fails only on the missing record.
+    """
+    _patch_actors(monkeypatch, rank=None)
+    store_name = _store_name()
+    dials: list[ServiceControlPlane] = []
+    both_dialed, second_may_read = asyncio.Event(), asyncio.Event()
+    connect, read = ServiceAddress.connect, ServiceControlPlane.strategy
+
+    async def dial(address: ServiceAddress) -> ServiceControlPlane:
+        plane = await connect(address)
+        dials.append(plane)
+        if len(dials) == 2:
+            both_dialed.set()
+        return plane
+
+    async def strategy(plane: ServiceControlPlane) -> ts.TorchStoreStrategy:
+        await both_dialed.wait()
+        result = await read(plane)
+        if plane is dials[1]:
+            await second_may_read.wait()
+        return result
+
+    monkeypatch.setattr(ServiceAddress, "connect", dial)
+    monkeypatch.setattr(ServiceControlPlane, "strategy", strategy)
+
+    async def run() -> None:
+        async with _other_service(store_name, service_strategy) as other:
+            kwargs = {"role": RankRole.REQUESTER, "group": 0, "address": other.address}
+            calls = [
+                asyncio.ensure_future(rank_client(store_name, **kwargs))
+                for _ in range(2)
+            ]
+            try:
+                done, pending = await asyncio.wait(
+                    calls, timeout=30, return_when=asyncio.FIRST_COMPLETED
+                )
+                ts.reset_client(store_name)
+                second_may_read.set()
+                [first], [second] = done, pending
+                first, second = first.result(), await asyncio.wait_for(second, 30)
+                kept = store_api._control_plane_map[store_name].control_plane
+                assert first._control_plane is second._control_plane is kept
+                assert kept is dials[0]
+                with pytest.raises(RuntimeError, match="is closed"):
+                    await dials[1].volume_records(["publisher/0"])
+                with pytest.raises(KeyError, match="publisher/0"):
+                    await second.strategy._prepare_volumes(["publisher/0"])
+            finally:
+                await _release(store_name)
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(60)
+def test_a_racing_client_on_a_plane_without_volume_records_keeps_its_hosts_resolver(
+    monkeypatch, rank_client
+) -> None:
+    """Leave the volume host of a client built on a racing call's record unbound when that plane shares no records.
+
+    Such a plane may still install a carrier volume host that nothing could rebind. The client
+    then reads records through its own plane's resolver.
+    """
+    _patch_actors(monkeypatch, rank=None)
+    store_name = _store_name()
+    planes: list[Any] = []
+    resolvers: list[Callable[..., Awaitable[dict[str, bytes]]]] = []
+    both_dialed, second_may_read = asyncio.Event(), asyncio.Event()
+
+    async def connect() -> ControlPlane:
+        plane = Mock(spec=ControlPlane)
+        plane.close = AsyncMock()
+        index = len(planes)
+        planes.append(plane)
+        if len(planes) == 2:
+            both_dialed.set()
+
+        async def records(volume_ids: Iterable[str]) -> dict[str, bytes]:
+            return {}
+
+        async def strategy() -> ts.TorchStoreStrategy:
+            await both_dialed.wait()
+            read = ts.TorchStoreStrategy()
+            read.set_volume_host(CarrierVolumeHost(records))
+            if index == 1:
+                await second_may_read.wait()
+            return read
+
+        resolvers.append(records)
+        plane.strategy = strategy
+        return plane
+
+    host_id = uuid.uuid4().hex
+    monkeypatch.setitem(_HOSTS, host_id, connect)
+    address = _RegistryAddress(store_name, host_id)
+
+    async def run() -> None:
+        kwargs = {"role": RankRole.REQUESTER, "group": 0, "address": address}
+        calls = [
+            asyncio.ensure_future(rank_client(store_name, **kwargs)) for _ in range(2)
+        ]
+        try:
+            done, pending = await asyncio.wait(
+                calls, timeout=30, return_when=asyncio.FIRST_COMPLETED
+            )
+            ts.reset_client(store_name)
+            second_may_read.set()
+            [first], [second] = done, pending
+            first, second = first.result(), await asyncio.wait_for(second, 30)
+            assert first._control_plane is second._control_plane is planes[0]
+            host = _installed_volume_host(second.strategy)
+            assert isinstance(host, CarrierVolumeHost)
+            assert host._resolver is resolvers[1]
+            planes[1].close.assert_awaited_once_with()
+        finally:
+            await _release(store_name)
+
+    asyncio.run(run())
+
+
+class _Abandoned(BaseException):
+    """Not an Exception: what a plane's strategy() turns a closed build's GeneratorExit into."""
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("converted", ["exception", "base_exception"])
+def test_a_build_closed_off_its_task_reraises_what_its_plane_turns_the_close_into(
+    monkeypatch, caplog, converted
+) -> None:
+    """Re-raise, closing nothing, what a dialed plane's strategy() makes of a closed build's GeneratorExit.
+
+    The close runs off the build's task as the GC's does, where closing the dial would need an
+    event loop. So the closer gets the plane's own error, and no close is started or logged.
+    """
+    caplog.set_level(logging.WARNING, logger=store_api.__name__)
+    _patch_actors(monkeypatch)
+    store_name = _store_name()
+    entered = threading.Event()
+    plane = Mock(spec=ControlPlane)
+    plane.close = AsyncMock()
+    error = RuntimeError("converted the close") if converted == "exception" else None
+
+    async def converting_strategy() -> ts.TorchStoreStrategy:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except GeneratorExit:
+            raise (error or _Abandoned()) from None
+        raise AssertionError("the strategy answered")
+
+    plane.strategy = converting_strategy
+
+    async def connect() -> ControlPlane:
+        return plane
+
+    host_id = uuid.uuid4().hex
+    monkeypatch.setitem(_HOSTS, host_id, connect)
+    address = _RegistryAddress(store_name, host_id)
+    build = ts.client(store_name, role=RankRole.REQUESTER, group=0, address=address)
+    loop = asyncio.new_event_loop()
+    runner = threading.Thread(target=loop.run_forever, daemon=True)
+    runner.start()
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        loop.call_soon_threadsafe(lambda: tasks.append(loop.create_task(build)))
+        assert entered.wait(30)
+    finally:
+        # Stopped and closed on every outcome. A loop thread blocked in a call keeps running
+        # with its loop open so that the case's own failure is the one reported.
+        loop.call_soon_threadsafe(loop.stop)
+        runner.join(30)
+        if not runner.is_alive():
+            loop.close()
+    raised: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            build.close()
+        except BaseException as closing:
+            raised.append(closing)
+
+    # A thread with no event loop, like a GC that runs off the build's task.
+    closer = threading.Thread(target=close)
+    closer.start()
+    closer.join(30)
+    [closing_error] = raised
+    if error is not None:
+        assert closing_error is error
+    else:
+        assert type(closing_error) is _Abandoned
+    plane.close.assert_not_called()
+    assert [r for r in caplog.records if r.name == store_api.__name__] == []
+
+
+@pytest.mark.timeout(60)
 def test_a_shutdown_due_right_after_an_instance_client_step_leaves_nothing(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Leave no record or cached client when shutdown follows a step on a caller's instance."""
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
     records = _ShutdownOnRecord()
     monkeypatch.setattr(store_api, "_control_plane_map", records)
@@ -3560,7 +3752,7 @@ def test_a_shutdown_due_right_after_an_instance_client_step_leaves_nothing(
         async with _other_service(store_name, service_strategy) as other:
             handle = await other.address.connect()
             try:
-                await ts.client(
+                await rank_client(
                     store_name, role=RankRole.PUBLISHER, control_plane=handle
                 )
                 assert records.task is not None
@@ -3576,10 +3768,10 @@ def test_a_shutdown_due_right_after_an_instance_client_step_leaves_nothing(
 
 @pytest.mark.timeout(60)
 def test_a_shutdown_due_right_after_a_reused_record_step_leaves_nothing(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Leave no record, client or owned service when shutdown follows a step on the record."""
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
 
     async def run() -> None:
@@ -3594,7 +3786,8 @@ def test_a_shutdown_due_right_after_a_reused_record_step_leaves_nothing(
             return result
 
         handle.strategy = strategy_then_shutdown
-        client = await ts.client(store_name, role=RankRole.PUBLISHER)
+        # A requester, since a publisher's volume start awaits before the step.
+        client = await rank_client(store_name, role=RankRole.REQUESTER, group=0)
         await shutting_down[0]
         assert store_api._control_plane_map == store_api._local_clent_map == {}
         assert store_api._owned_service_map == {}
@@ -3606,10 +3799,10 @@ def test_a_shutdown_due_right_after_a_reused_record_step_leaves_nothing(
 
 @pytest.mark.timeout(60)
 def test_a_shutdown_due_right_after_an_adopting_step_leaves_nothing(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Leave no record or client when shutdown follows a dial that adopts the recorded one."""
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
     dial = ServiceAddress.connect
 
@@ -3638,7 +3831,7 @@ def test_a_shutdown_due_right_after_an_adopting_step_leaves_nothing(
         async with _other_service(store_name, service_strategy) as other:
             calls = [
                 asyncio.ensure_future(
-                    ts.client(
+                    rank_client(
                         store_name, role=RankRole.PUBLISHER, address=other.address
                     )
                 )
@@ -3742,19 +3935,19 @@ class _ShutdownOnRead(dict):
 
 @pytest.mark.timeout(60)
 def test_a_shutdown_due_right_after_a_cached_read_returns_the_cached_client(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Return the cached client when a shutdown is due right after the cached read."""
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
     clients = _ShutdownOnRead()
     monkeypatch.setattr(store_api, "_local_clent_map", clients)
 
     async def run() -> None:
         address = await _initialize_service(store_name, service_strategy)
-        first = await ts.client(store_name, role=RankRole.PUBLISHER, address=address)
+        first = await rank_client(store_name, role=RankRole.PUBLISHER, address=address)
         clients.armed = True
-        again = await ts.client(store_name, role=RankRole.PUBLISHER, address=address)
+        again = await rank_client(store_name, role=RankRole.PUBLISHER, address=address)
         assert again is first
         assert clients.task is not None
         await clients.task
@@ -3766,10 +3959,10 @@ def test_a_shutdown_due_right_after_a_cached_read_returns_the_cached_client(
 
 @pytest.mark.timeout(60)
 def test_dialed_connections_close_when_replaced_or_redundant(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Share one connection among racing first calls, and close a record another replaces."""
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
     dials = _Dials(monkeypatch)
 
@@ -3781,7 +3974,7 @@ def test_dialed_connections_close_when_replaced_or_redundant(
                 # Each call gets its own copy of the address, as Monarch endpoints do.
                 clients = await asyncio.gather(
                     *(
-                        ts.client(
+                        rank_client(
                             store_name,
                             role=RankRole.PUBLISHER,
                             address=pickle.loads(pickle.dumps(first.address)),
@@ -3801,7 +3994,7 @@ def test_dialed_connections_close_when_replaced_or_redundant(
                         "publisher/0", "model", _layout()
                     )
                 ts.reset_client(store_name)
-                await ts.client(
+                await rank_client(
                     store_name, role=RankRole.PUBLISHER, address=second.address
                 )
                 assert dials.closes[recorded] == 1
@@ -3814,7 +4007,7 @@ def test_dialed_connections_close_when_replaced_or_redundant(
                 )
                 # The dialed connection passed back in keeps its record, open.
                 ts.reset_client(store_name)
-                await ts.client(
+                await rank_client(
                     store_name, role=RankRole.PUBLISHER, control_plane=connection
                 )
                 assert store_api._control_plane_map[store_name] == (
@@ -3875,11 +4068,23 @@ def test_a_dial_through_an_address_that_only_prints_like_the_record_replaces_it(
     actors.lookup.assert_not_called()
 
 
+# Helpers whose map steps count as their caller's. Their names are read off the functions: a rename fails at load.
+_HELPERS = (store_api._drop_client.__name__, store_api._keep_dropped.__name__)
+
+
+def _caller(depth: int) -> str:
+    """The function ``depth`` frames up that called a map step, past ``_HELPERS``."""
+    frame = sys._getframe(depth + 1)
+    while frame.f_code.co_name in _HELPERS and frame.f_back is not None:
+        frame = frame.f_back
+    return frame.f_code.co_name
+
+
 class _Recording:
     """Records each access's caller and whether the selection lock was held.
 
-    The caller is the first frame outside the container's own methods and the ``collections.abc`` mixins, and for
-    ``reset_client``'s pop the function that called ``reset_client``.
+    The caller is the first frame outside the container's own methods, the ``collections.abc`` mixins and
+    ``_HELPERS``.
     """
 
     def __init__(self, name: str, calls: list[tuple[str, str, str, bool]]) -> None:
@@ -3890,9 +4095,8 @@ class _Recording:
         while frame.f_back is not None and (
             frame.f_locals.get("self") is self
             or frame.f_globals.get("__name__") == "_collections_abc"
+            or frame.f_code.co_name in _HELPERS
         ):
-            frame = frame.f_back
-        if frame.f_code.co_name == "reset_client" and frame.f_back is not None:
             frame = frame.f_back
         locked = store_api._selection_lock.locked()
         self.calls.append((self.name, op, frame.f_code.co_name, locked))
@@ -3924,6 +4128,10 @@ class _LockChecked(_Recording, MutableMapping[str, Any]):
     def __len__(self) -> int:
         self._record("len")
         return len(self.data)
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        self._record("setdefault")
+        return super().setdefault(key, default)
 
     def __contains__(self, key: object) -> bool:
         self._record("in")
@@ -3962,14 +4170,30 @@ class _LockCheckedSet(_Recording, MutableSet[str]):
         self.data.discard(value)
 
 
+def _lock_checked_step(
+    name: str, step: Callable[..., Any], calls: list[tuple[str, str, str, bool]]
+) -> Callable[..., Any]:
+    """``step``, recording each call from ``torchstore.api`` with its caller and the lock's state."""
+
+    def checked(*args: Any, **kwargs: Any) -> Any:
+        caller = sys._getframe(1)
+        if caller.f_globals.get("__name__") == store_api.__name__:
+            locked = store_api._selection_lock.locked()
+            calls.append(("volumes", name, caller.f_code.co_name, locked))
+        return step(*args, **kwargs)
+
+    return checked
+
+
 @pytest.mark.timeout(60)
 def test_every_selection_step_holds_the_selection_lock(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Hold the lock wherever a selection step this case drives changes, reads or checks the selection maps or released stores.
 
-    A client's reads before it builds or looks up a controller hold it too. So none sees a step half done. The lock's
-    comment lets a later shutdown's read of the released stores and ``reset_client``'s own drop of a client take none.
+    Volume steps and a client's reads before it builds or looks up a controller hold it too. So none sees a step half
+    done. The lock's comment lets only ``reset_client`` (which drops a client and keeps its host) and a later
+    shutdown's read of the released stores take none.
     """
     actors = _patch_actors(monkeypatch)
     actors.lookup.side_effect = None
@@ -3985,6 +4209,16 @@ def test_every_selection_step_holds_the_selection_lock(
     monkeypatch.setattr(
         store_api, "_released_stores", _LockCheckedSet("released", calls)
     )
+    # Its lists record removals too (a shutdown's included).
+    monkeypatch.setattr(
+        store_api, "_dropped_carriers", _DroppedLockChecked("dropped", calls)
+    )
+    for owner, name in (
+        (service_module.CarrierServiceBackend, "stop_publisher_volumes"),
+        (carrier_volumes.PublisherVolume, "current"),
+    ):
+        step = _lock_checked_step(name, getattr(owner, name), calls)
+        monkeypatch.setattr(owner, name, step)
     service, monarch, standard, initialized = (_store_name() for _ in range(4))
     dialed, given = _store_name(), _store_name()
     plane = Mock(spec=ControlPlane)
@@ -3992,8 +4226,9 @@ def test_every_selection_step_holds_the_selection_lock(
 
     async def run() -> None:
         await _initialize_service(service, service_strategy)
-        await ts.client(service, role=RankRole.PUBLISHER)
-        await ts.client(service, role=RankRole.PUBLISHER)
+        await rank_client(service, role=RankRole.PUBLISHER)
+        await rank_client(service, role=RankRole.PUBLISHER)
+        ts.reset_client(service)
         await ts.client(monarch, role=RankRole.PUBLISHER)
         await ts.client(standard)
         # A standard store has no address for its ranks.
@@ -4001,25 +4236,97 @@ def test_every_selection_step_holds_the_selection_lock(
         await ts.shutdown(service)
         # The client step's other branches: a dial through an address, a caller's instance.
         async with _other_service(dialed, service_strategy) as other:
-            await ts.client(dialed, role=RankRole.PUBLISHER, address=other.address)
+            await rank_client(dialed, role=RankRole.PUBLISHER, address=other.address)
             await ts.shutdown(dialed)
         await ts.client(given, role=RankRole.PUBLISHER, control_plane=plane)
         await ts.shutdown(given)
 
     asyncio.run(run())
-    assert {call[:3] for call in calls if not call[3]} == set()
+    assert {call[:3] for call in calls if not call[3]} == {
+        ("clients", "getitem", "reset_client"),
+        ("clients", "del", "reset_client"),
+        ("dropped", "setdefault", "reset_client"),
+    }
     assert {
         ("records", "get", "_routing_client"),
         ("records", "get", "_check_cached_client"),
         ("records", "in", "_check_unrecorded"),
         ("clients", "getitem", "_shutdown_selected"),
+        ("clients", "getitem", "_initialize_routing"),
         ("forked", "get", "_check_not_forked"),
         ("forked", "getitem", "_select_control_plane"),
         ("forked", "getitem", "_shutdown_selected"),
         ("released", "discard", "initialize"),
         ("released", "add", "_shutdown_selected"),
         ("released", "in", "_check_unrecorded"),
+        ("dropped", "get", "_close_collected_carriers"),
+        ("dropped", "get", "_shutdown_selected"),
+        ("dropped", "del", "_shutdown_selected"),
+        ("volumes", "stop_publisher_volumes", "_shutdown_selected"),
+        ("volumes", "current", "_routing_client"),
     } <= {call[:3] for call in calls if call[3]}
+
+
+class _LockCheckedList(list):
+    """A store's list of dropped clients, recording each removal's caller and the lock's state."""
+
+    def __init__(self, calls: list[tuple[str, str, str, bool]]) -> None:
+        super().__init__()
+        self.calls = calls
+
+    def remove(self, value: Any) -> None:
+        locked = store_api._selection_lock.locked()
+        self.calls.append(("dropped", "remove", _caller(1), locked))
+        super().remove(value)
+
+    def __delitem__(self, index: Any) -> None:
+        locked = store_api._selection_lock.locked()
+        self.calls.append(("dropped", "del", _caller(1), locked))
+        super().__delitem__(index)
+
+
+class _DroppedLockChecked(_LockChecked):
+    """The dropped clients' map, whose lists record their removals."""
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        self._record("setdefault")
+        return self.data.setdefault(key, _LockCheckedList(self.calls))
+
+
+@pytest.mark.timeout(120)
+def test_rewriting_a_stores_dropped_clients_holds_the_selection_lock(
+    monkeypatch, service_strategy, rank_client
+) -> None:
+    """Remove a store's collected dropped clients under the selection lock as builds after them do.
+
+    The case above instruments that map but never reaches its removals.
+    """
+    _patch_actors(monkeypatch, rank=None)
+    calls: list[tuple[str, str, str, bool]] = []
+    monkeypatch.setattr(
+        store_api, "_dropped_carriers", _DroppedLockChecked("dropped", calls)
+    )
+
+    async def run() -> None:
+        # Builds after collected dropped clients: the third and fourth rewrite the dropped list.
+        store_name = _store_name()
+        await _initialize_service(store_name, service_strategy)
+        try:
+            for _ in range(3):
+                await rank_client(store_name, role=RankRole.REQUESTER, group=0)
+                ts.reset_client(store_name)
+                gc.collect()
+            await rank_client(store_name, role=RankRole.REQUESTER, group=0)
+        finally:
+            await ts.shutdown(store_name)
+
+    asyncio.run(run())
+    # reset_client appends without the lock, which the case above checks too.
+    unlocked = {call[:3] for call in calls if not call[3]}
+    assert unlocked == {("dropped", "setdefault", "reset_client")}
+    assert ("dropped", "remove", "_close_collected_carriers") in {
+        call[:3] for call in calls if call[3]
+    }
 
 
 class _CountingLock:
@@ -4118,9 +4425,12 @@ def test_each_initialize_and_shutdown_takes_the_selection_lock_once(
 
 @pytest.mark.timeout(60)
 def test_each_client_takes_the_selection_lock_once_per_step(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
-    """Take the lock once per step: twice for a standard client and three times for a routing one."""
+    """Take the lock once per step: twice for a standard client and three times for a Monarch routing one.
+
+    One on a recorded or dialed plane takes it once more, to read the dropped clients whose hosts it closes.
+    """
     actors = _patch_actors(monkeypatch)
     actors.lookup.side_effect = None
     actors.lookup.return_value = _controller_stub()
@@ -4139,24 +4449,24 @@ def test_each_client_takes_the_selection_lock_once_per_step(
         address = await _initialize_service(service, service_strategy)
         try:
             # On the driver's record, then through the address once the client is reset.
-            taken.append(await lock.taken_by(ts.client(service, role=role)))
+            taken.append(await lock.taken_by(rank_client(service, role=role)))
             ts.reset_client(service)
             taken.append(
-                await lock.taken_by(ts.client(service, role=role, address=address))
+                await lock.taken_by(rank_client(service, role=role, address=address))
             )
         finally:
             await _clean_up(lambda: _release(service))
         return taken
 
-    assert asyncio.run(run()) == [2, 3, 3, 3]
+    assert asyncio.run(run()) == [2, 3, 4, 4]
 
 
 @pytest.mark.timeout(60)
 def test_closes_run_after_the_selection_lock_is_released(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Close what each selection or shutdown replaced only after its step releases the lock."""
-    actors = _patch_actors(monkeypatch)
+    actors = _patch_actors(monkeypatch, rank=None)
     actors.lookup.side_effect = None
     actors.lookup.return_value = _controller_stub()
     closes: list[tuple[str, bool]] = []
@@ -4181,7 +4491,7 @@ def test_closes_run_after_the_selection_lock_is_released(
             try:
                 initialized = _initialize_service(store_name, service_strategy)
                 assert await closed_by(initialized) == []
-                dialed = ts.client(
+                dialed = rank_client(
                     store_name, role=RankRole.PUBLISHER, address=other.address
                 )
                 assert await closed_by(dialed) == [handle]
@@ -4194,10 +4504,10 @@ def test_closes_run_after_the_selection_lock_is_released(
 
 @pytest.mark.timeout(60)
 def test_a_cancelled_build_on_the_record_keeps_it_open(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Keep the record, the driver's own handle, open when a build that reuses it is cancelled."""
-    actors = _patch_actors(monkeypatch)
+    actors = _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
 
     async def run() -> None:
@@ -4206,7 +4516,7 @@ def test_a_cancelled_build_on_the_record_keeps_it_open(
         try:
             asked, answer = _hold_strategy(handle)
             building = asyncio.ensure_future(
-                ts.client(store_name, role=RankRole.PUBLISHER)
+                rank_client(store_name, role=RankRole.PUBLISHER)
             )
             await asyncio.wait_for(asked.wait(), 30)
             building.cancel()
@@ -4215,7 +4525,7 @@ def test_a_cancelled_build_on_the_record_keeps_it_open(
             answer.set()
             assert not handle._closed
             assert _service_handle(store_name) is handle
-            client = await ts.client(store_name, role=RankRole.PUBLISHER)
+            client = await rank_client(store_name, role=RankRole.PUBLISHER)
             assert client._control_plane is handle
         finally:
             await _clean_up(lambda: _release(store_name))
@@ -4226,10 +4536,10 @@ def test_a_cancelled_build_on_the_record_keeps_it_open(
 
 @pytest.mark.timeout(60)
 def test_a_failed_log_after_a_selection_still_closes_what_it_replaced(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Close the replaced handle even when the step after the client's selection fails."""
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
 
     async def run() -> None:
@@ -4243,7 +4553,7 @@ def test_a_failed_log_after_a_selection_still_closes_what_it_replaced(
                 ):
                     replaced = _service_handle(store_name)
                     with pytest.raises(RuntimeError, match="log failed"):
-                        await ts.client(
+                        await rank_client(
                             store_name, role=RankRole.PUBLISHER, address=other.address
                         )
                     with pytest.raises(RuntimeError, match="is closed"):
@@ -4258,11 +4568,11 @@ def test_a_failed_log_after_a_selection_still_closes_what_it_replaced(
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("error", [ConnectionResetError, RuntimeError])
 def test_a_failing_close_after_a_client_selection_only_logs(
-    monkeypatch, caplog, service_strategy, error
+    monkeypatch, caplog, service_strategy, error, rank_client
 ) -> None:
     """Keep a client's selection when closing the record it replaced fails, and log it."""
     caplog.set_level(logging.WARNING, logger=store_api.logger.name)
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
 
     async def run() -> None:
@@ -4272,7 +4582,7 @@ def test_a_failing_close_after_a_client_selection_only_logs(
             close = handle.close
             try:
                 handle.close = AsyncMock(side_effect=error("gone"))
-                client = await ts.client(
+                client = await rank_client(
                     store_name, role=RankRole.PUBLISHER, address=other.address
                 )
                 assert store_api._control_plane_map[store_name].address == other.address
@@ -4335,13 +4645,13 @@ def test_a_shutdown_cancelled_closing_the_handle_still_stops_its_service(
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize("failing", ["handle", "service"])
 def test_shutdown_releases_a_service_store_before_a_close_fails(
-    monkeypatch, service_strategy, failing
+    monkeypatch, service_strategy, failing, rank_client
 ) -> None:
     """Drop the record, client and owned service first, close both, then raise the failure.
 
     A failing handle close still stops the service.
     """
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
 
     async def run() -> None:
@@ -4355,7 +4665,7 @@ def test_shutdown_releases_a_service_store_before_a_close_fails(
             raise OSError("service failed")
 
         try:
-            await ts.client(store_name, role=RankRole.PUBLISHER)
+            await rank_client(store_name, role=RankRole.PUBLISHER)
             if failing == "handle":
                 failure = ConnectionResetError("handle failed")
                 handle.close = AsyncMock(side_effect=failure)
@@ -4378,13 +4688,15 @@ def test_shutdown_releases_a_service_store_before_a_close_fails(
 
 
 @pytest.mark.timeout(60)
-def test_service_selection_lines(monkeypatch, caplog, service_strategy) -> None:
+def test_service_selection_lines(
+    monkeypatch, caplog, service_strategy, rank_client
+) -> None:
     """Log the driver's line with the address, one per new client and none when cached.
 
     The driver builds its clients on its record, also when given its own address.
     """
     caplog.set_level(logging.INFO)
-    _patch_actors(monkeypatch)
+    _patch_actors(monkeypatch, rank=None)
     store_name = _store_name()
     dial = patch.object(
         ServiceAddress, "connect", autospec=True, side_effect=ServiceAddress.connect
@@ -4394,10 +4706,10 @@ def test_service_selection_lines(monkeypatch, caplog, service_strategy) -> None:
         address = await _initialize_service(store_name, service_strategy)
         try:
             with dial as dials:
-                await ts.client(store_name, role=RankRole.PUBLISHER)
+                await rank_client(store_name, role=RankRole.PUBLISHER)
                 ts.reset_client(store_name)
                 copy = pickle.loads(pickle.dumps(address))
-                await ts.client(
+                await rank_client(
                     store_name, role=RankRole.REQUESTER, group=0, address=copy
                 )
                 await ts.client(store_name)
@@ -4414,16 +4726,148 @@ def test_service_selection_lines(monkeypatch, caplog, service_strategy) -> None:
     ]
 
 
+class _Subclass(ts.TorchStoreStrategy):
+    """A strategy subclass, which volume servers refuse, since a config names only a transport."""
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize(
+    ("strategy", "error", "message"),
+    [
+        (_Subclass(TransportType.MonarchRPC), TypeError, "not _Subclass$"),
+        (ts.LocalRankStrategy(), TypeError, "not LocalRankStrategy$"),
+        (ts.TorchStoreStrategy(TransportType.NIXL), ValueError, "not NIXL$"),
+        (
+            ts.TorchStoreStrategy(TransportType.TorchComms),
+            ValueError,
+            "not TorchComms$",
+        ),
+        (
+            ts.TorchStoreStrategy(TransportType.MonarchRDMA),
+            ValueError,
+            "not MonarchRDMA$",
+        ),
+        (ts.TorchStoreStrategy(cast(Any, "Gloo")), ValueError, "not 'Gloo'$"),
+        (ts.TorchStoreStrategy(cast(Any, ["Gloo"])), ValueError, r"not \['Gloo'\]$"),
+        (ts.TorchStoreStrategy(cast(Any, "X" * 100)), ValueError, "not 'X{63}$"),
+    ],
+    ids=[
+        "subclass",
+        "local_rank",
+        "nixl",
+        "torchcomms",
+        "monarch_rdma",
+        "not_a_type",
+        "unhashable",
+        "long_value",
+    ],
+)
+def test_service_initialize_refuses_what_volume_servers_cannot_carry_before_starting(
+    monkeypatch, strategy, error, message
+) -> None:
+    """Refuse a strategy subclass or a transport volume servers lack before any service starts."""
+    actors = _patch_actors(monkeypatch)
+    start = AsyncMock(side_effect=AssertionError("a service started"))
+    monkeypatch.setattr(CoordinatorService, "start", start)
+    store_name = _store_name()
+    with pytest.raises(error, match=message):
+        asyncio.run(_initialize(store_name, "service", strategy=strategy))
+    start.assert_not_called()
+    actors.spawn.assert_not_called()
+    actors.lookup.assert_not_called()
+    assert store_api._control_plane_map == store_api._owned_service_map == {}
+
+
+@pytest.mark.timeout(60)
+def test_a_callers_plane_that_shares_volume_records_spawns_no_volume(
+    monkeypatch, service_strategy
+) -> None:
+    """Spawn no volume for a caller's plane that shares volume records, refusing a subclass first.
+
+    The driver refuses it before the plane's own init runs, which would refuse it too.
+    """
+    actors = _patch_actors(monkeypatch)
+    store_name = _store_name()
+
+    async def run() -> None:
+        service = await CoordinatorService.start(store_name, host=_LOCALHOST)
+        handle = await service.connect()
+        init = AsyncMock(wraps=handle.init)
+        handle.init = init  # type: ignore[method-assign]
+        try:
+            with pytest.raises(TypeError, match="not LocalRankStrategy$"):
+                await _initialize(store_name, handle, strategy=ts.LocalRankStrategy())
+            init.assert_not_awaited()
+            assert service._adapter.registry._publishers is None
+            assert (
+                await _initialize(store_name, handle, strategy=service_strategy) is None
+            )
+            assert store_api._control_plane_map[store_name] == (handle, None)
+            assert service._adapter.registry._publishers is not None
+            init.assert_awaited_once()
+        finally:
+            await _release(store_name)
+            await _close_all([handle, service])
+
+    asyncio.run(run())
+    actors.spawn.assert_not_called()
+    actors.lookup.assert_not_called()
+
+
+@pytest.mark.timeout(60)
+def test_service_logs_one_volume_line_per_new_publisher_client(
+    monkeypatch, caplog, service_strategy, rank_client
+) -> None:
+    """Log one ``routing volume=`` line, with its server and pid, per new publisher client.
+
+    A client made again on the running volume logs its own. Requesters and cached clients log none.
+    """
+    caplog.set_level(logging.INFO)
+    _patch_actors(monkeypatch, rank=None)
+    store_name = _store_name()
+
+    async def run() -> CarrierAddress:
+        await _initialize_service(store_name, service_strategy, publishers=2)
+        try:
+            publisher = await rank_client(store_name, rank=1, role=RankRole.PUBLISHER)
+            again = await rank_client(store_name, rank=1, role=RankRole.PUBLISHER)
+            assert again is publisher
+            [volume] = carrier_volumes._publishers.values()
+            ts.reset_client(store_name)
+            remade = await rank_client(store_name, rank=1, role=RankRole.PUBLISHER)
+            assert remade is not publisher
+            assert list(carrier_volumes._publishers.values()) == [volume]
+            ts.reset_client(store_name)
+            await rank_client(store_name, rank=0, role=RankRole.REQUESTER, group=0)
+            await ts.client(store_name)
+            assert volume.address is not None
+            return volume.address
+        finally:
+            await _release(store_name)
+
+    carrier = asyncio.run(run())
+    volume_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "routing volume=" in record.getMessage()
+    ]
+    line = f"routing volume=publisher/1 carrier={_LOCALHOST}:{carrier.port} pid={os.getpid()}"
+    assert volume_lines == [line, line]
+    assert carrier.host == _LOCALHOST
+    ranks = [line[3] for line in _selection_lines(caplog)]
+    assert ranks == ["-", "publisher/1", "publisher/1", "requester/0/0"]
+
+
 @pytest.mark.timeout(60)
 def test_the_fork_hook_names_a_caller_held_handle_and_skips_standard_clients(
-    monkeypatch, service_strategy
+    monkeypatch, service_strategy, rank_client
 ) -> None:
     """Run the API's fork hook here: name a caller's coordinator handle, keep standard clients.
 
-    The handle's record has no address and its store no client, so only the handle can name
-    the store, and a standard client cached before the service stores stays.
+    The handle alone names its store, which has no client and an address-less record. A standard
+    client cached first stays, and dropped clients leave the map, so the child's shutdown closes none.
     """
-    actors = _patch_actors(monkeypatch)
+    actors = _patch_actors(monkeypatch, rank=None)
     actors.lookup.side_effect = None
     actors.lookup.return_value = _controller_stub()
     # The hook keeps what it drops in this list, which is restored.
@@ -4438,9 +4882,11 @@ def test_the_fork_hook_names_a_caller_held_handle_and_skips_standard_clients(
         service = store_api._owned_service_map[store_name]
         async with _other_service(held, service_strategy) as other:
             handle = await other.address.connect()
+            dropped: list[Any] = []
             try:
-                await ts.client(held, role=RankRole.PUBLISHER, control_plane=handle)
+                await rank_client(held, role=RankRole.PUBLISHER, control_plane=handle)
                 ts.reset_client(held)
+                dropped = list(store_api._dropped_carriers[held])
                 # The hook frees the lock the fork held, here one held for it.
                 fork_lock = threading.Lock()
                 fork_lock.acquire()
@@ -4454,9 +4900,14 @@ def test_the_fork_hook_names_a_caller_held_handle_and_skips_standard_clients(
                 # Kept: it must never be freed before the rendezvous module's hook keeps its TCPStore.
                 assert any(kept is service for kept in store_api._inherited)
                 assert store_api._local_clent_map == {standard: standard_client}
+                assert store_api._dropped_carriers == {}
+                assert dropped and all(
+                    entry in store_api._inherited for entry in dropped
+                )
             finally:
                 failing = sys.exc_info()[1] is not None
-                await _close_all([handle, driver, service], failing)
+                hosts = [host for _, host in dropped]
+                await _close_all([*hosts, handle, driver, service], failing)
 
     asyncio.run(run())
 
@@ -4667,7 +5118,10 @@ def test_an_initialize_recording_after_an_overlapping_service_initialize_is_refu
 def test_a_service_initialize_raises_the_refusal_of_a_strategy_class_defined_in_a_function(
     monkeypatch, service_strategy, started_services
 ) -> None:
-    """Raise the TCPStore rendezvous's refusal of a strategy class without an importable name, and keep no service."""
+    """Refuse a strategy class defined in a function before a service starts.
+
+    Volume servers take only a plain ``TorchStoreStrategy``.
+    """
     _patch_actors(monkeypatch)
     store_name = _store_name()
 
@@ -4675,13 +5129,13 @@ def test_a_service_initialize_raises_the_refusal_of_a_strategy_class_defined_in_
         pass
 
     async def run() -> None:
-        refused: tuple[type[Exception], ...] = (AttributeError, pickle.PicklingError)
-        with pytest.raises(refused, match="local"):
+        with pytest.raises(
+            TypeError, match=r"plain TorchStoreStrategy, not .*<locals>"
+        ):
             await _initialize(
                 store_name, "service", strategy=LocalStrategy(TransportType.MonarchRPC)
             )
-        [service] = started_services
-        assert (service._server, service._rendezvous) == (None, None)
+        assert started_services == []
         assert store_api._control_plane_map == store_api._owned_service_map == {}
 
     asyncio.run(run())
@@ -4759,3 +5213,319 @@ def test_a_failed_service_initialize_leaves_no_server(
             assert "stopping the coordinator service on" in warned
 
     asyncio.run(run())
+
+
+def test_the_api_finds_no_carrier_host_before_the_service_backend_loads(
+    monkeypatch,
+) -> None:
+    """Report no carrier volume host while the service backend has not loaded, for a drop too.
+
+    A standard store's shutdown then neither loads the backend nor asks it for volumes to stop.
+    """
+    actors = _patch_actors(monkeypatch)
+    controller = _controller_stub()
+    actors.lookup.side_effect = None
+    actors.lookup.return_value = controller
+    monkeypatch.delitem(backend_module._backends, "service")
+    monkeypatch.delitem(backend_module._registered, "service")
+    strategy = ts.TorchStoreStrategy()
+    strategy.set_volume_host(CarrierVolumeHost(AsyncMock()))
+    assert store_api._volume_host(strategy) is None
+    store_name = _store_name()
+    monkeypatch.setitem(
+        store_api._local_clent_map,
+        store_name,
+        cast(LocalClient, SimpleNamespace(strategy=strategy)),
+    )
+    ts.reset_client(store_name)
+    assert store_api._local_clent_map == store_api._dropped_carriers == {}
+    # The service module stays imported, and a lookup through it would fail on the missing entry.
+    asyncio.run(ts.shutdown(store_name))
+    controller.teardown.call.assert_awaited_once_with()
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("close", ["failing", "cancelled"])
+def test_a_shutdown_finding_only_dropped_clients_closes_their_hosts_before_the_teardown(
+    monkeypatch, caplog, close
+) -> None:
+    """Close the hosts of a store's dropped clients before tearing it down when shutdown found only those.
+
+    A process holds such clients after it dialed a service store and then initialized the name on Monarch. A
+    failing close only logs. A shutdown cancelled during the close raises and tears nothing down.
+    """
+    caplog.set_level(logging.WARNING, logger=store_api.__name__)
+    actors = _patch_actors(monkeypatch)
+    controller = _controller_stub()
+    actors.lookup.side_effect = None
+    actors.lookup.return_value = controller
+    host = CarrierVolumeHost(AsyncMock())
+    store_name = _store_name()
+    collected = weakref.ref(ts.TorchStoreStrategy())
+    monkeypatch.setitem(store_api._dropped_carriers, store_name, [(collected, host)])
+
+    async def run() -> None:
+        closing = asyncio.Event()
+
+        async def held_close() -> None:
+            closing.set()
+            if close == "failing":
+                raise OSError("host close failed")
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(host, "close", held_close)
+        stopping = asyncio.ensure_future(ts.shutdown(store_name))
+        await asyncio.wait_for(closing.wait(), 30)
+        if close == "cancelled":
+            stopping.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await stopping
+        else:
+            await stopping
+
+    asyncio.run(run())
+    assert store_api._dropped_carriers[store_name] == []
+    warned = [
+        (record.getMessage(), record.exc_info and record.exc_info[0])
+        for record in caplog.records
+        if record.name == store_api.__name__
+    ]
+    if close == "cancelled":
+        controller.teardown.call.assert_not_awaited()
+        assert warned == []
+    else:
+        controller.teardown.call.assert_awaited_once_with()
+        assert warned == [
+            (f"closing dropped clients of store {store_name!r} failed", OSError)
+        ]
+
+
+class _Pending:
+    """Awaits for good: a teardown that never answers."""
+
+    def __await__(self) -> Any:
+        yield
+
+
+@pytest.mark.timeout(60)
+def test_a_shutdown_that_the_gc_closes_in_a_locked_step_drops_the_client_without_waiting(
+    monkeypatch,
+) -> None:
+    """Drop the client of a store whose pending shutdown the GC closes in a step that holds the lock.
+
+    The shutdown's cleanup never waits on the step it interrupts because ``reset_client`` takes no selection lock.
+    """
+    # A lock of the case's own: a collector that deadlocks keeps it, not the one later cases take.
+    monkeypatch.setattr(store_api, "_selection_lock", threading.Lock())
+    actors = _patch_actors(monkeypatch)
+    controller = _controller_stub()
+    controller.teardown = SimpleNamespace(call=_Pending)
+    actors.lookup.side_effect = None
+    actors.lookup.return_value = controller
+    store_name = _store_name()
+    monkeypatch.setitem(
+        store_api._local_clent_map, store_name, cast(LocalClient, object())
+    )
+    pending = [ts.shutdown(store_name)]
+    # Runs to the teardown, where it waits with no event loop left to resume it.
+    pending[0].send(None)
+    collected = threading.Event()
+
+    def collect() -> None:
+        with store_api._selection_lock:
+            pending.clear()
+            gc.collect()
+        collected.set()
+
+    threading.Thread(target=collect, daemon=True).start()
+    assert collected.wait(30), "the collector deadlocked"
+    assert store_name not in store_api._local_clent_map
+
+
+@pytest.mark.timeout(60)
+def test_a_dropped_client_on_monarch_volumes_keeps_no_carrier_host(
+    monkeypatch, service_strategy
+) -> None:
+    """Keep no host of a client whose strategy reaches Monarch's volumes when it is dropped.
+
+    Such a strategy holds no host. The store's shutdown once a service initialize took it
+    still returns.
+    """
+    strategy = ts.TorchStoreStrategy()
+    volumes = SimpleNamespace(
+        get_id=SimpleNamespace(
+            call=AsyncMock(return_value=[({}, ("publisher/0", "host"))])
+        )
+    )
+    coordinator = _mock_coordinator()
+    coordinator.strategy.call_one.return_value = strategy
+    actors = _patch_actors(monkeypatch)
+    actors.lookup.side_effect = None
+    actors.lookup.return_value = coordinator
+    store_name = _store_name()
+
+    async def run() -> None:
+        await strategy.set_storage_volumes(volumes)
+        assert strategy.volume_id_to_coord == {"publisher/0": {}}
+        client = await ts.client(store_name, role=RankRole.PUBLISHER)
+        assert client.strategy is strategy
+        ts.reset_client(store_name)
+        assert store_api._dropped_carriers == {}
+        await _initialize_service(store_name, service_strategy)
+        await ts.shutdown(store_name)
+
+    asyncio.run(run())
+
+
+def _carrier_client() -> tuple[Any, CarrierVolumeHost]:
+    """A cached client whose strategy resolves volumes through a carrier volume host of its own."""
+    backend_module.get_backend("service")
+    strategy = ts.TorchStoreStrategy()
+    host = CarrierVolumeHost(AsyncMock())
+    strategy.set_volume_host(host)
+    return SimpleNamespace(strategy=strategy), host
+
+
+class _ResetOnRelease(set):
+    """Released stores whose first mark of ``store_name`` runs reset_client as a finalizer in that locked step may."""
+
+    def __init__(self, store_name: str) -> None:
+        super().__init__()
+        self.store_name, self.reset = store_name, False
+
+    def add(self, name: str) -> None:
+        super().add(name)
+        if name == self.store_name and not self.reset:
+            self.reset = True
+            ts.reset_client(name)
+
+
+@pytest.mark.timeout(60)
+def test_a_reset_that_a_finalizer_runs_in_a_shutdowns_locked_step_leaves_its_host_to_that_shutdown(
+    monkeypatch,
+) -> None:
+    """Close the cached client's carrier host at a shutdown whose locked step runs reset_client in a finalizer."""
+    store_name = _store_name()
+    client, host = _carrier_client()
+    monkeypatch.setitem(store_api._local_clent_map, store_name, cast(Any, client))
+    # A fork's marker gives the shutdown a record of the store's to release.
+    monkeypatch.setitem(store_api._forked_stores, store_name, cast(Any, object()))
+    released = _ResetOnRelease(store_name)
+    monkeypatch.setattr(store_api, "_released_stores", released)
+    assert asyncio.run(store_api._shutdown_selected(store_name))
+    assert released.reset and host._closed
+    assert store_api._dropped_carriers.get(store_name, []) == []
+
+
+class _HeldAppend(dict):
+    """Dropped clients whose setdefault for ``store_name`` holds a thread's reset_client once it has the list."""
+
+    def __init__(
+        self, store_name: str, has_list: threading.Event, go: threading.Event
+    ) -> None:
+        super().__init__()
+        self.store_name, self.has_list, self.go = store_name, has_list, go
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        kept = super().setdefault(key, default)
+        if (
+            key == self.store_name
+            and threading.current_thread() is not threading.main_thread()
+        ):
+            self.has_list.set()
+            assert self.go.wait(30)
+        return kept
+
+
+@pytest.mark.timeout(60)
+def test_a_reset_on_another_thread_that_overlaps_a_shutdown_leaves_its_host_to_the_next(
+    monkeypatch,
+) -> None:
+    """Leave the store's next shutdown a host that reset_client on another thread appends after a shutdown's step."""
+    store_name = _store_name()
+    client, host = _carrier_client()
+    monkeypatch.setitem(store_api._local_clent_map, store_name, cast(Any, client))
+    has_list, go = threading.Event(), threading.Event()
+    monkeypatch.setattr(
+        store_api, "_dropped_carriers", _HeldAppend(store_name, has_list, go)
+    )
+    resetting = threading.Thread(
+        target=ts.reset_client, args=(store_name,), daemon=True
+    )
+    resetting.start()
+    try:
+        assert has_list.wait(30)
+        # This shutdown's step lands between the reset's lookup of the list and its append.
+        asyncio.run(store_api._shutdown_selected(store_name))
+    finally:
+        go.set()
+        resetting.join(30)
+    assert not resetting.is_alive() and not host._closed
+    asyncio.run(store_api._shutdown_selected(store_name))
+    assert host._closed
+
+
+class _ResetOnCopy(list):
+    """Dropped clients whose first copy runs reset_client like another thread between a shutdown's copy and removal."""
+
+    def __init__(self, store_name: str) -> None:
+        super().__init__()
+        self.store_name, self.reset = store_name, False
+
+    def __getitem__(self, index: Any) -> Any:
+        copied = super().__getitem__(index)
+        if isinstance(index, slice) and not self.reset:
+            self.reset = True
+            ts.reset_client(self.store_name)
+        return copied
+
+
+@pytest.mark.timeout(60)
+def test_a_reset_as_a_shutdown_copies_the_dropped_clients_leaves_its_host_to_the_next(
+    monkeypatch,
+) -> None:
+    """Leave the next shutdown a host that reset_client appends right after a shutdown copies the dropped clients."""
+    store_name = _store_name()
+    dropped, early = _carrier_client()
+    client, late = _carrier_client()
+    kept = _ResetOnCopy(store_name)
+    kept.append((weakref.ref(dropped.strategy), early))
+    monkeypatch.setitem(store_api._dropped_carriers, store_name, kept)
+    monkeypatch.setitem(store_api._local_clent_map, store_name, cast(Any, client))
+    asyncio.run(store_api._shutdown_selected(store_name))
+    assert kept.reset and early._closed and not late._closed
+    asyncio.run(store_api._shutdown_selected(store_name))
+    assert late._closed
+
+
+def test_restoring_the_context_of_an_error_whose_chain_cycles_keeps_the_chain() -> None:
+    """Return and leave alone a context chain that cycles like the one two exit callbacks raising one error make."""
+
+    async def two_closes_raising_one_error() -> BaseException:
+        error = RuntimeError("close failed")
+
+        async def close() -> None:
+            raise error
+
+        try:
+            raise KeyError("the caller's own error")
+        except KeyError:
+            try:
+                async with contextlib.AsyncExitStack() as closing:
+                    closing.push_async_callback(close)
+                    closing.push_async_callback(close)
+            except RuntimeError as raised:
+                return raised
+        raise AssertionError("no close raised")
+
+    error = asyncio.run(two_closes_raising_one_error())
+    assert error.__context__ is error
+    returned = threading.Event()
+
+    def restore() -> None:
+        store_api._restore_context(error, KeyError("another error"))
+        returned.set()
+
+    threading.Thread(target=restore, daemon=True).start()
+    assert returned.wait(30), "the walk did not end on the cycle"
+    assert error.__context__ is error

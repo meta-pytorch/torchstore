@@ -86,16 +86,6 @@ class _Mesh:
         self.steps.append("mesh stopped")
 
 
-class _Rendezvous:
-    """A stand-in for a handle's TCPStore connection."""
-
-    async def read_strategy(self) -> ts.TorchStoreStrategy:
-        return ts.TorchStoreStrategy(TransportType.MonarchRPC)
-
-    async def close(self) -> None:
-        pass
-
-
 @pytest.mark.parametrize(
     ("second", "raised", "deadline_s"),
     [
@@ -272,49 +262,50 @@ async def test_a_service_store_teardown_reports_its_failing_step_and_keeps_no_re
     """Report a failing teardown step rather than the release check after it.
 
     A shutdown that releases the store leaves its name out of the process's released stores once the stack closes.
+    The service arm serves its volumes in this process so the case runs it as it is.
     """
     monkeypatch.setattr(store_api, "_control_plane_map", {})
     monkeypatch.setattr(store_api, "_owned_service_map", {})
     released = store_api._released_stores
-    steps: list[str] = []
-    stores: list[str] = []
-    driver, service = Mock(), Mock()
+    shutdown, connect = ts.shutdown, ServiceAddress.connect
+    handles: list[ServiceControlPlane] = []
+    owned: list[tuple[str, Any, Any]] = []
 
     async def failing_close() -> None:
         raise RuntimeError("the handle close failed")
 
-    async def initialize(*, strategy: Any, store_name: str, **kwargs: Any) -> Any:
-        await strategy.set_storage_volumes(_stub_mesh(AsyncMock(return_value=None)))
-        stores.append(store_name)
-        store_api._control_plane_map[store_name] = store_api._SelectedControlPlane(
-            driver, None
-        )
-        store_api._owned_service_map[store_name] = service
-        address = ServiceAddress(store_name, "127.0.0.1", 1, "nonce")
-        handle = ServiceControlPlane(address, cast(Any, _Rendezvous()))
+    async def dialing(address: ServiceAddress) -> ServiceControlPlane:
+        handle = await connect(address)
+        handles.append(handle)
         if failure == "handle close":
             monkeypatch.setattr(handle, "close", failing_close)
-        return SimpleNamespace(connect=AsyncMock(return_value=handle))
+        return handle
 
-    async def shutdown(store_name: str) -> None:
+    async def shutting(store_name: str) -> None:
+        driver = store_api._control_plane_map[store_name].control_plane
+        owned.append((store_name, driver, store_api._owned_service_map[store_name]))
         # As ts.shutdown releases a store it records and owns before anything it closes can fail.
-        del store_api._control_plane_map[store_name]
-        del store_api._owned_service_map[store_name]
-        store_api._released_stores.add(store_name)
+        await shutdown(store_name)
         if failure == "shutdown":
             raise RuntimeError("the shutdown failed")
 
-    host = SimpleNamespace(spawn_procs=lambda **kwargs: _Mesh(steps))
-    monkeypatch.setattr(utils, "this_host", lambda: host)
-    monkeypatch.setattr(ts, "initialize", initialize)
-    monkeypatch.setattr(ts, "shutdown", shutdown)
+    monkeypatch.setattr(ServiceAddress, "connect", dialing)
+    monkeypatch.setattr(ts, "shutdown", shutting)
     reported = pytest.raises(RuntimeError, match=f"^the {failure} failed$")
-    with reported if failure else contextlib.nullcontext():
-        async with contextlib.AsyncExitStack() as exit_stack:
-            await utils.routing_clients({"publisher/0": {}}, {}, "service", exit_stack)
-    assert steps == ["mesh started", "mesh stopped"]
+    try:
+        with reported if failure else contextlib.nullcontext():
+            async with contextlib.AsyncExitStack() as exit_stack:
+                await utils.routing_clients(
+                    {"publisher/0": {}}, {}, "service", exit_stack
+                )
+    finally:
+        # The class's own close, for the handle whose close the case failed.
+        for handle in handles:
+            await ServiceControlPlane.close(handle)
+    [(store_name, driver, service)] = owned
+    assert driver._closed and (service._server, service._rendezvous) == (None, None)
     assert store_api._control_plane_map == store_api._owned_service_map == {}
-    assert store_api._released_stores is released and stores[0] not in released
+    assert store_api._released_stores is released and store_name not in released
 
 
 class _StubMesh:

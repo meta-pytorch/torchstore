@@ -64,6 +64,7 @@ from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 
 from ..test_carrier import _Children
+from .tcpstore_fixtures import _close_each
 
 pytestmark = [
     pytest.mark.timeout(120),
@@ -381,20 +382,6 @@ async def _fails_at_eof(
     assert time.monotonic() - start < _AT_EOF_S
 
 
-async def _close_each(
-    closes: Collection[Callable[[], Awaitable[object]]], failing: bool
-) -> None:
-    """Run every close in turn, then raise the first one's error unless the test's own is on its way."""
-    first: BaseException | None = None
-    for close in closes:
-        try:
-            await close()
-        except BaseException as error:
-            first = first or error
-    if first is not None and not failing:
-        raise first
-
-
 class _Served:
     """A service in this process, its driver's handle and the handles dialed from its address."""
 
@@ -621,7 +608,7 @@ async def test_only_the_serving_process_initializes_once_writing_ready_last() ->
         finally:
             rendezvous._prefixed = prefixed
         members = [tcpstore._member_key(rank) for rank in sorted(_PUBLISHERS)]
-        assert written == ["publishers", "strategy", "coordinator", *members, "ready"]
+        assert written == ["publishers", "config", "coordinator", *members, "ready"]
         # A rank that sees ``ready`` finds the registry already set up.
         assert publishers_at_ready == [frozenset(_PUBLISHERS)]
         coordinator = await rendezvous.read_coordinator()
@@ -819,7 +806,7 @@ async def test_a_store_without_a_coordinator_under_this_schema_fails_fast(
         served = rendezvous.address
         values = [
             (tcpstore._PUBLISHERS, tcpstore._encode_publishers(_PUBLISHERS)),
-            (tcpstore._STRATEGY, tcpstore._encode_strategy(_strategy())),
+            (tcpstore._CONFIG, tcpstore._encode_config(_strategy())),
             (tcpstore._READY, ready),
         ]
         deadline = time.monotonic() + 10
@@ -2576,6 +2563,21 @@ async def test_racing_first_calls_on_an_inherited_handle_keep_one_new_connection
         strategies = await asyncio.gather(handle.strategy(), handle.strategy())
         assert {type(strategy) for strategy in strategies} == {ts.TorchStoreStrategy}
         assert handle._rendezvous is dialed[0] and dialed[1]._store is None
+
+
+@pytest.mark.asyncio
+async def test_an_inherited_handle_dials_again_to_register_and_read_volume_records() -> None:
+    """Dial the TCPStore again when an inherited handle registers or reads a volume record."""
+    async with _served() as served:
+        handle = await served.connect()
+        await _as_inherited(handle)
+        await handle.register_volume("publisher/0", b"record")
+        assert handle._pid == os.getpid() and handle._rendezvous is not None
+        await _as_inherited(handle)
+        assert await handle.volume_records(["publisher/0"]) == {
+            "publisher/0": b"record"
+        }
+        assert handle._pid == os.getpid() and handle._rendezvous is not None
 
 
 @pytest.mark.asyncio

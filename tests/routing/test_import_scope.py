@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 import torchstore
+import torchstore.carrier
 
 from .test_control_plane import _imported
 
@@ -244,6 +245,14 @@ def test_core_modules_reach_the_service_stack_only_through_the_backend() -> None
         )
     ]
     assert spelled == []
+
+
+def test_only_the_service_module_imports_the_carrier_volume_module() -> None:
+    """Import ``torchstore.carrier_volumes`` only in the service backend's module, at any scope.
+
+    So the TCPStore rendezvous loads neither it nor the hooks it registers.
+    """
+    assert _importers("torchstore.carrier_volumes") == {"torchstore.routing.service"}
 
 
 def test_no_module_imports_an_old_path() -> None:
@@ -519,3 +528,31 @@ def test_old_module_paths_reexport_the_moved_names(old: str) -> None:
     ``test_old_module_paths.py`` checks the paths that need Monarch.
     """
     _assert_reexports(old)
+
+
+def test_carrier_users_import_only_its_exported_names() -> None:
+    """Reach the carrier only through ``torchstore.carrier``'s ``__all__``, never its submodules.
+
+    Lazy imports count too.
+    """
+    found = [
+        (module, node, names[0])
+        for module, (tree, is_package) in _modules().items()
+        if module != "torchstore.carrier"
+        and not module.startswith("torchstore.carrier.")
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for names in [_imports(module, is_package, node)]
+        if any(
+            name == "torchstore.carrier" or name.startswith("torchstore.carrier.")
+            for name in names
+        )
+    ]
+    users = {module for module, _, _ in found}
+    assert {"torchstore.routing.service", "torchstore.carrier_volumes"} <= users
+    exported = set(torchstore.carrier.__all__)
+    for module, node, source in found:
+        statement = f"{module}: {ast.unparse(node)}"
+        assert isinstance(node, ast.ImportFrom), statement
+        assert source == "torchstore.carrier", statement
+        assert {alias.name for alias in node.names} <= exported, statement

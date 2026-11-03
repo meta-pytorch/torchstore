@@ -4,10 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 import math
 import os
 import socket
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 import torch
 
@@ -329,3 +330,19 @@ def slice_covers(container: "TensorSlice", contained: "TensorSlice") -> bool:
     """Return whether container completely covers contained in global space."""
     intersection = get_slice_intersection(container, contained)
     return intersection is not None and same_slice_geometry(intersection, contained)
+
+
+def _off_task(task: "asyncio.Task[Any] | None") -> bool:
+    """Whether a cleanup runs outside the task that started its call (the GC closing that call is one case)."""
+    try:
+        return asyncio.current_task() is not task
+    except RuntimeError:
+        return True
+
+
+def _store_address(control_plane: object, address: Any) -> Any:
+    """The address naming a selection's store: its own, else any ``address`` attribute of its plane.
+
+    A ``ServiceControlPlane`` has one. The API and the carrier volume module both name stores by this rule.
+    """
+    return address if address is not None else getattr(control_plane, "address", None)

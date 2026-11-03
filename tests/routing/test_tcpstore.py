@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import dataclasses
 import gc
 import ipaddress
@@ -18,32 +17,46 @@ import math
 import os
 import pickle
 import re
-import select
-import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
-import tracemalloc
+import traceback
 import types
 import uuid
 import weakref
-import zlib
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any, cast, NoReturn
 
-import cloudpickle
 import pytest
 import torchstore as ts
-from monarch.actor import Actor, endpoint, this_host
 from torch.distributed import DistNetworkError, DistStoreError, TCPStore
 from torchstore import native_calls
-from torchstore.monarch.storage_volume import StorageVolume
+from torchstore.carrier_volumes import decode_volume_record, encode_volume_record
 from torchstore.routing import tcpstore
 from torchstore.routing.tcpstore import TCPStoreAddress, TCPStoreRendezvous
+from torchstore.storage import StorageVolumeCore
+from torchstore.strategy import _installed_volume_host
 from torchstore.transport import TransportType
+
+from ..test_carrier_volumes import _Volumes
+from . import tcpstore_fixtures
+from .tcpstore_fixtures import (
+    _connected,
+    _deadline,
+    _earlier_calls,
+    _join_native_calls,
+    _LOCALHOST,
+    _native_calls,
+    _PUBLISHER_RANKS,
+    _served,
+    _stop,
+    _store_name,
+    _strategy,
+    _until,
+)
 
 pytestmark = [
     pytest.mark.timeout(120),
@@ -51,17 +64,7 @@ pytestmark = [
     pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
 ]
 
-_LOCALHOST = "127.0.0.1"
 _UNREACHABLE: tuple[type[OSError], ...] = (ConnectionError, TimeoutError)
-_PUBLISHER_RANKS = frozenset({"publisher/0", "publisher/1"})
-# A TCPStore server the tests can stop or kill. It exits when its stdin closes.
-_SERVER = (
-    "import sys\n"
-    "from torch.distributed import TCPStore\n"
-    f"store = TCPStore({_LOCALHOST!r}, 0, is_master=True, wait_for_workers=False)\n"
-    "print(store.port, flush=True)\n"
-    "sys.stdin.read()\n"
-)
 # Connects within a deadline, then exits. argv: port, timeout_s, teardown_s.
 # Finalization waits up to teardown_s while a native call's thread exists, so one
 # that outlives the drain returns into it.
@@ -90,6 +93,52 @@ _CONNECT_THEN_EXIT = (
     "teardown = SlowTeardown(native, teardown_s)\n"
     "print('exiting at', time.monotonic(), flush=True)\n"
 )
+# Imports the module alone and decodes each config, refusing and recording every attempt to
+# import Monarch or cloudpickle, even a guarded one. argv: the tree's root, then hex configs.
+_DECODE_ALONE = (
+    "import json, sys, types\n"
+    "attempts = []\n"
+    "class Blocked:\n"
+    "    def find_spec(self, name, path=None, target=None):\n"
+    "        if name.split('.')[0] in ('monarch', 'cloudpickle'):\n"
+    "            attempts.append(name)\n"
+    "            raise ModuleNotFoundError(f'blocked {name}', name=name)\n"
+    "sys.meta_path.insert(0, Blocked())\n"
+    "for name in ('torchstore', 'torchstore.routing'):\n"
+    "    package = sys.modules[name] = types.ModuleType(name)\n"
+    "    package.__path__ = [sys.argv[1] + '/' + name.replace('.', '/')]\n"
+    "from torchstore.routing import tcpstore\n"
+    "for encoded in sys.argv[2:]:\n"
+    "    decoded = tcpstore._decode_config(bytes.fromhex(encoded))\n"
+    "    print(type(decoded).__name__, decoded.default_transport_type.name)\n"
+    "print(json.dumps(attempts), flush=True)\n"
+)
+# Reads a published store in a fresh process with Monarch and cloudpickle blocked, loads
+# its volume records and calls each volume. argv: the tree's root, then the address fields.
+_READ_RECORDS = (
+    "import asyncio, json, sys\n"
+    "sys.modules['monarch'] = sys.modules['cloudpickle'] = None\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from torchstore.carrier_volumes import CarrierVolumeHost\n"
+    "from torchstore.routing.tcpstore import TCPStoreAddress, TCPStoreRendezvous\n"
+    "from torchstore.strategy import _installed_volume_host\n"
+    "async def read():\n"
+    "    host, port, store_name, nonce = json.loads(sys.argv[2])\n"
+    "    address = TCPStoreAddress(host, port, store_name, nonce)\n"
+    "    rendezvous = await TCPStoreRendezvous.connect(address)\n"
+    "    publishers, strategy = await rendezvous.read()\n"
+    "    volumes = CarrierVolumeHost(rendezvous.volume_records)\n"
+    "    strategy.set_volume_host(volumes)\n"
+    "    await strategy._prepare_volumes(publishers)\n"
+    "    replies = {}\n"
+    "    for rank in sorted(publishers):\n"
+    "        ref = strategy.get_storage_volume(rank)\n"
+    "        replies[rank] = [ref.volume_hostname, await ref.volume.get_id.call_one()]\n"
+    "    hostnames = {v: volumes.hostname(v) for v in volumes.volume_ids()}\n"
+    "    await volumes.close()\n"
+    "    return [type(_installed_volume_host(strategy)).__name__, hostnames, replies]\n"
+    "print(json.dumps(asyncio.run(read())), flush=True)\n"
+)
 # Skips the Python dial before each native connect attempt, so attempts still dial a
 # refusing address natively, as after a server stops listening once it answered.
 _DIAL_NATIVELY = (
@@ -104,19 +153,6 @@ _IMPORT_ALONE = (
     "    package = sys.modules[name] = types.ModuleType(name)\n"
     "    package.__path__ = [sys.argv[1] + '/' + name.replace('.', '/')]\n"
     "from torchstore.routing import tcpstore\n"
-)
-# Checks the module loaded no Monarch or cloudpickle module, even through a guarded
-# import, then decodes with Monarch blocked. argv: root, hexes.
-_DECODE_WITHOUT_MONARCH = _IMPORT_ALONE + (
-    "loaded = [m for m in sys.modules if m.split('.')[0] in ('monarch', 'cloudpickle')]\n"
-    "assert not loaded, loaded\n"
-    "sys.modules['monarch'] = None\n"
-    "for encoded in sys.argv[2:]:\n"
-    "    try:\n"
-    "        decoded = tcpstore._decode_strategy(bytes.fromhex(encoded))\n"
-    "        print(type(decoded).__name__, flush=True)\n"
-    "    except ModuleNotFoundError as error:\n"
-    "        print(error.name.split('.')[0], flush=True)\n"
 )
 # Serves, connects, writes and checks with Monarch and cloudpickle blocked. argv[1]
 # is the repository root.
@@ -254,51 +290,10 @@ _FORK_CASES = _IMPORT_ALONE + (
     "print(json.dumps(results), flush=True)\n"
     "print(asyncio.run(inherited._check(['k'], time.monotonic() + 30)), flush=True)\n"
 )
+_joins_its_native_calls = tcpstore_fixtures._joins_its_native_calls
 
-
-def _store_name() -> str:
-    return f"tcpstore-test-{uuid.uuid4()}"
-
-
-def _strategy() -> ts.TorchStoreStrategy:
-    return ts.TorchStoreStrategy(TransportType.MonarchRPC)
-
-
-def _deadline() -> float:
-    return time.monotonic() + 60
-
-
-def _native_calls(name: str = "") -> list[threading.Thread]:
-    prefix = f"torchstore-tcpstore {name}"
-    return [t for t in threading.enumerate() if t.name.startswith(prefix)]
-
-
-_earlier_calls: set[threading.Thread] = set()
-
-
-def _join_native_calls() -> None:
-    """Let this test's native calls finish, so none outlives the test."""
-    mine = set(_native_calls()) - _earlier_calls
-    for thread in mine:
-        thread.join(timeout=60)
-    alive = [thread for thread in mine if thread.is_alive()]
-    assert not alive, "native TCPStore calls outlived the test"
-
-
-@pytest.fixture(autouse=True)
-def _joins_its_native_calls() -> Iterator[None]:
-    """Fail the test that leaves a native call running, not a later one."""
-    _earlier_calls.clear()
-    _earlier_calls.update(_native_calls())
-    yield
-    _join_native_calls()
-    assert not tcpstore._live_calls - _earlier_calls, "finished calls stayed registered"
-
-
-def _stop(process: subprocess.Popen[bytes]) -> None:
-    """Stop the server and wait until the kernel reports it stopped."""
-    process.send_signal(signal.SIGSTOP)
-    os.waitpid(process.pid, os.WUNTRACED)
+# Child processes import the tree that pytest imported.
+_ROOT = os.path.dirname(os.path.dirname(ts.__file__))
 
 
 def _connect_then_exit(
@@ -320,13 +315,6 @@ def _connect_then_exit(
     # CLOCK_MONOTONIC is system-wide, so this bounds the exit drain and the teardown.
     assert time.monotonic() - float(child.stdout.split()[-1]) < 20
     return child.stdout
-
-
-async def _until(condition: Callable[[], object], timeout_s: float = 30) -> None:
-    deadline = time.monotonic() + timeout_s
-    while not condition():
-        assert time.monotonic() < deadline, "condition not met before the deadline"
-        await asyncio.sleep(0.01)
 
 
 def _two_addresses(
@@ -373,62 +361,8 @@ def _has_ipv6_loopback() -> bool:
     return True
 
 
-@contextlib.asynccontextmanager
-async def _served(
-    host: str | None = _LOCALHOST, store_name: str | None = None
-) -> AsyncIterator[TCPStoreRendezvous]:
-    rendezvous = await TCPStoreRendezvous.serve(store_name or _store_name(), host=host)
-    try:
-        yield rendezvous
-    finally:
-        await rendezvous.close()
-
-
-@contextlib.asynccontextmanager
-async def _connected(address: TCPStoreAddress) -> AsyncIterator[TCPStoreRendezvous]:
-    rendezvous = await TCPStoreRendezvous.connect(address)
-    try:
-        yield rendezvous
-    finally:
-        await rendezvous.close()
-
-
-@pytest.fixture
-def server() -> Iterator[tuple[subprocess.Popen[bytes], TCPStoreAddress]]:
-    """Serve a TCPStore from a subprocess so a test can stop or kill it."""
-    with subprocess.Popen(
-        [sys.executable, "-c", _SERVER], stdin=subprocess.PIPE, stdout=subprocess.PIPE
-    ) as process:
-        try:
-            assert process.stdout is not None
-            readable, _, _ = select.select([process.stdout], [], [], 60)
-            line = process.stdout.readline() if readable else b""
-            if not line:
-                process.kill()  # a no-op once it has exited
-                pytest.fail(
-                    "the TCPStore server subprocess did not report its port "
-                    f"(exit status {process.wait(timeout=60)})"
-                )
-            nonce = uuid.uuid4().hex
-            yield process, TCPStoreAddress(_LOCALHOST, int(line), _store_name(), nonce)
-        finally:
-            process.kill()
-            process.wait(timeout=60)
-
-
-class _StrategyReader(Actor):
-    """Reads a published strategy in its own process and calls its volumes."""
-
-    @endpoint
-    async def read_volumes(self, address: TCPStoreAddress) -> tuple[str, dict, dict]:
-        async with _connected(address) as rendezvous:
-            publishers, strategy = await rendezvous.read()
-        replies = {}
-        for rank in sorted(publishers):
-            ref = strategy.get_storage_volume(rank)
-            reply = tuple(await ref.volume.get_id.call_one())
-            replies[rank] = (ref.volume_hostname, reply)
-        return type(strategy).__name__, dict(strategy.volume_id_to_hostname), replies
+# The shared fixtures, which pytest finds here under these names.
+server = tcpstore_fixtures.server
 
 
 @pytest.mark.asyncio
@@ -464,16 +398,18 @@ async def test_size_guards_reject_oversized_requests_before_sending(caplog) -> N
         await rendezvous._compare_set(half_key, b"v", _deadline())
         await rendezvous._compare_set(half_key + "h", b"v", _deadline())
 
-        # 4. publish checks every size before it writes anything. Random hex stays
-        # over the limit once the strategy is compressed.
-        oversized = _strategy()
-        oversized.volume_id_to_coord = {"publisher/0": {"procs": 0}}
-        oversized.volume_id_to_hostname = {"publisher/0": os.urandom(half * 2).hex()}
-        with pytest.raises(ValueError, match="value for 'strategy' has"):
-            await rendezvous.publish(_PUBLISHER_RANKS, oversized)
+        # 4. publish checks every size before it writes anything, the first key's
+        # and a later one's. Each of these publisher ids fits its own key.
+        publishers = [f"{i}-" + "p" * 7_000 for i in range(half * 2 // 7_000 + 1)]
+        with pytest.raises(ValueError, match="value for 'publishers' has"):
+            await rendezvous.publish(publishers, _strategy())
+        over = "c" * (half * 2 + 1)
+        with pytest.raises(ValueError, match="value for 'coordinator' has"):
+            await rendezvous.publish(_PUBLISHER_RANKS, _strategy(), coordinator=over)
         assert not await rendezvous._check([tcpstore._PUBLISHERS], _deadline())
+        assert not await rendezvous._check([tcpstore._CONFIG], _deadline())
         over_half = b"x" * (half + 1)
-        for key in (tcpstore._PUBLISHERS, tcpstore._STRATEGY, half_key + "hh"):
+        for key in (tcpstore._PUBLISHERS, half_key + "hh"):
             await rendezvous._compare_set(key, over_half, _deadline())
 
     # 5. Sizes are logged, as warnings once over half a limit.
@@ -487,7 +423,6 @@ async def test_size_guards_reject_oversized_requests_before_sending(caplog) -> N
     for key, remedy in [
         ("value", "a smaller value"),
         (tcpstore._PUBLISHERS, "fewer or shorter publisher names"),
-        (tcpstore._STRATEGY, "a smaller strategy"),
     ]:
         pattern = rf"key {key!r} \(\d+ key bytes\) on \S+, {value_limit} {remedy}$"
         assert re.search(pattern, warned, re.M), warned
@@ -505,65 +440,33 @@ async def test_size_guards_reject_oversized_requests_before_sending(caplog) -> N
     assert f"key {half_key!r}" in logged(logging.INFO)
 
 
-def test_a_strategy_over_the_inflate_limit_is_neither_encoded_nor_decoded(
-    monkeypatch,
-) -> None:
-    """Refuse to encode or decode a strategy whose pickle is over the inflate limit.
-
-    Decoding stops inflating just past the limit, so a small value never inflates far beyond it.
-    """
-    strategy = _strategy()
-    size = len(pickle.dumps(strategy))
-    monkeypatch.setattr(tcpstore, "_MAX_STRATEGY_BYTES", size)
-    encoded = tcpstore._encode_strategy(strategy)
-    assert type(tcpstore._decode_strategy(encoded)) is ts.TorchStoreStrategy
-    monkeypatch.setattr(tcpstore, "_MAX_STRATEGY_BYTES", size - 1)
-    with pytest.raises(ValueError, match=f"pickles to {size} bytes"):
-        tcpstore._encode_strategy(strategy)
-    with pytest.raises(ValueError, match=f"inflates past {size - 1} bytes"):
-        tcpstore._decode_strategy(encoded)
-
-    deflate = zlib.compressobj()
-    zeros = [deflate.compress(bytes(1 << 20)) for _ in range(64)]
-    bomb = b"".join([*zeros, deflate.flush()])  # about 64 KB that inflate to 64 MiB
-    tracemalloc.start()
-    try:
-        with pytest.raises(ValueError, match="inflates past"):
-            tcpstore._decode_strategy(bomb)
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
-    assert peak < 8 << 20, peak
-
-
-def test_exit_drains_for_5_s_and_readers_inflate_up_to_256_mib() -> None:
-    """Keep the documented bounds: 5 s for the exit drain and 256 MiB for an inflated strategy.
-
-    Other cases shrink both. Only this one fails if either grows.
-    """
+def test_exit_drains_for_5_s() -> None:
+    """Keep the documented 5s exit drain. Other cases shrink it. Only this one fails if it grows."""
     assert tcpstore._EXIT_DRAIN_S == 5.0
-    assert tcpstore._MAX_STRATEGY_BYTES == 256 << 20
 
 
 @pytest.mark.asyncio
 async def test_first_publish_wins_and_different_content_raises() -> None:
-    """Keep the first published content and reject a conflicting publish."""
-    published = _strategy()
+    """Keep the first published content and reject another publisher set or transport."""
     async with _served() as rendezvous, _connected(rendezvous.address) as other:
         # Neither connect deadline became the timeout of the hidden waits.
         for handle in (rendezvous, other):
             assert handle._store.timeout == timedelta(seconds=300)
-        await rendezvous.publish([*_PUBLISHER_RANKS, "publisher/0"], published)
-        await other.publish(_PUBLISHER_RANKS, published)  # the same set and strategy
+        await rendezvous.publish([*_PUBLISHER_RANKS, "publisher/0"], _strategy())
+        await other.publish(_PUBLISHER_RANKS, _strategy())  # the same set and config
 
         conflict = "already initialized .* 'publishers'"
         # The second set encodes to as many bytes as the published one.
         for conflicting in ({"publisher/0"}, {"publisher/2", "publisher/3"}):
             with pytest.raises(RuntimeError, match=conflict):
-                await other.publish(conflicting, published)
+                await other.publish(conflicting, _strategy())
+        gloo = ts.TorchStoreStrategy(TransportType.Gloo)
+        with pytest.raises(RuntimeError, match="already initialized .* 'config'"):
+            await other.publish(_PUBLISHER_RANKS, gloo)
 
-        publishers, _ = await other.read()
+        publishers, strategy = await other.read()
         assert publishers == _PUBLISHER_RANKS
+        assert strategy.default_transport_type is TransportType.MonarchRPC
 
 
 @pytest.mark.asyncio
@@ -580,16 +483,21 @@ async def test_publish_over_another_schemas_ready_marker_raises() -> None:
 async def test_publish_writes_ready_last_and_read_reads_it_first(monkeypatch) -> None:
     """Write ready last with compare_set and read ready alone first, one deadline each.
 
-    The strategy is decoded on the calling thread, inside its Monarch context.
+    The config is encoded before the first write and decoded on the calling thread.
     """
     calls: list[tuple[str, object]] = []
     deadlines: list[float] = []
     decoded_on: list[int] = []
-    run, decode = tcpstore._run_with_deadline, tcpstore._decode_strategy
+    run, encode = tcpstore._run_with_deadline, tcpstore._encode_config
+    decode = tcpstore._decode_config
 
     async def record(fn: Callable[[], object], deadline: float, what: str) -> object:
         deadlines.append(deadline)
         return await run(fn, deadline, what)
+
+    def record_encode(strategy: ts.TorchStoreStrategy) -> bytes:
+        calls.append(("encode", None))
+        return encode(strategy)
 
     def record_decode(data: bytes) -> object:
         decoded_on.append(threading.get_ident())
@@ -611,16 +519,18 @@ async def test_publish_writes_ready_last_and_read_reads_it_first(monkeypatch) ->
             **{name: recorded(name) for name in names}
         )
         monkeypatch.setattr(tcpstore, "_run_with_deadline", record)
-        monkeypatch.setattr(tcpstore, "_decode_strategy", record_decode)
+        monkeypatch.setattr(tcpstore, "_encode_config", record_encode)
+        monkeypatch.setattr(tcpstore, "_decode_config", record_decode)
         await rendezvous.publish(_PUBLISHER_RANKS, _strategy())
         await rendezvous.read()
         monkeypatch.undo()
         rendezvous._prefixed = prefixed
         assert await other._check([tcpstore._READY], _deadline())
 
-    ready, rest = [tcpstore._READY], [tcpstore._PUBLISHERS, tcpstore._STRATEGY]
+    ready, rest = [tcpstore._READY], [tcpstore._PUBLISHERS, tcpstore._CONFIG]
     members = [tcpstore._member_key(rank) for rank in sorted(_PUBLISHER_RANKS)]
     assert calls == [
+        ("encode", None),
         *[("compare_set", key) for key in rest],
         ("multi_set", members),
         ("compare_set", tcpstore._READY),
@@ -636,7 +546,7 @@ async def test_publish_writes_ready_last_and_read_reads_it_first(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_the_strategy_read_reads_ready_and_the_strategy_alone(
+async def test_the_strategy_read_reads_ready_and_the_config_alone(
     monkeypatch,
 ) -> None:
     """Read the strategy in four store calls under one deadline, never touching the publisher ranks."""
@@ -665,63 +575,191 @@ async def test_the_strategy_read_reads_ready_and_the_strategy_alone(
         deadlines.clear()
         assert type(await served.read_strategy()) is ts.TorchStoreStrategy
         assert len(deadlines) == 1, deadlines
-        ready, strategy = (tcpstore._READY,), (tcpstore._STRATEGY,)
+        ready, config = (tcpstore._READY,), (tcpstore._CONFIG,)
         assert seen == [
             ("check", ready),
             ("multi_get", ready),
-            ("check", strategy),
-            ("multi_get", strategy),
+            ("check", config),
+            ("multi_get", config),
         ]
     finally:
         await served.close()
 
 
-class _ModuleStrategy(ts.TorchStoreStrategy):
-    """Defined at module level, so the standard pickler encodes it by name."""
-
-
 @pytest.mark.asyncio
 async def test_keys_sit_under_the_store_name_and_nonce() -> None:
-    """Pin the publishers, strategy and ready keys and values under torchstore/routing/{store_name}/{nonce}.
+    """Pin the publishers, config and ready keys and values under torchstore/routing/{store_name}/{nonce}.
 
     The publishers' own keys have a case of their own.
     """
-    published = _ModuleStrategy(TransportType.MonarchRPC)
     store_name = _store_name()
     async with _served(store_name=store_name) as rendezvous:
-        await rendezvous.publish(_PUBLISHER_RANKS, published)
+        await rendezvous.publish(_PUBLISHER_RANKS, ts.TorchStoreStrategy())
         nonce, unprefixed = rendezvous.address.nonce, rendezvous._store
+        assert unprefixed is not None
         prefix = f"torchstore/routing/{store_name}/{nonce}"
-        keys = [f"{prefix}/{key}" for key in ("publishers", "strategy", "ready")]
+        keys = [f"{prefix}/{key}" for key in ("publishers", "config", "ready")]
         # check never waits, unlike multi_get.
         assert unprefixed.check(keys), f"the published keys are not under {prefix!r}"
-        publishers, strategy, ready = unprefixed.multi_get(keys)
+        publishers, config, ready = unprefixed.multi_get(keys)
+        assert not unprefixed.check([f"{prefix}/strategy"])
         _, decoded = await rendezvous.read()
     assert json.loads(publishers) == sorted(_PUBLISHER_RANKS)
     ranks = [f"publisher/{i}" for i in range(16)]
     encoded = tcpstore._encode_publishers(ranks[::-1])
     assert encoded == json.dumps(sorted(ranks)).encode()
-    assert strategy == tcpstore._encode_strategy(published)
-    assert type(decoded) is _ModuleStrategy
-    assert ready == b"2"
+    assert config == b'{"transport": "Unset", "v": 1}'
+    assert type(decoded) is ts.TorchStoreStrategy
+    assert decoded.default_transport_type is TransportType.Unset
+    assert _installed_volume_host(decoded) is None
+    assert ready == b"3"
+
+
+@pytest.mark.parametrize("transport_type", list(TransportType), ids=str)
+def test_config_round_trips_each_transport(transport_type: TransportType) -> None:
+    """Encode a plain strategy's transport by name and rebuild a bare strategy from it.
+
+    Which transports a store takes is its service's to check. The config names any.
+    """
+    config = tcpstore._encode_config(ts.TorchStoreStrategy(transport_type))
+    assert json.loads(config) == {"v": 1, "transport": transport_type.name}
+    decoded = tcpstore._decode_config(config)
+    assert type(decoded) is ts.TorchStoreStrategy
+    assert decoded.default_transport_type is transport_type
 
 
 @pytest.mark.asyncio
-async def test_a_strategy_class_defined_in_a_function_is_refused_before_any_write() -> None:
-    """Refuse a strategy whose class has no importable name, and write nothing.
+async def test_config_refuses_strategy_subclasses_and_values_that_are_no_transport() -> (
+    None
+):
+    """Refuse to turn a subclass into a base strategy or to name what is no ``TransportType``.
 
-    Only a by-value pickler such as cloudpickle encodes it, and the rendezvous pickles by name.
+    publish refuses them before writing anything.
     """
 
-    class LocalStrategy(ts.TorchStoreStrategy):
-        pass
+    class Subclass(ts.TorchStoreStrategy):
+        """A subclass that a by-value pickler could encode, which the config refuses."""
 
-    refused: tuple[type[Exception], ...] = (AttributeError, pickle.PicklingError)
+    refused = [
+        (Subclass(TransportType.MonarchRPC), TypeError, "not .*Subclass$"),
+        (
+            ts.LocalRankStrategy(TransportType.MonarchRPC),
+            TypeError,
+            "not LocalRankStrategy$",
+        ),
+        (ts.TorchStoreStrategy(cast(Any, "Gloo")), ValueError, "not 'Gloo'$"),
+        (ts.TorchStoreStrategy(cast(Any, ["Gloo"])), ValueError, r"not \['Gloo'\]$"),
+    ]
     async with _served() as rendezvous:
-        with pytest.raises(refused, match="local"):
-            await rendezvous.publish(_PUBLISHER_RANKS, LocalStrategy())
-        with pytest.raises(RuntimeError, match="init has not run"):
-            await rendezvous.read()
+        for strategy, error, message in refused:
+            with pytest.raises(error, match=message):
+                tcpstore._encode_config(strategy)
+            with pytest.raises(error, match=message):
+                await rendezvous.publish(_PUBLISHER_RANKS, strategy)
+        assert not await rendezvous._check([tcpstore._PUBLISHERS], _deadline())
+
+
+_LONG = "X" * 10**5
+
+
+@pytest.mark.parametrize(
+    ("config", "error"),
+    [
+        (_LONG.encode(), "malformed config b'" + "X" * 62 + ": JSONDecodeError"),
+        (b"[1]", "malformed config b'[1]': TypeError"),
+        (b'"v"', "malformed config b'\"v\"': TypeError"),
+        (
+            b'{"transport": "Gloo"}',
+            'malformed config b\'{"transport": "Gloo"}\': KeyError',
+        ),
+        (b'{"v": true, "transport": "Gloo"}', "config version True, not 1"),
+        (b'{"v": 1.0, "transport": "Gloo"}', "config version 1.0, not 1"),
+        (b'{"v": 2, "later": [], "transport": "Gloo"}', "config version 2, not 1"),
+        (
+            b'{"v": 1}',
+            "malformed config b'{\"v\": 1}': its fields are not v and transport",
+        ),
+        (
+            b'{"v": 1, "transport": "Gloo", "x": 1}',
+            'malformed config b\'{"v": 1, "transport": "Gloo", "x": 1}\': its fields'
+            " are not v and transport",
+        ),
+        (
+            json.dumps({"v": 1, "transport": _LONG}).encode(),
+            'malformed config b\'{"v": 1, "transport": "' + "X" * 39 + ": KeyError",
+        ),
+        (
+            b'{"v": 1, "transport": ["Gloo"]}',
+            'malformed config b\'{"v": 1, "transport": ["Gloo"]}\': TypeError',
+        ),
+        (
+            b'{"v": 1}' + b"[" * 65,
+            'malformed config b\'{"v": 1}' + "[" * 54 + ": over 64 brackets",
+        ),
+        (b"[" * 64 + b"]" * 64, "malformed config b'" + "[" * 62 + ": TypeError"),
+        (b'{"a":' * 65, "malformed config b'" + '{"a":' * 12 + '{": over 64 brackets'),
+    ],
+    ids=[
+        "not_json",
+        "array",
+        "string",
+        "no_version",
+        "bool_version",
+        "float_version",
+        "later_version",
+        "no_transport",
+        "extra_field",
+        "unknown_transport",
+        "unhashable_transport",
+        "arrays_past_the_cap",
+        "arrays_at_the_cap",
+        "objects_past_the_cap",
+    ],
+)
+def test_each_malformed_config_raises_its_own_error(config: bytes, error: str) -> None:
+    """Refuse each kind of config ``_encode_config`` never writes with ValueError naming why.
+
+    Errors quote at most 64 characters of the value, and the bracket cap counts both brackets.
+    """
+    with pytest.raises(ValueError) as raised:
+        tcpstore._decode_config(config)
+    assert str(raised.value) == error
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_config_fails_reads_naming_the_store() -> None:
+    """Fail both reads of a config another writer left malformed, naming the store, at once.
+
+    The error quotes at most 64 characters of what it read, never a whole value, and so does
+    each error chained under it: its traceback quotes at most twice that.
+    """
+    async with _served() as rendezvous:
+        values = {
+            tcpstore._PUBLISHERS: tcpstore._encode_publishers(_PUBLISHER_RANKS),
+            tcpstore._CONFIG: json.dumps({"v": 1, "transport": "X" * 10**5}).encode(),
+            tcpstore._READY: tcpstore._SCHEMA_VERSION,
+        }
+        for key, value in values.items():
+            await rendezvous._compare_set(key, value, _deadline())
+        failures = []
+        for read in (rendezvous.read, rendezvous.read_strategy):
+            with pytest.raises(RuntimeError, match="malformed config") as raised:
+                await read(timeout_s=5)
+            failures.append(raised.value)
+    for failure in failures:
+        assert f"on TCPStore {tcpstore._endpoint(rendezvous.address)}: " in str(failure)
+        assert isinstance(failure.__cause__, ValueError)
+        assert str(failure).count("X") <= 64 and len(str(failure)) < 300
+        formatted = traceback.format_exception(
+            type(failure), failure, failure.__traceback__
+        )
+        # The File lines name the checkout's path, which may hold an X of its own.
+        quoted = [
+            line
+            for line in "".join(formatted).splitlines()
+            if not line.lstrip().startswith('File "')
+        ]
+        assert "".join(quoted).count("X") <= 2 * 64
 
 
 @pytest.mark.asyncio
@@ -736,8 +774,8 @@ async def test_reads_fail_fast_before_publish_and_under_a_stale_nonce() -> None:
         assert time.monotonic() - start < 10
 
         # A publish that fails part way never writes the ready marker.
-        await earlier._compare_set(tcpstore._STRATEGY, b"other", _deadline())
-        with pytest.raises(RuntimeError, match="different 'strategy'"):
+        await earlier._compare_set(tcpstore._CONFIG, b"other", _deadline())
+        with pytest.raises(RuntimeError, match="different 'config'"):
             await earlier.publish(_PUBLISHER_RANKS, _strategy())
         with pytest.raises(RuntimeError, match="init has not run"):
             await earlier.read()
@@ -759,15 +797,19 @@ async def test_reads_fail_fast_before_publish_and_under_a_stale_nonce() -> None:
             f"schema version {tcpstore._SCHEMA_VERSION + b'0'!r}",
             f"schema version {tcpstore._SCHEMA_VERSION + b'0'!r}",
         ),
-        (tcpstore._SCHEMA_VERSION, "without its publishers", "without its strategy"),
+        (
+            tcpstore._SCHEMA_VERSION,
+            "without its publishers or config",
+            "without its config",
+        ),
     ],
-    ids=["other_schema", "longer_schema", "ready_without_strategy"],
+    ids=["other_schema", "longer_schema", "ready_without_config"],
 )
 @pytest.mark.asyncio
 async def test_reads_reject_unknown_schemas_and_missing_keys_at_once(
     ready: bytes, error: str, strategy_error: str
 ) -> None:
-    """Refuse a ready marker of another schema, or one missing keys, at once, on both reads."""
+    """Refuse a ready marker of another schema or one missing keys at once on both reads."""
     publishers = tcpstore._encode_publishers(())
     async with _served() as rendezvous:
         await rendezvous._compare_set(tcpstore._PUBLISHERS, publishers, _deadline())
@@ -782,43 +824,56 @@ async def test_reads_reject_unknown_schemas_and_missing_keys_at_once(
 
 
 @pytest.mark.asyncio
-async def test_published_volume_handles_work_from_another_process() -> None:
-    """Call storage volumes through a strategy read back in another process."""
-    store_name = _store_name()
-    strategy = _strategy()
-    meshes = [this_host().spawn_procs(per_host={"procs": len(_PUBLISHER_RANKS)})]
+async def test_published_records_reach_volumes_from_another_process() -> None:
+    """Call storage volumes through records read back in another process, without Monarch.
+
+    Hostnames come from the records: a record with a fake one gives it to that reference alone.
+    """
+    volumes = _Volumes()
     try:
-        meshes.append(this_host().spawn_procs(per_host={"procs": 1}))
-        await ts.initialize(
-            mesh=meshes[0],
-            strategy=strategy,
-            client_type=ts.ClientType.ROUTING,
-            store_name=store_name,
-        )
-        reader = meshes[1].spawn("strategy_reader", _StrategyReader)
-        driver_hostnames = dict(strategy.volume_id_to_hostname)
+        records = {}
+        for rank in sorted(_PUBLISHER_RANKS):
+            _, _, records[rank] = await volumes.serve(
+                StorageVolumeCore(rank), host=_LOCALHOST
+            )
+        locations = {
+            v: decode_volume_record(v, record) for v, record in records.items()
+        }
+        real = {v: location.hostname for v, location in locations.items()}
         # Hostnames only drive a same-host check, so handles work with fake ones.
         # Each volume gets its own, so a hostname read for the wrong volume shows.
-        fake_names = {v: v.replace("/", "-") + ".invalid" for v in driver_hostnames}
-        fake = copy.copy(strategy)
-        fake.volume_id_to_hostname = fake_names
+        fake_names = {v: v.replace("/", "-") + ".invalid" for v in records}
+        fake_records = {
+            v: encode_volume_record(location.address, fake_names[v])
+            for v, location in locations.items()
+        }
         reads = []
-        for published in (strategy, fake):
-            async with _served(store_name=store_name) as rendezvous:
-                await rendezvous.publish(_PUBLISHER_RANKS, published)
-                reads.append(await reader.read_volumes.call_one(rendezvous.address))
+        for published in (records, fake_records):
+            async with _served() as rendezvous:
+                await rendezvous.publish(_PUBLISHER_RANKS, _strategy())
+                for rank, record in published.items():
+                    await rendezvous.register_volume(rank, record)
+                address = rendezvous.address
+                fields = [address.host, address.port, address.store_name, address.nonce]
+                child = await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-c", _READ_RECORDS, _ROOT, json.dumps(fields)],
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+                assert child.returncode == 0, child.stderr[-2000:]
+                reads.append(json.loads(child.stdout.splitlines()[-1]))
     finally:
-        await asyncio.gather(*(mesh.stop() for mesh in meshes))
+        volumes.close()
 
     (kind, hostnames, replies), (fake_kind, fake_hostnames, fake_replies) = reads
-    assert kind == fake_kind == type(strategy).__name__
-    assert hostnames == driver_hostnames and set(hostnames) == _PUBLISHER_RANKS
+    assert kind == fake_kind == "CarrierVolumeHost"
+    assert hostnames == real and set(hostnames) == _PUBLISHER_RANKS
     # Each reference carries its volume's hostname and reaches that volume.
-    assert replies == {r: (hostnames[r], (r, hostnames[r])) for r in _PUBLISHER_RANKS}
+    assert replies == {r: [real[r], [r, real[r]]] for r in _PUBLISHER_RANKS}
     assert fake_hostnames == fake_names
-    assert fake_replies == {
-        r: (fake_names[r], reply) for r, (_, reply) in replies.items()
-    }
+    assert fake_replies == {r: [fake_names[r], [r, real[r]]] for r in _PUBLISHER_RANKS}
 
 
 @pytest.mark.asyncio
@@ -835,54 +890,23 @@ async def test_two_store_names_on_one_tcpstore_keep_separate_keys() -> None:
             assert (await second.read())[0] == _PUBLISHER_RANKS
 
 
-@pytest.mark.asyncio
-async def test_strategy_key_needs_monarch_to_decode() -> None:
-    """Import without Monarch or cloudpickle. Decoding the strategy key needs Monarch.
-
-    Its volume handles need Monarch: a strategy without volumes decodes without it.
-    """
-    strategy = _strategy()
-    mesh = this_host().spawn_procs(per_host={"procs": 1})
-    try:
-        volumes = await StorageVolume.spawn(
-            1, mesh, id_func=ts.LocalRankStrategy.get_volume_id
-        )
-        await strategy.set_storage_volumes(volumes)
-        with_volumes = tcpstore._encode_strategy(strategy).hex()
-    finally:
-        await mesh.stop()
-    root = os.path.dirname(os.path.dirname(ts.__file__))
-    no_volumes = tcpstore._encode_strategy(_strategy()).hex()
+def test_config_decodes_with_monarch_and_cloudpickle_blocked() -> None:
+    """Decode every config in a process where no import of Monarch or cloudpickle is even tried."""
+    transports = ["Unset", "SharedMemory", "Gloo", "MonarchRPC"]
+    configs = [
+        tcpstore._encode_config(ts.TorchStoreStrategy(TransportType[name])).hex()
+        for name in transports
+    ]
     child = subprocess.run(
-        [sys.executable, "-c", _DECODE_WITHOUT_MONARCH, root, no_volumes, with_volumes],
+        [sys.executable, "-c", _DECODE_ALONE, _ROOT, *configs],
         capture_output=True,
+        text=True,
         timeout=60,
     )
-    assert child.returncode == 0, child.stderr.decode()[-2000:]
-    decoded = child.stdout.split()[-2:]
-    assert decoded == [b"TorchStoreStrategy", b"monarch"], child.stdout
-
-
-@pytest.mark.asyncio
-async def test_the_strategy_key_grows_under_100_bytes_per_volume() -> None:
-    """Compress the strategy, whose pickle grows about 600 B per volume.
-
-    Its volume handles repeat each volume's ids, and every rank reads the whole key.
-    """
-    sizes: dict[int, int] = {}
-    for count in (2, 8):
-        strategy = _strategy()
-        mesh = this_host().spawn_procs(per_host={"procs": count})
-        try:
-            volumes = await StorageVolume.spawn(
-                count, mesh, id_func=ts.LocalRankStrategy.get_volume_id
-            )
-            await strategy.set_storage_volumes(volumes)
-            assert len(strategy.volume_id_to_coord) == count
-            sizes[count] = len(tcpstore._encode_strategy(strategy))
-        finally:
-            await mesh.stop()
-    assert (sizes[8] - sizes[2]) / 6 < 100, sizes
+    assert child.returncode == 0, child.stderr[-2000:]
+    *decoded, loaded = child.stdout.splitlines()
+    assert decoded == [f"TorchStoreStrategy {name}" for name in transports]
+    assert json.loads(loaded) == []
 
 
 def test_serve_and_connect_need_neither_monarch_nor_cloudpickle() -> None:
@@ -2562,11 +2586,18 @@ async def test_a_close_landing_after_the_closed_check_lets_that_call_run() -> No
 @pytest.mark.asyncio
 async def test_address_pickles_and_the_rendezvous_refuses() -> None:
     """Send addresses between processes, never live connections."""
+    picklers: list[Callable[[object], bytes]] = [pickle.dumps]
+    try:
+        import cloudpickle
+    except ImportError:
+        pass  # Monarch-free envs lack it. The stdlib checks still run.
+    else:
+        picklers.append(cloudpickle.dumps)
     async with _served() as rendezvous:
         assert pickle.loads(pickle.dumps(rendezvous.address)) == rendezvous.address
         with pytest.raises(dataclasses.FrozenInstanceError):
             rendezvous.address.nonce = "stale"  # type: ignore[misc]
-        for dumps in (pickle.dumps, cloudpickle.dumps):
+        for dumps in picklers:
             with pytest.raises(TypeError, match="pass the address"):
                 dumps(rendezvous)
 
@@ -2837,3 +2868,54 @@ async def test_a_served_store_answers_on_ipv6_and_ipv4() -> None:
             socket.create_connection((other_family, served.address.port), 10).close()
         finally:
             await served.close()
+
+
+# Serves a store, nests its config 100,000 arrays or objects deep and reads it both ways under a
+# raised recursion limit, under which Python 3.10's json would follow it past the stack. argv: the
+# root, then the bracket that nests.
+_READ_DEEP_CONFIG = (
+    "import asyncio, sys\n"
+    "sys.modules['monarch'] = sys.modules['cloudpickle'] = None\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from torchstore.routing.tcpstore import TCPStoreRendezvous\n"
+    "from torchstore.strategy import TorchStoreStrategy\n"
+    "from torchstore.transport import TransportType\n"
+    "async def read():\n"
+    "    rendezvous = await TCPStoreRendezvous.serve('deep-config', host='127.0.0.1')\n"
+    "    try:\n"
+    "        await rendezvous.publish(['publisher/0'], TorchStoreStrategy(TransportType.Gloo))\n"
+    "        nest = b'[' if sys.argv[2] == '[' else b'{\"a\":'\n"
+    "        rendezvous._prefixed.set('config', nest * 100_000)\n"
+    "        for read in (rendezvous.read, rendezvous.read_strategy):\n"
+    "            try:\n"
+    "                await read(timeout_s=30)\n"
+    "            except RuntimeError as e:\n"
+    "                print('read:', type(e.__cause__).__name__, e, flush=True)\n"
+    "    finally:\n"
+    "        await rendezvous.close()\n"
+    "sys.setrecursionlimit(200_000)\n"
+    "asyncio.run(read())\n"
+)
+
+
+@pytest.mark.parametrize("bracket", ["[", "{"], ids=["arrays", "objects"])
+def test_a_deeply_nested_config_fails_reads_under_a_raised_recursion_limit(
+    bracket: str,
+) -> None:
+    """Refuse a config nested past the bracket cap before parsing it, however high the recursion limit."""
+    child = subprocess.run(
+        [sys.executable, "-c", _READ_DEEP_CONFIG, _ROOT, bracket],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert child.returncode == 0, child.stderr[-2000:]
+    lines = [line for line in child.stdout.splitlines() if line.startswith("read:")]
+    assert len(lines) == 2, child.stdout
+    for line in lines:
+        # The quote is the first 64 characters of the value's repr.
+        assert re.fullmatch(
+            r"read: ValueError routing store 'deep-config' on TCPStore 127\.0\.0\.1:\d+: "
+            r"malformed config b'.{62}: over 64 brackets",
+            line,
+        ), line

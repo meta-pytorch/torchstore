@@ -352,13 +352,17 @@ def _drain_pairings() -> None:
 
 
 def _after_fork_in_child() -> None:
-    # A thread that held a lock or ran a pairing at the fork never releases the child's copy. A child
-    # forked during or after the parent's exit hooks is a live process.
+    # A thread that held a lock or ran a pairing at the fork never releases the child's copy. The cached
+    # pairs are the parent's. None retires because their volume halves still serve the parent's clients.
+    # A child forked during or after the parent's exit hooks is a live process.
     global _cache_lock, _pairings_lock, _pairing_now, _exit_deadline
     _cache_lock = threading.RLock()
     _pairings_lock = threading.Lock()
     _pairing_now = weakref.WeakKeyDictionary()
     _exit_deadline = None
+    _store_addrs.clear()
+    _pair_owners.clear()
+    _pair_groups.clear()
 
 
 os.register_at_fork(after_in_child=_after_fork_in_child)

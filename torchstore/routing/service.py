@@ -21,7 +21,7 @@ import pickle
 import threading
 import weakref
 import zlib
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from concurrent import futures
 from dataclasses import dataclass, field
 from typing import Any, cast, NoReturn, TYPE_CHECKING
@@ -38,15 +38,26 @@ from torchstore.carrier import (
     VOLUME_CLOSED,
     wait_future,
 )
+from torchstore.carrier_volumes import (
+    CarrierVolumeHost,
+    check_strategy,
+    forget_context_pairs,
+    PublisherVolume,
+    start_publisher_volume,
+    stop_publisher_volumes,
+)
 from torchstore.logging import LatencyTracker
+from torchstore.strategy import _installed_volume_host
 from . import layout_registry
 from ._gc import call_gc_paused
 from .control_plane import ControlPlane, ControlPlaneAddress
 from .layout_registry import LayoutRegistry
 from .tcpstore import TCPStoreAddress, TCPStoreRendezvous
+from .volume_records import VolumeRecords
 
 if TYPE_CHECKING:
     from torchstore.strategy import TorchStoreStrategy
+    from torchstore.transport.buffers import TransportContext
     from ._model import KeyRegistration, Registrations
 
 __all__ = [
@@ -181,8 +192,8 @@ class ServiceAddress(ControlPlaneAddress):
         return TCPStoreAddress(self.host, self.port, self.store_name, self.nonce)
 
 
-class ServiceControlPlane(ControlPlane):
-    """Reads a coordinator service's strategy from TCPStore and calls it for layouts.
+class ServiceControlPlane(ControlPlane, VolumeRecords):
+    """Reads a store's strategy and volume records from TCPStore, and calls its coordinator.
 
     Each handle holds its own TCPStore connection and a share of this process's one connection to
     the coordinator. A forked child's copy dials the TCPStore again when it next reads it: planes must work after fork.
@@ -235,11 +246,32 @@ class ServiceControlPlane(ControlPlane):
             tracker.track_e2e()
 
     async def strategy(self) -> TorchStoreStrategy:
-        """Decode a fresh copy of the strategy from TCPStore on every call."""
+        """Decode a fresh strategy from TCPStore on every call, resolving volumes from records.
+
+        A config naming a transport volume servers do not carry fails the read naming the store.
+        """
         tracker = _latency_tracker("strategy")
         try:
             rendezvous = await self._state()
-            return await rendezvous.read_strategy()
+            strategy = await rendezvous.read_strategy(check=check_strategy)
+            strategy.set_volume_host(CarrierVolumeHost(self.volume_records))
+            return strategy
+        finally:
+            tracker.track_e2e()
+
+    async def register_volume(self, volume_id: str, record: bytes, /) -> None:
+        tracker = _latency_tracker("register_volume")
+        try:
+            rendezvous = await self._state()
+            await rendezvous.register_volume(volume_id, record)
+        finally:
+            tracker.track_e2e()
+
+    async def volume_records(self, volume_ids: Collection[str], /) -> dict[str, bytes]:
+        tracker = _latency_tracker("volume_records")
+        try:
+            rendezvous = await self._state()
+            return await rendezvous.volume_records(volume_ids)
         finally:
             tracker.track_e2e()
 
@@ -599,12 +631,14 @@ class CoordinatorService:
     async def _init(
         self, publishers: Collection[str], strategy: TorchStoreStrategy
     ) -> None:
-        """Set up the registry, then write publishers, strategy, coordinator, a key per publisher and ``ready``."""
+        """Set up the registry, then write publishers, config, coordinator, a key per publisher and ``ready``."""
         if os.getpid() != self._pid:
             raise self._error(
                 "this coordinator service was inherited across fork: only the process"
                 " that started it initializes it"
             )
+        # First, so that a strategy volume servers cannot honor leaves init to a later call.
+        check_strategy(strategy)
         with self._lock:
             rendezvous, server = self._rendezvous, self._server
         # Close clears both, and no handle exists until start has served the coordinator.
@@ -643,6 +677,33 @@ class CarrierServiceBackend(ServiceBackend):
         if isinstance(control_plane, ServiceControlPlane):
             return control_plane.address
         return None
+
+    def check_strategy(self, strategy: TorchStoreStrategy) -> None:
+        check_strategy(strategy)
+
+    def volume_host(self, strategy: object) -> CarrierVolumeHost | None:
+        host = _installed_volume_host(strategy)
+        return host if isinstance(host, CarrierVolumeHost) else None
+
+    def forget_context_pairs(
+        self, volume_ids: Iterable[str], transport_context: TransportContext
+    ) -> None:
+        forget_context_pairs(volume_ids, transport_context)
+
+    async def start_publisher_volume(
+        self,
+        volume_id: str,
+        *,
+        store_name: str,
+        selection: tuple[Any, Any],
+        register: Callable[[str, bytes], Awaitable[None]],
+    ) -> PublisherVolume:
+        return await start_publisher_volume(
+            volume_id, store_name=store_name, selection=selection, register=register
+        )
+
+    def stop_publisher_volumes(self, store_name: str) -> list[PublisherVolume]:
+        return stop_publisher_volumes(store_name)
 
 
 def _after_fork_in_child() -> None:

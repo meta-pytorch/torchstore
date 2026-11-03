@@ -148,8 +148,10 @@ asyncio.run(main())
 class _InstrumentedCore(StorageVolumeCore):
     """A volume core that records its calls and how many overlap, and holds the named ones."""
 
-    def __init__(self, held: Collection[str] = ()) -> None:
-        super().__init__(f"volume-{uuid.uuid4()}")
+    def __init__(
+        self, held: Collection[str] = (), *, volume_id: str | None = None
+    ) -> None:
+        super().__init__(volume_id or f"volume-{uuid.uuid4()}")
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self.held = set(held)
         self.release = threading.Event()
@@ -1545,6 +1547,9 @@ def test_queued_retired_keys_wait_for_a_bounded_number_of_servers_and_none_in_a_
     monkeypatch.setattr(carrier_volumes, "_retired", {})
     monkeypatch.setattr(carrier_volumes, "_retiring", collections.deque())
     monkeypatch.setattr(carrier_volumes, "_pair_servers", {})
+    monkeypatch.setattr(carrier_volumes, "_publisher_lock", threading.Lock())
+    monkeypatch.setattr(carrier_volumes, "_publishers", {})
+    monkeypatch.setattr(carrier_volumes, "_inherited", [])
     monkeypatch.setattr(carrier_volumes, "_RETIRED_SERVERS", 2)
     servers = [dataclasses.replace(_ADDRESS, port=port) for port in (1, 2, 3, 4)]
     for n, server in enumerate(servers):

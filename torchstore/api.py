@@ -5,8 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import contextlib
 import os
+import sys
 import threading
+import weakref
 from collections.abc import Awaitable, Callable
 from functools import partial
 from logging import getLogger
@@ -16,17 +19,24 @@ import torch
 from torch.distributed.tensor import DTensor
 
 import torchstore.state_dict_utils
-from torchstore.backend import get_backend, loaded_backend
+from torchstore.backend import get_backend, loaded_backend, ServiceBackend
 from torchstore.client import ClientType, LocalClient
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
-from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
+from torchstore.routing.volume_records import VolumeRecords
+from torchstore.strategy import (
+    _installed_volume_host,
+    ControllerStorageVolumes,
+    TorchStoreStrategy,
+)
 from torchstore.transport.types import TensorSlice
+from torchstore.utils import _off_task, _store_address
 
 if TYPE_CHECKING:
     from monarch.actor import ProcMesh
 
+    from torchstore.carrier_volumes import CarrierVolumeHost, PublisherVolume
     from torchstore.monarch.controller import Controller
     from torchstore.monarch.spmd import _SPMDSession
     from torchstore.routing.service import CoordinatorService
@@ -59,9 +69,9 @@ _control_plane_map: dict[str, _SelectedControlPlane] = {}
 _owned_service_map: dict[str, "CoordinatorService"] = {}
 
 # Held while initialize, client and shutdown update the control-plane records, owned services,
-# fork markers and released stores with the client cache, for a client build's lone cache write,
-# and across fork. Other reads and reset_client rely on the overlaps their docstrings allow. Never
-# held across an await: dialed connections and services close after it is released.
+# fork markers, released stores and dropped clients with the client cache, for a client build's lone
+# cache write, and across fork. Other reads and reset_client rely on the overlaps their docstrings
+# allow. Never held across an await: dialed connections and services close after it is released.
 _selection_lock = threading.Lock()
 
 # Stores whose record ts.shutdown released here, until a routing initialize on Monarch's
@@ -73,6 +83,13 @@ _released_stores: set[str] = set()
 # until a selection, a standard initialize or a shutdown. Without address= or
 # control_plane=, calls for them raise instead of looking Monarch up.
 _forked_stores: dict[str, ControlPlaneAddress] = {}
+
+# Volume hosts of clients that reset_client or a newer client dropped, beside weak refs to
+# their strategies. Shutdown closes them, and a build the collected ones but the newest.
+# Both take entries out of a store's list in place because reset_client appends without the lock.
+_dropped_carriers: dict[
+    str, list[tuple[weakref.ref[TorchStoreStrategy], "CarrierVolumeHost"]]
+] = {}
 
 # How long a caller waits for a dialed connection's close, which then runs on alone
 # until its event loop ends.
@@ -101,6 +118,11 @@ def _routing_namespace(role: RankRole, group: int | None) -> str:
     return f"{role.value}/{group}"
 
 
+def _client_rank(role: RankRole, group: int | None) -> str:
+    """This process's rank ID in a routing store, such as ``publisher/0``."""
+    return _routing_volume_id(_routing_namespace(role, group))
+
+
 def _caller_control_plane(
     control_plane: str | ControlPlane,
 ) -> ControlPlane | Literal["service"] | None:
@@ -116,6 +138,11 @@ def _caller_control_plane(
         "control_plane must be 'monarch', 'service' or a ControlPlane instance, "
         f"got {control_plane!r}"
     )
+
+
+def _hosts_volumes(control_plane: ControlPlane | Literal["service"] | None) -> bool:
+    """Whether publishers serve their own volumes: on a control plane sharing volume records."""
+    return isinstance(control_plane, str) or isinstance(control_plane, VolumeRecords)
 
 
 def _check_one_store(store_name: str, control_plane: ControlPlane) -> None:
@@ -282,23 +309,39 @@ async def _close_quietly(
 ) -> None:
     """Close ``dialed`` unless ``kept`` holds its connection, then stop ``service``.
 
-    Failures only log, so the caller's selection, or its own error, stands.
+    Each runs even if an earlier one is cancelled, and failures only log, so the caller's
+    selection, or its own error, stands.
     """
-    try:
+    async with contextlib.AsyncExitStack() as closing:
+        if service is not None:
+            closing.push_async_callback(_stop_service_quietly, service)
         if dialed is not None and (
             kept is None or dialed.control_plane is not kept.control_plane
         ):
-            await _close_dialed_quietly(dialed)
-    finally:
-        if service is not None:
-            try:
-                await service.close()
-            except Exception:
-                logger.warning(
-                    "stopping the coordinator service on %s failed",
-                    service.address,
-                    exc_info=True,
-                )
+            closing.push_async_callback(_close_dialed_quietly, dialed)
+
+
+async def _stop_service_quietly(service: "CoordinatorService") -> None:
+    """Stop a coordinator service, logging a failure so the caller's outcome stands."""
+    try:
+        await service.close()
+    except Exception:
+        logger.warning(
+            "stopping the coordinator service on %s failed",
+            service.address,
+            exc_info=True,
+        )
+
+
+async def _close_carrier_quietly(
+    strategy: TorchStoreStrategy | None, host: "CarrierVolumeHost | None", whose: str
+) -> None:
+    """Close a dropped client's volume handles and only log a failure so the caller's outcome stands."""
+    try:
+        if host is not None:
+            await _close_carrier(strategy, host)
+    except Exception:
+        logger.warning("closing %s volume handles failed", whose, exc_info=True)
 
 
 def _log_control_plane(
@@ -337,17 +380,18 @@ async def initialize(
     control plane.
 
     With ``control_plane="service"`` ranks dial ``$TORCHSTORE_TCPSTORE_HOST``, else this
-    host's name. Like TCPStore, the coordinator listens on every interface without
-    authentication: any TCPStore client can read the nonce and incarnation that its JSON
-    hello checks before unpickling a request, and can rewrite the strategy every rank
-    unpickles, so the job's network must be trusted.
+    host's name, and each publisher's volume at ``$TORCHSTORE_CARRIER_HOST``, else its host's.
+    The coordinator and volumes, like TCPStore, listen on every interface unauthenticated: any
+    TCPStore client can read what their JSON hellos check before unpickling and can rewrite the
+    addresses whose replies ranks unpickle, so trust the network.
 
     Args:
         num_storage_volumes (int): Number of storage volumes to create. Defaults to 1.
         strategy (TorchStoreStrategy, optional): Strategy for distributing tensors across volumes.
             Uses ControllerStorageVolumes if None and num_storage_volumes=1.
         store_name (str): Unique name for this store instance. Defaults to DEFAULT_TORCHSTORE_NAME.
-        mesh (ProcMesh, optional): Monarch ProcMesh on which to spawn StorageVolumes
+        mesh (ProcMesh, optional): Monarch ProcMesh on which to spawn StorageVolumes.
+            Where publishers serve their own volumes, as on ``"service"``, only its size is read.
         client_type: Client implementation to initialize. Routing clients lazily
             exchange state-dict layouts and construct routes.
         control_plane: Where a routing store's ranks share publishers and layouts.
@@ -365,13 +409,15 @@ async def initialize(
         RuntimeError: If num_storage_volumes > 1 but no strategy is provided, or, for a
             routing initialize in the process whose earlier call started it, the store still
             runs that coordinator service (checked before anything spawns and as it records).
-            Also once the volumes spawned, if control_plane is a plane dialed from a service's address.
+            Also if control_plane is a plane dialed from a service's address.
         ConnectionError: If the service's advertised host does not answer, about
             60 s in.
-        TypeError: If control_plane is neither a string nor a ``ControlPlane``.
+        TypeError: If control_plane is neither a string nor a ``ControlPlane``, or
+            publishers serve their own volumes and strategy is not a plain one.
         ValueError: If control_plane is a string other than ``"monarch"`` or
-            ``"service"``, anything but ``"monarch"`` for a standard store, or an
-            instance that serves another store. On ``"service"`` also for a
+            ``"service"``, anything but ``"monarch"`` for a standard store, an
+            instance that serves another store, or publishers serve their own volumes
+            over a transport they do not carry. On ``"service"`` also for a
             ``store_name`` too long for the TCPStore keys it publishes (over about
             8,100 UTF-8 bytes).
 
@@ -426,20 +472,25 @@ async def _initialize_routing(
     store_name: str,
     control_plane: ControlPlane | Literal["service"] | None,
 ) -> ControlPlaneAddress | None:
-    """Spawn trainer volumes, then initialize the chosen control plane or Monarch's."""
-    backend = get_backend("monarch")
+    """Spawn trainer volumes unless publishers serve their own, then initialize the control plane."""
     with _selection_lock:
         if store_name in _owned_service_map:
             raise _service_still_runs(store_name)
         if isinstance(control_plane, ControlPlane):
             _check_one_store(store_name, control_plane)
     namespace = _routing_namespace(RankRole.PUBLISHER, None)
-    volumes = await backend.spawn_volumes(
-        mesh, 1, partial(_routing_volume_id, namespace)
-    )
-    await strategy.set_storage_volumes(volumes)
+    if _hosts_volumes(control_plane):
+        # Before anything starts, as the volume servers that ranks start must honor it.
+        get_backend("service").check_strategy(strategy)
+    else:
+        # Volumes are Monarch actors here, also under a caller's own control plane.
+        volumes = await get_backend("monarch").spawn_volumes(
+            mesh, 1, partial(_routing_volume_id, namespace)
+        )
+        await strategy.set_storage_volumes(volumes)
 
-    publishers = {f"{namespace}/{rank}" for rank in range(mesh.size())}
+    num_publishers = mesh.size()
+    publishers = {f"{namespace}/{rank}" for rank in range(num_publishers)}
 
     selected: _SelectedControlPlane | None = None
     service: "CoordinatorService | None" = None
@@ -447,7 +498,7 @@ async def _initialize_routing(
         selected, service = await _start_service(store_name, publishers, strategy)
         kind = "service"
     elif control_plane is None:
-        coordinator = await backend.coordinator(store_name)
+        coordinator = await get_backend("monarch").coordinator(store_name)
         await coordinator.init(
             publishers=publishers,
             strategy=strategy,
@@ -468,7 +519,7 @@ async def _initialize_routing(
             if service is not None:
                 _owned_service_map[store_name] = service
             # The store starts over, so a client cached on its old state goes too.
-            reset_client(store_name)
+            _drop_client(store_name)
     if overlapped:
         await _close_quietly(selected, None, service)
         raise _service_still_runs(store_name)
@@ -513,12 +564,17 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     path created by ``torchstore.spmd.initialize()``, which also stops Job API
     sidecars and tears down the Monarch host mesh.
 
-    For a routing store whose control plane this process initialized, was given
-    or connected to, or whose dialed record a fork dropped, it drops only that record
-    and the client, closes a connection made through an address and stops a service
-    ``initialize`` started here. Another shutdown then drops only a client, unless an SPMD
-    session of the name tears its store down. A caller's control plane stays open, and the
-    store's volumes stay with their mesh. Never overlap it with another ``initialize``,
+    For a routing store whose control plane this process initialized, was given or
+    connected to, or whose dialed record a fork dropped, it drops only that record and
+    the client, closes its clients' volume handles and a connection made through an
+    address, and stops a service ``initialize`` started here and the volume this process
+    serves, giving a call already running 30s. A call stuck in a Gloo transfer runs past
+    that grace, and this process's exit waits for it up to ``TORCHSTORE_GLOO_INIT_TIMEOUT``
+    (120s by default). A handshake its volume runs after the requester gave up holds exit only
+    for the exit hooks' bounded waits, after which it can abort the process if it returns while
+    the interpreter finalizes. Another shutdown then drops only a client, unless an SPMD session of
+    the name tears its store down. A caller's control plane stays open, and Monarch volumes
+    stay with their mesh. Never overlap it with another ``initialize``,
     ``client`` or ``shutdown`` call for the same store in this process.
 
     Args:
@@ -529,8 +585,8 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
             5s. The record and client are dropped by then, and the close runs on as a
             task of this event loop.
         RuntimeError: If that close ends cancelled or in ``GeneratorExit``, after the same drop.
-        Exception: Whatever that connection's ``close`` raises, after the same drop,
-            or stopping the store's coordinator service, after its 5s grace.
+        Exception: Whatever stopping this process's publisher volume, closing a client's
+            volume handles, that connection or the service raises, once every close ran.
 
     Example:
         >>> import torchstore as ts
@@ -560,31 +616,162 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
 
 async def _shutdown_selected(store_name: str) -> bool:
-    """Release a store's record, client and owned service, then close what they hold.
+    """Release a store's record, client, owned service and publisher volume, then close them.
 
-    Returns False if there was nothing to release. A close's error propagates.
+    Volumes stop, then every client's volume handles, the connection and the service, each even
+    if an earlier close fails. Returns False, logging any failure, if it found only dropped clients.
     """
+    # None before the service backend loads: this process serves no volume yet.
+    backend = loaded_backend("service")
+    # The caller's own error if it shuts down while handling one. AsyncExitStack drops it.
+    outer = sys.exc_info()[1]
     with _selection_lock:
         selected = _control_plane_map.pop(store_name, None)
-        forked = _forked_stores.pop(store_name, None)
-        if selected is None and forked is None:
-            return False
         # Owned only beside a record of the store, which no step removes while the service stays.
         service = _owned_service_map.pop(store_name, None)
-        _released_stores.add(store_name)
-        reset_client(store_name)
+        forked = _forked_stores.pop(store_name, None)
+        volumes = [] if backend is None else backend.stop_publisher_volumes(store_name)
+        released = not (selected is None and forked is None and not volumes)
+        carriers = []
+        if released:
+            _released_stores.add(store_name)
+            cached = _client_carrier(_local_clent_map.pop(store_name, None))
+            if cached is not None:
+                carriers.append(cached)
+        # Taken after the client and in place. No host is then lost to a reset_client that moved it
+        # here from a finalizer or appends from another thread meanwhile.
+        kept = _dropped_carriers.get(store_name, [])
+        taken = kept[:]
+        del kept[: len(taken)]
+        carriers += [(strategy_ref(), host) for strategy_ref, host in taken]
     try:
-        if selected is not None:
-            await _close_dialed(selected)
+        async with contextlib.AsyncExitStack() as closing:
+            if service is not None:
+                closing.push_async_callback(service.close)
+            if selected is not None:
+                closing.push_async_callback(_close_dialed, selected)
+            for strategy, host in carriers:
+                closing.push_async_callback(_close_carrier, strategy, host)
+            for volume in volumes:
+                closing.push_async_callback(volume.close)
+    except BaseException as error:
+        _restore_context(error, outer)
+        if released or not isinstance(error, Exception):
+            raise
+        # The store's own teardown runs next, which a failed close must not skip.
+        logger.warning(
+            "closing dropped clients of store %r failed", store_name, exc_info=True
+        )
+    return released
+
+
+def _restore_context(error: BaseException, outer: BaseException | None) -> None:
+    """Link the end of ``error``'s context chain to ``outer`` like a raise outside AsyncExitStack.
+
+    A chain that cycles (as AsyncExitStack makes when two callbacks raise one error) stays as it is.
+    """
+    seen = {id(error)}
+    while error.__context__ is not None:
+        error = error.__context__
+        if id(error) in seen:
+            return
+        seen.add(id(error))
+    if outer is not None and error is not outer:
+        error.__context__ = outer
+
+
+async def _close_carrier(
+    strategy: TorchStoreStrategy | None, host: "CarrierVolumeHost"
+) -> None:
+    """Close a released client's handles to carrier volumes, then forget its Gloo pairs.
+
+    A collected client's strategy is None, and its pairs' groups went with it.
+    """
+    volume_ids = list(host.volume_ids())
+    try:
+        await host.close()
     finally:
-        if service is not None:
-            await service.close()
-    return True
+        if strategy is not None:
+            get_backend("service").forget_context_pairs(
+                volume_ids, strategy.transport_context
+            )
+
+
+def _volume_host(strategy: object) -> "CarrierVolumeHost | None":
+    """A strategy's carrier volume host, if it resolves volumes through one.
+
+    None before the service backend loads, which a client sharing volume records loads first.
+    """
+    service = loaded_backend("service")
+    return None if service is None else service.volume_host(strategy)
+
+
+def _client_carrier(
+    client: LocalClient | None,
+) -> "tuple[TorchStoreStrategy, CarrierVolumeHost] | None":
+    """A client's strategy and its carrier volume host, if it resolves volumes through one."""
+    strategy = getattr(client, "strategy", None)
+    host = _volume_host(strategy)
+    if strategy is None or host is None:
+        return None
+    return strategy, host
+
+
+def _keep_dropped(store_name: str, client: LocalClient | None) -> None:
+    """Hold a dropped client's carrier volume host in one append until ``shutdown`` closes it.
+
+    Its strategy is held weakly, so collecting the client frees what it read, and a later
+    client's build closes the host once a newer dropped client is collected too.
+    """
+    carrier = _client_carrier(client)
+    if carrier is not None:
+        strategy, host = carrier
+        _dropped_carriers.setdefault(store_name, []).append(
+            (weakref.ref(strategy), host)
+        )
+
+
+async def _close_collected_carriers(store_name: str) -> None:
+    """Close the volume hosts of the store's dropped clients that were collected, but the newest.
+
+    The newest keeps its connections for the client being built to share. Each close runs even
+    if an earlier one fails or is cancelled, and a failure only logs.
+    """
+    with _selection_lock:
+        kept = _dropped_carriers.get(store_name, [])
+        collected = [entry for entry in kept if entry[0]() is None][:-1]
+        for entry in collected:
+            kept.remove(entry)
+    async with contextlib.AsyncExitStack() as closing:
+        for _, host in collected:
+            closing.push_async_callback(
+                _close_carrier_quietly, None, host, "a collected client's"
+            )
+
+
+def _drop_client(store_name: str) -> None:
+    """Drop the store's cached client and forget its Gloo pairs to carrier volumes.
+
+    It needs no selection lock: each step changes one map at once or locks its own state, and shutdown
+    takes what it finds in place. A shutdown on another thread between its steps leaves this host to the next.
+    """
+    dropped = _local_clent_map.pop(store_name, None)
+    carrier = _client_carrier(dropped)
+    if carrier is not None:
+        strategy, host = carrier
+        get_backend("service").forget_context_pairs(
+            host.volume_ids(), strategy.transport_context
+        )
+    _keep_dropped(store_name, dropped)
 
 
 def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
-    """Reset the cached or installed client for a given store."""
-    _local_clent_map.pop(store_name, None)
+    """Reset the cached or installed client for a given store and forget its Gloo pairs to carrier volumes.
+
+    Its volume handles close at the store's next ``shutdown`` or at a later build once it and a newer dropped
+    client are collected. A finalizer or a signal handler may call it during ``initialize``, ``client`` or ``shutdown``.
+    """
+    _drop_client(store_name)
 
 
 # What the hook below drops in a forked child, kept alive until the child exits so that the
@@ -595,12 +782,15 @@ _inherited: list[object] = []
 
 
 def _after_fork_in_child(lock: threading.Lock) -> None:
-    """Free the selection lock the fork held, and drop dialed records, service handles' records and owned services.
+    """Free the fork's selection lock and drop dialed records, service handles' records, owned services and dropped clients.
 
     The parent's stay the parent's. Until a selection, a standard initialize or a shutdown of such a store, ``client``
     raises for it without ``address`` or ``control_plane``. Other planes a caller passed stay recorded with their clients.
     """
     lock.release()
+    for carriers in _dropped_carriers.values():
+        _inherited.extend(carriers)
+    _dropped_carriers.clear()
     # None before the service backend loads: no handle exists yet.
     service = loaded_backend("service")
     for store_name, selected in list(_control_plane_map.items()):
@@ -676,14 +866,27 @@ async def client(
     Raises:
         TypeError: If address or control_plane has the wrong type, the address's class
             is not a dataclass of its own or has ``eq=False`` without an ``__eq__`` of its
-            own, or its ``connect`` returns something other than a ``ControlPlane``.
+            own, its ``connect`` returns something other than a ``ControlPlane``, or a
+            publisher's control plane shares volume records but resolves volumes another way.
         ValueError: If address or control_plane comes without role, the address
             names another store, control_plane (else address) differs from the cached
             client's, control_plane serves another store, or the first client of a
             store with a recorded control plane, or one shut down here with no SPMD
             session of its name, has no role.
         RuntimeError: In a forked child, if a call without address or control_plane
-            needs a store whose connection the fork dropped.
+            needs a store whose connection the fork dropped. With any selection: if a
+            shutdown stops a publisher's volume as it starts, another
+            thread's start of it fails, or the store holds another record for that
+            volume, which closes the new one.
+        KeyError: If a publisher's rank is not among the store's publishers. The
+            volume it started closes.
+        TimeoutError: If a publisher cannot write its volume's record in time, which
+            closes the volume as a cancel during that write does, or another call's start
+            of that volume takes over 150 s, which closes that start only if its event loop
+            has closed.
+        ConnectionError: If the TCPStore connection drops as a publisher writes its
+            volume's record. The volume closes. That write, like a timed-out or
+            cancelled one, can still land and refuse a retry: start the store over.
 
     Example:
         >>> store_client = await client()
@@ -801,7 +1004,7 @@ async def _routing_client(
     if control_plane is None and address is None and recorded is None:
         return await _monarch_routing_client(store_name, role, group)
     # Check role and group first, so a bad call dials nothing.
-    rank = _routing_volume_id(_routing_namespace(role, group))
+    rank = _client_rank(role, group)
     if given is not None:
         selected = given
     elif address is not None and (recorded is None or recorded.address != address):
@@ -816,9 +1019,22 @@ async def _routing_client(
         # The record, also when this process already connected through ``address``.
         assert recorded is not None
         selected = recorded
+    strategy: TorchStoreStrategy | None = None
+    volume = None
+    task = asyncio.current_task()
     try:
+        await _close_collected_carriers(store_name)
+        # A plane sharing volume records reaches volumes through the service backend's hosts.
+        service = (
+            get_backend("service") if _hosts_volumes(selected.control_plane) else None
+        )
         strategy = await selected.control_plane.strategy()
+        if role == RankRole.PUBLISHER and service is not None:
+            volume = await _start_volume(service, store_name, rank, selected, strategy)
     except Exception:
+        if _off_task(task):
+            # The GC is closing an abandoned build, maybe in a locked step of this thread.
+            raise
         if selected is not recorded:
             # The call's own error propagates, not the close's.
             await _close_dialed_quietly(selected)
@@ -827,6 +1043,8 @@ async def _routing_client(
         # A coroutine closed unfinished may have no running loop to close on.
         raise
     except BaseException:
+        if _off_task(task):
+            raise
         if selected is not recorded:
             # A cancel or a crash: waiting for the close would hold the caller past it.
             task = _start_close(selected)
@@ -834,9 +1052,38 @@ async def _routing_client(
                 _leave_running(task, selected.address)
         raise
     with _selection_lock:
-        routing_client, selected, closing, built = _record_client(
-            store_name, rank, role, selected, recorded, strategy
+        # A shutdown, or a start for another store of this name, stopped the volume.
+        step = None
+        if volume is None or volume.current():
+            step = _record_client(store_name, rank, role, selected, recorded, strategy)
+    if step is None:
+        async with contextlib.AsyncExitStack() as discarding:
+            if selected is not recorded:
+                discarding.push_async_callback(_close_dialed_quietly, selected)
+            if strategy is not None:
+                # No client took it, and its host's handles close nothing when collected.
+                discarding.push_async_callback(
+                    _close_carrier_quietly,
+                    strategy,
+                    _volume_host(strategy),
+                    "a discarded client's",
+                )
+        if selected is not recorded:
+            # A shutdown or a start for another store of this name stopped its volume.
+            raise _lost_build(
+                store_name,
+                _store_address(selected.control_plane, selected.address),
+                "Call ts.client again, or restart the store if it refuses the volume"
+                " as already registered",
+            )
+        # Through the record, which a shutdown that stopped the volume also released.
+        raise _lost_build(
+            store_name,
+            _store_address(selected.control_plane, selected.address),
+            "Call ts.initialize again or pass address=, and restart the store if it"
+            " refuses the volume as already registered",
         )
+    routing_client, selected, closing, built = step
     try:
         if built:
             _log_control_plane(
@@ -845,9 +1092,73 @@ async def _routing_client(
                 store_name,
                 rank,
             )
+            if volume is not None:
+                _log_volume(volume)
     finally:
-        await _close_quietly(closing, selected)
+        async with contextlib.AsyncExitStack() as closes:
+            if strategy is not None and routing_client.strategy is not strategy:
+                # A racing call's client is shared, and collecting this host closes nothing.
+                closes.push_async_callback(
+                    _close_carrier_quietly,
+                    strategy,
+                    _volume_host(strategy),
+                    "a discarded client's",
+                )
+            closes.push_async_callback(_close_quietly, closing, selected)
     return routing_client
+
+
+def _lost_build(
+    store_name: str, address: ControlPlaneAddress | None, remedy: str
+) -> RuntimeError:
+    """The error of a build whose publisher volume a shutdown or another store's start stopped."""
+    where = "" if address is None else f" on {address}"
+    return RuntimeError(
+        f"routing store {store_name!r}{where} was shut down or replaced while this "
+        f"client was being built. {remedy}"
+    )
+
+
+async def _start_volume(
+    service: ServiceBackend,
+    store_name: str,
+    volume_id: str,
+    selected: _SelectedControlPlane,
+    strategy: TorchStoreStrategy,
+) -> "PublisherVolume":
+    """Serve this publisher's volume, or adopt the one this process serves, into ``strategy``."""
+    plane = selected.control_plane
+    assert isinstance(plane, VolumeRecords)
+    host = service.volume_host(strategy)
+    if host is None:
+        raise TypeError(
+            f"{type(plane).__name__} shares volume records, so its strategy() must"
+            " resolve volumes through a CarrierVolumeHost, not"
+            f" {type(_installed_volume_host(strategy)).__name__}"
+        )
+    volume = await service.start_publisher_volume(
+        volume_id,
+        store_name=store_name,
+        selection=selected,
+        register=plane.register_volume,
+    )
+    # One that a shutdown stopped as it served has no record, and the step fails the build.
+    if volume.record is not None:
+        host.adopt(volume_id, volume.record)
+    return volume
+
+
+def _log_volume(volume: "PublisherVolume") -> None:
+    """Log where this publisher's volume listens, once per new client."""
+    address = volume.address
+    assert address is not None
+    logger.info(
+        "routing volume=%s carrier=%s:%d pid=%d",
+        volume.volume_id,
+        address.host,
+        address.port,
+        os.getpid(),
+    )
 
 
 def _record_client(
@@ -881,9 +1192,15 @@ def _record_client(
             if cached is not None:
                 return cached, current, selected, False
             closing, selected = selected, current
+            # The strategy came through this call's own dial, which closes after the step.
+            host = _volume_host(strategy)
+            if host is not None and isinstance(current.control_plane, VolumeRecords):
+                host.rebind(current.control_plane.volume_records)
         else:
             closing = _select_control_plane(store_name, selected)
     routing_client = RoutingClient(rank, role, selected.control_plane, strategy)
+    # A racing call's client stays with its caller, so shutdown closes its handles too.
+    _keep_dropped(store_name, _local_clent_map.get(store_name))
     _local_clent_map[store_name] = routing_client
     return routing_client, selected, closing, True
 
@@ -893,7 +1210,7 @@ async def _monarch_routing_client(
 ) -> RoutingClient:
     """Build and cache a routing client on the Monarch coordinator found by name."""
     # Check role and group first, so a bad call looks nothing up.
-    rank = _routing_volume_id(_routing_namespace(role, group))
+    rank = _client_rank(role, group)
     control_plane = await get_backend("monarch").coordinator(store_name)
     strategy = await control_plane.strategy()
     routing_client = RoutingClient(rank, role, control_plane, strategy)

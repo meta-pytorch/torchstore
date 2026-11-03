@@ -30,15 +30,19 @@ from monarch.actor import (
     endpoint,
     get_or_spawn_controller,
 )
+from torchstore.carrier_volumes import CarrierVolumeHost
 from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing._model import KeyRegistration, Registrations
 from torchstore.routing.control_plane import ControlPlane
 from torchstore.routing.layout_registry import LayoutRegistry
+from torchstore.routing.volume_records import VolumeRecords
+from torchstore.strategy import _installed_volume_host
 from torchstore.transport import TransportType
 
 from ..volume_meshes import VolumeMesh
 from .file_store_control_plane import FileStoreControlPlane
-from .utils import registry_store, service_store, tensor_slice
+from .tcpstore_fixtures import service_store
+from .utils import registry_store, tensor_slice
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -629,7 +633,10 @@ async def test_each_call_takes_the_interface_parameters(make_control_plane) -> N
 
 @pytest.mark.asyncio
 async def test_strategy_returns_the_registered_strategy(make_control_plane) -> None:
-    """Return a strategy of the registered type and transport, resolving its volumes."""
+    """Return a strategy of the registered type and transport, resolving its volumes.
+
+    A plane that shares volume records resolves them through its records instead.
+    """
     volumes = [("0", "host-0"), ("1", "host-1")]
     for transport in (TransportType.MonarchRPC, TransportType.Gloo):
         registered = ts.TorchStoreStrategy(transport)
@@ -638,6 +645,10 @@ async def test_strategy_returns_the_registered_strategy(make_control_plane) -> N
         strategy = await control_plane.strategy()
         assert type(strategy) is ts.TorchStoreStrategy
         assert strategy.default_transport_type == transport
+        if isinstance(control_plane, VolumeRecords):
+            host = _installed_volume_host(strategy)
+            assert isinstance(host, CarrierVolumeHost) and not host.volume_ids()
+            continue
         for rank, (volume_id, hostname) in enumerate(volumes):
             volume = strategy.get_storage_volume(volume_id)
             assert volume.volume == ("slice", {"procs": rank}), volume_id
