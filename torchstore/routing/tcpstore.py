@@ -26,15 +26,17 @@ import time
 import uuid
 import weakref
 import zlib
-from collections.abc import Callable, Collection, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial
-from typing import Any, Generic, NoReturn, TYPE_CHECKING, TypeVar
+from typing import Any, Generic, NamedTuple, NoReturn, TYPE_CHECKING, TypeVar
+from urllib.parse import quote
 
 from torch.distributed import DistError, DistNetworkError, PrefixStore, TCPStore
 
 from torchstore import native_calls
+from torchstore.routing.volume_records import VolumeRecords
 
 if TYPE_CHECKING:
     from torchstore.strategy import TorchStoreStrategy
@@ -51,6 +53,19 @@ _MAX_KEY_BYTES = 8 * 1024
 _MAX_VALUE_BYTES = 8 * 1024 * 1024
 # Readers stop inflating a strategy past this, so no small value takes unbounded memory.
 _MAX_STRATEGY_BYTES = 256 * 1024 * 1024
+# Reads go in chunks of at most 16 keys, so a reply holds at most 16 records, and a
+# chunk's request (9 bytes, plus 8 and the wire key per key) stays within the server's
+# 4 KiB read buffer unless the chunk is one longer key alone. The client still sends
+# in 1440 B flushes, so a full chunk's request can take two or three reads.
+_READ_CHUNK_KEYS = 16
+_READ_CHUNK_BYTES = 4 * 1024
+# A store call takes the GIL back as it returns and can wait a switch interval (5 ms by
+# default) or more for it while other threads run Python. A native call's thread hop waits too.
+# So a read makes its record checks and fetches in one native call, and a publish writes the
+# per-publisher keys by one multi_set of up to this many per native call: 16 for 4,096 keys.
+_MEMBER_CHUNK_KEYS = 256
+# A volume_records KeyError names at most this many missing ids and its checks stop once they are found.
+_NAMED_MISSING = 16
 # get and multi_get wait on the store timeout internally, so it is never shortened.
 _STORE_TIMEOUT = timedelta(seconds=300)
 _DEFAULT_TIMEOUT_S = 60.0
@@ -90,7 +105,10 @@ _PUBLISHERS = "publishers"
 _STRATEGY = "strategy"
 _COORDINATOR = "coordinator"
 _READY = "ready"
-_SCHEMA_VERSION = b"1"
+# The value of each publisher's own key. Registration reads only whether the key exists.
+_MEMBER = b"1"
+# Stores of this schema hold those keys. Calls refuse any other schema at the ready check.
+_SCHEMA_VERSION = b"2"
 # What keeps a published value under the value limit, for the near-limit WARNING.
 _SMALLER_VALUE = {
     _PUBLISHERS: "fewer or shorter publisher names",
@@ -145,6 +163,13 @@ class TCPStoreAddress:
     nonce: str
 
 
+class _Publish(NamedTuple):
+    """What one publish writes, encoded and size-checked: its values by key, then the publishers' own keys."""
+
+    values: dict[str, bytes]
+    members: list[str]
+
+
 def _endpoint(address: TCPStoreAddress) -> str:
     return f"{address.host}:{address.port}"
 
@@ -170,6 +195,94 @@ def _check_sizes(prefix: str, key: str, value: bytes = b"") -> int:
             f"(the limit is {_MAX_VALUE_BYTES})"
         )
     return key_size
+
+
+def _volume_key(volume_id: str) -> str:
+    # One key segment, so no volume id can reach another key under the prefix.
+    return f"volume/{quote(volume_id, safe='')}"
+
+
+def _member_key(volume_id: str) -> str:
+    # Written for each publisher before ready, so membership is one check of one key.
+    return f"member/{quote(volume_id, safe='')}"
+
+
+def _member_keys(prefix: str, publishers: Collection[str]) -> list[str]:
+    """Return the publishers' own keys sorted and without repeats.
+
+    A key over the wire cap raises ValueError. An id that UTF-8 cannot encode raises
+    UnicodeEncodeError (a ValueError too).
+    """
+    members = sorted({_member_key(publisher) for publisher in publishers})
+    for member in members:
+        _check_sizes(prefix, member)
+    return members
+
+
+def _read_chunks(prefix: str, keys: Sequence[str]) -> list[list[str]]:
+    """Split ``keys`` into chunks that each fit both read bounds above.
+
+    A key whose request alone is over the byte budget gets a chunk of its own.
+    """
+    chunks: list[list[str]] = []
+    request_size = 0
+    for key in keys:
+        key_size = 8 + _check_sizes(prefix, key)
+        if (
+            chunks
+            and len(chunks[-1]) < _READ_CHUNK_KEYS
+            and request_size + key_size <= _READ_CHUNK_BYTES
+        ):
+            chunks[-1].append(key)
+            request_size += key_size
+        else:
+            chunks.append([key])
+            request_size = 9 + key_size
+    return chunks
+
+
+def _start_store_call(what: str, deadline: float, given_up: Callable[[], bool]) -> None:
+    """Refuse a store call named ``what`` in a native call once its deadline passes, its caller gives up or exit begins."""
+    if not deadline - time.monotonic() > 0:
+        raise TimeoutError(f"{what} was not started: its deadline had passed")
+    if given_up():
+        raise RuntimeError(f"{what} was not started: its caller gave up")
+    if _exiting:
+        raise RuntimeError(f"{what} was not started: exiting")
+
+
+def _read_records(
+    ids: Mapping[str, str],
+    chunks: Sequence[list[str]],
+    start: Callable[[str], None],
+    store: PrefixStore,
+) -> tuple[list[str], dict[str, bytes]]:
+    """Return the ids under ``chunks``' keys without a record, ``_NAMED_MISSING`` at most, or else every record.
+
+    Checks the chunks in turn and each key of a failed chunk right after it, and stops at that many missing ids.
+    Fetches only once every key has a record. Calls ``start`` with each store call's name before making it.
+    """
+
+    def exists(keys: list[str]) -> bool:
+        start(f"check({keys!r})")
+        return store.check(keys)
+
+    missing: list[str] = []
+    for chunk in chunks:
+        if not exists(chunk):
+            for key in chunk:
+                if not exists([key]):
+                    missing.append(ids[key])
+                    if len(missing) >= _NAMED_MISSING:
+                        return missing, {}
+    if missing:
+        return missing, {}
+    records: dict[str, bytes] = {}
+    for chunk in chunks:
+        # multi_get blocks on a missing key. Records are never deleted.
+        start(f"multi_get({chunk!r})")
+        records.update(zip((ids[key] for key in chunk), store.multi_get(chunk)))
+    return missing, records
 
 
 def _resolve(host: str, port: int, attempt_s: float) -> list[str]:
@@ -600,12 +713,12 @@ async def _open(
         await asyncio.sleep(pause)
 
 
-class TCPStoreRendezvous:
+class TCPStoreRendezvous(VolumeRecords):
     """One connection to a routing store's keys on a TCPStore.
 
-    The driver calls ``serve`` and publishes the publisher ranks and strategy
-    once. Other ranks ``connect`` to its address and read them back. ``timeout_s``
-    bounds a whole call, 60 s if None. TimeoutError and ConnectionError name the server.
+    The driver calls ``serve`` and publishes the publisher ranks, the strategy and a key per publisher once. Other
+    ranks ``connect`` to its address to read them back and to register and read volume records. ``timeout_s`` bounds
+    a whole call, 60 s if None. TimeoutError and ConnectionError name the server.
     """
 
     def __init__(self, address: TCPStoreAddress, store: TCPStore) -> None:
@@ -676,6 +789,101 @@ class TCPStoreRendezvous:
         )
         return cls(address, store)
 
+    async def register_volume(
+        self,
+        volume_id: str,
+        record: bytes,
+        /,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
+        """Write a publisher's volume record once. The same record again returns.
+
+        ``timeout_s=None`` means 60 s. Non-publisher ids raise KeyError and another record RuntimeError. Before
+        sending, a record that is not bytes raises TypeError and an empty or oversized record or long id ValueError.
+        """
+        key = _volume_key(volume_id)
+        if not isinstance(record, bytes):
+            # A str would be stored and then compare unequal to the bytes read back.
+            raise TypeError(
+                f"volume {volume_id!r} has a {type(record).__name__} record, not bytes"
+            )
+        if not record:
+            # compare_set would let a later record replace an empty one.
+            raise ValueError(f"volume {volume_id!r} has an empty record")
+        key_size = _check_sizes(_prefix(self.address), key, record)
+        member = _member_key(volume_id)
+        timeout_s = _DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout_s
+        await self._require_ready(deadline)
+        # Both are written before ready, so a missing publisher set means a malformed store.
+        if not await self._check([member], deadline):
+            if not await self._check([_PUBLISHERS], deadline):
+                raise self._error("marked ready without its publishers")
+            raise KeyError(f"{volume_id!r} is not a publisher rank")
+        stored = await self._call(
+            f"compare_set({key!r})",
+            lambda store: store.compare_set(key, "", record),  # type: ignore[arg-type]
+            deadline,
+        )
+        if stored != record:
+            raise self._error(
+                f"volume {volume_id!r} is already registered with another record"
+            )
+        # Warns near either cap as _compare_set does.
+        near_limit = 2 * key_size > _MAX_KEY_BYTES or 2 * len(record) > _MAX_VALUE_BYTES
+        logger.log(
+            logging.WARNING if near_limit else logging.INFO,
+            "Volume %r has its record of %d bytes at TCPStore key %r (%d key bytes) on %s%s",
+            volume_id,
+            len(record),
+            key,
+            key_size,
+            _endpoint(self.address),
+            (
+                f". A key over {_MAX_KEY_BYTES} bytes or a record over {_MAX_VALUE_BYTES} bytes"
+                " fails registration: shorten the store name"
+            )
+            if near_limit
+            else "",
+        )
+
+    async def volume_records(
+        self,
+        volume_ids: Collection[str],
+        /,
+        *,
+        timeout_s: float | None = None,
+    ) -> dict[str, bytes]:
+        """Return the record of each id in ``volume_ids``, in chunks and never waiting.
+
+        ``timeout_s=None`` means 60 s. A KeyError names the ids without a record, 16 at most, before any is
+        fetched, and an id over the key cap raises ValueError before sending. The store calls after the ready
+        marker's share one native call.
+        """
+        ids = {_volume_key(volume_id): volume_id for volume_id in volume_ids}
+        if not ids:
+            return {}
+        chunks = _read_chunks(_prefix(self.address), list(ids))
+        timeout_s = _DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout_s
+        await self._require_ready(deadline)
+        missing, records = await self._steps(
+            f"reading {len(ids)} volume records",
+            partial(_read_records, ids, chunks),
+            deadline,
+        )
+        if missing:
+            first = (
+                ""
+                if len(missing) < _NAMED_MISSING
+                else f" (the first {len(missing)} found)"
+            )
+            raise KeyError(
+                self._named(f"no volume record for {sorted(missing)}{first}")
+            )
+        return records
+
     async def publish(
         self,
         publishers: Collection[str],
@@ -684,26 +892,50 @@ class TCPStoreRendezvous:
         coordinator: str | None = None,
         timeout_s: float | None = None,
     ) -> None:
-        """Write the publisher ranks, the strategy and any coordinator, then ``ready``.
+        """Write the publisher ranks, the strategy, any coordinator and a key per publisher, then ``ready``.
 
         Raises:
-            ValueError: If a key or value is over its size limit. Nothing is written.
+            ValueError: If a key or value is over its limit or UTF-8 cannot encode a publisher id. Nothing is written.
             RuntimeError: If the store was already published with other content.
         """
-        timeout_s = _DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
-        deadline = time.monotonic() + timeout_s
+        prepared = self.prepare_publish(publishers, strategy, coordinator=coordinator)
+        await self.publish_prepared(prepared, timeout_s=timeout_s)
+
+    def prepare_publish(
+        self,
+        publishers: Collection[str],
+        strategy: TorchStoreStrategy,
+        /,
+        *,
+        coordinator: str | None = None,
+    ) -> _Publish:
+        """Encode and size-check what ``publish`` writes, raising as it would before any store call.
+
+        ``publish_prepared`` then writes it. A caller can thus refuse a publish before work of its own.
+        """
+        # Walked twice below: a one-shot iterable still gets every publisher's own key.
+        publishers = list(publishers)
         values = {
             _PUBLISHERS: _encode_publishers(publishers),
             _STRATEGY: _encode_strategy(strategy),
         }
         if coordinator is not None:
             values[_COORDINATOR] = coordinator.encode()
-        values[_READY] = _SCHEMA_VERSION
-        for key, value in values.items():
+        members = _member_keys(_prefix(self.address), publishers)
+        for key, value in [*values.items(), (_READY, _SCHEMA_VERSION)]:
             _check_sizes(_prefix(self.address), key, value)
-        for key, value in values.items():
-            if await self._compare_set(key, value, deadline) != value:
-                raise self._error(f"store already initialized with a different {key!r}")
+        return _Publish(values, members)
+
+    async def publish_prepared(
+        self, prepared: _Publish, /, *, timeout_s: float | None = None
+    ) -> None:
+        """Write what ``prepare_publish`` returned, as ``publish`` does. ``timeout_s=None`` means 60 s."""
+        timeout_s = _DEFAULT_TIMEOUT_S if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout_s
+        for key, value in prepared.values.items():
+            await self._write_once(key, value, deadline)
+        await self._write_members(prepared.members, deadline)
+        await self._write_once(_READY, _SCHEMA_VERSION, deadline)
 
     async def read(
         self,
@@ -783,7 +1015,10 @@ class TCPStoreRendezvous:
             )
 
     def _error(self, problem: str) -> RuntimeError:
-        return RuntimeError(
+        return RuntimeError(self._named(problem))
+
+    def _named(self, problem: str) -> str:
+        return (
             f"routing store {self.address.store_name!r} on TCPStore "
             f"{_endpoint(self.address)}: {problem}"
         )
@@ -791,6 +1026,37 @@ class TCPStoreRendezvous:
     async def _call(
         self, what: str, fn: Callable[[PrefixStore], _T], deadline: float
     ) -> _T:
+        # Only the call holds the store. A kept error holds this frame and must not keep the store.
+        call = _NativeCall(partial(fn, self._live_store()))
+        return await self._lane.run(
+            call,
+            deadline,
+            f"{what} on TCPStore {_endpoint(self.address)}",
+        )
+
+    async def _steps(
+        self,
+        what: str,
+        fn: Callable[[Callable[[str], None], PrefixStore], _T],
+        deadline: float,
+    ) -> _T:
+        """Make ``fn``'s store calls in one native call to spare each a thread hop.
+
+        ``fn`` passes each store call's name to its first argument before making it. That argument
+        raises once ``deadline`` has passed, the caller has given up or exit has begun.
+        """
+        endpoint = _endpoint(self.address)
+
+        def start(step: str) -> None:
+            _start_store_call(
+                f"{step} on TCPStore {endpoint}", deadline, lambda: call.given_up
+            )
+
+        call = _NativeCall(partial(fn, start, self._live_store()))
+        return await self._lane.run(call, deadline, f"{what} on TCPStore {endpoint}")
+
+    def _live_store(self) -> PrefixStore:
+        """Return this connection's store. A forked child or a closed connection gets RuntimeError."""
         if os.getpid() != self._pid:
             raise RuntimeError(
                 f"connection to TCPStore {_endpoint(self.address)} was inherited "
@@ -801,13 +1067,46 @@ class TCPStoreRendezvous:
             raise RuntimeError(
                 f"connection to TCPStore {_endpoint(self.address)} is closed"
             )
-        call = _NativeCall(partial(fn, prefixed))
-        del prefixed  # a kept error holds this frame, which must not keep the store
-        return await self._lane.run(
-            call,
-            deadline,
-            f"{what} on TCPStore {_endpoint(self.address)}",
+        return prefixed
+
+    async def _write_members(self, members: Sequence[str], deadline: float) -> None:
+        """Write the publisher keys by one multi_set per native call of up to ``_MEMBER_CHUNK_KEYS`` keys.
+
+        Only a publish whose publisher list matched the stored one gets here, and each writes ``_MEMBER`` to
+        the same keys. multi_set's last write therefore wins harmlessly. A failed chunk ends the publish.
+        """
+        if not members:
+            return
+        endpoint = _endpoint(self.address)
+        longest = max(members, key=lambda member: len(member.encode()))
+        key_size = _check_sizes(_prefix(self.address), longest)
+        near_cap = 2 * key_size > _MAX_KEY_BYTES
+        # One line per publish rather than per publisher, a warning near the key cap as in _compare_set.
+        logger.log(
+            logging.WARNING if near_cap else logging.INFO,
+            "Writing a key per publisher, %d in all, the longest %r (%d key bytes), to TCPStore %s%s",
+            len(members),
+            longest,
+            key_size,
+            endpoint,
+            f". A key over {_MAX_KEY_BYTES} bytes fails the publish: shorten the store name"
+            if near_cap
+            else "",
         )
+        for start in range(0, len(members), _MEMBER_CHUNK_KEYS):
+            chunk = list(members[start : start + _MEMBER_CHUNK_KEYS])
+            # multi_set returns before the server applies it. Ready's compare_set later on this connection
+            # returns only once these keys are in: the server applies one connection's requests in order.
+            await self._call(
+                f"multi_set of {len(chunk)} publisher keys from {chunk[0]!r}",
+                lambda store, keys=chunk: store.multi_set(keys, [_MEMBER] * len(keys)),  # type: ignore[arg-type]
+                deadline,
+            )
+
+    async def _write_once(self, key: str, value: bytes, deadline: float) -> None:
+        """Write ``value`` by compare_set, raising RuntimeError if ``key`` holds another non-empty value."""
+        if await self._compare_set(key, value, deadline) != value:
+            raise self._error(f"store already initialized with a different {key!r}")
 
     async def _compare_set(self, key: str, value: bytes, deadline: float) -> bytes:
         key_size = _check_sizes(_prefix(self.address), key, value)

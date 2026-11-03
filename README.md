@@ -629,6 +629,10 @@ connection whose JSON hello it accepted, and that hello checks only values that 
 TCPStore client can read. Each rank also unpickles the strategy it reads from the
 TCPStore and every reply of the coordinator whose address it reads there, and any
 TCPStore client can overwrite both. So choose `"service"` only on a trusted network.
+The TCPStore keys a store's name goes into stay under its 8KiB key limit only for a name
+of up to about 8,100 UTF-8 bytes. `ts.initialize` refuses a longer one with `ValueError`
+only after it spawns volumes on `mesh` and starts the TCPStore and the coordinator. It
+closes both servers before it raises but leaves the volumes running on `mesh`.
 
 Volumes stay Monarch actors on `mesh`, each rank's id still comes from Monarch's
 `current_rank()`, and the strategy, which holds the volumes' Monarch handles, reaches

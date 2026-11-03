@@ -583,7 +583,7 @@ async def test_address_pickles_compares_by_value_and_hides_its_nonce() -> None:
 
 @pytest.mark.asyncio
 async def test_only_the_serving_process_initializes_once_writing_ready_last() -> None:
-    """Refuse init through an address and a second init. Write the four keys, ready last."""
+    """Refuse init through an address and a second init. Write each key once, ready last."""
     async with _served(publishers=None) as served:
         rendezvous = served.service._rendezvous
         assert rendezvous is not None
@@ -603,6 +603,10 @@ async def test_only_the_serving_process_initializes_once_writing_ready_last() ->
                     publishers_at_ready.append(registry._publishers)
                 return self.store.compare_set(key, expected, value)
 
+            def multi_set(self, keys: list[str], values: list[bytes]) -> None:
+                written.extend(keys)
+                self.store.multi_set(keys, values)
+
         rendezvous._prefixed = Recorder(prefixed)  # type: ignore[assignment]
         try:
             handle = await served.connect()
@@ -616,7 +620,8 @@ async def test_only_the_serving_process_initializes_once_writing_ready_last() ->
                 await served.driver.init(_PUBLISHERS, _strategy())
         finally:
             rendezvous._prefixed = prefixed
-        assert written == ["publishers", "strategy", "coordinator", "ready"]
+        members = [tcpstore._member_key(rank) for rank in sorted(_PUBLISHERS)]
+        assert written == ["publishers", "strategy", "coordinator", *members, "ready"]
         # A rank that sees ``ready`` finds the registry already set up.
         assert publishers_at_ready == [frozenset(_PUBLISHERS)]
         coordinator = await rendezvous.read_coordinator()
@@ -657,17 +662,17 @@ async def test_a_failed_init_is_not_retried_and_keeps_layouts(
     async with _served(publishers=None) as served:
         rendezvous = served.service._rendezvous
         assert rendezvous is not None
-        publish = rendezvous.publish
+        publish = rendezvous.publish_prepared
 
         async def late(*args: Any, **kwargs: Any) -> None:
             # Every key is written, ready included, before the caller gives up.
             await publish(*args, **kwargs)
             raise TimeoutError("publish timed out")
 
-        monkeypatch.setattr(rendezvous, "publish", late)
+        monkeypatch.setattr(rendezvous, "publish_prepared", late)
         with pytest.raises(TimeoutError, match="publish timed out"):
             await served.driver.init(_PUBLISHERS, _strategy())
-        monkeypatch.setattr(rendezvous, "publish", publish)
+        monkeypatch.setattr(rendezvous, "publish_prepared", publish)
         key = _key()
         handle = await served.connect()
         await _register(handle, key, "publisher/0")
@@ -675,6 +680,62 @@ async def test_a_failed_init_is_not_retried_and_keeps_layouts(
             await served.driver.init(_PUBLISHERS, _strategy())
         await _register(handle, key, "publisher/1")
         assert await handle.get_layouts(key, timeout_s=0) == _layouts(key)
+
+
+@pytest.mark.parametrize(
+    "publisher, error",
+    [
+        pytest.param("p" * 8192, "bytes on the wire", id="key_over_the_cap"),
+        pytest.param("\ud800", "surrogates not allowed", id="not_utf8"),
+        pytest.param(None, "value for 'publishers' has", id="publishers_over_the_cap"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_publish_the_tcpstore_refuses_leaves_init_to_a_later_call(
+    monkeypatch: pytest.MonkeyPatch, publisher: str | None, error: str
+) -> None:
+    """Refuse a publish the TCPStore cannot take with an error naming the store before setting up the registry.
+
+    Its publisher ids can be too long for their own keys, not UTF-8 or together over the 8 MiB value cap.
+    A later init then runs and prepares its publish once.
+    """
+    # 1,100 ids of 8,000 bytes, each under the key cap and together over the value cap.
+    extra = [publisher] if publisher else [f"{i:04}{'q' * 7996}" for i in range(1100)]
+    async with _served(publishers=None) as served:
+        rendezvous = served.service._rendezvous
+        assert rendezvous is not None
+        prepare = rendezvous.prepare_publish
+        prepared: list[Any] = []
+
+        def preparing(*args: Any, **kwargs: Any) -> Any:
+            prepared.append(prepare(*args, **kwargs))
+            return prepared[-1]
+
+        monkeypatch.setattr(rendezvous, "prepare_publish", preparing)
+        address = served.service.address
+        named = re.escape(
+            f"routing store {address.store_name!r} on {address}: cannot publish: "
+        )
+        with pytest.raises(ValueError, match=f"^{named}.*{error}"):
+            await served.driver.init([*_PUBLISHERS, *extra], _strategy())
+        await served.driver.init(_PUBLISHERS, _strategy())
+    assert len(prepared) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_store_name_too_long_for_its_keys_fails_init_naming_the_store() -> None:
+    """Refuse a store name too long for its keys with an error naming the store before setting up the registry."""
+    store_name = f"{'s' * 8192}-{_store_name()}"
+    async with _served(publishers=None, store_name=store_name) as served:
+        address = served.service.address
+        named = re.escape(
+            f"routing store {store_name!r} on {address}: cannot publish: "
+        )
+        with pytest.raises(
+            ValueError, match=f"^{named}TCPStore key .* bytes on the wire"
+        ):
+            await served.driver.init(_PUBLISHERS, _strategy())
+        assert served.service._adapter.registry._publishers is None
 
 
 @pytest.mark.asyncio
@@ -744,7 +805,7 @@ async def test_a_failed_read_is_not_cached() -> None:
     ("ready", "error"),
     [
         (tcpstore._SCHEMA_VERSION, "marked ready without a coordinator"),
-        (b"2", "schema version b'2'"),
+        (b"1", "schema version b'1'"),
     ],
     ids=["no_coordinator", "other_schema"],
 )
