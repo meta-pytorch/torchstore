@@ -178,10 +178,13 @@ either one to choose the limit yourself.
 Monarch shuts down at exit through exit hooks, one registered when it loads and one at its
 first use outside an actor, such as `this_host()`, `current_rank()` or TorchStore's first
 call that starts actors, as `ts.initialize` does. Exit hooks run in reverse order of
-registration, so register one that calls TorchStore after `ts.initialize` returns. A hook
-registered before Monarch loads, such as right after `import torchstore`, runs after
-Monarch's shutdown, and its TorchStore calls raise pyo3's `PanicException`, which derives
-from `BaseException`, so `except Exception` does not catch it.
+registration, so register one that calls TorchStore after `ts.initialize` returns. In a
+process that loads Monarch before exit, a hook registered before Monarch loads (such as
+right after `import torchstore`) runs after Monarch's shutdown. Its TorchStore calls then
+raise pyo3's `PanicException`, which derives from `BaseException` and so escapes
+`except Exception`. A hook that makes the process's first TorchStore call loads Monarch
+during exit instead. Python runs no exit hook registered that late. Monarch then never
+shuts down at exit and the hook's calls work as on main.
 
 Monarch code that core modules held now lives under `torchstore.monarch`, such as the
 controller, storage volume and routing coordinator modules, Monarch RDMA and
@@ -226,10 +229,12 @@ at `import torchstore` happen then instead:
   job loggers, such as `monarch._src.job.job`, get Monarch's own level, stderr handler and
   `propagate=False` when the backend loads them, which replaces a level or `propagate` you
   set on them before that, so configure them after it
-- TorchStore's Monarch backend binds Monarch names such as
-  `monarch.actor.get_or_spawn_controller` and `monarch.rdma.RDMABuffer` when it loads, so a
-  patch of one that is active then stays bound after the patch ends, and a patch made
-  afterwards does not reach the backend
+- TorchStore's Monarch backend binds `monarch.actor.get_or_spawn_controller` and
+  `current_rank` when it loads. It takes `monarch.rdma.RDMABuffer` from
+  `torchstore.monarch.rdma`, which binds it as that module loads. That happens with the
+  backend or earlier through an old path, the storage volume module or an unpickled
+  handle. A patch of one of these names that is active at its binding stays bound after
+  the patch ends. A patch made afterwards does not reach the backend
 - Monarch's import-time warning filters, such as showing its RDMA fallback warning once,
   now take precedence over filters you set for those warnings after `import torchstore`,
   and a `warnings.catch_warnings` block around the call that loads Monarch drops them when
