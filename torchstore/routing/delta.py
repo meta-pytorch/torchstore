@@ -68,6 +68,8 @@ _HEADER_DTYPE = torch.int64
 _HEADER_BYTES = 3 * _HEADER_DTYPE.itemsize
 _INDEX_DTYPE = torch.int32
 _OVERFLOW = -1
+# Elements compared per step; bounds accelerator temporaries to a few hundred MB.
+_CHUNK_NUMEL = 1 << 24
 _WIRE_DTYPES = (
     torch.float32,
     torch.bfloat16,
@@ -89,6 +91,11 @@ _BITS_DTYPES = {
     4: torch.int32,
     8: torch.int64,
 }
+
+
+def _new_epoch() -> int:
+    """Random epoch distinguishing publisher instances that reuse versions."""
+    return int.from_bytes(os.urandom(8), "little") >> 1
 
 
 def _delta_key(key: str) -> str:
@@ -136,19 +143,18 @@ class _Entry:
     capacity: int
     # Previous version in the wire dtype, in host memory.
     previous: torch.Tensor
+    # Row that is put, in host memory.
     packed: torch.Tensor
-    # Host copy of ``packed`` that is put; ``packed`` itself on CPU sources.
-    host_packed: torch.Tensor
     row_slice: TensorSlice
 
 
 class StateDictDelta:
     """Publisher-side encoder of per-version state-dict deltas.
 
-    Keeps a copy of the previous version in the wire dtype in host memory, and
-    fixed-size packed buffers. Accelerator tensors are compared on their device,
-    copying the previous version there one tensor at a time. Pass it to
-    :func:`put_state_dict_delta` with each new version.
+    Keeps a copy of the previous version in the wire dtype and fixed-size
+    packed rows, both in host memory. Accelerator tensors are compared on their
+    device, copying the previous version there in chunks of ``_CHUNK_NUMEL``
+    elements. Pass it to :func:`put_state_dict_delta` with each new version.
 
     Args:
         state_dict: Template with the same keys, shapes, placements and devices
@@ -180,8 +186,7 @@ class StateDictDelta:
         self._preserve_dtype_keys = preserve_dtype_keys
         self._entries: dict[str, _Entry] = {}
         self._version = 0
-        # Distinguishes publisher instances that reuse version numbers.
-        self._epoch = int.from_bytes(os.urandom(8), "little") >> 1
+        self._epoch = _new_epoch()
         for flat_key, value in flattened.items():
             if not isinstance(value, torch.Tensor):
                 raise TypeError(
@@ -202,22 +207,14 @@ class StateDictDelta:
             per_shard = math.ceil(value.numel() / math.prod(grid))
             capacity = 8 * max(1, math.ceil(max_fraction * per_shard / 8))
             nbytes = _row_bytes(capacity, wire_dtype)
-            packed = torch.empty(nbytes, dtype=torch.uint8, device=local.device)
-            host_packed = (
-                packed
-                if local.device.type == "cpu"
-                else torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-            )
+            pin_memory = local.device.type != "cpu"
             self._entries[flat_key] = _Entry(
                 wire_dtype=wire_dtype,
                 capacity=capacity,
                 previous=torch.empty(
-                    local.shape,
-                    dtype=wire_dtype,
-                    pin_memory=local.device.type != "cpu",
+                    local.shape, dtype=wire_dtype, pin_memory=pin_memory
                 ),
-                packed=packed,
-                host_packed=host_packed,
+                packed=torch.zeros(nbytes, dtype=torch.uint8, pin_memory=pin_memory),
                 row_slice=TensorSlice(
                     offsets=coordinate + (0,),
                     coordinates=(),
@@ -229,47 +226,63 @@ class StateDictDelta:
 
     @torch.no_grad()
     def _stage(self, state_dict: Mapping[str, Any]) -> None:
-        """Encode ``state_dict`` against the previous version and copy it to host."""
+        """Encode ``state_dict`` against the previous version into the rows."""
         flattened, _mapping = flatten_state_dict(dict(state_dict))
         if flattened.keys() != self._entries.keys():
             raise ValueError("state dict keys do not match the delta template")
-        devices = set()
-        for flat_key, entry in self._entries.items():
-            value = flattened[flat_key]
-            local = value._local_tensor if isinstance(value, DTensor) else value
-            wire = local.to(entry.wire_dtype).contiguous()
-            capacity = entry.capacity
-            values_end = _HEADER_BYTES + capacity * entry.wire_dtype.itemsize
-            indices_end = values_end + capacity * _INDEX_DTYPE.itemsize
-            header = entry.packed[:_HEADER_BYTES].view(_HEADER_DTYPE)
-            count = header[0]
-            header[1].fill_(self._version + 1)
-            header[2].fill_(self._epoch)
-            if self._version == 0:
-                count.fill_(_OVERFLOW)
-            elif wire.numel() == 0:
-                count.zero_()
-            else:
-                bits_dtype = _BITS_DTYPES[entry.wire_dtype.itemsize]
-                previous = entry.previous.to(local.device, non_blocking=True)
-                changed = (wire.view(bits_dtype) != previous.view(bits_dtype)).flatten()
-                num_changed = torch.count_nonzero(changed)
-                indices = torch.nonzero_static(changed, size=capacity, fill_value=0)
-                indices = indices.squeeze(1)
-                entry.packed[_HEADER_BYTES:values_end].view(entry.wire_dtype).copy_(
-                    wire.flatten()[indices]
-                )
-                entry.packed[values_end:indices_end].view(_INDEX_DTYPE).copy_(indices)
-                count.copy_(torch.where(num_changed > capacity, _OVERFLOW, num_changed))
-            # Stream-ordered after the read of the previous version above.
-            entry.previous.copy_(wire, non_blocking=True)
-            if entry.host_packed is not entry.packed:
-                entry.host_packed.copy_(entry.packed, non_blocking=True)
-                devices.add(entry.packed.device)
-        # Not the whole device: callers may overlap work on other streams.
-        for device in devices:
-            torch.accelerator.current_stream(device).synchronize()
+        try:
+            devices = set()
+            for flat_key, entry in self._entries.items():
+                value = flattened[flat_key]
+                local = value._local_tensor if isinstance(value, DTensor) else value
+                self._encode(entry, local.reshape(-1))
+                if local.device.type != "cpu":
+                    devices.add(local.device)
+            # Not the whole device: callers may overlap work on other streams.
+            for device in devices:
+                torch.accelerator.current_stream(device).synchronize()
+        except BaseException:
+            # Some rows and previous copies may hold the new version: a new
+            # epoch makes requesters read full tensors.
+            self._version = 0
+            self._epoch = _new_epoch()
+            raise
         self._version += 1
+
+    def _encode(self, entry: _Entry, source: torch.Tensor) -> None:
+        """Encode the flat ``source`` into ``entry.packed`` on the current stream.
+
+        Syncs the stream once per chunk to size the changed elements.
+        """
+        capacity = entry.capacity
+        wire_dtype = entry.wire_dtype
+        values_end = _HEADER_BYTES + capacity * wire_dtype.itemsize
+        header = entry.packed[:_HEADER_BYTES].view(_HEADER_DTYPE)
+        values = entry.packed[_HEADER_BYTES:values_end].view(wire_dtype)
+        indices = entry.packed[values_end:].view(_INDEX_DTYPE)
+        bits_dtype = _BITS_DTYPES[wire_dtype.itemsize]
+        previous = entry.previous.view(-1)
+        # Overflow on the first version.
+        count = 0 if self._version > 0 else capacity + 1
+        for start in range(0, source.numel(), _CHUNK_NUMEL):
+            wire = source[start : start + _CHUNK_NUMEL].to(wire_dtype)
+            host_previous = previous[start : start + wire.numel()]
+            if count <= capacity:
+                old = host_previous.to(wire.device, non_blocking=True)
+                changed = torch.nonzero(wire.view(bits_dtype) != old.view(bits_dtype))
+                found = changed.squeeze(1)
+                end = count + found.numel()
+                if end <= capacity:
+                    values[count:end].copy_(wire[found], non_blocking=True)
+                    indices[count:end].copy_(
+                        (found + start).to(_INDEX_DTYPE), non_blocking=True
+                    )
+                count = end
+            # Stream-ordered after the read of the previous version above.
+            host_previous.copy_(wire, non_blocking=True)
+        header[0] = count if count <= capacity else _OVERFLOW
+        header[1] = self._version + 1
+        header[2] = self._epoch
 
 
 async def put_state_dict_delta(
@@ -308,7 +321,7 @@ async def put_state_dict_delta(
         )
     await store.put_batch(
         {
-            _state_dict_storage_key(delta_key, flat_key): entry.host_packed.view(
+            _state_dict_storage_key(delta_key, flat_key): entry.packed.view(
                 entry.row_slice.local_shape
             )
             for flat_key, entry in delta._entries.items()

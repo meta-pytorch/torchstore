@@ -243,6 +243,28 @@ def test_stage_encodes_changed_elements_and_overflow() -> None:
     assert version.item() == 5
 
 
+def test_stage_failure_starts_a_new_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed stage may leave rows partly encoded, so requesters must read in full."""
+    tensors = {"a": torch.zeros(16), "b": torch.zeros(16)}
+    delta = StateDictDelta(tensors, max_fraction=0.5)
+    delta._stage(tensors)
+    epoch = delta._epoch
+    encode = delta._encode
+    calls = []
+
+    def fail_second(entry, source):
+        calls.append(entry)
+        if len(calls) == 2:
+            raise RuntimeError("encode failed")
+        encode(entry, source)
+
+    monkeypatch.setattr(delta, "_encode", fail_second)
+    with pytest.raises(RuntimeError, match="encode failed"):
+        delta._stage(tensors)
+    assert delta._version == 0
+    assert delta._epoch != epoch
+
+
 @pytest.mark.asyncio
 async def test_delta_sync_falls_back_for_stale_destinations(
     full_reads: dict[object, set[str]],
