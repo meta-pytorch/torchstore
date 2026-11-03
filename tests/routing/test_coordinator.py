@@ -7,21 +7,15 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import contextlib
 import inspect
+import os
 import re
+import tempfile
 import threading
 import time
 import uuid
-from collections.abc import (
-    AsyncIterator,
-    Awaitable,
-    Callable,
-    Collection,
-    Coroutine,
-    Mapping,
-)
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping
 from typing import Any, Protocol
 from unittest.mock import ANY, call, create_autospec
 
@@ -29,21 +23,22 @@ import pytest
 import pytest_asyncio
 import torch
 import torchstore as ts
-import torchstore.routing.coordinator as coordinator_module
+import torchstore.monarch.coordinator as coordinator_module
 from monarch.actor import (
     ActorError,
     concurrent_endpoint,
     endpoint,
     get_or_spawn_controller,
 )
+from torchstore.monarch.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing._model import KeyRegistration, Registrations
 from torchstore.routing.control_plane import ControlPlane
-from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.transport import TransportType
 
 from ..volume_meshes import VolumeMesh
-from .utils import tensor_slice
+from .file_store_control_plane import FileStoreControlPlane
+from .utils import registry_store, service_store, tensor_slice
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -99,77 +94,24 @@ async def _coordinator(publishers=None, strategy=None):
     return coordinator
 
 
-class _HostedRegistry(ControlPlane):
-    """Runs each call as a task on the registry's loop, like a concurrent endpoint."""
-
-    def __init__(
-        self, registry: LayoutRegistry, loop: asyncio.AbstractEventLoop
-    ) -> None:
-        self._registry = registry
-        self._loop = loop
-
-    async def _on_host(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
-        return await asyncio.wrap_future(
-            asyncio.run_coroutine_threadsafe(coroutine, self._loop)
-        )
-
-    async def init(
-        self, publishers: Collection[str], strategy: ts.TorchStoreStrategy
-    ) -> None:
-        await self._on_host(self._registry.init(publishers, strategy))
-
-    async def strategy(self) -> ts.TorchStoreStrategy:
-        return await self._on_host(self._registry.strategy())
-
-    async def register_layout(
-        self, rank: str, key: str, registrations: Mapping[str, KeyRegistration]
-    ) -> None:
-        await self._on_host(self._registry.register_layout(rank, key, registrations))
-
-    async def get_layouts(
-        self, key: str, *, timeout_s: float | None = None
-    ) -> Registrations:
-        layouts = await self._on_host(
-            self._registry.get_layouts(key, timeout_s=timeout_s)
-        )
-        # Callers own their layouts, as with Monarch's pickled replies.
-        return {rank: dict(registrations) for rank, registrations in layouts.items()}
-
-
 @contextlib.asynccontextmanager
-async def _registry_store() -> AsyncIterator[Callable[[], Awaitable[_HostedRegistry]]]:
-    """Host one ``LayoutRegistry`` on a thread's own event loop, without Monarch.
+async def _file_store() -> AsyncIterator[Callable[[], Awaitable[TimedControlPlane]]]:
+    """Open handles on one ``FileStoreControlPlane`` store in a temporary directory."""
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "control_plane")
 
-    Exit fails if the host loop has not stopped within 10 s.
-    """
-    hosting: concurrent.futures.Future = concurrent.futures.Future()
+        async def connect() -> TimedControlPlane:
+            return FileStoreControlPlane(path)
 
-    async def host() -> None:
-        stop = asyncio.Event()
-        hosting.set_result((asyncio.get_running_loop(), stop))
-        await stop.wait()
-
-    thread = threading.Thread(target=asyncio.run, args=(host(),), daemon=True)
-    thread.start()
-    loop, stop = await asyncio.wrap_future(hosting)
-    registry = LayoutRegistry()
-
-    async def connect() -> _HostedRegistry:
-        return _HostedRegistry(registry, loop)
-
-    try:
         yield connect
-    finally:
-        # ``asyncio.run`` cancels any call still running on the host loop.
-        loop.call_soon_threadsafe(stop.set)
-        await asyncio.to_thread(thread.join, 10)
-        assert not thread.is_alive(), "the registry's host loop did not stop"
 
 
 @pytest_asyncio.fixture(
     params=[
         pytest.param(_monarch_store, id="monarch"),
-        pytest.param(_registry_store, id="registry"),
+        pytest.param(registry_store, id="registry"),
+        pytest.param(service_store, id="service"),
+        pytest.param(_file_store, id="filestore"),
     ]
 )
 async def make_control_plane(
@@ -572,18 +514,19 @@ async def test_a_handle_serves_calls_from_another_event_loop(
     waiting_here = asyncio.ensure_future(
         control_plane.get_layouts("model", timeout_s=30)
     )
-    registering: list[float] = []
+    registered: list[float] = []
     outcome: list[Any] = []
 
     async def on_another_loop() -> Registrations:
         lookup = asyncio.ensure_future(control_plane.get_layouts("model", timeout_s=30))
         await _assert_still_pending(lookup)
         for rank, registration in expected.items():
-            # The last stamp precedes the registration that completes the key.
-            registering.append(time.monotonic())
+            # A file write can stall for seconds on a loaded host.
             await asyncio.wait_for(
-                control_plane.register_layout(rank, "model", registration), timeout=1
+                control_plane.register_layout(rank, "model", registration), timeout=5
             )
+        # Stamped once the registration that completes the key has returned.
+        registered.append(time.monotonic())
         return await asyncio.wait_for(lookup, timeout=5)
 
     def run() -> None:
@@ -598,16 +541,18 @@ async def test_a_handle_serves_calls_from_another_event_loop(
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     try:
-        layouts = await asyncio.wait_for(waiting_here, timeout=10)
+        layouts = await asyncio.wait_for(waiting_here, timeout=20)
     except asyncio.TimeoutError:
         raise AssertionError(f"this loop's lookup never woke: {outcome!r}") from None
+    woke = time.monotonic()
     assert layouts == expected
-    # Only the guard's timer could wake this loop otherwise, 10 s after it slept.
-    assert time.monotonic() - registering[-1] < 5, "the plane left this loop asleep"
     deadline = time.monotonic() + 15
     while thread.is_alive() and time.monotonic() < deadline:
         await asyncio.sleep(0.01)
     assert outcome == [expected], f"the other loop did not finish: {outcome!r}"
+    # Otherwise only the guard's timer wakes this loop, 20s after it slept, while the
+    # other loop's 0.5s check and two registrations bounded at 5s each end by 10.5s.
+    assert woke - registered[0] < 5, "the plane left this loop asleep"
     layouts = await asyncio.wait_for(
         control_plane.get_layouts("model", timeout_s=0), timeout=1
     )
@@ -843,3 +788,42 @@ async def test_monarch_adapter_passes_actor_errors_through() -> None:
             await asyncio.wait_for(
                 control_plane.get_layouts("model", timeout_s=0), timeout=1
             )
+
+
+@pytest.mark.asyncio
+async def test_file_store_trusts_only_its_own_finished_directory(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refuse an existing directory, one without ``ready`` and one others may write.
+
+    A value whose link fails never lands, so no partial value wins.
+    """
+    path = str(tmp_path / "earlier_run")
+    os.mkdir(path, 0o700)
+    plane = FileStoreControlPlane(path)
+    with pytest.raises(RuntimeError, match="init has not run"):
+        await plane.strategy()
+    with pytest.raises(FileExistsError):
+        await plane.init({"publisher/0"}, ts.TorchStoreStrategy())
+    with open(os.path.join(path, "ready"), "wb"):
+        pass
+    # An unreadable directory raises its own error, not "init has not run".
+    os.chmod(path, 0)
+    try:
+        with pytest.raises(PermissionError, match="Permission denied"):
+            await plane.strategy()
+    finally:
+        os.chmod(path, 0o777)
+    with pytest.raises(PermissionError, match="open to other users"):
+        await plane.strategy()
+
+    failing = str(tmp_path / "failing")
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            os, "link", create_autospec(os.link, side_effect=OSError("full"))
+        )
+        with pytest.raises(OSError, match="full"):
+            await FileStoreControlPlane(failing).init(
+                {"publisher/0"}, ts.TorchStoreStrategy()
+            )
+    assert os.listdir(failing) == []
