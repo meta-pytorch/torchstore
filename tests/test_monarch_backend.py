@@ -7,9 +7,11 @@
 """The Monarch backend makes the Monarch calls that core modules once made themselves."""
 
 import asyncio
+import contextvars
 import logging
 from datetime import timedelta
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -288,3 +290,37 @@ def test_frame_length_default_reaches_monarch_only_where_it_applies(
         if warned
         else []
     )
+
+
+def test_monarch_backend_reads_a_rank_only_from_an_actors_context(monkeypatch) -> None:
+    """Return the current actor context's rank, else None, starting no root client.
+
+    A driver's root client context is no actor's and gives None too, on the installed torchmonarch as well.
+    """
+    context = monarch_backend.actor_mesh._context
+
+    def driver() -> int | None:
+        # Monarch's own call makes its root client's context current, as a driver's first call does.
+        monarch_backend.actor_mesh.context()
+        return monarch_backend.MonarchBackend().actor_rank()
+
+    assert contextvars.Context().run(driver) is None
+    actor: Any = SimpleNamespace(message_rank=SimpleNamespace(rank=3))
+    root: Any = SimpleNamespace()
+    # Monarch's own context variable beside a root client that only this module sees.
+    client = SimpleNamespace(try_get=lambda: root)
+    actor_mesh = SimpleNamespace(_context=context, _client_context=client)
+    monkeypatch.setattr(monarch_backend, "actor_mesh", actor_mesh)
+    backend = monarch_backend.MonarchBackend()
+
+    def ranks() -> list[int | None]:
+        seen = [backend.actor_rank()]
+        # Monarch's current_rank() would have started its root client and made it current.
+        assert context.get() is None
+        for current in (actor, root):
+            context.set(current)
+            seen.append(backend.actor_rank())
+        return seen
+
+    # A context of its own leaves the variable unset at first and after.
+    assert contextvars.Context().run(ranks) == [None, 3, None]

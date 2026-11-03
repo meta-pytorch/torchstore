@@ -92,6 +92,10 @@ def _fresh_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(store_api, "_forked_stores", {})
     monkeypatch.setattr(store_api, "_closing", set())
     monkeypatch.setattr(store_api, "_dropped_carriers", {})
+    monkeypatch.setattr(store_api, "_building", set())
+    monkeypatch.setattr(store_api, "_attempted", set())
+    monkeypatch.setattr(store_api, "_building_ranks", {})
+    monkeypatch.setattr(store_api, "_standard_stores", set())
     monkeypatch.setattr(carrier_volumes, "_publishers", {})
     yield
     left = [
@@ -362,6 +366,130 @@ def test_standard_shutdown_finds_the_stores_own_controller(backend) -> None:
 
     backend.controller.assert_awaited_once_with("named-store")
     controller.teardown.call.assert_awaited_once_with()
+
+
+def test_a_cached_monarch_client_refuses_rank(monkeypatch) -> None:
+    """Refuse ``rank=`` once the cached client takes its rank from Monarch, even the same one."""
+    coordinator = SimpleNamespace(
+        strategy=SimpleNamespace(call_one=AsyncMock(return_value=object()))
+    )
+    monkeypatch.setattr(
+        monarch_backend, "get_or_spawn_controller", AsyncMock(return_value=coordinator)
+    )
+    monkeypatch.setattr(
+        monarch_backend, "current_rank", lambda: SimpleNamespace(rank=0)
+    )
+    store_name = _store_name()
+
+    async def run() -> None:
+        client = await ts.client(store_name, role=RankRole.PUBLISHER)
+        with pytest.raises(ValueError, match="^rank is only for control planes"):
+            await ts.client(store_name, role=RankRole.PUBLISHER, rank=0)
+        assert await ts.client(store_name) is client
+
+    asyncio.run(run())
+
+
+def test_a_cached_standard_client_refuses_rank(monkeypatch) -> None:
+    """Refuse ``rank=`` once the store's cached client is a standard one, and keep returning it."""
+    controller = SimpleNamespace(
+        get_controller_strategy=SimpleNamespace(
+            call_one=AsyncMock(return_value=object())
+        )
+    )
+    monkeypatch.setattr(store_api, "_controller", AsyncMock(return_value=controller))
+    store_name = _store_name()
+
+    async def run() -> None:
+        client = await ts.client(store_name)
+        assert not isinstance(client, RoutingClient)
+        with pytest.raises(ValueError, match="^rank is only for control planes"):
+            await ts.client(store_name, role=RankRole.PUBLISHER, rank=0)
+        assert await ts.client(store_name) is client
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize(
+    "then",
+    ["initialize", "standard", "standard_before", "client", "routing_client"],
+)
+def test_a_refused_client_of_an_address_leaves_a_later_monarch_stores_shutdown_to_monarch(
+    monkeypatch, service_strategy, then
+) -> None:
+    """Tear a store down through Monarch once Monarch has it, though a client here of its address was refused.
+
+    A Monarch initialize, a standard one before or after, a standard client, or a Monarch routing client
+    each do. A second shutdown asks Monarch again unless the refusal came after a standard initialize.
+    """
+    actors = _patch_actors(monkeypatch)
+    controller = _controller_stub()
+    actors.lookup.side_effect = None
+    actors.lookup.return_value = controller
+    store_name = _store_name()
+
+    async def run() -> None:
+        if then == "standard_before":
+            await ts.initialize(store_name=store_name)
+        async with _other_service(store_name, service_strategy) as other:
+            with pytest.raises(KeyError, match="'publisher/1' is not a publisher rank"):
+                await ts.client(
+                    store_name, role=RankRole.PUBLISHER, rank=1, address=other.address
+                )
+        if then == "initialize":
+            await _initialize(store_name)
+        elif then == "standard":
+            await ts.initialize(store_name=store_name)
+        elif then == "standard_before":
+            pass
+        elif then == "client":
+            await ts.client(store_name)
+        else:
+            await ts.client(store_name, role=RankRole.PUBLISHER)
+        await ts.shutdown(store_name)
+        controller.teardown.call.assert_awaited_once_with()
+        # The standard store's teardown ends its claim, and a refusal made after its initialize
+        # then keeps the next shutdown off Monarch.
+        await ts.shutdown(store_name)
+        teardowns = 1 if then == "standard_before" else 2
+        assert controller.teardown.call.await_count == teardowns
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("then", ["shutdown", "client"])
+def test_a_shutdown_after_a_refused_client_of_an_address_records_no_released_store(
+    monkeypatch, service_strategy, then
+) -> None:
+    """Until Monarch takes the name, ask Monarch nothing on any shutdown after a client of an address was refused.
+
+    That shutdown records no released store, so a role-less client of the name still goes to Monarch.
+    """
+    actors = _patch_actors(monkeypatch)
+    controller = _controller_stub()
+    actors.lookup.side_effect = None
+    actors.lookup.return_value = controller
+    store_name = _store_name()
+
+    async def run() -> None:
+        async with _other_service(store_name, service_strategy) as other:
+            with pytest.raises(KeyError, match="'publisher/1' is not a publisher rank"):
+                await ts.client(
+                    store_name, role=RankRole.PUBLISHER, rank=1, address=other.address
+                )
+        await ts.shutdown(store_name)
+        actors.lookup.assert_not_awaited()
+        if then == "client":
+            assert not isinstance(await ts.client(store_name), RoutingClient)
+            await ts.shutdown(store_name)
+            controller.teardown.call.assert_awaited_once_with()
+        else:
+            await ts.shutdown(store_name)
+            actors.lookup.assert_not_awaited()
+
+    asyncio.run(run())
 
 
 @dataclass(frozen=True)
@@ -1119,6 +1247,29 @@ def test_a_cached_client_still_checks_its_arguments(monkeypatch) -> None:
             assert (
                 await ts.client(store_name, role=RankRole.PUBLISHER, group=1) is client
             )
+
+    asyncio.run(run())
+
+
+@pytest.mark.timeout(60)
+def test_a_failed_monarch_routing_client_leaves_its_shutdown_to_monarch(
+    monkeypatch,
+) -> None:
+    """Mark nothing for a client that failed on Monarch's path, so its shutdown still goes to Monarch."""
+    actors = _patch_actors(monkeypatch)
+    controller = _controller_stub()
+    controller.strategy.call_one.side_effect = ActorError(
+        RuntimeError("RoutingCoordinator.init has not run")
+    )
+    actors.lookup.side_effect = None
+    actors.lookup.return_value = controller
+    store_name = _store_name()
+
+    async def run() -> None:
+        with pytest.raises(ActorError, match="RoutingCoordinator.init has not run"):
+            await ts.client(store_name, role=RankRole.PUBLISHER)
+        await ts.shutdown(store_name)
+        controller.teardown.call.assert_awaited_once_with()
 
     asyncio.run(run())
 
@@ -3600,14 +3751,15 @@ def test_a_client_built_on_a_racing_calls_record_reads_records_through_that_reco
 
 @pytest.mark.timeout(60)
 def test_a_racing_client_on_a_plane_without_volume_records_keeps_its_hosts_resolver(
-    monkeypatch, rank_client
+    monkeypatch,
 ) -> None:
     """Leave the volume host of a client built on a racing call's record unbound when that plane shares no records.
 
     Such a plane may still install a carrier volume host that nothing could rebind. The client
     then reads records through its own plane's resolver.
     """
-    _patch_actors(monkeypatch, rank=None)
+    # ts.client takes ranks from Monarch on a plane without volume records and refuses rank= there.
+    _patch_actors(monkeypatch)
     store_name = _store_name()
     planes: list[Any] = []
     resolvers: list[Callable[..., Awaitable[dict[str, bytes]]]] = []
@@ -3643,7 +3795,7 @@ def test_a_racing_client_on_a_plane_without_volume_records_keeps_its_hosts_resol
     async def run() -> None:
         kwargs = {"role": RankRole.REQUESTER, "group": 0, "address": address}
         calls = [
-            asyncio.ensure_future(rank_client(store_name, **kwargs)) for _ in range(2)
+            asyncio.ensure_future(ts.client(store_name, **kwargs)) for _ in range(2)
         ]
         try:
             done, pending = await asyncio.wait(
@@ -4189,7 +4341,7 @@ def _lock_checked_step(
 def test_every_selection_step_holds_the_selection_lock(
     monkeypatch, service_strategy, rank_client
 ) -> None:
-    """Hold the lock wherever a selection step this case drives changes, reads or checks the selection maps or released stores.
+    """Hold the lock wherever a step this case drives touches the selection maps, rank claims or released stores.
 
     Volume steps and a client's reads before it builds or looks up a controller hold it too. So none sees a step half
     done. The lock's comment lets only ``reset_client`` (which drops a client and keeps its host) and a later
@@ -4204,6 +4356,7 @@ def test_every_selection_step_holds_the_selection_lock(
         ("_owned_service_map", "services"),
         ("_local_clent_map", "clients"),
         ("_forked_stores", "forked"),
+        ("_building_ranks", "ranks"),
     ):
         monkeypatch.setattr(store_api, attribute, _LockChecked(name, calls))
     monkeypatch.setattr(
@@ -4256,6 +4409,8 @@ def test_every_selection_step_holds_the_selection_lock(
         ("forked", "get", "_check_not_forked"),
         ("forked", "getitem", "_select_control_plane"),
         ("forked", "getitem", "_shutdown_selected"),
+        ("ranks", "setdefault", "_reserve_rank"),
+        ("ranks", "get", "_release_rank"),
         ("released", "discard", "initialize"),
         ("released", "add", "_shutdown_selected"),
         ("released", "in", "_check_unrecorded"),
@@ -4263,7 +4418,7 @@ def test_every_selection_step_holds_the_selection_lock(
         ("dropped", "get", "_shutdown_selected"),
         ("dropped", "del", "_shutdown_selected"),
         ("volumes", "stop_publisher_volumes", "_shutdown_selected"),
-        ("volumes", "current", "_routing_client"),
+        ("volumes", "current", "_build_routing_client"),
     } <= {call[:3] for call in calls if call[3]}
 
 
@@ -4430,6 +4585,8 @@ def test_each_client_takes_the_selection_lock_once_per_step(
     """Take the lock once per step: twice for a standard client and three times for a Monarch routing one.
 
     One on a recorded or dialed plane takes it once more, to read the dropped clients whose hosts it closes.
+    One given an address takes it twice more, to mark its build for a shutdown and then unmark it.
+    One given ``rank`` takes it once more, to release that rank once its build ends.
     """
     actors = _patch_actors(monkeypatch)
     actors.lookup.side_effect = None
@@ -4458,7 +4615,7 @@ def test_each_client_takes_the_selection_lock_once_per_step(
             await _clean_up(lambda: _release(service))
         return taken
 
-    assert asyncio.run(run()) == [2, 3, 4, 4]
+    assert asyncio.run(run()) == [2, 3, 5, 7]
 
 
 @pytest.mark.timeout(60)
@@ -5529,3 +5686,25 @@ def test_restoring_the_context_of_an_error_whose_chain_cycles_keeps_the_chain() 
     threading.Thread(target=restore, daemon=True).start()
     assert returned.wait(30), "the walk did not end on the cycle"
     assert error.__context__ is error
+
+
+def test_the_fork_hook_drops_the_parents_builds_in_flight(monkeypatch) -> None:
+    """Refuse no rank in a forked child, and keep a parent's build from the child's shutdown.
+
+    That build ending in the child afterwards releases no claim the child made for another rank ID,
+    and ends quietly where the child made none.
+    """
+    monkeypatch.setattr(store_api, "_building", {"s"})
+    monkeypatch.setattr(store_api, "_building_ranks", {"s": ["publisher/0"]})
+    # The hook frees the lock the fork held, here one held for it.
+    fork_lock = threading.Lock()
+    fork_lock.acquire()
+    store_api._after_fork_in_child(fork_lock)
+    assert store_api._building_ranks == {}
+    with store_api._selection_lock:
+        store_api._release_rank("s", "publisher/0")
+        store_api._reserve_rank("s", "requester/0/0")
+    assert asyncio.run(store_api._shutdown_selected("s")) is False
+    with store_api._selection_lock:
+        store_api._release_rank("s", "publisher/0")
+    assert store_api._building_ranks == {"s": ["requester/0/0"]}

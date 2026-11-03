@@ -33,14 +33,13 @@ import weakref
 import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
 from pathlib import Path
-from typing import Any, cast, NoReturn
+from typing import Any, NoReturn
 
 import pytest
 import torch
 import torch.multiprocessing as mp
 import torchstore as ts
 import torchstore.api as store_api
-import torchstore.backend as backend_module
 from torchstore.carrier import (
     CallTimeoutError,
     CarrierAddress,
@@ -2371,17 +2370,15 @@ async def test_each_call_logs_one_timing_line(
 
 @pytest.mark.asyncio
 async def test_a_client_dialed_through_the_address_names_the_service_kind(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Name a handle ``service`` in TorchStore's selection line, by its ``kind``."""
-    monarch = cast(backend_module.Backend, types.SimpleNamespace(rank=lambda: 0))
-    monkeypatch.setitem(backend_module._backends, "monarch", monarch)
     caplog.set_level(logging.INFO)
     async with _served() as served:
         address = served.service.address
         try:
             await ts.client(
-                address.store_name, role=ts.RankRole.PUBLISHER, address=address
+                address.store_name, role=ts.RankRole.PUBLISHER, address=address, rank=0
             )
         finally:
             # Shutting down a store with no record would look up Monarch's controller.
