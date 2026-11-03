@@ -29,6 +29,7 @@ class StorageVolumeCore:
     """
 
     def __init__(self, volume_id: str) -> None:
+        # A host that skips this constructor sets both itself: get_id reads volume_id and the rest read store.
         self.volume_id: str = volume_id
         self.store: StorageImpl = InMemoryStore()
 
@@ -75,7 +76,10 @@ class StorageVolumeCore:
 
 
 class StorageImpl:
-    """Abstract base class for storage implementations."""
+    """Abstract base class for storage implementations.
+
+    Like ``InMemoryStore``, a store must also define the ``reset`` that every volume's ``reset`` calls.
+    """
 
     def __init__(self) -> None:
         self.transport_context = TransportContext()
