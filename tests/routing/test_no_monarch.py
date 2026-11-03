@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -103,7 +104,7 @@ report["entry_points"] = {
         "LocalRankStrategy.get_volume_id": ts.LocalRankStrategy.get_volume_id,
         "spawn_actors": lambda: asyncio.run(torchstore.utils.spawn_actors(1, object, "probe")),
         "DirectWeightSyncSource.register": lambda: DirectWeightSyncSource().register(
-            {"weight": torch.ones(2)}, rank=0
+            {}, rank=0
         ),
     }.items()
 }
@@ -160,7 +161,6 @@ async def main():
     await ts.initialize(mesh=mesh, strategy=ts.LocalRankStrategy())
     try:
         report["after_initialize"] = old_paths()
-        report["rdma"] = ts.transport.monarch_rdma.monarch_rdma_transport_available()
     finally:
         await ts.shutdown()
     return report
@@ -172,7 +172,7 @@ with open(out, "w") as f:
 """
 
 _FORK_CHILD = """
-import asyncio, json, os, signal, sys, time
+import asyncio, json, os, signal, sys, traceback
 
 root, out = sys.argv[1:]
 sys.path.insert(0, root)
@@ -192,17 +192,26 @@ async def use_a_store():
 # The child forks before any call has loaded Monarch, then uses TorchStore.
 pid = os.fork()
 if pid == 0:
-    got = asyncio.run(use_a_store())
+    try:
+        got = asyncio.run(use_a_store())
+    except BaseException:
+        traceback.print_exc()
+        sys.exit(1)
     with open(out, "w") as f:
         json.dump({"got": got}, f)
     sys.exit(0)
-deadline = time.monotonic() + 150
-while os.waitpid(pid, os.WNOHANG) == (0, 0):
-    if time.monotonic() > deadline:
-        os.kill(pid, signal.SIGKILL)
-        os.waitpid(pid, 0)
-        sys.exit("the forked child hung")
-    time.sleep(0.1)
+
+
+def hung(signum, frame):
+    os.kill(pid, signal.SIGKILL)
+    sys.exit("the forked child hung")
+
+
+signal.signal(signal.SIGALRM, hung)
+signal.alarm(150)
+status = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+signal.alarm(0)
+sys.exit(status and f"the forked child failed with status {status}")
 """
 
 _VOLUME_CHILD = """
@@ -217,11 +226,10 @@ with open(out, "w") as f:
     json.dump({"rdma": transport.TransportType.MonarchRDMA in transport._backend_transports}, f)
 """
 
-_BACKEND_CHILD = """
-import json, logging, sys
+# A handler the children below add to the root logger, recording each frame-length warning.
+_FRAME_WARNINGS = """
+import logging
 
-root, out = sys.argv[1:]
-sys.path.insert(0, root)
 frame_warnings = []
 
 
@@ -229,8 +237,15 @@ class FrameWarnings(logging.Handler):
     def emit(self, record):
         if "HYPERACTOR_CODEC_MAX_FRAME_LENGTH" in record.getMessage():
             frame_warnings.append([record.levelname, record.name, record.getMessage()])
+"""
 
+_BACKEND_CHILD = (
+    _FRAME_WARNINGS
+    + """
+import json, sys
 
+root, out = sys.argv[1:]
+sys.path.insert(0, root)
 logging.getLogger().addHandler(FrameWarnings())
 import torchstore
 
@@ -244,6 +259,7 @@ report["after_backend"] = list(frame_warnings)
 with open(out, "w") as f:
     json.dump(report, f)
 """
+)
 
 _LOGGING_CHILD = """
 import json, logging, sys
@@ -257,6 +273,10 @@ report = {
     "logger": getattr(torchstore, "logger", None) is logging.getLogger("torchstore"),
     "stdout_handlers": len(stdout),
 }
+try:
+    torchstore.not_a_name
+except AttributeError as error:
+    report["unknown"] = str(error)
 with open(out, "w") as f:
     json.dump(report, f)
 """
@@ -284,44 +304,31 @@ with open(out, "w") as f:
 """
 
 # The common order: import at the top, configure logging in main(), then the first call.
-_DICTCONFIG_CHILD = """
-import json, logging, logging.config, sys
+_DICTCONFIG_CHILD = (
+    _FRAME_WARNINGS
+    + """
+import json, logging.config, sys
 
 root, out = sys.argv[1:]
 sys.path.insert(0, root)
 import torchstore
 
-logging.config.dictConfig({"version": 1, "root": {"level": "WARNING"}})
-frame_warnings = []
-
-
-class FrameWarnings(logging.Handler):
-    def emit(self, record):
-        if "HYPERACTOR_CODEC_MAX_FRAME_LENGTH" in record.getMessage():
-            frame_warnings.append([record.levelname, record.name, record.getMessage()])
-
-
+logging.config.dictConfig({"version": 1})
 logging.getLogger().addHandler(FrameWarnings())
 import torchstore.monarch.backend
 
 with open(out, "w") as f:
     json.dump({"logged": frame_warnings}, f)
 """
+)
 
-_RELOAD_CHILD = """
-import importlib, json, logging, sys
+_RELOAD_CHILD = (
+    _FRAME_WARNINGS
+    + """
+import importlib, json, sys
 
 root, out, reloaded = sys.argv[1:]
 sys.path.insert(0, root)
-frame_warnings = []
-
-
-class FrameWarnings(logging.Handler):
-    def emit(self, record):
-        if "HYPERACTOR_CODEC_MAX_FRAME_LENGTH" in record.getMessage():
-            frame_warnings.append(record.getMessage())
-
-
 logging.getLogger().addHandler(FrameWarnings())
 from monarch.config import get_global_config
 import torchstore
@@ -339,6 +346,7 @@ report = {
 with open(out, "w") as f:
     json.dump(report, f)
 """
+)
 
 _monarch_installed = pytest.mark.skipif(
     importlib.util.find_spec("monarch") is None, reason="Monarch is not installed"
@@ -514,26 +522,54 @@ def test_a_child_forked_after_the_import_can_use_torchstore(tmp_path: Path) -> N
 def test_import_keeps_the_package_logger_and_sets_up_logging_only_when_it_exports(
     tmp_path: Path, frame_length: str | None, stdout_handlers: int
 ) -> None:
-    """Define ``torchstore.logger`` on every import, and add a stdout handler only on export."""
+    """Define ``torchstore.logger`` on every import, refuse other unknown names, and add a stdout handler only on export."""
     extra_env = None
     if frame_length is not None:
         extra_env = {"HYPERACTOR_CODEC_MAX_FRAME_LENGTH": frame_length}
     report = _run_child(_LOGGING_CHILD, tmp_path / "report.json", extra_env=extra_env)
-    assert report == {"logger": True, "stdout_handlers": stdout_handlers}
+    assert report == {
+        "logger": True,
+        "stdout_handlers": stdout_handlers,
+        "unknown": "module 'torchstore' has no attribute 'not_a_name'",
+    }
+
+
+def _read_by_type_checkers(statements: list[ast.stmt]) -> Iterator[ast.stmt]:
+    """Each module-level statement in a block a type checker may read: all but ``TYPE_CHECKING``'s else."""
+    for node in statements:
+        yield node
+        if isinstance(node, ast.If):
+            yield from _read_by_type_checkers(node.body)
+            if ast.unparse(node.test) != "TYPE_CHECKING":
+                yield from _read_by_type_checkers(node.orelse)
+        elif isinstance(node, (ast.Try, ast.With)):
+            for block in (node.body, getattr(node, "orelse", [])):
+                yield from _read_by_type_checkers(block)
+            yield from _read_by_type_checkers(getattr(node, "finalbody", []))
+            for handler in getattr(node, "handlers", []):
+                yield from _read_by_type_checkers(handler.body)
 
 
 def test_type_checkers_see_the_package_logger_but_no_module_getattr() -> None:
-    """Show type checkers ``logger``'s type and hide the module ``__getattr__`` that accepts any name."""
+    """Show type checkers ``logger``'s type and hide the module ``__getattr__`` that accepts any name.
+
+    A ``__getattr__`` defined or assigned in any block they may read counts.
+    """
     tree = ast.parse(Path(_ROOT, "torchstore", "__init__.py").read_text())
-    # The module's top-level statements as a type checker reads them, through TYPE_CHECKING's branch.
-    seen = []
-    for node in tree.body:
-        if isinstance(node, ast.If) and ast.unparse(node.test) == "TYPE_CHECKING":
-            seen.extend(node.body)
-        else:
-            seen.append(node)
+    seen = list(_read_by_type_checkers(tree.body))
     getattrs = [
-        n for n in seen if isinstance(n, ast.FunctionDef) and n.name == "__getattr__"
+        ast.unparse(n)
+        for n in seen
+        if (isinstance(n, ast.FunctionDef) and n.name == "__getattr__")
+        or (
+            isinstance(n, (ast.Assign, ast.AnnAssign))
+            and "__getattr__"
+            in {
+                t.id
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+                if isinstance(t, ast.Name)
+            }
+        )
     ]
     declared = [ast.unparse(n) for n in seen if isinstance(n, ast.AnnAssign)]
     assert (getattrs, declared) == ([], ["logger: Logger"])
@@ -572,9 +608,9 @@ def test_frame_length_warning_survives_a_logging_config_run_after_the_import(
 
 @_monarch_installed
 @pytest.mark.parametrize("reloaded", ["package", "backend"])
-def test_frame_length_default_survives_a_reload_once_per_process(
+def test_frame_length_default_survives_a_reload_with_one_warning(
     tmp_path: Path, reloaded: str
 ) -> None:
-    """Raise a Monarch loaded first after a package reload, and warn once after a backend reload."""
+    """Warn once and leave a Monarch loaded first at the default, after a package or backend reload."""
     report = _run_child(_RELOAD_CHILD, tmp_path / "report.json", reloaded)
     assert report == {"warnings": 1, "limit": _FRAME_LENGTH_DEFAULT}
