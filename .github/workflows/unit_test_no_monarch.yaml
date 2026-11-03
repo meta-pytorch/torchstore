@@ -98,18 +98,34 @@ jobs:
         run: |
           tests=(
             tests/routing/test_control_plane.py
+            tests/routing/test_directory.py
             tests/routing/test_gc.py
             tests/routing/test_import_scope.py
             tests/routing/test_layout_registry.py
             tests/routing/test_no_monarch.py
+            tests/routing/test_plan.py
+            tests/routing/test_record_strategy.py
+            tests/routing/test_routed_sync_mp.py
+            tests/routing/test_service.py
+            tests/routing/test_service_paths.py
+            tests/routing/test_service_volumes.py
+            tests/routing/test_tcpstore.py
+            tests/routing/test_volume_records.py
+            tests/test_carrier.py
+            tests/test_carrier_codec.py
+            tests/test_carrier_volume_host.py
+            tests/test_carrier_volumes.py
             tests/test_direct_weight_sync.py
             tests/test_directory.py
+            tests/test_gloo_transport.py
             tests/test_monarch_rdma.py
             tests/test_nixl_transport.py
             tests/test_rdma_memory_cache.py
             tests/test_shared_memory_overwrite.py
             tests/test_state_dict_utils.py
+            tests/test_torch_distributed_transport.py
             tests/test_torchcomms_transport.py
+            tests/test_transport_buffers.py
             tests/test_transport_pickling.py
             tests/test_utils.py
             tests/test_volume_core.py

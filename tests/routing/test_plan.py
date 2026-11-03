@@ -11,7 +11,7 @@ import torch
 from torchstore.routing._model import KeyRegistration
 from torchstore.routing.plan import RoutingPlan
 
-from .utils import tensor_slice
+from .slices import tensor_slice
 
 
 def test_collapses_replicated_publishers_to_one_deterministic_source() -> None:
