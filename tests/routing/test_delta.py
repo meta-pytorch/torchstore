@@ -210,6 +210,49 @@ async def test_delta_sync_matches_latest_version(
             assert reads == [everything, set(), None, everything]
 
 
+@pytest.mark.asyncio
+async def test_delta_sync_middle_dim_shards_of_a_nested_state_dict(
+    full_reads: dict[object, set[str]],
+) -> None:
+    """Each requester shard lies inside a publisher shard of a middle dim."""
+    shape = (2, 12, 3)
+    first = torch.randn(shape, generator=torch.Generator().manual_seed(0))
+    second = first.clone()
+    second[0, 1, 2] += 1
+    second[1, 2, 0] += 1
+    second[1, 9, 1] += 1
+    second[0, 5, 0] += 1
+    clients = await routing_clients(
+        publishers={f"publisher/{rank}": {} for rank in range(2)},
+        requesters={f"requester/{rank}": {} for rank in range(6)},
+    )
+    deltas = {
+        rank: StateDictDelta(
+            {"layer": {"w": _distribute(first, (2,), [Shard(1)], rank)}},
+            max_fraction=0.5,
+        )
+        for rank in range(2)
+    }
+    destinations = {
+        rank: {"layer": {"w": _distribute(torch.zeros(shape), (6,), [Shard(1)], rank)}}
+        for rank in range(6)
+    }
+    for version, value in enumerate([first, second]):
+        for rank, delta in deltas.items():
+            state_dict = {"layer": {"w": _distribute(value, (2,), [Shard(1)], rank)}}
+            await put_state_dict_delta(
+                clients[f"publisher/{rank}"], delta, state_dict, "model"
+            )
+        for rank, destination in destinations.items():
+            client = clients[f"requester/{rank}"]
+            await get_state_dict_delta(client, "model", destination)
+            assert bool(full_reads.pop(client, set())) == (version == 0)
+            expected = _distribute(value, (6,), [Shard(1)], rank)
+            assert torch.equal(
+                destination["layer"]["w"].to_local(), expected.to_local()
+            )
+
+
 @pytest.mark.parametrize(
     "device",
     [

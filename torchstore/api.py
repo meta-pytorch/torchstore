@@ -577,7 +577,8 @@ async def get_state_dict_delta(
         user_state_dict (dict): Destination tensors, as written by the previous call.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
         strict (bool): Raise on keys that no publisher has, instead of leaving
-            them unchanged. Defaults to True.
+            them unchanged. Tensors without local elements are skipped.
+            Defaults to True.
 
     Returns:
         dict: ``user_state_dict``.

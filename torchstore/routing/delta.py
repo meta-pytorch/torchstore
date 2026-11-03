@@ -10,12 +10,12 @@ Every version, a publisher puts the full state dict, then one fixed-size packed
 row per tensor shard holding only the elements whose wire bytes changed since
 the previous version:
 
-    [header: int64 x 3][values: wire dtype x cap][indices: int32 x cap]
+    [header: int64 x 4][values: wire dtype x cap][indices: int32 x cap]
 
 ``indices`` are flat offsets into the publisher's local shard. The header holds
 the number of changed elements (-1 when they do not fit in ``cap``, and on the
-first version), the number of put versions, and a random epoch per publisher
-instance. Rows live under ``{key}/delta/{flat_key}`` as a
+first version), the number of put versions, a random epoch per publisher
+instance, and the wire dtype. Rows live under ``{key}/delta/{flat_key}`` as a
 uint8 tensor of global shape ``(*sharded mesh axis sizes, nbytes)``, so each
 shard's row sits at its mesh coordinates and replicas collapse to one row.
 
@@ -198,7 +198,7 @@ class StateDictDelta:
             Rows are fixed size, so a get reads about
             ``max_fraction * (itemsize + 4) / itemsize`` of the bytes of the
             publisher shards it overlaps, and at least 8 elements plus a
-            24-byte header per shard.
+            32-byte header per shard.
         transfer_dtype: Wire dtype of floating-point tensors, as in
             ``put_state_dict``.
         preserve_dtype_keys: Flat keys that keep their own dtype, as in
@@ -482,8 +482,11 @@ async def _plan(
             )
             if route is not None:
                 new_routes[flat_key] = route
-            elif strict and flattened[flat_key].numel() > 0:
+            elif strict and _local(flattened[flat_key]).numel() > 0:
                 raise KeyError(f"no publisher has {flat_key!r} of {key!r}")
+        if not new_routes:
+            # Nothing to plan, e.g. the local shards are empty.
+            return {k: routes[k] for k in flattened if k in routes}
         # Plan the full reads first: each row is read from the replica that
         # serves its shard's full read, as replicas differ after a failed put.
         await store.get_layouts(
