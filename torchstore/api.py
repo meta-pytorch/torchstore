@@ -533,12 +533,14 @@ async def put_state_dict_delta(
     delta: StateDictDelta,
     state_dict: dict[str, Any],
     key: str,
+    *,
     store_name: str = DEFAULT_TORCHSTORE_NAME,
 ) -> None:
     """Put a new version of the state dict ``key``: in full, then its changes.
 
     Requires a routing client. Requesters read the full tensors whose changes
-    do not fit. Once ``key`` has deltas, put every version through this.
+    do not fit. Once ``key`` has deltas, put every version through this, and
+    do not overlap it with ``get_state_dict_delta`` of ``key``.
 
     Args:
         delta (StateDictDelta): Encoder built from a template of ``state_dict``.
@@ -557,16 +559,18 @@ async def put_state_dict_delta(
 async def get_state_dict_delta(
     key: str,
     user_state_dict: dict[str, Any],
-    store_name: str = DEFAULT_TORCHSTORE_NAME,
     *,
+    store_name: str = DEFAULT_TORCHSTORE_NAME,
     strict: bool = True,
 ) -> dict[str, Any]:
     """Update ``user_state_dict`` in place to the latest version of ``key``.
 
     Requires a routing client. Applies only the changed elements to tensors
     that hold the previous version, as written by the previous call and not
-    modified since, and reads the rest in full. Call after the first
-    ``put_state_dict_delta`` of ``key`` completed.
+    modified since, and reads the rest in full. A tensor holds the previous
+    version if its storage and version counter are unchanged, so pass the same
+    tensors every call. Blocks until the first ``put_state_dict_delta`` of
+    ``key``, up to the layout timeout, and must not overlap a put of ``key``.
 
     Args:
         key (str): Unique identifier of the state_dict.

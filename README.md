@@ -334,10 +334,10 @@ await ts.get_state_dict_delta("policy", user_state_dict=buffers)
 
 Each get reads about `max_fraction * (itemsize + 4) / itemsize` of the bytes of
 the publisher shards overlapping its tensors, and at least 8 elements plus a
-24-byte header per shard. The publisher keeps a copy of the
+32-byte header per shard. The publisher keeps a copy of the
 previous version in the wire dtype in host memory and compares against it on
 every put, on the tensors' device. Puts and gets of one key must not overlap. A
-restarted publisher must use the same template and `max_fraction`.
+restarted publisher must use the same template, `max_fraction`, `transfer_dtype` and `preserve_dtype_keys`.
 
 ## Transport Backends
 

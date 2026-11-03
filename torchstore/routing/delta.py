@@ -33,8 +33,6 @@ requesters keep the older data.
 
 from __future__ import annotations
 
-import functools
-import itertools
 import logging
 import math
 import os
@@ -46,7 +44,6 @@ from typing import Any
 import torch
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import _StridedShard
 
 from torchstore.direct_weight_sync import _request_to_slice
@@ -67,9 +64,9 @@ __all__ = ["StateDictDelta", "get_state_dict_delta", "put_state_dict_delta"]
 logger = logging.getLogger(__name__)
 
 DELTA = "delta"
-# Row header: [count, version, epoch].
+# Row header: [count, version, epoch, index of the wire dtype in _WIRE_DTYPES].
 _HEADER_DTYPE = torch.int64
-_HEADER_BYTES = 3 * _HEADER_DTYPE.itemsize
+_HEADER_BYTES = 4 * _HEADER_DTYPE.itemsize
 _INDEX_DTYPE = torch.int32
 _OVERFLOW = -1
 # Elements compared per step; bounds accelerator temporaries to a few hundred MB.
@@ -133,11 +130,11 @@ def _shard_grid(value: torch.Tensor) -> tuple[tuple[int, ...], tuple[int, ...]]:
     for dim in {
         p.dim % value.ndim for p in value.placements if isinstance(p, _StridedShard)
     }:
-        chain = tuple(
+        chain = [
             (mesh.size(axis), getattr(p, "split_factor", None))
             for axis, p in enumerate(value.placements)
             if isinstance(p, (Shard, _StridedShard)) and p.dim % value.ndim == dim
-        )
+        ]
         if not _one_box_per_rank(value.shape[dim], chain):
             raise ValueError(
                 f"placements {value.placements} do not give each rank one "
@@ -152,38 +149,23 @@ def _shard_grid(value: torch.Tensor) -> tuple[tuple[int, ...], tuple[int, ...]]:
     )
 
 
-@functools.cache
-def _one_box_per_rank(size: int, chain: tuple[tuple[int, int | None], ...]) -> bool:
-    """Whether sharding a dim of ``size`` gives every rank the box DTensor reports.
+def _one_box_per_rank(size: int, chain: list[tuple[int, int | None]]) -> bool:
+    """Whether sharding a dim of ``size`` gives every rank one even, contiguous box.
 
     ``chain`` holds (mesh axis size, split factor or None for ``Shard``) of each
-    mesh axis sharding the dim, in mesh order. Splits ``arange(size)`` as
-    ``distribute_tensor`` does, for every coordinate, so all ranks agree.
+    mesh axis sharding the dim, in mesh order. Holds if each split factor is
+    the number of shards of the axes after it, as with FSDP over TP, and the
+    shards are even. Uneven shards are rejected: FSDP and ``distribute_tensor``
+    split them differently.
     """
-    placements = [
-        Shard(0)
-        if split_factor is None
-        else _StridedShard(0, split_factor=split_factor)
-        for _num_chunks, split_factor in chain
-    ]
-    mesh_shape = tuple(num_chunks for num_chunks, _split_factor in chain)
-    for coordinate in itertools.product(*(range(n) for n in mesh_shape)):
-        local = torch.arange(size)
-        for placement, num_chunks, index in zip(placements, mesh_shape, coordinate):
-            shards, _pad = placement._split_tensor(
-                local, num_chunks, with_padding=False
-            )
-            local = shards[index]
-        shape, offsets = _compute_local_shape_and_global_offset(
-            (size,),
-            mesh_shape=mesh_shape,
-            my_coordinate=list(coordinate),
-            placements=placements,
-        )
-        expected = torch.arange(offsets[0], offsets[0] + shape[0])
-        if not torch.equal(local, expected):
-            return False
-    return True
+    if size % math.prod(num_chunks for num_chunks, _split_factor in chain):
+        return False
+    return all(
+        split_factor is None
+        or split_factor
+        == math.prod(num_chunks for num_chunks, _split_factor in chain[index + 1 :])
+        for index, (_num_chunks, split_factor) in enumerate(chain)
+    )
 
 
 @dataclass
@@ -335,6 +317,7 @@ class StateDictDelta:
         header[0] = count if count <= capacity else _OVERFLOW
         header[1] = self._version + 1
         header[2] = self._epoch
+        header[3] = _WIRE_DTYPES.index(wire_dtype)
 
 
 async def put_state_dict_delta(
@@ -655,6 +638,14 @@ def _apply(
         coordinate: row[:_HEADER_BYTES].view(_HEADER_DTYPE).tolist()
         for coordinate, row in rows.items()
     }
+    for header in headers.values():
+        # Routes keep the wire dtype of the first layout; decoding with
+        # another one of the same size would silently corrupt the destination.
+        if _WIRE_DTYPES[header[3]] != route.wire_dtype:
+            raise ValueError(
+                f"a publisher changed the wire dtype from {route.wire_dtype} to "
+                f"{_WIRE_DTYPES[header[3]]}; restart requesters to read it"
+            )
     # Rows may be at different versions, e.g. after one publisher restarted;
     # each is checked against the version the destination holds from it.
     latest = {

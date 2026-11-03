@@ -233,18 +233,19 @@ def test_stage_encodes_changed_elements_and_overflow(
     [entry] = delta._entries.values()
     assert entry.packed.is_pinned() == (device != "cpu")
     assert entry.capacity == 8
-    count, version, epoch = entry.packed[:24].view(torch.int64)
+    count, version, epoch, wire_dtype = entry.packed[:32].view(torch.int64)
 
     delta._stage({"w": weight})
     assert count.item() == -1, "the first version is always sent in full"
     assert version.item() == 1
     assert epoch.item() == delta._epoch
+    assert wire_dtype.item() == delta_module._WIRE_DTYPES.index(torch.float32)
 
     weight[[2, 9]] = torch.tensor([1.0, -2.0], device=device)
     delta._stage({"w": weight})
     assert count.item() == 2
-    values = entry.packed[24 : 24 + 8 * 4].view(torch.float32)[:2]
-    indices = entry.packed[24 + 8 * 4 :].view(torch.int32)[:2]
+    values = entry.packed[32 : 32 + 8 * 4].view(torch.float32)[:2]
+    indices = entry.packed[32 + 8 * 4 :].view(torch.int32)[:2]
     assert indices.tolist() == [2, 9]
     assert values.tolist() == [1.0, -2.0]
 
@@ -412,6 +413,9 @@ async def test_delta_sync_retries_failed_plan(
     install = requester._install_requester_plan
 
     def fail_once(key, registrations, **kwargs):
+        """Fail the first install of the delta rows, after the full plan."""
+        if not key.endswith("/delta"):
+            return install(key, registrations, **kwargs)
         monkeypatch.setattr(requester, "_install_requester_plan", install)
         raise RuntimeError("injected")
 
@@ -486,6 +490,29 @@ async def test_delta_sync_reads_rows_from_the_full_read_replica() -> None:
         await get_state_dict_delta(requester, "model", destination)
     for flat_key in keys:
         assert torch.equal(destination[flat_key], weights[flat_key]), flat_key
+
+
+@pytest.mark.asyncio
+async def test_delta_sync_rejects_a_changed_wire_dtype() -> None:
+    clients = await routing_clients(
+        publishers={"publisher/0": {}}, requesters={"requester/0": {}}
+    )
+    publisher, requester = clients["publisher/0"], clients["requester/0"]
+    weight = torch.randn(_SHAPE)
+    delta = StateDictDelta(
+        {"w": weight}, max_fraction=0.5, transfer_dtype=torch.float16
+    )
+    await put_state_dict_delta(publisher, delta, {"w": weight}, "model")
+    destination = torch.zeros(_SHAPE, dtype=torch.float16)
+    await get_state_dict_delta(requester, "model", {"w": destination})
+
+    # A restarted publisher with another wire dtype of the same size.
+    delta = StateDictDelta(
+        {"w": weight}, max_fraction=0.5, transfer_dtype=torch.bfloat16
+    )
+    await put_state_dict_delta(publisher, delta, {"w": weight + 1}, "model")
+    with pytest.raises(ValueError, match="wire dtype"):
+        await get_state_dict_delta(requester, "model", {"w": destination})
 
 
 @pytest.mark.asyncio
