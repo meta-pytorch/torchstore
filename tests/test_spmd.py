@@ -821,6 +821,45 @@ class SPMDInitializeTest(unittest.IsolatedAsyncioTestCase):
             await session.shutdown()
         teardown.assert_not_awaited()
 
+    async def test_a_peer_shuts_its_session_down_after_a_failed_routing_client(
+        self,
+    ) -> None:
+        """Take the name from a failed routing client's mark and shut the session down despite a later one."""
+        import cloudpickle
+
+        store_name = f"marked_{uuid.uuid4().hex[:8]}"
+        env = ts.spmd.SPMDEnv(
+            rank=1,
+            local_rank=1,
+            world_size=2,
+            local_world_size=2,
+            master_addr=_MASTER_ADDR,
+            master_port=_reserve_free_port(),
+        )
+        rendezvous = MagicMock()
+        rendezvous.get.return_value = cloudpickle.dumps("controller")
+        with _api._selection_lock:
+            _api._attempted.add(store_name)
+        try:
+            with (
+                patch("torchstore.monarch.spmd.TCPStore", return_value=rendezvous),
+                patch("torchstore.monarch.spmd.StoreJob.from_store", return_value=None),
+            ):
+                await ts.initialize_spmd(
+                    strategy=ts.HostStrategy(), store_name=store_name, env=env
+                )
+            self.assertNotIn(store_name, _api._attempted)
+            session = _api._spmd_state_map[store_name]
+            with _api._selection_lock:
+                # A failed client after the session is outranked by it at shutdown.
+                _api._attempted.add(store_name)
+            with patch.object(session, "shutdown", AsyncMock()) as shutdown:
+                await ts.shutdown(store_name)
+            shutdown.assert_awaited_once_with()
+        finally:
+            _api._spmd_state_map.pop(store_name, None)
+            _api._attempted.discard(store_name)
+
 
 @unittest.skipUnless(
     _supports_monarch_spmd(),

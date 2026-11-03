@@ -43,6 +43,7 @@ from torchstore.carrier_volumes import (
     check_strategy,
     forget_context_pairs,
     PublisherVolume,
+    serves_another_publisher,
     start_publisher_volume,
     stop_publisher_volumes,
 )
@@ -699,11 +700,18 @@ class CarrierServiceBackend(ServiceBackend):
         register: Callable[[str, bytes], Awaitable[None]],
     ) -> PublisherVolume:
         return await start_publisher_volume(
-            volume_id, store_name=store_name, selection=selection, register=register
+            volume_id,
+            store_name=store_name,
+            selection=selection,
+            register=register,
+            sole=True,
         )
 
     def stop_publisher_volumes(self, store_name: str) -> list[PublisherVolume]:
         return stop_publisher_volumes(store_name)
+
+    def serves_another_publisher(self, store_name: str, volume_id: str) -> bool:
+        return serves_another_publisher(store_name, volume_id)
 
 
 def _after_fork_in_child() -> None:

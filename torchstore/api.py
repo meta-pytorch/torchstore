@@ -31,7 +31,7 @@ from torchstore.strategy import (
     TorchStoreStrategy,
 )
 from torchstore.transport.types import TensorSlice
-from torchstore.utils import _off_task, _store_address
+from torchstore.utils import _off_task, _store_address, start_daemon_thread
 
 if TYPE_CHECKING:
     from monarch.actor import ProcMesh
@@ -84,6 +84,20 @@ _released_stores: set[str] = set()
 # control_plane=, calls for them raise instead of looking Monarch up.
 _forked_stores: dict[str, ControlPlaneAddress] = {}
 
+# Stores this process builds a client for through an address or a plane, until one such build
+# records the store or fails into _attempted. Shutdown releases a marked store without Monarch until
+# a selection, a standard initialize, an SPMD session, or a Monarch or standard client takes the name.
+_building: set[str] = set()
+_attempted: set[str] = set()
+# Standard stores initialized here until shut down, whose teardown no such mark skips.
+_standard_stores: set[str] = set()
+# Per store, the rank IDs that builds in flight were given. A racing build given another is refused.
+_building_ranks: dict[str, list[str]] = {}
+
+# The most publishers a store on "service" takes, four times the design's largest scale. The
+# rendezvous writes their keys well within its deadline even beside busy threads.
+_MAX_SERVICE_PUBLISHERS = 16_384
+
 # Volume hosts of clients that reset_client or a newer client dropped, beside weak refs to
 # their strategies. Shutdown closes them, and a build the collected ones but the newest.
 # Both take entries out of a store's list in place because reset_client appends without the lock.
@@ -107,6 +121,26 @@ def _routing_volume_id(namespace: str) -> str:
     return f"{namespace}/{get_backend('monarch').rank()}"
 
 
+def _actor_rank() -> int:
+    """This call's position in its Monarch mesh (``current_rank``), from the Monarch backend.
+
+    It is the actor's rank only for an endpoint called on the whole mesh, not through a slice.
+    Raises ValueError outside an actor's context, as in a Monarch driver or without torchmonarch.
+    """
+    try:
+        rank = get_backend("monarch").actor_rank()
+    except ModuleNotFoundError as error:
+        if error.name is None or error.name.split(".")[0] != "monarch":
+            raise
+        rank = None
+    if rank is None:
+        raise ValueError(
+            "pass rank=: this call has no rank of its own. No Monarch actor context is current"
+            " outside an actor or on a thread that threading.Thread or run_in_executor started"
+        )
+    return rank
+
+
 def _routing_namespace(role: RankRole, group: int | None) -> str:
     """The namespace of one participating mesh."""
     if role == RankRole.PUBLISHER:
@@ -118,9 +152,37 @@ def _routing_namespace(role: RankRole, group: int | None) -> str:
     return f"{role.value}/{group}"
 
 
-def _client_rank(role: RankRole, group: int | None) -> str:
-    """This process's rank ID in a routing store, such as ``publisher/0``."""
-    return _routing_volume_id(_routing_namespace(role, group))
+def _client_rank(
+    namespace: str, rank: int | None, control_plane: ControlPlane | None
+) -> str:
+    """This process's rank ID in a routing store, such as ``publisher/0``.
+
+    Where publishers serve their own volumes it is ``rank``, or without one the call's position
+    in its Monarch mesh. On other control planes Monarch's ``current_rank`` names it, and
+    ``rank`` raises.
+    """
+    if not _hosts_volumes(control_plane):
+        if rank is not None:
+            raise _hosted_only("rank")
+        return _routing_volume_id(namespace)
+    return f"{namespace}/{_actor_rank() if rank is None else rank}"
+
+
+def _hosted_only(argument: str) -> ValueError:
+    """The error for ``rank`` or ``num_publishers`` where Monarch spawns the volumes."""
+    return ValueError(
+        f"{argument} is only for control planes whose publishers serve their own"
+        " volumes, such as 'service'. On others, volumes are Monarch actors and ranks"
+        " come from Monarch"
+    )
+
+
+def _check_int(name: str, value: object, minimum: int) -> None:
+    """Refuse anything but an int of at least ``minimum``. A bool is not one."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be an int, got {value!r}")
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {value}")
 
 
 def _caller_control_plane(
@@ -168,6 +230,7 @@ def _select_control_plane(
     if selected is not None:
         _check_one_store(store_name, selected.control_plane)
     _forked_stores.pop(store_name, None)
+    _attempted.discard(store_name)
     recorded = _control_plane_map.get(store_name)
     if selected is None:
         _released_stores.discard(store_name)
@@ -344,6 +407,16 @@ async def _close_carrier_quietly(
         logger.warning("closing %s volume handles failed", whose, exc_info=True)
 
 
+async def _close_volume_quietly(volume: "PublisherVolume") -> None:
+    """Stop a publisher volume that no client took and only log a failure so the caller's error stands."""
+    try:
+        await volume.close()
+    except Exception:
+        logger.warning(
+            "stopping routing volume=%s failed", volume.volume_id, exc_info=True
+        )
+
+
 def _log_control_plane(
     kind: str, address: ControlPlaneAddress | None, store_name: str, rank: str
 ) -> None:
@@ -366,6 +439,7 @@ async def initialize(
     client_type: ClientType = ClientType.STANDARD,
     *,
     control_plane: str | ControlPlane = "monarch",
+    num_publishers: int | None = None,
 ) -> ControlPlaneAddress | None:
     """Initialize the TorchStore distributed storage system.
 
@@ -400,26 +474,33 @@ async def initialize(
             beside a TCPStore. An instance, which serves only this store, is
             initialized here for later clients in this process, and log lines name
             it by ``kind`` or class name.
+        num_publishers: The publisher count, in place of ``mesh``, where publishers serve
+            their own volumes, so any launcher can start them: publisher ``r`` passes
+            ``rank=r`` to ``ts.client``, for ``r`` from 0 to ``num_publishers - 1``.
 
     Returns:
-        For ``"service"`` the address that every rank passes to ``ts.client``,
+        For ``"service"`` the address that ranks in other processes pass to ``ts.client``,
         otherwise None.
 
     Raises:
-        RuntimeError: If num_storage_volumes > 1 but no strategy is provided, or, for a
-            routing initialize in the process whose earlier call started it, the store still
-            runs that coordinator service (checked before anything spawns and as it records).
+        RuntimeError: If num_storage_volumes > 1 but no strategy is provided, or a routing
+            store gets no strategy, or neither mesh nor num_publishers, or, for a routing
+            initialize in the process whose earlier call started it, the store still runs
+            that coordinator service (checked before anything spawns and as it records).
             Also if control_plane is a plane dialed from a service's address.
         ConnectionError: If the service's advertised host does not answer, about
             60 s in.
         TypeError: If control_plane is neither a string nor a ``ControlPlane``, or
-            publishers serve their own volumes and strategy is not a plain one.
+            publishers serve their own volumes and strategy is not a plain one, or
+            num_publishers is not an int.
         ValueError: If control_plane is a string other than ``"monarch"`` or
             ``"service"``, anything but ``"monarch"`` for a standard store, an
             instance that serves another store, or publishers serve their own volumes
-            over a transport they do not carry. On ``"service"`` also for a
-            ``store_name`` too long for the TCPStore keys it publishes (over about
-            8,100 UTF-8 bytes).
+            over a transport they do not carry. Also if num_publishers is below 1, comes
+            with mesh, or comes where Monarch spawns the volumes or for a standard store,
+            or ``"service"`` gets more than 16,384 publishers, four times the design's
+            largest scale, or a ``store_name`` too long for the TCPStore keys it publishes
+            (over about 8,100 UTF-8 bytes).
 
     Example:
         >>> import torchstore as ts
@@ -427,14 +508,27 @@ async def initialize(
         >>> >>> await ts.initialize("my_custom_store")
     """
     caller_control_plane = _caller_control_plane(control_plane)
+    if num_publishers is not None:
+        _check_int("num_publishers", num_publishers, 1)
     if client_type == ClientType.ROUTING:
-        if strategy is None or mesh is None:
-            raise RuntimeError("routing mode requires both mesh and strategy")
+        if num_publishers is not None:
+            if not _hosts_volumes(caller_control_plane):
+                raise _hosted_only("num_publishers")
+            if mesh is not None:
+                raise ValueError("pass mesh or num_publishers, not both")
+        if strategy is None or (mesh is None and num_publishers is None):
+            # Upstream's text comes first for callers that match it.
+            raise RuntimeError(
+                "routing mode requires both mesh and strategy, or num_publishers in place"
+                " of mesh where publishers serve their own volumes"
+            )
         return await _initialize_routing(
-            mesh, strategy, store_name, caller_control_plane
+            mesh, strategy, store_name, caller_control_plane, num_publishers
         )
     if caller_control_plane is not None:
         raise ValueError("standard stores take only control_plane='monarch'")
+    if num_publishers is not None:
+        raise ValueError("standard stores take no num_publishers")
 
     if num_storage_volumes == 1 and strategy is None:
         strategy = ControllerStorageVolumes()
@@ -463,14 +557,17 @@ async def initialize(
         # Client and shutdown reach this controller, unless a routing record of the name stays.
         _released_stores.discard(store_name)
         _forked_stores.pop(store_name, None)
+        _attempted.discard(store_name)
+        _standard_stores.add(store_name)
     return None
 
 
 async def _initialize_routing(
-    mesh: "ProcMesh",
+    mesh: "ProcMesh | None",
     strategy: TorchStoreStrategy,
     store_name: str,
     control_plane: ControlPlane | Literal["service"] | None,
+    num_publishers: int | None,
 ) -> ControlPlaneAddress | None:
     """Spawn trainer volumes unless publishers serve their own, then initialize the control plane."""
     with _selection_lock:
@@ -489,7 +586,14 @@ async def _initialize_routing(
         )
         await strategy.set_storage_volumes(volumes)
 
-    num_publishers = mesh.size()
+    if num_publishers is None:
+        assert mesh is not None
+        num_publishers = mesh.size()
+    if isinstance(control_plane, str) and num_publishers > _MAX_SERVICE_PUBLISHERS:
+        raise ValueError(
+            f"'service' takes at most {_MAX_SERVICE_PUBLISHERS} publishers, got"
+            f" {num_publishers}: four times the design's largest scale"
+        )
     publishers = {f"{namespace}/{rank}" for rank in range(num_publishers)}
 
     selected: _SelectedControlPlane | None = None
@@ -574,8 +678,11 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
     for the exit hooks' bounded waits, after which it can abort the process if it returns while
     the interpreter finalizes. Another shutdown then drops only a client, unless an SPMD session of
     the name tears its store down. A caller's control plane stays open, and Monarch volumes
-    stay with their mesh. Never overlap it with another ``initialize``,
-    ``client`` or ``shutdown`` call for the same store in this process.
+    stay with their mesh. A store whose only ``ts.client`` here is still connecting through
+    an address or a plane, or failed once it began to, asks Monarch nothing however often it
+    is shut down. Never overlap it with another ``initialize``, ``client`` or ``shutdown``
+    call for the same store in this process except with such a connecting ``client``. That
+    client raises ``RuntimeError`` if this shutdown released the store's record it connects through.
 
     Args:
         store_name (str): Name of the store to shutdown. Defaults to DEFAULT_TORCHSTORE_NAME.
@@ -609,9 +716,11 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
         return
 
     controller = await _controller(store_name)
+    task = _current_task()
     try:
         await controller.teardown.call()
     finally:
+        _locked_cleanup(partial(_standard_stores.discard, store_name), _off_task(task))
         reset_client(store_name)
 
 
@@ -619,7 +728,8 @@ async def _shutdown_selected(store_name: str) -> bool:
     """Release a store's record, client, owned service and publisher volume, then close them.
 
     Volumes stop, then every client's volume handles, the connection and the service, each even
-    if an earlier close fails. Returns False, logging any failure, if it found only dropped clients.
+    if an earlier close fails. Returns False, logging any failure, if it found only dropped clients
+    and no client this process builds, or failed to build, through an address or a plane.
     """
     # None before the service backend loads: this process serves no volume yet.
     backend = loaded_backend("service")
@@ -631,10 +741,20 @@ async def _shutdown_selected(store_name: str) -> bool:
         service = _owned_service_map.pop(store_name, None)
         forked = _forked_stores.pop(store_name, None)
         volumes = [] if backend is None else backend.stop_publisher_volumes(store_name)
-        released = not (selected is None and forked is None and not volumes)
+        # A session or a standard store here outranks the marks, as for released stores.
+        attempted = (
+            store_name not in _spmd_state_map
+            and store_name not in _standard_stores
+            and (store_name in _building or store_name in _attempted)
+        )
+        found = not (selected is None and forked is None and not volumes)
+        released = found or attempted
         carriers = []
-        if released:
+        # A build's mark stays for later shutdowns. One that alone recorded nothing records no
+        # released store either, and a role-less call then still looks Monarch up.
+        if found:
             _released_stores.add(store_name)
+        if released:
             cached = _client_carrier(_local_clent_map.pop(store_name, None))
             if cached is not None:
                 carriers.append(cached)
@@ -791,6 +911,8 @@ def _after_fork_in_child(lock: threading.Lock) -> None:
     for carriers in _dropped_carriers.values():
         _inherited.extend(carriers)
     _dropped_carriers.clear()
+    _building.clear()
+    _building_ranks.clear()
     # None before the service backend loads: no handle exists yet.
     service = loaded_backend("service")
     for store_name, selected in list(_control_plane_map.items()):
@@ -816,6 +938,16 @@ os.register_at_fork(
 )
 
 
+def _start_spmd_session(store_name: str, session: "_SPMDSession") -> None:
+    """Register an SPMD session, which takes the name as a standard initialize does.
+
+    It outranks a failed routing client's mark only while it runs. This step drops the mark too.
+    """
+    with _selection_lock:
+        _attempted.discard(store_name)
+        _spmd_state_map[store_name] = session
+
+
 async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> "Controller":
     """Get a controller handle for interacting with the store."""
     session = _spmd_state_map.get(store_name)
@@ -831,15 +963,19 @@ async def client(
     group: int | None = None,
     address: ControlPlaneAddress | None = None,
     control_plane: ControlPlane | None = None,
+    rank: int | None = None,
 ) -> LocalClient:
     """Get a local client handle for interacting with the store.
 
     Returns a cached LocalClient instance that provides the interface for put/get operations.
     Never overlap it with an ``initialize`` or ``shutdown`` call for the same store in this
-    process, nor a first call with ``address`` or ``control_plane`` with another ``client``
-    call for the store unless both pass one address and neither passes ``control_plane``:
-    those share one connection, and its client unless ``reset_client`` drops it in between.
-    Concurrent first calls without a role share one client.
+    process other than a ``shutdown`` while it is the store's only client here and connects
+    through an address or a plane. It then raises ``RuntimeError`` if that shutdown released
+    the store's record it connects through. Nor overlap a first call with ``address`` or
+    ``control_plane`` with another ``client`` call for the store unless both pass one
+    address and neither passes ``control_plane``. Those share one connection and its client
+    (unless ``reset_client`` drops it in between), and of two for different rank IDs one
+    raises. Concurrent first calls without a role share one client.
 
     Args:
         store_name (str): Name of the store to get a client for. Defaults to DEFAULT_TORCHSTORE_NAME.
@@ -859,6 +995,10 @@ async def client(
             record (kept across ``reset_client``), then the Monarch lookup, which needs no
             argument: unlike ``initialize`` this takes no ``"monarch"``. A cached client
             refuses other instances, even a copy that an actor call delivers.
+        rank: This process's rank on its mesh, from 0, so any launcher can start ranks
+            where publishers serve their own volumes. It needs ``role``. In a Monarch endpoint it
+            defaults to the call's position (``current_rank``), the actor's rank only on a
+            whole-mesh call, so pass it otherwise, a driver included. Other planes refuse it.
 
     Returns:
         LocalClient: A client instance for performing storage operations.
@@ -866,13 +1006,18 @@ async def client(
     Raises:
         TypeError: If address or control_plane has the wrong type, the address's class
             is not a dataclass of its own or has ``eq=False`` without an ``__eq__`` of its
-            own, its ``connect`` returns something other than a ``ControlPlane``, or a
-            publisher's control plane shares volume records but resolves volumes another way.
-        ValueError: If address or control_plane comes without role, the address
-            names another store, control_plane (else address) differs from the cached
-            client's, control_plane serves another store, or the first client of a
-            store with a recorded control plane, or one shut down here with no SPMD
-            session of its name, has no role.
+            own, its ``connect`` returns something other than a ``ControlPlane``, rank is
+            not an int, or a publisher's control plane shares volume records but resolves
+            volumes another way.
+        ValueError: If address, control_plane or rank comes without role, the address names
+            another store, control_plane (else address) or rank differs from the cached
+            client's, control_plane serves another store, or the first client of a store with a
+            recorded control plane, or one shut down here with no SPMD session of its name, has
+            no role. Also if rank is negative or comes where ranks come from Monarch, another
+            call in this process builds the store's client for another rank or this process
+            serves another publisher rank's volume of the store, or publishers serve their own
+            volumes and a call outside an actor's context passes no rank. A connection this call
+            dialed closes.
         RuntimeError: In a forked child, if a call without address or control_plane
             needs a store whose connection the fork dropped. With any selection: if a
             shutdown stops a publisher's volume as it starts, another
@@ -908,6 +1053,12 @@ async def client(
         )
     if role is None and (address is not None or control_plane is not None):
         raise ValueError("address and control_plane are for routing clients: pass role")
+    wanted = None
+    if rank is not None:
+        if role is None:
+            raise ValueError("rank is for routing clients: pass role")
+        _check_int("rank", rank, 0)
+        wanted = f"{_routing_namespace(RankRole(role), group)}/{rank}"
     if address is not None and address.store_name != store_name:
         raise ValueError(
             f"address is for store {address.store_name!r}, not {store_name!r}"
@@ -917,15 +1068,32 @@ async def client(
             _check_one_store(store_name, control_plane)
         cached = _local_clent_map.get(store_name)
         if cached is not None:
-            _check_cached_client(store_name, address, control_plane)
+            _check_cached_client(store_name, address, control_plane, wanted)
             return cached
         if role is None:
             _check_unrecorded(store_name)
+        elif wanted is not None:
+            _reserve_rank(store_name, wanted)
+        # The build fails if a shutdown on another thread releases it before the build reads it.
+        seen = _control_plane_map.get(store_name)
 
     if role is not None:
-        return await _routing_client(
-            store_name, RankRole(role), group, address, control_plane
+        task = asyncio.current_task()
+        # One through an address or a plane is marked for shutdown while it builds.
+        build = (
+            _routing_client
+            if address is None and control_plane is None
+            else _building_client
         )
+        try:
+            return await build(
+                store_name, RankRole(role), group, address, control_plane, rank, seen
+            )
+        finally:
+            if wanted is not None:
+                _locked_cleanup(
+                    partial(_release_rank, store_name, wanted), _off_task(task)
+                )
     controller = await _controller(store_name)
     controller_strategy = await controller.get_controller_strategy.call_one()
     local_client = LocalClient(
@@ -937,7 +1105,89 @@ async def client(
         # Racing first calls share the client cached first: a process's Gloo pair to a volume ID
         # serves one live client, so a second would be refused its tensor transfers.
         local_client = _local_clent_map.setdefault(store_name, local_client)
+        _attempted.discard(store_name)
     return local_client
+
+
+async def _building_client(
+    store_name: str,
+    role: RankRole,
+    group: int | None,
+    address: ControlPlaneAddress | None,
+    control_plane: ControlPlane | None,
+    rank: int | None,
+    seen: _SelectedControlPlane | None,
+) -> LocalClient:
+    """Build a routing client through an address or a plane, marked as running for ``shutdown``.
+
+    A failed one marks the store in ``_attempted``.
+    """
+    # Checked first, so a call refused for its arguments marks nothing.
+    _routing_namespace(role, group)
+    if (
+        rank is not None
+        and control_plane is not None
+        and not _hosts_volumes(control_plane)
+    ):
+        raise _hosted_only("rank")
+    task = asyncio.current_task()
+    with _selection_lock:
+        _building.add(store_name)
+    try:
+        return await _routing_client(
+            store_name, role, group, address, control_plane, rank, seen
+        )
+    except BaseException:
+        _locked_cleanup(partial(_attempted.add, store_name), _off_task(task))
+        raise
+    finally:
+        _locked_cleanup(partial(_building.discard, store_name), _off_task(task))
+
+
+def _locked_cleanup(update: Callable[[], None], closed: bool) -> None:
+    """Run ``update`` under ``_selection_lock`` and never wait for it if the GC closed the call.
+
+    The collector can close a build or a shutdown inside a locked step of this thread. Then ``update`` runs
+    here if the lock is free, else on a thread once it frees, and not at all where no thread starts (as the
+    interpreter finalizes or the OS refuses one), which leaves a build running and its rank claimed.
+    """
+    if not closed:
+        with _selection_lock:
+            update()
+    elif _selection_lock.acquire(blocking=False):
+        try:
+            update()
+        finally:
+            _selection_lock.release()
+    else:
+        start_daemon_thread(
+            partial(_locked_cleanup, update, False), "torchstore-selection-update"
+        )
+
+
+def _reserve_rank(store_name: str, wanted: str) -> None:
+    """Count a build of the store's client as rank ID ``wanted``, refusing one while another runs.
+
+    The caller holds ``_selection_lock``. Two builds for different ranks would each serve a volume
+    or share one client of the wrong rank.
+    """
+    building = _building_ranks.setdefault(store_name, [])
+    other = next((rank_id for rank_id in building if rank_id != wanted), None)
+    if other is not None:
+        raise ValueError(
+            f"another ts.client call in this process builds store {store_name!r} as"
+            f" {other}, not {wanted}"
+        )
+    building.append(wanted)
+
+
+def _release_rank(store_name: str, wanted: str) -> None:
+    """Drop one count of builds as ``wanted``. The caller holds ``_selection_lock``."""
+    building = _building_ranks.get(store_name)
+    if building is not None and wanted in building:
+        building.remove(wanted)
+        if not building:
+            del _building_ranks[store_name]
 
 
 def _check_unrecorded(store_name: str) -> None:
@@ -970,8 +1220,9 @@ def _check_cached_client(
     store_name: str,
     address: ControlPlaneAddress | None,
     control_plane: ControlPlane | None,
+    rank: str | None,
 ) -> None:
-    """Refuse a control plane other than the cached client's, else another address."""
+    """Refuse a control plane other than the cached client's, else another address or rank ID."""
     selected = _control_plane_map.get(store_name)
     if control_plane is not None:
         if selected is None or selected.control_plane is not control_plane:
@@ -985,6 +1236,24 @@ def _check_cached_client(
             f"the cached client for store {store_name!r} did not connect through "
             f"{address}. Call ts.reset_client to replace it"
         )
+    if rank is not None:
+        cached = _local_clent_map[store_name]
+        if not isinstance(cached, RoutingClient) or not _hosts_volumes(
+            cached.control_plane
+        ):
+            raise _hosted_only("rank")
+        if cached.rank_id != rank:
+            # A publisher volume outlives reset_client, so only shutdown lets this process serve another.
+            remedy = (
+                "Call ts.shutdown to release it"
+                if rank.split("/")[0] == RankRole.PUBLISHER.value
+                and get_backend("service").serves_another_publisher(store_name, rank)
+                else "Call ts.reset_client to replace it"
+            )
+            raise ValueError(
+                f"the cached client for store {store_name!r} is {cached.rank_id}, not"
+                f" {rank}. {remedy}"
+            )
 
 
 async def _routing_client(
@@ -993,18 +1262,31 @@ async def _routing_client(
     group: int | None,
     address: ControlPlaneAddress | None,
     control_plane: ControlPlane | None,
+    given_rank: int | None,
+    seen: _SelectedControlPlane | None,
 ) -> LocalClient:
-    """Build and cache a routing client on the first plane in ``client``'s order."""
+    """Build and cache a routing client on the first plane in ``client``'s order.
+
+    ``seen`` is the store's record as ``client`` began. The build fails once another thread's shutdown released it.
+    """
     with _selection_lock:
         recorded = _control_plane_map.get(store_name)
+        if seen is not None and recorded is not seen:
+            raise _lost_record(store_name, seen)
         # Checked in the read's locked step: a selection drops the marker as it records the store.
         if control_plane is None and address is None and recorded is None:
             _check_not_forked(store_name)
         given = None if control_plane is None else _given(store_name, control_plane)
     if control_plane is None and address is None and recorded is None:
+        if given_rank is not None:
+            raise ValueError(
+                "rank needs the store's address (address=) or control plane"
+                f" (control_plane=): store {store_name!r} has no control plane in this"
+                " process, and on Monarch's coordinator ranks come from Monarch"
+            )
         return await _monarch_routing_client(store_name, role, group)
     # Check role and group first, so a bad call dials nothing.
-    rank = _client_rank(role, group)
+    namespace = _routing_namespace(role, group)
     if given is not None:
         selected = given
     elif address is not None and (recorded is None or recorded.address != address):
@@ -1019,6 +1301,50 @@ async def _routing_client(
         # The record, also when this process already connected through ``address``.
         assert recorded is not None
         selected = recorded
+    try:
+        rank = _client_rank(namespace, given_rank, selected.control_plane)
+        if given_rank is None:
+            # Claimed once the plane is known (after any dial) so a racing build refuses before it reads the strategy.
+            with _selection_lock:
+                _check_racing_rank(store_name, rank)
+                _reserve_rank(store_name, rank)
+    except Exception:
+        if selected is not recorded:
+            await _close_dialed_quietly(selected)
+        raise
+    if given_rank is not None:
+        return await _build_routing_client(store_name, role, rank, selected, recorded)
+    task = asyncio.current_task()
+    try:
+        return await _build_routing_client(store_name, role, rank, selected, recorded)
+    finally:
+        _locked_cleanup(partial(_release_rank, store_name, rank), _off_task(task))
+
+
+def _check_racing_rank(store_name: str, rank: str) -> None:
+    """Refuse a build as ``rank`` once the store's client of another rank ID is cached.
+
+    The caller holds ``_selection_lock``.
+    """
+    cached = _local_clent_map.get(store_name)
+    if isinstance(cached, RoutingClient) and cached.rank_id != rank:
+        raise ValueError(
+            f"another ts.client call in this process built store {store_name!r} as"
+            f" {cached.rank_id}, not {rank}"
+        )
+
+
+async def _build_routing_client(
+    store_name: str,
+    role: RankRole,
+    rank: str,
+    selected: _SelectedControlPlane,
+    recorded: _SelectedControlPlane | None,
+) -> LocalClient:
+    """Read the strategy and start a publisher's volume where the plane shares volume records.
+
+    Then cache a client on ``selected``, or share a racing call's cached client or record as ``_record_client`` does.
+    """
     strategy: TorchStoreStrategy | None = None
     volume = None
     task = asyncio.current_task()
@@ -1052,9 +1378,12 @@ async def _routing_client(
                 _leave_running(task, selected.address)
         raise
     with _selection_lock:
-        # A shutdown, or a start for another store of this name, stopped the volume.
+        # A shutdown, or a start for another store of this name, stopped the volume. A shutdown
+        # also releases the record this build read.
         step = None
-        if volume is None or volume.current():
+        if (volume is None or volume.current()) and (
+            selected is not recorded or _control_plane_map.get(store_name) is recorded
+        ):
             step = _record_client(store_name, rank, role, selected, recorded, strategy)
     if step is None:
         async with contextlib.AsyncExitStack() as discarding:
@@ -1068,6 +1397,9 @@ async def _routing_client(
                     _volume_host(strategy),
                     "a discarded client's",
                 )
+            if volume is not None and volume.stop():
+                # It started after a shutdown released the record this build read, so no stop took it.
+                discarding.push_async_callback(_close_volume_quietly, volume)
         if selected is not recorded:
             # A shutdown or a start for another store of this name stopped its volume.
             raise _lost_build(
@@ -1076,13 +1408,8 @@ async def _routing_client(
                 "Call ts.client again, or restart the store if it refuses the volume"
                 " as already registered",
             )
-        # Through the record, which a shutdown that stopped the volume also released.
-        raise _lost_build(
-            store_name,
-            _store_address(selected.control_plane, selected.address),
-            "Call ts.initialize again or pass address=, and restart the store if it"
-            " refuses the volume as already registered",
-        )
+        # Through a record a shutdown released: it stopped the volume, or the stack above did for one started later.
+        raise _lost_record(store_name, selected)
     routing_client, selected, closing, built = step
     try:
         if built:
@@ -1106,6 +1433,24 @@ async def _routing_client(
                 )
             closes.push_async_callback(_close_quietly, closing, selected)
     return routing_client
+
+
+def _current_task() -> "asyncio.Task[Any] | None":
+    """The running task, or None for a coroutine stepped outside any event loop."""
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+def _lost_record(store_name: str, selected: _SelectedControlPlane) -> RuntimeError:
+    """The error of a build through the store's record that a shutdown released."""
+    return _lost_build(
+        store_name,
+        _store_address(selected.control_plane, selected.address),
+        "Call ts.initialize again or pass address=, and restart the store if it"
+        " refuses the volume as already registered",
+    )
 
 
 def _lost_build(
@@ -1210,12 +1555,13 @@ async def _monarch_routing_client(
 ) -> RoutingClient:
     """Build and cache a routing client on the Monarch coordinator found by name."""
     # Check role and group first, so a bad call looks nothing up.
-    rank = _client_rank(role, group)
+    rank = _client_rank(_routing_namespace(role, group), None, None)
     control_plane = await get_backend("monarch").coordinator(store_name)
     strategy = await control_plane.strategy()
     routing_client = RoutingClient(rank, role, control_plane, strategy)
     with _selection_lock:
         _local_clent_map[store_name] = routing_client
+        _attempted.discard(store_name)
     _log_control_plane(_control_plane_kind(control_plane), None, store_name, rank)
     return routing_client
 

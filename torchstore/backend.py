@@ -53,6 +53,13 @@ class Backend(ABC):
         """
 
     @abstractmethod
+    def actor_rank(self) -> int | None:
+        """Return this call's position in its mesh if an actor's context is current, else None.
+
+        A driver's root client context is no actor's. Unlike ``rank``, it starts nothing.
+        """
+
+    @abstractmethod
     async def spawn_volumes(
         self, mesh: Any, num_volumes: int, id_func: Callable[[], str], /
     ) -> Any:
@@ -170,12 +177,17 @@ class ServiceBackend(ABC):
     ) -> PublisherVolume:
         """Serve this process's publisher volume of ``store_name``, registered through ``register``.
 
-        ``selection`` is the (control plane, address) pair that names the store.
+        ``selection`` is the (control plane, address) pair that names the store. A live volume of
+        another ID that this process serves under the store's name raises ValueError.
         """
 
     @abstractmethod
     def stop_publisher_volumes(self, store_name: str) -> list[PublisherVolume]:
         """Withdraw this process's publisher volumes of ``store_name``. The caller closes each."""
+
+    @abstractmethod
+    def serves_another_publisher(self, store_name: str, volume_id: str) -> bool:
+        """Whether this process serves a publisher volume of ``store_name`` other than ``volume_id``."""
 
 
 # The module of each backend, which registers it as it loads. No other core code names them.

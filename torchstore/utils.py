@@ -8,6 +8,9 @@ import asyncio
 import math
 import os
 import socket
+import sys
+import threading
+from collections.abc import Callable
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -129,6 +132,20 @@ def get_local_hostname() -> str:
     falls back to ``socket.gethostname()``.
     """
     return os.environ.get(TORCHSTORE_HOSTNAME_ENV, socket.gethostname())
+
+
+def start_daemon_thread(target: Callable[[], object], name: str) -> None:
+    """Run ``target`` on a daemon thread of its own unless the interpreter finalizes.
+
+    Python 3.10 would wait for good in a finalizing ``start``. Nothing runs where ``start`` is
+    refused either, as at interpreter shutdown on Python 3.12 and later or at the OS's thread limit.
+    """
+    if sys.is_finalizing():
+        return
+    try:
+        threading.Thread(target=target, name=name, daemon=True).start()
+    except RuntimeError:
+        pass
 
 
 async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):

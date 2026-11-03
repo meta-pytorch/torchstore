@@ -146,7 +146,7 @@ async def initialize(
         monarch_port=monarch_port,
         configure_job=configure_job,
     )
-    _api._spmd_state_map[store_name] = session
+    _api._start_spmd_session(store_name, session)
 
 
 __all__ = ["SPMDEnv", "initialize"]

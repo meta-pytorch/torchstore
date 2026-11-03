@@ -62,6 +62,16 @@ class RoutingClient(LocalClient):
         self._publisher_layouts: dict[str, Any] = {}
         self._requested_keys: dict[str, set[str]] = {}
 
+    @property
+    def rank_id(self) -> str:
+        """This client's rank ID, such as ``publisher/0``."""
+        return self._routing_directory.rank
+
+    @property
+    def control_plane(self) -> ControlPlane:
+        """The control plane this client registers and fetches layouts through."""
+        return self._control_plane
+
     @torch.no_grad()
     async def register_layout(
         self,

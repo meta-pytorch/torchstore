@@ -13,24 +13,14 @@ from typing import Any
 
 import pytest
 import torchstore as ts
-import torchstore.api as store_api
 from torchstore.client import LocalClient
 
 
 @pytest.fixture
-def rank_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Callable[..., Coroutine[Any, Any, LocalClient]]:
-    """Get ``ts.client(store_name, **kwargs)`` in this process as rank ``rank`` of its mesh.
-
-    Service cases that build clients here take their ranks from this one place.
-    """
+def rank_client() -> Callable[..., Coroutine[Any, Any, LocalClient]]:
+    """Get ``ts.client(store_name, rank=rank, **kwargs)`` in this process with ``rank`` 0 by default."""
 
     async def client(store_name: str, *, rank: int = 0, **kwargs: Any) -> LocalClient:
-        # A rank ID's last part is Monarch's rank, set here without loading the Monarch backend.
-        monkeypatch.setattr(
-            store_api, "_routing_volume_id", lambda namespace: f"{namespace}/{rank}"
-        )
-        return await ts.client(store_name, **kwargs)
+        return await ts.client(store_name, rank=rank, **kwargs)
 
     return client
