@@ -31,9 +31,9 @@ __all__ = ["Backend", "get_backend"]
 class Backend(ABC):
     """Spawns and finds the actors that serve TorchStore's stores on one runtime.
 
-    Core modules call the controller and volume handles returned here as Monarch actor
-    handles, through ``call``, ``call_one`` and a mesh's ``slice`` on the endpoints those
-    actors define, and never import the runtime themselves.
+    Core modules use the returned handles as Monarch actor handles without importing the
+    runtime: ``call`` (iterated as point and value pairs), ``call_one`` and ``slice(**point)``
+    on the actors' endpoints, and ``len()`` of a volume mesh.
     """
 
     @abstractmethod
@@ -131,8 +131,9 @@ _backends: dict[str, Backend] = {}
 def get_backend(name: str, /) -> Backend:
     """Return backend ``name``, importing its module on the first call.
 
-    Raises ``ValueError`` for an unknown name, and ``ModuleNotFoundError`` naming the missing
-    module, such as ``monarch`` from the torchmonarch package, if its runtime is not installed.
+    Concurrent first calls may each build one and the last stays cached. Raises ``ValueError``
+    for an unknown name, and ``ModuleNotFoundError`` naming the missing module, such as
+    ``monarch`` from the torchmonarch package, if its runtime is not installed.
     """
     backend = _backends.get(name)
     if backend is not None:
