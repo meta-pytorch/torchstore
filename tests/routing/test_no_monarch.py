@@ -95,7 +95,7 @@ report["entry_points"] = {
         "LocalRankStrategy.get_volume_id": ts.LocalRankStrategy.get_volume_id,
         "spawn_actors": lambda: asyncio.run(torchstore.utils.spawn_actors(1, object, "probe")),
         "DirectWeightSyncSource.register": lambda: DirectWeightSyncSource().register(
-            {"weight": torch.ones(2)}, rank=0
+            {}, rank=0
         ),
     }.items()
 }
@@ -153,7 +153,6 @@ async def main():
     await ts.initialize(mesh=mesh, strategy=ts.LocalRankStrategy())
     try:
         report["after_initialize"] = old_paths()
-        report["rdma"] = ts.transport.monarch_rdma.monarch_rdma_transport_available()
     finally:
         await ts.shutdown()
     return report
@@ -165,7 +164,7 @@ with open(out, "w") as f:
 """
 
 _FORK_CHILD = """
-import asyncio, json, os, signal, sys, time
+import asyncio, json, os, signal, sys, traceback
 
 root, out = sys.argv[1:]
 sys.path.insert(0, root)
@@ -185,17 +184,26 @@ async def use_a_store():
 # The child forks before any call has loaded Monarch, then uses TorchStore.
 pid = os.fork()
 if pid == 0:
-    got = asyncio.run(use_a_store())
+    try:
+        got = asyncio.run(use_a_store())
+    except BaseException:
+        traceback.print_exc()
+        sys.exit(1)
     with open(out, "w") as f:
         json.dump({"got": got}, f)
     sys.exit(0)
-deadline = time.monotonic() + 150
-while os.waitpid(pid, os.WNOHANG) == (0, 0):
-    if time.monotonic() > deadline:
-        os.kill(pid, signal.SIGKILL)
-        os.waitpid(pid, 0)
-        sys.exit("the forked child hung")
-    time.sleep(0.1)
+
+
+def hung(signum, frame):
+    os.kill(pid, signal.SIGKILL)
+    sys.exit("the forked child hung")
+
+
+signal.signal(signal.SIGALRM, hung)
+signal.alarm(150)
+status = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+signal.alarm(0)
+sys.exit(status and f"the forked child failed with status {status}")
 """
 
 _VOLUME_CHILD = """
