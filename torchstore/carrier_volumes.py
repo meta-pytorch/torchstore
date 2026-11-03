@@ -17,10 +17,13 @@ import collections
 import itertools
 import logging
 import os
+import sys
 import threading
 import time
+import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
+from concurrent import futures
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, NoReturn, TYPE_CHECKING
 
@@ -31,7 +34,10 @@ from torchstore.carrier import (
     CarrierProtocolError,
     CarrierServer,
     JsonRecord,
+    wait_future,
 )
+from torchstore.storage import StorageVolumeCore
+from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import (
     gloo,
     GlooTransportBuffer,
@@ -39,18 +45,24 @@ from torchstore.transport import (
     SharedMemoryTransportBuffer,
     TransportType,
 )
+from torchstore.utils import _off_task, _store_address
 from torchstore.volume_host import VolumeHost
 
 if TYPE_CHECKING:
-    from torchstore.storage import StorageVolumeCore
     from torchstore.strategy import StorageVolumeRef
+    from torchstore.transport.buffers import TransportContext
 
 __all__ = [
     "CARRIER_TRANSPORTS",
     "CarrierVolumeHost",
+    "check_strategy",
     "decode_volume_record",
     "encode_volume_record",
+    "forget_context_pairs",
+    "PublisherVolume",
     "serve_volume",
+    "start_publisher_volume",
+    "stop_publisher_volumes",
     "VOLUME_ENDPOINTS",
     "VolumeLocation",
     "VolumeProxy",
@@ -106,6 +118,18 @@ _pair_servers: dict[str, CarrierAddress] = {}
 _RETIRED_SERVERS = 65536
 # Held while a call takes its server's keys. Nothing that gives a key up takes it.
 _retired_lock = threading.Lock()
+# How long a stopping publisher volume gives its running call. Read when used so tests can
+# shorten it.
+_VOLUME_CLOSE_GRACE_S = 30.0
+# How long a caller waits for another task's start of its volume before it raises. Read when
+# used so tests can shorten it.
+_START_WAIT_S = 150.0
+# This process's publisher volumes by store name and volume ID. The lock guards the map and
+# each volume's server and core. It is never held across an await.
+_publisher_lock = threading.Lock()
+_publishers: dict[tuple[str, str], PublisherVolume] = {}
+# A forked child's inherited publisher volumes, kept so that none of their destructors runs there.
+_inherited: list[PublisherVolume] = []
 
 
 class VolumeLocation(NamedTuple):
@@ -130,6 +154,35 @@ class VolumeRecord(JsonRecord):
     service: str
     scope: str = field(repr=False)
     incarnation: str
+
+
+def check_strategy(strategy: TorchStoreStrategy) -> None:
+    """Refuse a strategy that volume servers cannot honor, before anything depends on it.
+
+    Raises:
+        TypeError: If ``strategy`` is not exactly a ``TorchStoreStrategy``.
+        ValueError: If its transport is neither ``Unset`` nor in ``CARRIER_TRANSPORTS``.
+    """
+    if type(strategy) is not TorchStoreStrategy:
+        raise TypeError(
+            "volume servers take a plain TorchStoreStrategy, not"
+            f" {type(strategy).__qualname__}"
+        )
+    transport_type = strategy.default_transport_type
+    # Typed first: an unhashable value would fail the membership test with TypeError.
+    if not isinstance(transport_type, TransportType) or (
+        transport_type is not TransportType.Unset
+        and transport_type not in CARRIER_TRANSPORTS
+    ):
+        name = (
+            transport_type.name
+            if isinstance(transport_type, TransportType)
+            else f"{transport_type!r:.64}"
+        )
+        raise ValueError(
+            "volume servers carry SharedMemory, Gloo and MonarchRPC, or Unset to choose"
+            f" among them, not {name}"
+        )
 
 
 def encode_volume_record(address: CarrierAddress, hostname: str) -> bytes:
@@ -236,6 +289,20 @@ def _close_at_exit() -> None:
                 dispatcher.park()
     finally:
         loop.close()
+
+
+def forget_context_pairs(
+    volume_ids: Iterable[str], transport_context: TransportContext
+) -> None:
+    """Forget the Gloo pair this process caches for each of ``volume_ids`` if ``transport_context`` holds its group.
+
+    Each volume drops its half at this process's next call to it. Another context's pair stays.
+    """
+    groups = transport_context.get(gloo.GlooProcessGroupCache)
+    for volume_id in volume_ids:
+        store_key = gloo.cached_store_key(volume_id)
+        if store_key is not None and groups.lookup(store_key) is not None:
+            gloo.forget_pair(volume_id, store_key, transport_context)
 
 
 def _retire(volume_id: str, store_key: str) -> None:
@@ -437,6 +504,13 @@ class CarrierVolumeHost(VolumeHost):
             "a carrier volume host does not pickle: each process builds its own"
         )
 
+    def rebind(
+        self, resolver: Callable[[Collection[str]], Awaitable[Mapping[str, bytes]]]
+    ) -> None:
+        """Read the records this host lacks through ``resolver`` from now on."""
+        with self._lock:
+            self._resolver = resolver
+
     def adopt(self, volume_id: str, record: bytes) -> None:
         """Resolve ``volume_id`` through a record this process holds, with no resolver call.
 
@@ -446,6 +520,9 @@ class CarrierVolumeHost(VolumeHost):
         # Unlocked so that an adopt takes the lock once. A close racing past here fails ``_install``.
         self._check_open()
         location = decode_volume_record(volume_id, record)
+        # Read unlocked since a racing install only makes this forget redundant.
+        if not self._closed and volume_id not in self._entries:
+            _forget_unheld_pairs([volume_id])
         with self._lock:
             held = self._entries.get(volume_id)
             if held is not None and held.location != location:
@@ -481,6 +558,8 @@ class CarrierVolumeHost(VolumeHost):
             volume_id: decode_volume_record(volume_id, records[volume_id])
             for volume_id in lacking
         }
+        if not self._closed:
+            _forget_unheld_pairs(lacking)
         with self._lock:
             self._install(locations)
 
@@ -565,14 +644,264 @@ class CarrierVolumeHost(VolumeHost):
         return entry
 
 
+def _forget_unheld_pairs(volume_ids: Iterable[str]) -> None:
+    """Forget this process's cached Gloo pair to each volume a host is about to resolve unless a live client holds it.
+
+    Gloo caches one pair per volume ID for the whole process. Called outside the host's lock since
+    ``reset_client`` may take it on a thread that holds Gloo's.
+    """
+    for volume_id in volume_ids:
+        gloo.forget_unheld_pair(volume_id)
+
+
+class PublisherVolume:
+    """A publisher's volume that this process serves for one store, with its record.
+
+    ``start_publisher_volume`` serves and registers it, and ``close`` stops serving it.
+    """
+
+    def __init__(
+        self, volume_id: str, store_name: str, selection: tuple[Any, Any]
+    ) -> None:
+        self.volume_id = volume_id
+        self.store_name = store_name
+        # The (control plane, address) it serves: the address, else the plane's, names the store.
+        self.selection = selection
+        # Set when the start that made this volume ends: None, or why it failed.
+        self.started: futures.Future[str | None] = futures.Future()
+        # Both set once served and before ``started`` is. Readers that waited for ``started`` read both unlocked.
+        self.record: bytes | None = None
+        self.address: CarrierAddress | None = None
+        # Taken by close. _publisher_lock guards both.
+        self._server: CarrierServer | None = None
+        self._core: StorageVolumeCore | None = None
+        # Set by a withdraw under _publisher_lock or by _abandon when it finds that lock held.
+        self._stopped = False
+        # The event loop its start runs on. Held weakly so an abandoned start stays collectable.
+        self._start_loop: weakref.ref[asyncio.AbstractEventLoop] | None = None
+
+    def __repr__(self) -> str:
+        return f"PublisherVolume({self.volume_id!r} of {self.store_name!r})"
+
+    def current(self) -> bool:
+        """Whether this process still serves this volume for its store: no stop took it."""
+        with _publisher_lock:
+            key = (self.store_name, self.volume_id)
+            return _publishers.get(key) is self and not self._stopped
+
+    def stop(self) -> bool:
+        """Take this volume out of this process's map, so no start adopts it. True if this call did.
+
+        ``close`` then stops serving it.
+        """
+        with _publisher_lock:
+            return _withdraw(self)
+
+    async def close(self) -> None:
+        """Stop this volume and its server: queued calls fail, a running one gets the grace.
+
+        The core resets only once no handler runs: a FIFO handler that outlives the grace,
+        and every handler after a cancelled close, keeps running on its dispatcher thread.
+        """
+        self.stop()
+        with _publisher_lock:
+            server, self._server = self._server, None
+            core, self._core = self._core, None
+        if server is None or core is None:
+            return
+        try:
+            await server.close(grace_s=_VOLUME_CLOSE_GRACE_S)
+        except BaseException as error:
+            cancelled = isinstance(error, asyncio.CancelledError)
+            self._keep_core(
+                "close was cancelled" if cancelled else f"close failed: {error!r}"
+            )
+            raise
+        if server.stats()["running"]:
+            self._keep_core("handler outlived the grace")
+        else:
+            await core.reset()
+
+    def serves(self, selection: tuple[Any, Any]) -> bool:
+        """Whether ``selection`` names this volume's store: the same control plane or an equal store address."""
+        store = _store_address(*selection)
+        return selection[0] is self.selection[0] or (
+            store is not None and store == _store_address(*self.selection)
+        )
+
+    def _keep_core(self, why: str) -> None:
+        # Its last reference is then the running handler's, which frees it when it returns.
+        logger.warning(
+            "routing volume=%s %s, so its core stays unreset", self.volume_id, why
+        )
+
+    def _abandoned(self) -> bool:
+        """Whether its start's event loop closed or went. Such a start never finishes."""
+        if self._start_loop is None:
+            return False
+        loop = self._start_loop()
+        return loop is None or loop.is_closed()
+
+    def _abandon(self) -> None:
+        """Stop serving without waiting: the GC closed this volume's start, maybe in a locked step here."""
+        if _publisher_lock.acquire(blocking=False):
+            try:
+                _withdraw(self)
+            finally:
+                _publisher_lock.release()
+        else:
+            # The next start of its ID takes it out of the map, if the close below has not yet.
+            self._stopped = True
+        _close_on_thread(self)
+
+    async def _start(
+        self,
+        register: Callable[[str, bytes], Awaitable[None]],
+        stale: PublisherVolume | None,
+    ) -> None:
+        """Stop ``stale``, then serve and register unless a stop took this volume meanwhile.
+
+        Any failure closes and drops it, also a registration that timed out, lost its connection,
+        was cancelled or was abandoned with its task, since no retry reuses its record.
+        """
+        task = asyncio.current_task()
+        self._start_loop = weakref.ref(asyncio.get_running_loop())
+        failure = None
+        try:
+            if stale is not None:
+                await stale.close()
+            core = StorageVolumeCore(self.volume_id)
+            scope = f"{self.store_name}/{uuid.uuid4().hex}"
+            server, record = await serve_volume(core, scope=scope)
+            with _publisher_lock:
+                stopped = self._stopped
+                if not stopped:
+                    self._server, self._core = server, core
+                    self.record, self.address = record, server.address
+            if stopped:
+                # A stop took it while it served: its caller's build then finds it stopped.
+                await server.close(grace_s=0)
+                return
+            await register(self.volume_id, record)
+        except BaseException as error:
+            failure = f"starting volume {self.volume_id!r}"
+            if isinstance(error, asyncio.CancelledError):
+                failure += " was cancelled in another task"
+            elif isinstance(error, GeneratorExit):
+                failure += " was abandoned in another task"
+            else:
+                failure += f" failed in another task: {error!r}"
+            if _off_task(task):
+                self._abandon()
+            else:
+                await self.close()
+            raise
+        finally:
+            self.started.set_result(failure)
+
+
+def _close_on_thread(volume: PublisherVolume) -> None:
+    """Close ``volume`` on a thread of its own, which may wait for a lock that this thread holds."""
+
+    def close() -> None:
+        try:
+            asyncio.run(volume.close())
+        except Exception:
+            logger.warning(
+                "stopping routing volume=%s failed", volume.volume_id, exc_info=True
+            )
+
+    # A finalizing interpreter starts no thread, and the exit hook closed every served volume.
+    if not sys.is_finalizing():
+        try:
+            threading.Thread(
+                target=close,
+                name=f"torchstore-volume-close {volume.volume_id}",
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            # Python 3.12 and later refuse new threads at interpreter shutdown.
+            pass
+
+
+async def start_publisher_volume(
+    volume_id: str,
+    *,
+    store_name: str,
+    selection: tuple[Any, Any],
+    register: Callable[[str, bytes], Awaitable[None]],
+) -> PublisherVolume:
+    """Serve this process's volume ``volume_id`` for one store, registered through ``register``.
+
+    ``selection``, a (control plane, address) pair, names the store. Another store's volume of that
+    name stops first. Callers on any thread share one start, and one that fails closes its volume.
+    """
+    key = (store_name, volume_id)
+    with _publisher_lock:
+        volume, stale = _publishers.get(key), None
+        if volume is not None and volume._stopped:
+            # A start the GC closed in a locked step stopped it without taking it out.
+            _withdraw(volume)
+            volume = None
+        if volume is not None and not volume.serves(selection):
+            stale, volume = volume, None
+            _withdraw(stale)
+        starting = volume is None
+        if volume is None:
+            volume = PublisherVolume(volume_id, store_name, selection)
+            _publishers[key] = volume
+        # Decided here, since a start that closes its volume leaves the map before it ends.
+        waiting = not starting and not volume.started.done()
+    if starting:
+        await volume._start(register, stale)
+        return volume
+    if waiting:
+        if not await wait_future(volume.started, _START_WAIT_S):
+            if volume._abandoned():
+                # With its loop gone it would never register or close. A live start still does.
+                await volume.close()
+            raise TimeoutError(
+                f"starting volume {volume_id!r} in another task did not finish within"
+                f" {_START_WAIT_S:g} s"
+            )
+        failure = volume.started.result()
+        if failure is not None:
+            raise RuntimeError(failure)
+    return volume
+
+
+def stop_publisher_volumes(store_name: str) -> list[PublisherVolume]:
+    """Withdraw this process's publisher volumes of ``store_name``. The caller must ``close`` each."""
+    with _publisher_lock:
+        taken = [
+            volume for (name, _), volume in _publishers.items() if name == store_name
+        ]
+        for volume in taken:
+            _withdraw(volume)
+    return taken
+
+
+def _withdraw(volume: PublisherVolume) -> bool:
+    """Mark ``volume`` stopped and take it out of the map. True if it was there. Hold the lock."""
+    volume._stopped = True
+    key = (volume.store_name, volume.volume_id)
+    if _publishers.get(key) is not volume:
+        return False
+    del _publishers[key]
+    return True
+
+
 def _after_fork_in_child() -> None:
-    # A thread that held a host's lock or the retired keys' lock at the fork never releases the
-    # child's copy, and the parent's pairs are not the child's to retire.
-    global _retired_lock, _retired, _retiring, _pair_servers
+    # A thread that held a host's lock, the retired keys' lock or the publisher lock at the fork never
+    # releases the child's copy, and the parent's pairs and servers are not the child's.
+    global _retired_lock, _retired, _retiring, _pair_servers, _publisher_lock, _publishers
     for host in list(_hosts):
         host._lock = threading.Lock()
     _retired_lock = threading.Lock()
     _retired, _retiring, _pair_servers = {}, collections.deque(), {}
+    _publisher_lock = threading.Lock()
+    _inherited.extend(_publishers.values())
+    _publishers = {}
 
 
 os.register_at_fork(after_in_child=_after_fork_in_child)

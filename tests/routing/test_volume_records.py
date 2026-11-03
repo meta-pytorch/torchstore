@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Volume records on the TCPStore rendezvous: contract, keys, chunks and failures."""
+"""Volume records on the TCPStore rendezvous and the coordinator service: contract, keys, chunks, failures."""
 
 from __future__ import annotations
 
@@ -40,16 +40,12 @@ import pytest_asyncio
 from torchstore import native_calls
 from torchstore.routing import tcpstore, volume_records as volume_records_module
 from torchstore.routing.layout_registry import LayoutRegistry
+from torchstore.routing.service import ServiceControlPlane
 from torchstore.routing.tcpstore import TCPStoreRendezvous
 from torchstore.routing.volume_records import VolumeRecords
 
-# The shared TCPStore tests import cloudpickle and Monarch when they load.
-pytest.importorskip("cloudpickle")
-pytest.importorskip("monarch")
-
-from . import test_tcpstore as tcpstore_tests
-from .test_control_plane import _imported
-from .test_tcpstore import (
+from . import tcpstore_fixtures
+from .tcpstore_fixtures import (
     _connected,
     _deadline,
     _LOCALHOST,
@@ -60,7 +56,9 @@ from .test_tcpstore import (
     _store_name,
     _strategy,
     _until,
+    service_store,
 )
+from .test_control_plane import _imported
 
 pytestmark = [
     pytest.mark.timeout(120),
@@ -68,9 +66,9 @@ pytestmark = [
     pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning"),
 ]
 
-# The TCPStore tests' fixtures, which pytest finds here under these names.
-server = tcpstore_tests.server
-_joins_its_native_calls = tcpstore_tests._joins_its_native_calls
+# The shared TCPStore fixtures, which pytest finds here under these names.
+server = tcpstore_fixtures.server
+_joins_its_native_calls = tcpstore_fixtures._joins_its_native_calls
 
 # The design's interface. The rendezvous adds only a keyword-only timeout to each.
 _DESIGN = {
@@ -279,7 +277,28 @@ async def _tcpstore_records(
         yield connect
 
 
-@pytest_asyncio.fixture(params=[pytest.param(_tcpstore_records, id="tcpstore")])
+@contextlib.asynccontextmanager
+async def _service_records(
+    publishers: Collection[str] | None,
+) -> AsyncIterator[Callable[[], Awaitable[VolumeRecords]]]:
+    """Serve a coordinator service, initialize it unless ``publishers`` is None, and connect handles."""
+    async with service_store() as connect:
+        driver = await connect()
+        if publishers is not None:
+            await driver.init(publishers, _strategy())
+
+        async def records() -> VolumeRecords:
+            return cast(VolumeRecords, await connect())
+
+        yield records
+
+
+@pytest_asyncio.fixture(
+    params=[
+        pytest.param(_tcpstore_records, id="tcpstore"),
+        pytest.param(_service_records, id="service"),
+    ]
+)
 async def make_records(
     request: pytest.FixtureRequest,
 ) -> AsyncIterator[Callable[..., Awaitable[Any]]]:
@@ -689,7 +708,7 @@ async def test_a_publish_without_publishers_writes_and_logs_no_publisher_key(
     async with _served() as rendezvous:
         with _recording(rendezvous) as (calls, _):
             await rendezvous.publish([], _strategy())
-    published = [tcpstore._PUBLISHERS, tcpstore._STRATEGY, tcpstore._READY]
+    published = [tcpstore._PUBLISHERS, tcpstore._CONFIG, tcpstore._READY]
     assert calls == [("compare_set", key) for key in published]
     assert not [r for r in caplog.records if "per publisher" in r.getMessage()]
 
@@ -1092,10 +1111,10 @@ async def test_calls_on_a_closed_handle_fail(method: str) -> None:
 
 @pytest.mark.asyncio
 async def test_records_leave_the_published_keys_unchanged() -> None:
-    """Leave the publishers, strategy, coordinator and ready marker alone, even under ids named after them."""
+    """Leave the publishers, config, coordinator and ready marker alone, even under ids named after them."""
     names = (
         tcpstore._PUBLISHERS,
-        tcpstore._STRATEGY,
+        tcpstore._CONFIG,
         tcpstore._COORDINATOR,
         tcpstore._READY,
     )
@@ -1413,18 +1432,21 @@ async def test_a_kept_read_error_holds_no_store_so_close_stops_the_server(
             socket.create_connection((_LOCALHOST, rendezvous.address.port), 10)
 
 
-def test_interface_is_the_design_and_the_rendezvous_implements_it() -> None:
-    """Keep the design's two coroutines. The rendezvous adds a keyword-only timeout."""
+def test_interface_is_the_design_and_its_implementations_keep_it() -> None:
+    """Keep the design's two coroutines. The rendezvous adds a keyword-only timeout and the service plane nothing."""
     assert VolumeRecords.__abstractmethods__ == set(_DESIGN)
     public = {name for name in dir(VolumeRecords) if not name.startswith("_")}
     assert public == set(_DESIGN)
     assert issubclass(TCPStoreRendezvous, VolumeRecords)
+    assert issubclass(ServiceControlPlane, VolumeRecords)
     for name, signature in _DESIGN.items():
         assert inspect.iscoroutinefunction(getattr(VolumeRecords, name)), name
         assert str(inspect.signature(getattr(VolumeRecords, name))) == signature
         implemented = str(inspect.signature(getattr(TCPStoreRendezvous, name)))
         timeout = ", *, timeout_s: 'float | None' = None)"
         assert implemented == signature.replace(")", timeout, 1), name
+        served = str(inspect.signature(getattr(ServiceControlPlane, name)))
+        assert served == signature, name
 
 
 def test_interface_loads_only_the_standard_library() -> None:

@@ -47,6 +47,12 @@ _HOST_METHODS = (
 )
 
 
+def _installed_volume_host(strategy: object) -> "VolumeHost | None":
+    """Return the volume host ``set_volume_host`` installed on ``strategy``, else None."""
+    state = getattr(strategy, "__dict__", None)
+    return None if state is None else state.get(_VOLUME_HOST)
+
+
 class StorageVolumeRef:
     __slots__ = (
         "volume",
