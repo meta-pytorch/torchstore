@@ -6,6 +6,7 @@
 
 import os
 from logging import getLogger
+from typing import Any, TYPE_CHECKING
 
 from torchstore import spmd
 from torchstore.api import (
@@ -37,14 +38,30 @@ from torchstore.strategy import (
 
 initialize_spmd = spmd.initialize
 
-if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", None) is None:
-    init_logging()
-    logger = getLogger(__name__)
-    logger.warning(
-        "Warning: setting HYPERACTOR_CODEC_MAX_FRAME_LENGTH since this needs to be set"
-        " to enable large RPC calls via Monarch"
-    )
-    os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = "910737418240"
+_FRAME_LENGTH = 910737418240
+# Monarch reads the frame length when it first loads, which importing TorchStore never
+# does. Once loaded, torchstore.monarch.backend logs this export and may hand it to a
+# Monarch that loaded first, on the conditions its _apply_frame_length_default names.
+# A reload of this package keeps the first import's flag.
+if "_exported_frame_length" not in globals():
+    _exported_frame_length = os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH") is None
+    if _exported_frame_length:
+        init_logging()
+        os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = str(_FRAME_LENGTH)
+
+# Type checkers see the logger's type but not __getattr__, which would let any name through.
+if TYPE_CHECKING:
+    from logging import Logger
+
+    logger: Logger
+else:
+
+    def __getattr__(name: str) -> Any:
+        # The package logger comes into being at its first use, so a logging config run after
+        # the import leaves it enabled for the warning the Monarch backend logs when it loads.
+        if name == "logger":
+            return getLogger(__name__)
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

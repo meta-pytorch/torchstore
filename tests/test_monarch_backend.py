@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
+import torchstore
 import torchstore.backend as backend_module
 import torchstore.monarch.backend as monarch_backend
 import torchstore.monarch.storage_volume as storage_volume_module
@@ -221,3 +222,69 @@ def test_spawn_actors_without_a_mesh_uses_this_host_and_logs_as_before(
         for record in caplog.records
         if "Spawning actors" in record.getMessage()
     ] == [("torchstore.utils", "Spawning actors on the local host")]
+
+
+_DEFAULT = 910737418240
+
+
+@pytest.mark.parametrize(
+    ("exported", "variable", "limit", "pinned", "configured", "warned"),
+    [
+        (False, str(_DEFAULT), 10737418240, False, None, False),
+        (True, "1234567890", 10737418240, False, None, False),
+        (True, None, 10737418240, False, None, False),
+        (True, str(_DEFAULT), 10737418240, False, _DEFAULT, True),
+        (True, str(_DEFAULT), 10737418240, True, _DEFAULT, False),
+        (True, str(_DEFAULT), _DEFAULT, False, None, True),
+        (True, str(_DEFAULT), 20000000000, False, None, False),
+        (True, str(_DEFAULT), 1234567890, False, None, False),
+    ],
+    ids=[
+        "not-exported",
+        "changed-after-import",
+        "removed-after-import",
+        "monarch-own-limit",
+        "own-limit-outranks-configure",
+        "default-in-effect",
+        "larger-limit-chosen",
+        "smaller-limit-chosen",
+    ],
+)
+def test_frame_length_default_reaches_monarch_only_where_it_applies(
+    monkeypatch, caplog, exported, variable, limit, pinned, configured, warned
+) -> None:
+    """Configure Monarch's own limit up to the exported default, and warn once that is in effect.
+
+    A pinned limit stands for a variable Monarch read when it loaded, which outranks
+    ``configure``, so configuring leaves it as it was.
+    """
+    monkeypatch.setattr(torchstore, "_exported_frame_length", exported)
+    if variable is None:
+        monkeypatch.delenv("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", raising=False)
+    else:
+        monkeypatch.setenv("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", variable)
+    config = {"codec_max_frame_length": limit}
+    calls = []
+
+    def configure(**values: int) -> None:
+        calls.append(values)
+        if not pinned:
+            config.update(values)
+
+    monkeypatch.setattr(monarch_backend, "get_global_config", lambda: dict(config))
+    monkeypatch.setattr(monarch_backend, "configure", configure)
+    caplog.set_level(logging.WARNING, logger="torchstore")
+
+    monarch_backend._apply_frame_length_default()
+
+    assert calls == (
+        [] if configured is None else [{"codec_max_frame_length": configured}]
+    )
+    assert [r.getMessage() for r in caplog.records if r.name == "torchstore"] == (
+        [
+            "Warning: setting HYPERACTOR_CODEC_MAX_FRAME_LENGTH since this needs to be"
+            " set to enable large RPC calls via Monarch"
+        ]
+        if warned
+        else []
+    )
