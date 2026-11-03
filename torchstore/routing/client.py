@@ -27,6 +27,7 @@ from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
 from torchstore.utils import same_slice_geometry
+from ._gc import call_gc_paused
 from ._model import KeyRegistration, RankRole
 from .control_plane import ControlPlane
 from .directory import RoutingDirectory
@@ -60,6 +61,16 @@ class RoutingClient(LocalClient):
         # far, so later gets can plan keys earlier gets did not pass.
         self._publisher_layouts: dict[str, Any] = {}
         self._requested_keys: dict[str, set[str]] = {}
+
+    @property
+    def rank_id(self) -> str:
+        """This client's rank ID, such as ``publisher/0``."""
+        return self._routing_directory.rank
+
+    @property
+    def control_plane(self) -> ControlPlane:
+        """The control plane this client registers and fetches layouts through."""
+        return self._control_plane
 
     @torch.no_grad()
     async def register_layout(
@@ -102,13 +113,18 @@ class RoutingClient(LocalClient):
         *,
         strict: bool = True,
     ) -> None:
-        """Fetch publisher layouts and plan the keys of ``state_dict`` not yet planned.
+        """Fetch publisher layouts, load their volumes for lookups, and plan the keys of ``state_dict`` not yet planned.
 
         Each get may pass a different subset of the state dict, e.g. one group of
         parameters at a time; each key is planned the first time it is passed.
         """
         if self._role != RankRole.REQUESTER:
             raise RuntimeError("only requester clients get layouts")
+        loaded = self._publisher_layouts.get(key)
+        if loaded is not None:
+            # On every later get too: a host closed since the first then fails here with its own error,
+            # where get_state_dict's mapping read would report it as a missing push.
+            await self.strategy._prepare_volumes(loaded)
         if state_dict is None:
             if key in self._registered_layouts:
                 return
@@ -129,6 +145,7 @@ class RoutingClient(LocalClient):
         publishers = self._publisher_layouts.get(key)
         if publishers is None:
             publishers = await self._control_plane.get_layouts(key)
+            await self.strategy._prepare_volumes(publishers)
             self._publisher_layouts[key] = publishers
         slices, dtypes, _mapping = _state_dict_storage_metadata(new_state_dict, key)
         new_keys = set(slices)
@@ -159,9 +176,15 @@ class RoutingClient(LocalClient):
             for name, tensor_slice in slices.items()
         }
         rank = self._routing_directory.rank
-        self._routing_directory.install(
-            RoutingPlan.for_requester(rank, registrations, publishers)
-        )
+        if registrations:
+            # Planning allocates objects for every publisher's slice of every key, and
+            # generational collections would keep walking the growing plan.
+            plan = call_gc_paused(
+                RoutingPlan.for_requester, rank, registrations, publishers
+            )
+        else:
+            plan = RoutingPlan.for_requester(rank, registrations, publishers)
+        self._routing_directory.install(plan)
         # Unpublished keys stay unplanned so a strict get still rejects them.
         requested.update(slices)
         self._registered_layouts.add(key)

@@ -4,7 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import collections
 import dataclasses
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import Any, TYPE_CHECKING, TypeVar
@@ -16,6 +18,8 @@ from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
+
+logger = logging.getLogger(__name__)
 
 
 class TransportCache(ABC):
@@ -50,10 +54,14 @@ class TransportContext:
         self._caches: dict[type[TransportCache], TransportCache] = {}
 
     def get(self, cache_type: type[T]) -> T:
-        """Get or lazily create a cache by its type (calls cache_type() if new)."""
-        if cache_type not in self._caches:
-            self._caches[cache_type] = cache_type()
-        return self._caches[cache_type]  # type: ignore[return-value]
+        """Get or lazily create a cache by its type (calls cache_type() if new).
+
+        Threads that create one at once all get the cache stored first.
+        """
+        cache = self._caches.get(cache_type)
+        if cache is None:
+            cache = self._caches.setdefault(cache_type, cache_type())
+        return cache  # type: ignore[return-value]
 
     def clear(self) -> None:
         """Clear all caches."""
@@ -135,13 +143,16 @@ class TransportBuffer:
     Methods Called on STORAGE VOLUME (Remote Process)
     -------------------------------------------------
     The base `__getstate__` sets `storage_volume_ref` to None in the copy the storage
-    volume works on, in the reply and in any copy made by pickle or the `copy` module, so
-    these use `ctx` and the fields the client set instead. A state other than a dict, which
-    only a hook of a later base class returns, passes through unchanged.
+    volume works on, in the reply and in any copy that pickle or the `copy` module makes
+    through it. These methods use `ctx` and the fields the client set instead. A class in the
+    MRO with its own `__reduce__`, `__reduce_ex__`, `__copy__` or `__deepcopy__` can bypass it and
+    keep the handle. A state other than a dict, which only a hook of a later base class returns,
+    passes through unchanged with the handle.
 
     - `recv_handshake`: Exchange connection info (if requires_handshake returns True)
     - `handle_put_request`: Receive tensor data and return list aligned with entries
     - `handle_get_request`: Send stored tensor data back to client
+    - `handle_refused_put` / `handle_refused_get`: End the client's half of a request the store refuses
 
     Implementing a Custom TransportBuffer
     -------------------------------------
@@ -159,11 +170,12 @@ class TransportBuffer:
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
     - `_call_volume_get`: Custom handling of the get RPC (e.g. cancellation)
     - `recv_handshake`: StorageVolume side of the default handshake
-    - `drop`: Resource cleanup (especially important for RDMA buffers)
-    - `__getstate__`: Start from `super().__getstate__()`, a copy of the instance dict, or of the
-      dict a later base class's hook returns, with the client-only volume handle set to None. A
-      subclass that keeps fields in `__slots__` adds them there and restores them in its own
-      `__setstate__`
+    - `handle_refused_put`, `handle_refused_get`: End client halves that wait for the volume (e.g., Gloo)
+    - `drop`: Resource cleanup (especially important for RDMA buffers). A buffer without one skips it
+    - `__getstate__`: Start from `super().__getstate__()`, a copy of the instance dict, or of a dict
+      the hook of a class between `TransportBuffer` and `object` returns, with the client-only volume
+      handle set to None. That hook's other state comes back as it built it, handle included. A
+      subclass that keeps fields in `__slots__` adds them there and restores them in its own `__setstate__`
 
     Attributes
     ----------
@@ -185,7 +197,7 @@ class TransportBuffer:
     ----------
     storage_volume_ref : StorageVolumeRef
         Reference to the target storage volume, including actor handle and transport context.
-        Copies made through the base `__getstate__` hold None.
+        Copies the base `__getstate__` makes from a dict state hold None.
 
     """
 
@@ -201,19 +213,26 @@ class TransportBuffer:
         self.storage_volume_ref = storage_volume_ref
 
     def __getstate__(self) -> Any:
-        """Omit the client-only volume handle and the transport caches it holds.
+        """Omit the client-only volume handle and the transport caches it holds from a dict state.
 
-        Starts from the hook of a base class after this one in the MRO, if one defines it, else
-        from the instance dict. A dict state comes back copied, with the handle set to None if set.
+        Starts from the hook of a base class between this one and ``object`` in the MRO if one defines it,
+        else from the instance dict. A dict state comes back as a copy with the handle set to None if set:
+        an ``OrderedDict`` or ``defaultdict`` as one again and any other dict as a plain dict. Other states pass through.
         """
         mro = type(self).__mro__
-        later = mro[mro.index(TransportBuffer) + 1 : -1]
+        # The defining class comes from its cell because a reload of this module rebinds the global.
+        later = mro[mro.index(__class__) + 1 : -1]  # type: ignore[name-defined]
         if any("__getstate__" in vars(base) for base in later):
             state = super().__getstate__()
         else:
             state = self.__dict__
         if isinstance(state, dict):
-            state = dict(state)
+            if isinstance(state, collections.OrderedDict):
+                state = collections.OrderedDict(state)
+            elif isinstance(state, collections.defaultdict):
+                state = collections.defaultdict(state.default_factory, state)
+            else:
+                state = dict(state)
             if "storage_volume_ref" in state:
                 state["storage_volume_ref"] = None
         return state
@@ -243,6 +262,7 @@ class TransportBuffer:
         if not self.casts_on_put:
             requests = _apply_transfer_dtypes(requests)
         meta_requests = [r.meta_only() for r in requests]
+        raised = False
         try:
             if self.requires_handshake(requests):
                 await self.perform_handshake(requests, meta_requests, l)
@@ -257,10 +277,11 @@ class TransportBuffer:
             # while drop() still handles cleanup on both success and failure.
             await self._post_request_success()
             l.track_step("_post_request_success")
+        except BaseException:
+            raised = True
+            raise
         finally:
-            await self.drop()
-            l.track_step("drop")
-            l.track_e2e()
+            await self._drop_after_call(l, raised)
 
     async def get_from_storage_volume(self, requests: list[Request]) -> list[Any]:
         if self.supports_batch_gets:
@@ -274,6 +295,7 @@ class TransportBuffer:
     async def _get_requests(self, requests: list[Request]) -> list[Any]:
         l = LatencyTracker("get")
         meta_requests = [r.meta_only() for r in requests]
+        raised = False
         try:
             if self.requires_handshake(requests):
                 await self.perform_handshake(requests, meta_requests, l)
@@ -288,14 +310,41 @@ class TransportBuffer:
 
             await self._post_request_success()
             l.track_step("_post_request_success")
+        except BaseException:
+            raised = True
+            raise
         finally:
-            await self.drop()
-            l.track_step("drop")
-            l.track_e2e()
+            await self._drop_after_call(l, raised)
         return response
 
     async def _call_volume_get(self, meta_requests: list[Request]) -> "TransportBuffer":
         return await self.storage_volume_ref.volume.get.call_one(self, meta_requests)
+
+    async def _drop_after_call(
+        self, latency_tracker: LatencyTracker, raised: bool
+    ) -> None:
+        """Run ``drop`` if the buffer has one, raising an ``Exception`` from it only when the call raised nothing.
+
+        After a call that raised or was cancelled, such an ``Exception`` is logged at WARNING instead,
+        so the call's own error or cancel propagates. A cancel or other ``BaseException`` from that
+        ``drop`` propagates in its place.
+        """
+        try:
+            # Looked up on each call so a drop from a mixin after this class or from __getattr__ runs.
+            drop = getattr(self, "drop", None)
+            if drop is not None:
+                await drop()
+        except Exception:
+            if not raised:
+                raise
+            logger.warning(
+                "%s.drop() failed after its call raised",
+                type(self).__name__,
+                exc_info=True,
+            )
+        else:
+            latency_tracker.track_step("drop")
+            latency_tracker.track_e2e()
 
     async def perform_handshake(
         self,
@@ -387,6 +436,30 @@ class TransportBuffer:
     ) -> None:
         # called on the storage volume side
         raise NotImplementedError()
+
+    async def handle_refused_put(
+        self,
+        ctx: "TransportContext",
+        requests: list[Request],
+    ) -> None:
+        """Called on the storage volume when the store's ``put`` refuses a request before ``handle_put_request``.
+
+        A transport whose client half waits for the volume's half ends it here. The store logs an
+        ``Exception`` from this hook at WARNING and still raises its refusal. The default does nothing.
+        """
+        pass
+
+    async def handle_refused_get(
+        self,
+        ctx: "TransportContext",
+        requests: list[Request],
+    ) -> None:
+        """Called on the storage volume when the store's ``get`` refuses a request before ``handle_get_request``.
+
+        A transport whose client half waits for the volume's half ends it here. The store logs an
+        ``Exception`` from this hook at WARNING and still raises its refusal. The default does nothing.
+        """
+        pass
 
     # Helper methods
     def _assert_valid_tensor(
