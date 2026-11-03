@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import itertools
 import logging
 import os
 import pickle
 import threading
 import weakref
+import zlib
 from collections.abc import Callable, Collection, Mapping
 from concurrent import futures
 from dataclasses import dataclass, field
@@ -62,6 +64,14 @@ _ENDPOINTS = ("register_layout", "get_layouts")
 _CLOSE_GRACE_S = 5.0
 # A lookup's call deadline outlasts its wait by this, so a timeout names missing publishers.
 _REPLY_MARGIN_S = 60.0
+# On Llama 3 70B and Kimi K2.5 layouts: 7 to 10% smaller than level 6, and level 9's bytes in less time.
+_PART_ZLIB_LEVEL = 8
+# The empty last block that ends a raw deflate stream of parts.
+_LAST_BLOCK = b"\x03\x00"
+# How every part ends so that parts join into one stream: a sync flush's empty stored block.
+_SYNC_FLUSH = b"\x00\x00\xff\xff"
+# Deflate's largest ratio of inflated to deflated bytes.
+_DEFLATE_MAX_RATIO = 1032
 
 # What a forked child lets go of. Weak, so they never keep a handle or service alive.
 _handles: weakref.WeakSet[ServiceControlPlane] = weakref.WeakSet()
@@ -83,49 +93,65 @@ def _wait_s(timeout_s: float | None) -> float:
     )
 
 
-def _encode_layouts(layouts: Mapping[str, Any]) -> bytes:
-    """Join each rank's part, pickling a layout that has none, into a reply with no memo.
+def _compress_part(layout: Mapping[str, Any]) -> tuple[bytes, int]:
+    """Pickle and compress a layout into a part and its pickle's size.
 
-    A memo would keep every part's bytes alive in a reader's unpickler until the reply loads.
+    A part is a raw deflate stream's blocks up to a sync flush. Parts thus join into one stream.
     """
-    parts = {
-        rank: (
-            layout
-            if isinstance(layout, _PickledLayout)
-            # @lint-ignore PYTHONPICKLEISBAD Layouts must reach ranks in other processes.
-            else _PickledLayout(pickle.dumps(layout, protocol=5))
-        )
-        for rank, layout in layouts.items()
-    }
+    # @lint-ignore PYTHONPICKLEISBAD Layouts must reach ranks in other processes.
+    pickled = pickle.dumps(layout, protocol=5)
+    compressor = zlib.compressobj(_PART_ZLIB_LEVEL, zlib.DEFLATED, -zlib.MAX_WBITS)
+    part = compressor.compress(pickled) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    return part, len(pickled)
+
+
+def _inflate(stream: bytes, size: int) -> bytes:
+    """Inflate a raw deflate stream into one buffer of its ``size`` inflated bytes, which zlib returns uncopied.
+
+    Its first call (more past 4GiB) fills that buffer and reaches the stream's end. The full buffer makes CPython call
+    once more (with no input) into a spare 64KiB block it drops. Each call yields the GIL once.
+    """
+    return zlib.decompress(stream, wbits=-zlib.MAX_WBITS, bufsize=size)
+
+
+def _inflate_part(part: bytes, size: int) -> bytes:
+    """Inflate one part of ``size`` inflated bytes in one call, which yields the GIL once.
+
+    A byte to spare in its buffer spares CPython the empty call a full buffer makes. zlib then copies the part once.
+    """
+    return zlib.decompress(part + _LAST_BLOCK, wbits=-zlib.MAX_WBITS, bufsize=size + 1)
+
+
+def _encode_layouts(parts: Mapping[str, tuple[bytes, int]]) -> bytes:
+    """Pickle a reply of the ranks, their pickles' sizes and their parts, which a reader joins into one stream."""
+    ranks, pieces = list(parts), list(parts.values())
     buffer = io.BytesIO()
     # @lint-ignore PYTHONPICKLEISBAD Layouts must reach ranks in other processes.
     pickler = pickle.Pickler(buffer, protocol=5)
-    # Safe without a memo: the reply holds only rank names and parts, none shared.
+    # Safe without a memo: the reply holds only rank names, sizes and parts, none shared.
     pickler.fast = True
-    pickler.dump(parts)
+    pickler.dump((ranks, [size for _, size in pieces], [part for part, _ in pieces]))
     return buffer.getvalue()
 
 
-def _decode_layouts(data: Any) -> Any:
+def _decode_layouts(data: Any) -> dict[str, Any]:
+    """Load a reply as each rank's layout: inflate its parts at once, then unpickle each in one pause of collection.
+
+    ``dict`` takes each part's ``pickle.loads`` through ``map`` in C and holds the GIL from one part to the next.
+    """
+    # Unpaused: of a reply's objects collection tracks only its tuple and three lists.
+    # @lint-ignore PYTHONPICKLEISBAD Replies come from the store's own coordinator.
+    ranks, sizes, parts = pickle.loads(data)
+    # zlib yields the GIL as it inflates, so it runs before the pause, where other threads would run with collection off.
+    pickled = memoryview(_inflate(b"".join([*parts, _LAST_BLOCK]), sum(sizes)))
+    views = [
+        pickled[end - size : end]
+        for size, end in zip(sizes, itertools.accumulate(sizes))
+    ]
     # A large layout's new objects set off collections that more than double Python 3.10's decode
     # time. Pickling leaves few new objects alive, so only decoding pauses collection.
-    # @lint-ignore PYTHONPICKLEISBAD Layouts come from the store's own ranks and coordinator.
-    return call_gc_paused(pickle.loads, data)
-
-
-class _PickledLayout:
-    """One rank's layout as its publisher pickled it, which unpickles as that layout."""
-
-    __slots__ = ("data",)
-
-    def __init__(self, data: bytes) -> None:
-        self.data = data
-
-    def __reduce__(self) -> tuple[Any, ...]:
-        # Loads as a nested ``pickle.loads`` of ``data``, so readers keep plain ``pickle.loads`` and
-        # free each part's unpickler as it returns. Encoding a reply copies ``data`` rather than pickling.
-        # @lint-ignore PYTHONPICKLEISBAD Layouts come from the store's own ranks.
-        return pickle.loads, (self.data,)
+    # @lint-ignore PYTHONPICKLEISBAD Layouts come from the store's own ranks.
+    return call_gc_paused(dict, zip(ranks, map(pickle.loads, views)))
 
 
 def _named(address: ServiceAddress, problem: str) -> str:
@@ -225,11 +251,10 @@ class ServiceControlPlane(ControlPlane):
     ) -> None:
         tracker = _latency_tracker(f"register_layout key={key}")
         try:
-            # Pickled here, in parallel with other publishers, so the coordinator's one loop only
-            # decodes a layout and keeps these bytes as the rank's part.
-            # @lint-ignore PYTHONPICKLEISBAD Layouts must reach ranks in other processes.
-            data = pickle.dumps(dict(registrations), protocol=5)
-            await self._call("register_layout", rank, key, data)
+            # Pickled and compressed here, in parallel with other publishers, so the coordinator's
+            # one loop only decodes a layout and keeps these bytes as the rank's part.
+            part, size = _compress_part(dict(registrations))
+            await self._call("register_layout", rank, key, part, size)
         finally:
             tracker.track_e2e()
 
@@ -382,8 +407,8 @@ class _CoordinatorAdapter:
 
     def __init__(self, registry: LayoutRegistry) -> None:
         self.registry = registry
-        # Each rank's first layout per key, as its publisher pickled it, until the reply is encoded.
-        self._parts: dict[str, dict[str, _PickledLayout]] = {}
+        # Each rank's first layout per key, as its publisher sent it and its pickle's size, until the reply is encoded.
+        self._parts: dict[str, dict[str, tuple[bytes, int]]] = {}
         # A rank's first layout wins, so complete layouts are encoded once for all requesters.
         self._encoded: dict[str, bytes] = {}
 
@@ -402,15 +427,28 @@ class _CoordinatorAdapter:
         self.registry = LayoutRegistry()
         self.drop_encodings()
 
-    async def register_layout(self, rank: str, key: str, data: bytes) -> None:
-        registrations = _decode_layouts(data)
+    async def register_layout(
+        self, rank: str, key: str, part: bytes, size: int
+    ) -> None:
+        # An honest size never asks for more than deflate can give so none takes unbounded memory.
+        if type(size) is not int or not 0 <= size <= _DEFLATE_MAX_RATIO * len(part):
+            raise ValueError(
+                f"a layout part of {len(part)} bytes cannot inflate to {size!r} bytes"
+            )
+        pickled = _inflate_part(part, size)
+        # zlib stops at a part's own last block, which would end every reader's joined stream there.
+        if part[-len(_SYNC_FLUSH) :] != _SYNC_FLUSH:
+            raise ValueError("a layout part must end with a sync flush")
+        # @lint-ignore PYTHONPICKLEISBAD Layouts come from the store's own ranks.
+        registrations = call_gc_paused(pickle.loads, pickled)
         await self.registry.register_layout(rank, key, registrations)
         if key in self._encoded:
             return
         # The registry keeps a rank's first layout, and no task runs between its return and here.
         ranks = self._parts.setdefault(key, {})
         if rank not in ranks:
-            ranks[rank] = _PickledLayout(data)
+            # Its pickle's own size: a reply then splits its stream right whatever size came with it.
+            ranks[rank] = part, len(pickled)
 
     async def get_layouts(self, key: str, wait: float | None) -> pickle.PickleBuffer:
         """Return ``key``'s complete layouts as a buffer that the carrier sends uncopied."""
@@ -420,15 +458,16 @@ class _CoordinatorAdapter:
             # Lookups that one registration woke find the first one's encoding.
             encoded = self._encoded.get(key)
             if encoded is None:
-                ranks = self._parts.get(key, {})
-                # Parts unpickle as their layouts. A layout without one is pickled here.
+                parts = self._parts.get(key, {})
+                # A layout whose part went (as with drop_encodings) is compressed again here.
                 encoded = _encode_layouts(
                     {
-                        rank: ranks.get(rank) or layout
+                        rank: parts.get(rank) or _compress_part(layout)
                         for rank, layout in layouts.items()
                     }
                 )
                 self._encoded[key] = encoded
+                # Only now so that a failed encode leaves the parts for the next lookup.
                 self._parts.pop(key, None)
         return pickle.PickleBuffer(encoded)
 
