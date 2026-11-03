@@ -192,25 +192,35 @@ controller, storage volume and routing coordinator modules, Monarch RDMA and
 `torchstore.routing.coordinator`, and the old module paths, such as
 `torchstore.storage_volume`, still re-export every name the old modules defined except
 the coordinator's `_Layouts` and `_LAYOUT_REGISTRATION_TIMEOUT_S`, which moved to
-`torchstore.routing.layout_registry`. Code that used those modules changes in three ways:
+`torchstore.routing.layout_registry`. Code that used those modules changes in four ways:
 
-- Import each name from the module that defines it, or a Monarch name from Monarch. The
-  old paths no longer offer names their modules only imported, such as `spawn_actors`
-  and Monarch's `Actor` and `endpoint` on `torchstore.storage_volume`. `torchstore.api`,
-  `torchstore.spmd`, `torchstore.strategy`, `torchstore.transport` and
-  `torchstore.utils` no longer offer the names that went with their Monarch code, such
-  as `torchstore.api`'s actor classes and `torchstore.spmd`'s bootstrap. A star import
-  of `torchstore.controller`, `torchstore.storage_volume` or
+- Import each name from the module that defines it, or a Monarch name from Monarch, but
+  `InMemoryStore` and `StorageImpl` from `torchstore.storage_volume`, which loads Monarch.
+  The module that now defines them is internal. The old paths no longer offer names their
+  modules only imported, such as `spawn_actors` and Monarch's `Actor` and `endpoint` on
+  `torchstore.storage_volume`. `torchstore.api`, `torchstore.spmd`, `torchstore.strategy`,
+  `torchstore.transport` and `torchstore.utils` no longer offer the names that went with
+  their Monarch code, such as `torchstore.api`'s actor classes and `torchstore.spmd`'s
+  bootstrap. A star import of `torchstore.controller`, `torchstore.storage_volume` or
   `torchstore.transport.monarch_rdma` now gives only the names in its `__all__`
 - Patch a moved name in the module whose code reads it, such as
   `torchstore.monarch.rdma.monarch_rdma_available` instead of
   `torchstore.transport.monarch_rdma.monarch_rdma_available`, since a patch through an
-  old path no longer reaches that code. Patching an attribute of a moved class, such as
-  a method of `InMemoryStore`, still works through either path
+  old path no longer reaches that code. Each volume's store and host name now come from
+  `torchstore.storage`, which is internal and may change, so set `TORCHSTORE_HOSTNAME` to
+  choose the host name, and treat a patch of `torchstore.storage.InMemoryStore` or
+  `torchstore.storage.get_local_hostname` as a patch of internals. Patching an attribute
+  of a moved class, such as a method of `InMemoryStore`, still works through any path
+  that offers the class
 - `import torchstore` no longer loads the old paths or `torchstore.storage_utils`.
   TorchStore's Monarch backend loads them when it loads, so before that, or in a process
   that never loads it, import a module, as in `import torchstore.transport.monarch_rdma`,
   before reading it as an attribute
+- `StorageVolume` now subclasses `StorageVolumeCore`, which is internal, and shadows the
+  core's methods with its endpoints. `InMemoryStore` and `StorageImpl` now name
+  `torchstore.storage` as their `__module__` and in their repr and pickles. Older
+  TorchStore versions cannot load those pickles. Importing the volume module or its old
+  path also loads `torchstore.storage`
 
 `typing.get_type_hints` on `ts.initialize` and `ts.initialize_spmd` needs `ProcMesh` from
 `monarch.actor` and `StoreJob` from `torchstore.monarch.spmd` in `localns`, since their

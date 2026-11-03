@@ -35,8 +35,10 @@ _OLD_PATHS = {
         "RoutingCoordinator": "torchstore.monarch.coordinator",
     },
     "torchstore.storage_volume": {
-        name: "torchstore.monarch.storage_volume"
-        for name in ("FULL_TENSOR", "InMemoryStore", "StorageImpl", "StorageVolume")
+        "FULL_TENSOR": "torchstore.monarch.storage_volume",
+        "InMemoryStore": "torchstore.storage",
+        "StorageImpl": "torchstore.storage",
+        "StorageVolume": "torchstore.monarch.storage_volume",
     },
     "torchstore.transport.monarch_rdma": {
         name: "torchstore.monarch.rdma"
