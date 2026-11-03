@@ -172,15 +172,37 @@ def _names(tree: ast.Module) -> Iterator[tuple[str, ast.AST]]:
             yield node.attr, node
 
 
-def _bindings(node: ast.AST) -> list[tuple[str, ast.AST]]:
-    """Each name an assignment statement or expression binds, with the value bound."""
-    if isinstance(node, ast.Assign):
-        return [(t.id, node.value) for t in node.targets if isinstance(t, ast.Name)]
-    if isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
-        return (
-            [(node.target.id, node.value)] if isinstance(node.target, ast.Name) else []
-        )
+def _target_names(target: ast.AST) -> list[str]:
+    """Each name a binding target binds, inside tuple, list and starred targets too."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in _target_names(element)]
     return []
+
+
+def _bindings(node: ast.AST) -> list[tuple[str, ast.AST]]:
+    """Each name an assignment, a ``for`` or ``with`` target or a comprehension binds.
+
+    Each comes with the expression it is bound from.
+    """
+    if isinstance(node, ast.Assign):
+        pairs = [(target, node.value) for target in node.targets]
+    elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+        pairs = [(node.target, node.value)]
+    elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+        pairs = [(node.target, node.iter)]
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        pairs = [
+            (item.optional_vars, item.context_expr)
+            for item in node.items
+            if item.optional_vars is not None
+        ]
+    else:
+        return []
+    return [(name, value) for target, value in pairs for name in _target_names(target)]
 
 
 def _is_sys(node: ast.AST, sys_names: set[str]) -> bool:
@@ -191,7 +213,7 @@ def _is_sys(node: ast.AST, sys_names: set[str]) -> bool:
 
 
 def _sys_names(tree: ast.Module) -> set[str]:
-    """``sys``, each name an import binds to it and each name assigned one of those."""
+    """``sys``, each name an import binds to it and each name bound from an expression reading one."""
     names = {"sys"} | {
         alias.asname or alias.name
         for node in ast.walk(tree)
@@ -200,7 +222,14 @@ def _sys_names(tree: ast.Module) -> set[str]:
         if alias.name == "sys"
     }
     bindings = [binding for node in ast.walk(tree) for binding in _bindings(node)]
-    while more := {n for n, value in bindings if _is_sys(value, names)} - names:
+    while (
+        more := {
+            n
+            for n, value in bindings
+            if any(_is_sys(node, names) for node in ast.walk(value))
+        }
+        - names
+    ):
         names |= more
     return names
 
@@ -208,8 +237,9 @@ def _sys_names(tree: ast.Module) -> set[str]:
 def test_no_core_module_checks_sys_modules_or_find_spec() -> None:
     """Read ``sys.modules`` in no core module, and ``find_spec`` only in main's NIXL probe.
 
-    ``sys`` is any name an import or assignment binds to it, or an attribute so named, and
-    ``.modules``, ``.__dict__``, ``getattr``, ``vars`` and ``from sys import modules`` count.
+    ``sys`` is any name an import binds to it or a binding binds from an expression reading it,
+    or an attribute so named. ``.modules``, ``.__dict__``, ``getattr``, ``vars`` and
+    ``from sys import modules`` count.
     """
     for module, (tree, is_package) in _modules().items():
         if _in_monarch_package(module):
@@ -230,29 +260,28 @@ def test_no_core_module_checks_sys_modules_or_find_spec() -> None:
 
 
 def test_only_the_backend_imports_by_name() -> None:
-    """Import ``importlib``, ``pkgutil`` or ``builtins`` only in ``torchstore.backend``.
+    """Import ``importlib``, ``pkgutil``, ``builtins``, ``runpy``, ``imp`` or ``zipimport`` only in the backend.
 
-    No other core module names ``__import__`` or ``import_module``, as a name or a string.
-    Main's NIXL probe imports ``importlib.util.find_spec`` alone.
+    No other core module names ``__import__``, ``import_module`` or ``__builtins__``, as a name
+    or a string, or calls ``exec``, ``eval`` or ``compile``. Main's NIXL probe imports
+    ``importlib.util.find_spec`` alone.
     """
+    loaders = ("builtins", "imp", "importlib", "pkgutil", "runpy", "zipimport")
+    by_name = ("__builtins__", "__import__", "import_module")
     found = set()
     for module, (tree, is_package) in _modules().items():
         if _in_monarch_package(module) or module == "torchstore.backend":
             continue
         for node in ast.walk(tree):
             imported = _imports(module, is_package, node)
-            if any(
-                name.split(".")[0] in ("builtins", "importlib", "pkgutil")
-                for name in imported
-            ):
+            if any(name.split(".")[0] in loaders for name in imported):
                 found.add((module, ast.unparse(node)))
-            if isinstance(node, ast.Constant) and node.value in (
-                "__import__",
-                "import_module",
-            ):
+            if isinstance(node, ast.Constant) and node.value in by_name:
+                found.add((module, ast.unparse(node)))
+            if isinstance(node, ast.Name) and node.id in ("compile", "eval", "exec"):
                 found.add((module, ast.unparse(node)))
         for name, node in _names(tree):
-            if name in ("__import__", "import_module"):
+            if name in by_name:
                 found.add((module, ast.unparse(node)))
     assert found == {(_NIXL_PROBE, "from importlib.util import find_spec")}
 
@@ -278,9 +307,7 @@ def test_layout_registry_loads_only_the_standard_library() -> None:
     annotations = {"._model", "torchstore.strategy"}
     assert _imported(tree.body) == on_load
     assert _imported(type_checking) == annotations
-    guarded = {id(node) for statement in type_checking for node in ast.walk(statement)}
-    unguarded = (node for node in ast.walk(tree) if id(node) not in guarded)
-    assert _imported(unguarded) == on_load
+    assert _imported(_runtime_nodes(tree)) == on_load
 
 
 def _assert_reexports(old: str) -> None:
