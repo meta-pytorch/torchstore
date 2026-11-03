@@ -10,6 +10,9 @@ Uses a MockRDMABuffer that copies source bytes into the dest byte view,
 simulating what real RDMA does. No GPU or RDMA infrastructure needed.
 """
 
+import asyncio
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 import torch
 
@@ -35,6 +38,153 @@ class MockRDMABuffer:
 
     async def drop(self):
         pass
+
+
+@pytest.fixture
+def registered_buffers(monkeypatch):
+    buffers = []
+
+    def register(source_bytes):
+        buffer = MockRDMABuffer(source_bytes)
+        buffer.drop = AsyncMock()
+        buffers.append(buffer)
+        return buffer
+
+    monkeypatch.setattr("monarch.rdma.RDMABuffer", register)
+    return buffers
+
+
+@pytest.mark.parametrize("transfer_dtype", [None, torch.bfloat16])
+async def test_register_cleanup_is_idempotent(registered_buffers, transfer_dtype):
+    source = DirectWeightSyncSource()
+    weights = {"weight": torch.ones(4), "bias": torch.ones(2)}
+    handles = source.register(weights, rank=3, transfer_dtype=transfer_dtype)
+
+    assert set(handles) == set(weights)
+    assert all(handle.source_rank == 3 for handle in handles.values())
+    for (name, tensor), buffer in zip(weights.items(), registered_buffers, strict=True):
+        expected = tensor.to(transfer_dtype) if transfer_dtype else tensor
+        assert torch.equal(buffer._source, to_byte_view(expected))
+        assert handles[name].rdma_buffer is buffer
+
+    await source.cleanup()
+    await source.cleanup()
+
+    for buffer in registered_buffers:
+        buffer.drop.assert_awaited_once()
+    assert source.refresh() == 0
+
+
+async def test_cleanup_after_partial_registration(registered_buffers):
+    source = DirectWeightSyncSource()
+    weights = {"valid": torch.ones(4), "invalid": torch.ones(2, 3).T}
+
+    with pytest.raises(AssertionError, match="Expected contiguous tensor"):
+        source.register(weights, rank=0)
+
+    assert len(registered_buffers) == 1
+    await source.cleanup()
+    registered_buffers[0].drop.assert_awaited_once()
+
+
+async def test_cleanup_after_native_registration_failure(monkeypatch):
+    source = DirectWeightSyncSource()
+    buffer = MockRDMABuffer(to_byte_view(torch.ones(4)))
+    buffer.drop = AsyncMock()
+    monkeypatch.setattr(
+        "monarch.rdma.RDMABuffer",
+        Mock(side_effect=[buffer, RuntimeError("native registration failed")]),
+    )
+
+    with pytest.raises(RuntimeError, match="native registration failed"):
+        source.register({"first": torch.ones(4), "second": torch.ones(4)}, rank=0)
+
+    await source.cleanup()
+    buffer.drop.assert_awaited_once()
+
+
+@pytest.mark.parametrize("transfer_dtype", [None, torch.bfloat16])
+async def test_cleanup_owns_repeated_parameter_names(
+    registered_buffers, transfer_dtype
+):
+    source = DirectWeightSyncSource()
+    first = torch.ones(4)
+    second = torch.zeros(4)
+    source.register({"weight": first}, rank=0, transfer_dtype=transfer_dtype)
+    source.register({"weight": second}, rank=0, transfer_dtype=transfer_dtype)
+
+    first.fill_(3)
+    second.fill_(7)
+    assert source.refresh() == (2 if transfer_dtype else 0)
+    for tensor, buffer in zip([first, second], registered_buffers, strict=True):
+        expected = tensor.to(transfer_dtype) if transfer_dtype else tensor
+        assert torch.equal(buffer._source, to_byte_view(expected))
+
+    await source.cleanup()
+
+    assert len(registered_buffers) == 2
+    for buffer in registered_buffers:
+        buffer.drop.assert_awaited_once()
+
+
+@pytest.mark.parametrize("transfer_dtype", [None, torch.bfloat16])
+async def test_cleanup_continues_and_retries_failed_buffers(
+    registered_buffers, transfer_dtype
+):
+    source = DirectWeightSyncSource()
+    source.register(
+        {"first": torch.ones(4), "second": torch.ones(4)},
+        rank=0,
+        transfer_dtype=transfer_dtype,
+    )
+    first, second = registered_buffers
+    failure = RuntimeError("native deregistration failed")
+    first.drop.side_effect = [failure, None]
+
+    with pytest.raises(RuntimeError):
+        await source.cleanup()
+
+    first.drop.assert_awaited_once()
+    second.drop.assert_awaited_once()
+    if transfer_dtype:
+        assert source.refresh() == 1
+
+    await source.cleanup()
+    await source.cleanup()
+
+    assert first.drop.await_count == 2
+    second.drop.assert_awaited_once()
+    assert source.refresh() == 0
+
+
+async def test_concurrent_cleanup_does_not_drop_twice(registered_buffers):
+    source = DirectWeightSyncSource()
+    source.register({"weight": torch.ones(4)}, rank=0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def drop():
+        started.set()
+        await release.wait()
+
+    registered_buffers[0].drop.side_effect = drop
+    first = asyncio.create_task(source.cleanup())
+    await started.wait()
+    second = asyncio.create_task(source.cleanup())
+    release.set()
+    await asyncio.gather(first, second)
+
+    registered_buffers[0].drop.assert_awaited_once()
+
+
+async def test_cleanup_skips_empty_tensor_registrations(registered_buffers):
+    source = DirectWeightSyncSource()
+    handles = source.register({"empty": torch.empty(0)}, rank=0)
+
+    assert handles["empty"].rdma_buffer is None
+    assert registered_buffers == []
+    await source.cleanup()
+    await source.cleanup()
 
 
 def _make_sharded_handles(
@@ -217,7 +367,7 @@ async def test_refresh():
 
     # Manually set up staging (simulating what register() does)
     staging_buf = source_tensor.contiguous()
-    source._staging["weight"] = (staging_buf, source_tensor)
+    source._staging[0] = (staging_buf, source_tensor)
 
     # Create mock handle pointing at the staging buffer
     mock_buf = MockRDMABuffer(to_byte_view(staging_buf))
@@ -266,7 +416,7 @@ async def test_transfer_dtype():
     # Mock RDMABuffer by patching — register() calls RDMABuffer internally,
     # so we need to test via the staging + mock handle approach instead.
     staging_buf = original.to(torch.bfloat16).contiguous()
-    source._staging["weight"] = (staging_buf, original)
+    source._staging[0] = (staging_buf, original)
 
     # Create mock handle pointing at the bfloat16 staging buffer
     mock_buf = MockRDMABuffer(to_byte_view(staging_buf))
@@ -292,7 +442,7 @@ async def test_transfer_dtype():
     assert torch.equal(dest, expected)
 
     # All params should be staged (due to transfer_dtype)
-    assert "weight" in source._staging
+    assert 0 in source._staging
 
     # Modify source (simulates optimizer.step() updating float32 param)
     original.fill_(42.0)
