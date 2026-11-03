@@ -710,18 +710,26 @@ strategy = ts.LocalRankStrategy(default_transport_type=TransportType.Gloo)
 await ts.initialize(num_storage_volumes=N, strategy=strategy)
 ```
 
-A custom transport subclasses `torchstore.transport.buffers.TransportBuffer`. Clients
-pickle each buffer to its storage volume, and the base class's `__getstate__` sets
-`storage_volume_ref` to None in that copy, in the reply and in copies made with the
-`copy` module, so volume-side code reads its `ctx` argument and the fields the client set.
-A subclass hook extends `super().__getstate__()`, a copy of the instance dict. Where a
-class after `TransportBuffer` in the subclass's method resolution order defines its own
-hook, such as a mixin listed after the transport class, the base hook starts from that
-hook's state instead, copying a dict and passing anything else through unchanged, handle
-included. A subclass that keeps fields in `__slots__` adds them there and restores them in
-its own `__setstate__`. Otherwise slot fields that no hook of the subclass returns are
-lost in copies, and a `__setstate__` that unpacks the base hook's state as Python's
-(dict, slots) pair fails.
+Because TorchStore selects only its built-in transports, the rules below are for a transport
+added to TorchStore and for buffer subclasses that code builds itself, all of which
+subclass `torchstore.transport.buffers.TransportBuffer`. Clients pickle each buffer to its
+storage volume, and the base class's `__getstate__` sets `storage_volume_ref` to None in
+that copy, in the reply and in copies that pickle or the `copy` module makes through that
+hook. So volume-side code reads its `ctx` argument and the fields the client set, and a
+buffer forwarded to another process can no longer put or get: build each buffer in the
+process that uses it. A class in the method resolution order with its own `__reduce__`,
+`__reduce_ex__`, `__copy__` or `__deepcopy__` can bypass that hook and keep the handle in
+its copies. A subclass hook extends `super().__getstate__()`, a copy of the instance dict.
+Where a class between `TransportBuffer` and `object` in the subclass's method resolution
+order defines its own hook, such as a mixin listed after the transport class, the base hook
+starts from that hook's state instead. Either way it copies a dict state as an `OrderedDict`
+or `defaultdict` when it is one and as a plain dict otherwise, and it passes anything else
+through unchanged with the handle. A copied `defaultdict` keeps its default factory and
+pickles only if pickle can carry that factory. Give such a state a module-level factory in
+place of a lambda or have the hook return a plain dict. A subclass that keeps fields in
+`__slots__` adds them there and restores them in its own `__setstate__`. Otherwise slot
+fields that no hook of the subclass returns are lost in copies, and a `__setstate__` that
+unpacks the base hook's state as Python's (dict, slots) pair fails.
 
 ## Testing
 

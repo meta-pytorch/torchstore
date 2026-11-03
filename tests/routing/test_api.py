@@ -1417,26 +1417,60 @@ def test_a_close_that_fails_as_its_shutdown_is_cancelled_is_logged(
     assert isinstance(failed.exc_info[1], ConnectionResetError)
 
 
-def test_a_close_wait_closed_after_its_close_ended_schedules_nothing() -> None:
-    """Let a waiting coroutine closed once its loop is gone end quietly, its close already done."""
-    selected = store_api._SelectedControlPlane(
-        SimpleNamespace(close=AsyncMock()), _RegistryAddress("store", "host")
+@pytest.fixture
+def ended_close_wait():
+    """Start close waits whose closes each end on a new loop that then closes.
+
+    Teardown closes each wait and its loop on every outcome.
+    """
+    with contextlib.ExitStack() as cleanup:
+
+        def start(selected: store_api._SelectedControlPlane) -> Any:
+            loop = asyncio.new_event_loop()
+            cleanup.callback(loop.close)
+            waiting = store_api._wait_for_close(selected)
+            cleanup.callback(waiting.close)
+
+            async def end_the_close() -> None:
+                waiting.send(None)
+                # The close runs and ends, but nothing resumes the waiting coroutine.
+                await asyncio.wait(store_api._closing)
+
+            loop.run_until_complete(end_the_close())
+            loop.close()
+            return waiting
+
+        yield start
+
+
+@pytest.mark.parametrize(
+    "ending, logged",
+    [
+        (None, False),
+        (asyncio.CancelledError(), False),
+        (ConnectionResetError("peer gone"), True),
+    ],
+    ids=["done", "cancelled", "failed"],
+)
+def test_a_close_wait_closed_after_its_close_and_loop_ended_logs_only_a_failure(
+    ended_close_wait, caplog, ending, logged
+) -> None:
+    """Let a waiting coroutine closed after its close and loop ended log a failed close and only that."""
+    caplog.set_level(logging.WARNING, logger=store_api.logger.name)
+    address = _RegistryAddress("store", "host")
+    close = AsyncMock(side_effect=ending)
+    waiting = ended_close_wait(
+        store_api._SelectedControlPlane(SimpleNamespace(close=close), address)
     )
-    loop = asyncio.new_event_loop()
-
-    async def start_and_abandon() -> Any:
-        waiting = store_api._wait_for_close(selected)
-        waiting.send(None)
-        # The close runs and ends, but nothing resumes the waiting coroutine.
-        await asyncio.gather(*store_api._closing)
-        return waiting
-
-    try:
-        waiting = loop.run_until_complete(start_and_abandon())
-    finally:
-        loop.close()
     waiting.close()
-    selected.control_plane.close.assert_awaited_once_with()
+
+    close.assert_awaited_once_with()
+    message = f"closing the connection dialed through {address} failed"
+    assert [
+        (r.name, r.getMessage(), r.exc_info and r.exc_info[1])
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ] == ([(store_api.logger.name, message, ending)] if logged else [])
 
 
 @pytest.mark.timeout(60)

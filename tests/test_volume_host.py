@@ -6,6 +6,7 @@
 
 """Tests for resolving storage volume IDs through a volume host a strategy installs."""
 
+import asyncio
 import pickle
 import typing
 from collections.abc import Collection
@@ -49,16 +50,21 @@ async def test_an_installed_host_resolves_ids_in_place_of_the_attributes() -> No
     """Resolve each ID through the installed host only, also one the attributes hold too."""
     strategy = TorchStoreStrategy(TransportType.Gloo)
     await strategy.set_storage_volumes(VolumeMesh([("a", "host-a"), ("b", "mesh-b")]))
-    strategy.set_volume_host(_RecordHost({"b": ("handle-b", "host-b")}))
+    strategy.set_volume_host(
+        _RecordHost(
+            {"b": (("slice", {"procs": 1}), "host-b"), "c": ("handle-c", "host-c")}
+        )
+    )
 
-    ref = strategy.get_storage_volume("b")
+    ref = strategy.get_storage_volume("c")
     assert (ref.volume, ref.volume_id, ref.volume_hostname) == (
-        "handle-b",
-        "b",
-        "host-b",
+        "handle-c",
+        "c",
+        "host-c",
     )
     assert ref.transport_context is strategy.transport_context
     assert ref.default_transport_type is TransportType.Gloo
+    assert strategy.get_storage_volume("b").volume_hostname == "host-b"
     with pytest.raises(KeyError):
         strategy.get_storage_volume("a")
 
@@ -66,11 +72,43 @@ async def test_an_installed_host_resolves_ids_in_place_of_the_attributes() -> No
 def test_a_second_host_replaces_the_first() -> None:
     """Resolve through the host installed last."""
     strategy = TorchStoreStrategy()
-    strategy.set_volume_host(_RecordHost({"a": ("first", "first-host")}))
-    strategy.set_volume_host(_RecordHost({"a": ("second", "second-host")}))
+    strategy.set_volume_host(
+        _RecordHost({"a": ("handle-a", "first-host"), "b": ("handle-b", "host-b")})
+    )
+    strategy.set_volume_host(_RecordHost({"a": ("handle-a", "second-host")}))
 
     ref = strategy.get_storage_volume("a")
-    assert (ref.volume, ref.volume_hostname) == ("second", "second-host")
+    assert (ref.volume, ref.volume_hostname) == ("handle-a", "second-host")
+    with pytest.raises(KeyError):
+        strategy.get_storage_volume("b")
+
+
+class _SliceMesh(VolumeMesh):
+    """A stand-in volume mesh whose every slice is a new handle that equals only itself as Monarch's is."""
+
+    def slice(self, **coord: int) -> object:
+        return object()
+
+
+@pytest.mark.asyncio
+async def test_a_host_that_hands_out_new_handles_for_mesh_ids_installs() -> None:
+    """Install a host whose handles for the mesh's own IDs are new objects and resolve through it."""
+    strategy = TorchStoreStrategy()
+    await strategy.set_storage_volumes(_SliceMesh([("a", "mesh-host-a")]))
+    handle = strategy.storage_volumes.slice(procs=0)
+    strategy.set_volume_host(_RecordHost({"a": (handle, "host-a")}))
+
+    ref = strategy.get_storage_volume("a")
+    assert (ref.volume, ref.volume_hostname) == (handle, "host-a")
+
+
+def test_only_a_volume_host_installs() -> None:
+    """Refuse anything but a ``VolumeHost`` and install nothing."""
+    strategy = TorchStoreStrategy()
+    before = set(vars(strategy))
+    with pytest.raises(TypeError, match="expected a VolumeHost, got dict"):
+        strategy.set_volume_host({})
+    assert set(vars(strategy)) == before
 
 
 def test_an_installed_host_travels_with_a_pickled_strategy() -> None:
@@ -143,6 +181,121 @@ async def test_an_empty_host_that_reads_as_false_still_resolves(monkeypatch) -> 
         strategy.select_storage_volume()
 
 
+def test_selection_resolves_through_the_host_it_checked(monkeypatch) -> None:
+    """Resolve the client's ID through the host that listed it even if another replaced it since."""
+    monkeypatch.setenv("RANK", "1")
+    strategy = LocalRankStrategy()
+
+    class Replaced(_RecordHost):
+        def volume_ids(self) -> Collection[str]:
+            # Another thread may install a host between the check and the lookup.
+            strategy.set_volume_host(_RecordHost({}))
+            return super().volume_ids()
+
+    strategy.set_volume_host(Replaced({"1": ("handle-1", "host-1")}))
+    assert strategy.select_storage_volume().volume == "handle-1"
+
+
+@pytest.mark.asyncio
+async def test_selection_without_a_host_ignores_a_first_host_installed_meanwhile(
+    monkeypatch,
+) -> None:
+    """Resolve the client's ID through the mesh tables, not through a first host installed after the check."""
+    monkeypatch.setenv("RANK", "1")
+    strategy = LocalRankStrategy()
+    await strategy.set_storage_volumes(VolumeMesh([("1", "host-1")]))
+
+    class Installs(dict):
+        def __contains__(self, volume_id: object) -> bool:
+            # Another thread may install a host between the check and the lookup.
+            strategy.set_volume_host(_RecordHost({}))
+            return super().__contains__(volume_id)
+
+    strategy.volume_id_to_coord = Installs(strategy.volume_id_to_coord)
+    assert strategy.select_storage_volume().volume == ("slice", {"procs": 0})
+
+
+def _own_ref(strategy: TorchStoreStrategy, volume_id: str) -> StorageVolumeRef:
+    """The reference that each strategy below resolves every ID to."""
+    return StorageVolumeRef(
+        "own-handle",
+        volume_id,
+        strategy.transport_context,
+        strategy.default_transport_type,
+    )
+
+
+class _SelectsOwnLookup(LocalRankStrategy):
+    """Resolves every ID through a lookup of its own."""
+
+    def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
+        return _own_ref(self, volume_id)
+
+
+class _InheritsOwnLookup(_SelectsOwnLookup):
+    """Inherits its parent's lookup."""
+
+
+class _ServesLookup(LocalRankStrategy):
+    """Serves a lookup of its own through ``__getattribute__``."""
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "get_storage_volume":
+            return lambda volume_id: _own_ref(self, volume_id)
+        return super().__getattribute__(name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "strategy_cls", [_SelectsOwnLookup, _InheritsOwnLookup, _ServesLookup]
+)
+async def test_selection_resolves_through_a_subclass_lookup(
+    monkeypatch, strategy_cls: type[LocalRankStrategy]
+) -> None:
+    """Resolve the client's ID through a lookup a subclass defines, inherits or serves as main did."""
+    monkeypatch.setenv("RANK", "0")
+    strategy = strategy_cls()
+    await strategy.set_storage_volumes(VolumeMesh([("0", "host-0")]))
+    assert strategy.select_storage_volume().volume == "own-handle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("patch_base", [False, True], ids=["instance", "base"])
+async def test_selection_resolves_through_a_patched_lookup(
+    monkeypatch, patch_base: bool
+) -> None:
+    """Resolve the client's ID through a patch of the instance's or the base class's lookup as main did."""
+    monkeypatch.setenv("RANK", "0")
+    strategy = LocalRankStrategy()
+    await strategy.set_storage_volumes(VolumeMesh([("0", "host-0")]))
+    looked_up: list[str] = []
+
+    def lookup(*args: Any) -> str:
+        # Python binds a patch of the class's lookup to the strategy and not one of the instance's.
+        looked_up.append(args[-1])
+        return "patched-ref"
+
+    target = TorchStoreStrategy if patch_base else strategy
+    monkeypatch.setattr(target, "get_storage_volume", lookup)
+    assert strategy.select_storage_volume() == "patched-ref"
+    assert looked_up == ["0"]
+
+
+@pytest.mark.asyncio
+async def test_selection_names_a_missing_volume_before_a_patched_lookup(
+    monkeypatch,
+) -> None:
+    """Refuse a client ID the attributes lack with main's message and never reach a patched lookup."""
+    monkeypatch.setenv("RANK", "1")
+    strategy = LocalRankStrategy()
+    await strategy.set_storage_volumes(VolumeMesh([("0", "host-0")]))
+    lookup = Mock(return_value="patched-ref")
+    monkeypatch.setattr(strategy, "get_storage_volume", lookup)
+    with pytest.raises(KeyError, match="found for 1 self.volume_id_to_coord="):
+        strategy.select_storage_volume()
+    lookup.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_selection_without_a_host_names_a_missing_volume(monkeypatch) -> None:
     """Refuse a client ID the attributes lack with main's message, with no host installed."""
@@ -170,14 +323,49 @@ async def test_a_failed_set_drops_the_host_and_resolves_nothing() -> None:
     """Leave the new mesh with no volumes, not even the last mesh's, and no host, as main did."""
     strategy = TorchStoreStrategy()
     await strategy.set_storage_volumes(VolumeMesh([("a", "host-a")]))
-    strategy.set_volume_host(_RecordHost({"a": ("handle-a", "host-a")}))
+    strategy.set_volume_host(_RecordHost({"b": ("handle-b", "host-b")}))
     mesh = Mock(get_id=Mock(call=AsyncMock(side_effect=RuntimeError("a volume died"))))
     with pytest.raises(RuntimeError, match="a volume died"):
         await strategy.set_storage_volumes(mesh)
 
     assert strategy.storage_volumes is mesh
-    with pytest.raises(KeyError, match="^'a'$"):
-        strategy.get_storage_volume("a")
+    for volume_id in ("a", "b"):
+        with pytest.raises(KeyError, match=f"^'{volume_id}'$"):
+            strategy.get_storage_volume(volume_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_a_host_installed_while_volumes_are_set_is_dropped(fails: bool) -> None:
+    """Drop the host a set finds and one installed while it waits for the mesh even if it fails."""
+    strategy = TorchStoreStrategy()
+    strategy.set_volume_host(_RecordHost({"b": ("handle-b", "host-b")}))
+    asked, answer = asyncio.Event(), asyncio.Event()
+
+    async def get_id() -> list:
+        asked.set()
+        await answer.wait()
+        if fails:
+            raise RuntimeError("a volume died")
+        return [({"procs": 0}, ("a", "mesh-host-a"))]
+
+    mesh = VolumeMesh([])
+    mesh.get_id = Mock(call=get_id)
+    setting = asyncio.ensure_future(strategy.set_storage_volumes(mesh))
+    await asked.wait()
+    with pytest.raises(KeyError, match="^'b'$"):
+        strategy.get_storage_volume("b")
+    strategy.set_volume_host(_RecordHost({"c": ("handle-c", "host-c")}))
+    answer.set()
+    if fails:
+        with pytest.raises(RuntimeError, match="a volume died"):
+            await setting
+    else:
+        await setting
+        assert strategy.get_storage_volume("a").volume == ("slice", {"procs": 0})
+
+    with pytest.raises(KeyError, match="^'c'$"):
+        strategy.get_storage_volume("c")
 
 
 def test_a_subclass_that_skips_the_base_constructor_resolves_its_attributes() -> None:
@@ -242,9 +430,90 @@ def test_a_strategy_that_overrides_a_host_method_refuses_a_host(
 ) -> None:
     """Refuse a host where the class overrides a method that reads or drops it, and install none."""
     strategy = strategy_cls()
-    with pytest.raises(TypeError, match=f"overrides {overridden}, which would ignore"):
+    with pytest.raises(
+        TypeError, match=f"overrides {overridden}, and TorchStore cannot tell"
+    ):
         strategy.set_volume_host(_RecordHost({}))
     assert vars(strategy).keys() == vars(strategy_cls()).keys()
+
+
+_COPY_HOOKS = (
+    "__getstate__",
+    "__setstate__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__copy__",
+    "__deepcopy__",
+)
+
+
+@pytest.mark.parametrize("hook", _COPY_HOOKS)
+def test_a_strategy_class_with_its_own_copy_hook_refuses_a_host(hook: str) -> None:
+    """Refuse a host where the class decides what its copies keep and install none."""
+    strategy = type(
+        "OwnHook", (TorchStoreStrategy,), {hook: lambda self, *args: None}
+    )()
+    before = set(vars(strategy))
+    with pytest.raises(
+        TypeError, match=f"overrides {hook}, and TorchStore cannot tell"
+    ):
+        strategy.set_volume_host(_RecordHost({}))
+    assert set(vars(strategy)) == before
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "set_storage_volumes",
+        "select_storage_volume",
+        "get_storage_volume",
+        "__reduce_ex__",
+    ],
+)
+def test_a_strategy_instance_with_its_own_host_method_refuses_a_host(name: str) -> None:
+    """Refuse a host where a patch gave the instance its own set, lookup or copy hook."""
+    strategy = TorchStoreStrategy()
+    vars(strategy)[name] = lambda *args: None
+    before = set(vars(strategy))
+    with pytest.raises(
+        TypeError, match=f"overrides {name}, and TorchStore cannot tell"
+    ):
+        strategy.set_volume_host(_RecordHost({}))
+    assert set(vars(strategy)) == before
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "set_storage_volumes",
+        "select_storage_volume",
+        "get_storage_volume",
+        "__reduce_ex__",
+    ],
+)
+def test_a_patch_of_the_base_class_host_method_refuses_a_host(
+    monkeypatch, name: str
+) -> None:
+    """Refuse a host where a patch replaced the base class's own set, lookup or copy hook that a strategy inherits."""
+    monkeypatch.setattr(TorchStoreStrategy, name, lambda *args: None)
+    strategy = LocalRankStrategy()
+    before = set(vars(strategy))
+    with pytest.raises(
+        TypeError, match=f"overrides {name}, and TorchStore cannot tell"
+    ):
+        strategy.set_volume_host(_RecordHost({}))
+    assert set(vars(strategy)) == before
+
+
+def test_a_strategy_class_with_its_own_attribute_lookup_refuses_a_host() -> None:
+    """Refuse a host where the class's ``__getattribute__`` could stand in for any host method."""
+    strategy = _ServesLookup()
+    before = set(vars(strategy))
+    with pytest.raises(
+        TypeError, match="overrides __getattribute__, and TorchStore cannot tell"
+    ):
+        strategy.set_volume_host(_RecordHost({}))
+    assert set(vars(strategy)) == before
 
 
 @pytest.mark.parametrize(
@@ -254,8 +523,12 @@ def test_a_strategy_that_overrides_a_host_method_refuses_a_host(
 def test_type_hints_of_every_strategy_class_resolve(
     strategy_cls: type[TorchStoreStrategy],
 ) -> None:
-    """Resolve each strategy class's hints at run time, as on main."""
+    """Resolve each strategy class's hints and those of its host method at run time."""
     assert typing.get_type_hints(strategy_cls) == {}
+    assert typing.get_type_hints(strategy_cls.set_volume_host) == {
+        "host": VolumeHost,
+        "return": type(None),
+    }
 
 
 @pytest.mark.asyncio
@@ -272,19 +545,40 @@ async def test_setting_volumes_adds_no_host_attribute() -> None:
     ]
 
 
+class _OwnName(TorchStoreStrategy):
+    """Keeps an attribute of its own named like the host."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._volume_host = "rack-7"
+
+    def own(self) -> str:
+        return self._volume_host
+
+
+class _TorchStoreStrategy(TorchStoreStrategy):
+    """Keeps a private ``__volume_host`` that Python mangles by this class's name."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.__volume_host = "rack-7"
+
+    def own(self) -> str:
+        return self.__volume_host
+
+
 @pytest.mark.asyncio
-async def test_a_subclass_attribute_named_volume_host_is_its_own() -> None:
-    """Keep a subclass's own ``_volume_host`` through set and lookups, as on main."""
-
-    class OwnName(TorchStoreStrategy):
-        def __init__(self) -> None:
-            super().__init__()
-            self._volume_host = "rack-7"
-
-    strategy = OwnName()
+@pytest.mark.parametrize("strategy_cls", [_OwnName, _TorchStoreStrategy])
+async def test_a_subclass_attribute_named_volume_host_is_its_own(
+    strategy_cls: type[_OwnName | _TorchStoreStrategy],
+) -> None:
+    """Keep a subclass's own ``_volume_host`` or ``__volume_host`` through set and lookups."""
+    strategy = strategy_cls()
+    with pytest.raises(KeyError, match="^'a'$"):
+        strategy.get_storage_volume("a")
     await strategy.set_storage_volumes(VolumeMesh([("a", "host-a")]))
     ref = strategy.get_storage_volume("a")
-    assert strategy._volume_host == "rack-7"
+    assert strategy.own() == "rack-7"
     assert (ref.volume, ref.volume_hostname) == (("slice", {"procs": 0}), "host-a")
 
 

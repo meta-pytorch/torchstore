@@ -16,7 +16,6 @@ without an ibverbs backend.
 import logging
 import pickle
 import re
-import threading
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +23,7 @@ import torch
 import torchstore.monarch.rdma as monarch_rdma
 from torchstore import transport
 from torchstore.monarch.rdma import MonarchRDMATransportBuffer, RdmaContext
+from torchstore.strategy import StorageVolumeRef
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.types import Request
@@ -97,14 +97,15 @@ class MockVolume:
     def __init__(self, metas) -> None:
         self.get_meta = MockEndpoint(metas)
 
-
-class MockStorageVolumeRef:
-    def __init__(self, metas=None) -> None:
-        self.volume_id = "test_volume"
-        self.volume = MockVolume(metas or [])
-        self.transport_context = TransportContext()
+    def __reduce__(self):
         # Pickle refuses it, so a buffer copy that kept this handle could not be sent.
-        self.lock = threading.Lock()
+        raise TypeError("a request must not carry its volume handle")
+
+
+def _volume_ref(metas=None) -> StorageVolumeRef:
+    return StorageVolumeRef(
+        MockVolume(metas or []), "test_volume", TransportContext(), TransportType.Unset
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -118,7 +119,7 @@ def fake_rdma(monkeypatch):
 
 @pytest.fixture
 def ref():
-    return MockStorageVolumeRef()
+    return _volume_ref()
 
 
 @pytest.fixture
@@ -232,7 +233,7 @@ class TestMonarchRDMABatchPut:
         )
 
         get_buffer = MonarchRDMATransportBuffer(
-            MockStorageVolumeRef(metas=[(tensor.shape, tensor.dtype)])
+            _volume_ref(metas=[(tensor.shape, tensor.dtype)])
         )
         get_requests = [Request.from_any("empty", None)]
         await get_buffer._pre_get_hook(get_requests)
@@ -275,7 +276,7 @@ class TestMonarchRDMABatchGet:
     @pytest.mark.asyncio
     async def test_get_with_allocation_uses_fetched_meta(self):
         metas = [(torch.Size([5]), torch.float32)]
-        ref = MockStorageVolumeRef(metas=metas)
+        ref = _volume_ref(metas=metas)
         buffer = MonarchRDMATransportBuffer(ref)
         requests = [Request.from_any("k1", None)]
 
@@ -315,7 +316,7 @@ class TestMonarchRDMABatchGet:
     async def test_get_object_routes_through_context(self):
         # k1 stores a tensor (meta = shape/dtype); k2 stores an object, for
         # which get_meta returns the "obj" sentinel.
-        ref = MockStorageVolumeRef(metas=[(torch.Size([4]), torch.float32), "obj"])
+        ref = _volume_ref(metas=[(torch.Size([4]), torch.float32), "obj"])
         buffer = MonarchRDMATransportBuffer(ref)
         requests = [Request.from_any("k1", None), Request.from_any("k2", None)]
         await buffer._pre_get_hook(requests)
@@ -382,6 +383,8 @@ class TestRdmaContext:
             tensor=t,
             shape=t.shape,
             dtype=t.dtype,
+            is_object=True,
+            objects={"step": 1},
         )
 
         state = ctx.__getstate__()
@@ -391,6 +394,7 @@ class TestRdmaContext:
         assert state["rdma_buffer"] is not None
         assert state["shape"] == t.shape
         assert state["dtype"] == t.dtype
+        assert (state["is_object"], state["objects"]) == (True, {"step": 1})
 
 
 @pytest.fixture

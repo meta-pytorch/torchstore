@@ -54,9 +54,10 @@ class _SelectedControlPlane(NamedTuple):
 # reset_client, and stores selected with control_plane="monarch" never enter it.
 _control_plane_map: dict[str, _SelectedControlPlane] = {}
 
-# Held while initialize, client and shutdown update the record together with the client
-# cache, and across fork. Other reads and reset_client rely on the overlaps their docstrings
-# allow. Never held across an await: a dialed connection closes after it is released.
+# Held while initialize, client and shutdown update the record with the client cache, for a
+# client build's lone cache write, and across fork. Other reads and reset_client rely on the
+# overlaps their docstrings allow. Never held across an await: a dialed connection closes
+# after it is released.
 _selection_lock = threading.Lock()
 
 # Stores whose record ts.shutdown released here, until a routing initialize on Monarch's
@@ -199,8 +200,8 @@ def _leave_running(
 async def _wait_for_close(selected: _SelectedControlPlane) -> bool:
     """Close a dialed connection, waiting for it at most ``_CLOSE_WAIT_S``.
 
-    Returns False if the close outlasts the wait. Such a close, or one whose caller is cancelled, also
-    in the loop step the close ends in, runs on while its event loop runs and logs a failure unless it
+    Returns False if the close outlasts the wait. Such a close, or one whose caller is cancelled (also in the loop step
+    it ends in) or whose waiting coroutine is closed, runs on while its event loop runs and logs a failure unless it
     ends cancelled. One ending cancelled or in ``GeneratorExit`` while its caller waits raises ``RuntimeError``.
     """
     task = _start_close(selected)
@@ -209,8 +210,10 @@ async def _wait_for_close(selected: _SelectedControlPlane) -> bool:
     try:
         await asyncio.wait({task}, timeout=_CLOSE_WAIT_S)
     except GeneratorExit:
-        # A coroutine closed unfinished may have no loop left to schedule a done task's callback.
-        if not task.done():
+        # A coroutine closed unfinished may have no loop left to run a done task's callback.
+        if task.done():
+            _log_close_failure(selected.address, task)
+        else:
             _leave_running(task, selected.address)
         raise
     except BaseException:
@@ -509,8 +512,9 @@ def _after_fork_in_child(lock: threading.Lock) -> None:
 
 
 # Hold the lock across fork so a child copies no half-made update unless a signal handler raises
-# while the before hook waits. Each hook takes or frees the lock it was registered with so a
-# reload that registers them again uses two.
+# while the before hook waits: CPython then forks anyway and the after hooks free a lock the before
+# hook never took. Otherwise a fork from code under the lock on its holder's thread waits for good.
+# Each hook takes or frees the lock it was registered with so a reload that registers them again uses two.
 os.register_at_fork(
     before=_selection_lock.acquire,
     after_in_parent=_selection_lock.release,

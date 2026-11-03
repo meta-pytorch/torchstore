@@ -18,17 +18,31 @@ from torchstore.backend import get_backend
 from torchstore.transport import TransportType
 from torchstore.transport.buffers import TransportContext
 from torchstore.utils import get_local_hostname
+from torchstore.volume_host import VolumeHost
 
 if TYPE_CHECKING:
     from torchstore.monarch.storage_volume import StorageVolume
-    from torchstore.volume_host import VolumeHost
 
 logger = logging.getLogger(__name__)
 
-# The instance-dict key of an installed volume host, mangled so that no subclass attribute shares it.
-_VOLUME_HOST = "_TorchStoreStrategy__volume_host"
-# The methods that read or drop an installed host, so a subclass overriding one would ignore it.
-_HOST_METHODS = ("set_storage_volumes", "select_storage_volume", "get_storage_volume")
+# The instance-dict key of an installed volume host. No subclass attribute shares it since no
+# attribute syntax spells it.
+_VOLUME_HOST = "torchstore.volume_host"
+# Methods that read or drop an installed host, the attribute lookup that can stand in for any of
+# them and hooks that decide what a copy keeps. A class or instance overriding one or a patch of
+# the base class's own may skip the host, which TorchStore cannot check.
+_HOST_METHODS = (
+    "set_storage_volumes",
+    "select_storage_volume",
+    "get_storage_volume",
+    "__getattribute__",
+    "__getstate__",
+    "__setstate__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__copy__",
+    "__deepcopy__",
+)
 
 
 class StorageVolumeRef:
@@ -54,6 +68,40 @@ class StorageVolumeRef:
         self.transport_context = transport_context
         self.default_transport_type = default_transport_type
         self.volume_hostname = volume_hostname
+
+
+def _host_ref(
+    strategy: "TorchStoreStrategy", host: VolumeHost, volume_id: str
+) -> StorageVolumeRef:
+    """Resolve ``volume_id`` through ``host`` with the strategy's transport settings."""
+    return StorageVolumeRef(
+        host.endpoints(volume_id),
+        volume_id,
+        strategy.transport_context,
+        strategy.default_transport_type,
+        volume_hostname=host.hostname(volume_id),
+    )
+
+
+def _mesh_ref(strategy: "TorchStoreStrategy", volume_id: str) -> StorageVolumeRef:
+    """Resolve ``volume_id`` through the strategy's mesh tables."""
+    volume_coord = strategy.volume_id_to_coord[volume_id]
+
+    return StorageVolumeRef(
+        strategy.storage_volumes.slice(**volume_coord),
+        volume_id,
+        strategy.transport_context,
+        strategy.default_transport_type,
+        volume_hostname=strategy.volume_id_to_hostname.get(volume_id),
+    )
+
+
+def _overrides(strategy: "TorchStoreStrategy", name: str) -> bool:
+    """Whether the strategy's instance or class has a ``name`` other than the base class's at import."""
+    return (
+        name in vars(strategy)
+        or getattr(type(strategy), name, None) is not _BASE_METHODS[name]
+    )
 
 
 class TorchStoreStrategy:
@@ -103,7 +151,7 @@ class TorchStoreStrategy:
     async def set_storage_volumes(self, storage_volumes):
         """Configure the storage volumes and build ID-to-coordinate mapping.
 
-        Lookups then resolve these volumes, not a host installed before.
+        Lookups then resolve these volumes, not a host installed before or while this runs.
 
         Args:
             storage_volumes: Actor mesh of storage volume actors.
@@ -112,32 +160,41 @@ class TorchStoreStrategy:
         self.storage_volumes = storage_volumes
         self.volume_id_to_coord = {}
         self.volume_id_to_hostname = {}
-        for coord, (volume_id, hostname) in await self.storage_volumes.get_id.call():
-            self.volume_id_to_coord[volume_id] = coord
-            self.volume_id_to_hostname[volume_id] = hostname
+        try:
+            volumes = await self.storage_volumes.get_id.call()
+            for coord, (volume_id, hostname) in volumes:
+                self.volume_id_to_coord[volume_id] = coord
+                self.volume_id_to_hostname[volume_id] = hostname
+        finally:
+            vars(self).pop(_VOLUME_HOST, None)
 
-    def set_volume_host(self, host: "VolumeHost") -> None:
-        """Resolve every volume ID through ``host`` until ``set_storage_volumes`` runs again.
+    def set_volume_host(self, host: VolumeHost) -> None:
+        """Resolve every volume ID through ``host`` until a ``set_storage_volumes`` call starts or ends.
 
-        Internal and subject to change, for TorchStore's own volume hosts.
+        Internal and subject to change, for TorchStore's own volume hosts. Because transports cache
+        their connection to a volume by its ID (Gloo for the whole process), ``host`` must resolve
+        each ID to the volume that ID names everywhere else in this process.
 
         Raises:
-            TypeError: If this strategy's class overrides a method that reads or drops the host.
+            TypeError: If ``host`` is no ``VolumeHost``, or this strategy's instance, its class or a
+                patch of the base class replaces ``__getattribute__``, a method that reads or drops
+                the host or a hook that decides what a copy keeps.
         """
-        overridden = [
-            name
-            for name in _HOST_METHODS
-            if getattr(type(self), name) is not getattr(TorchStoreStrategy, name)
-        ]
+        if not isinstance(host, VolumeHost):
+            raise TypeError(f"expected a VolumeHost, got {type(host).__name__}")
+        overridden = [name for name in _HOST_METHODS if _overrides(self, name)]
         if overridden:
             raise TypeError(
-                f"{type(self).__name__} overrides {', '.join(overridden)}, which would"
-                " ignore a volume host"
+                f"this {type(self).__name__} overrides {', '.join(overridden)}, and TorchStore"
+                " cannot tell whether that honors a volume host"
             )
         vars(self)[_VOLUME_HOST] = host
 
     def select_storage_volume(self) -> StorageVolumeRef:
         """Select the storage volume for the current client process.
+
+        One read of the installed host decides the path. A host installed meanwhile never resolves
+        the client's ID.
 
         Returns:
             StorageVolumeRef: Reference to the storage volume for this client.
@@ -145,17 +202,21 @@ class TorchStoreStrategy:
         # client_id == volume_id for this strategy
         client_id = self.get_client_id()
         host = vars(self).get(_VOLUME_HOST)
-        if host is None:
-            if client_id not in self.volume_id_to_coord:
+        if host is not None:
+            if client_id not in host.volume_ids():
                 raise KeyError(
-                    f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
+                    f"No corresponding storage volume found for {client_id} in the volume host"
                 )
-        elif client_id not in host.volume_ids():
+            return _host_ref(self, host, client_id)
+        if client_id not in self.volume_id_to_coord:
             raise KeyError(
-                f"No corresponding storage volume found for {client_id} in the volume host"
+                f"No corresponding storage volume found for {client_id} {self.volume_id_to_coord=}"
             )
-
-        return self.get_storage_volume(client_id)
+        lookup = self.get_storage_volume
+        if getattr(lookup, "__func__", None) is not _BASE_METHODS["get_storage_volume"]:
+            # As at main, a lookup that a subclass, a patch or __getattribute__ supplies resolves the ID.
+            return lookup(client_id)
+        return _mesh_ref(self, client_id)
 
     def get_storage_volume(self, volume_id: str) -> StorageVolumeRef:
         """Return the reference to the storage volume with a given ID.
@@ -171,22 +232,14 @@ class TorchStoreStrategy:
         """
         host = vars(self).get(_VOLUME_HOST)
         if host is not None:
-            return StorageVolumeRef(
-                host.endpoints(volume_id),
-                volume_id,
-                self.transport_context,
-                self.default_transport_type,
-                volume_hostname=host.hostname(volume_id),
-            )
-        volume_coord = self.volume_id_to_coord[volume_id]
+            return _host_ref(self, host, volume_id)
+        return _mesh_ref(self, volume_id)
 
-        return StorageVolumeRef(
-            self.storage_volumes.slice(**volume_coord),
-            volume_id,
-            self.transport_context,
-            self.default_transport_type,
-            volume_hostname=self.volume_id_to_hostname.get(volume_id),
-        )
+
+# The base class's own host methods as imported so that a later patch of one counts as an override.
+_BASE_METHODS = {
+    name: getattr(TorchStoreStrategy, name, None) for name in _HOST_METHODS
+}
 
 
 class HostStrategy(TorchStoreStrategy):
