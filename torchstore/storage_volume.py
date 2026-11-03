@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Awaitable, Callable
 from logging import getLogger
 from typing import Any
 
@@ -294,10 +295,14 @@ class InMemoryStore(StorageImpl):
         transport_buffer: TransportBuffer,
         requests: list[Request],
     ) -> None:
-        # Extract existing tensor for potential in-place update
-        entries_with_current_obj = [
-            (request, self._extract_existing(request)) for request in requests
-        ]
+        try:
+            # Extract existing tensor for potential in-place update
+            entries_with_current_obj = [
+                (request, self._extract_existing(request)) for request in requests
+            ]
+        except Exception:
+            await self._end_refused(transport_buffer.handle_refused_put, requests)
+            raise
 
         # fetch from remote
         results = await transport_buffer.handle_put_request(
@@ -328,14 +333,33 @@ class InMemoryStore(StorageImpl):
         requests: list[Request],
     ) -> TransportBuffer:
         data_entries = []
-        for request in requests:
-            if request.key not in self.kv:
-                raise KeyError(
-                    f"Key '{request.key}' not found. {list(self.kv.keys())=}"
-                )
-            data_entries.append((request, self._get_data(request)))
+        try:
+            for request in requests:
+                if request.key not in self.kv:
+                    raise KeyError(
+                        f"Key '{request.key}' not found. {list(self.kv.keys())=}"
+                    )
+                data_entries.append((request, self._get_data(request)))
+        except Exception:
+            await self._end_refused(transport_buffer.handle_refused_get, requests)
+            raise
         await transport_buffer.handle_get_request(self.transport_context, data_entries)
         return transport_buffer
+
+    async def _end_refused(
+        self,
+        hook: Callable[[TransportContext, list[Request]], Awaitable[None]],
+        requests: list[Request],
+    ) -> None:
+        """Run a refusal ``hook``, logging an ``Exception`` from it so the caller still raises its refusal."""
+        try:
+            await hook(self.transport_context, requests)
+        except Exception:
+            logger.warning(
+                "%s() failed after the volume refused its request",
+                hook.__qualname__,
+                exc_info=True,
+            )
 
     def _get_data(self, request):
         key = request.key
