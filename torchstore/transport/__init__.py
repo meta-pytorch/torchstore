@@ -85,47 +85,71 @@ def _backend_transport_available(transport_type: TransportType) -> bool:
     return entry is not None and entry.available()
 
 
+class _Probe(NamedTuple):
+    name: str
+    transport: TransportType
+    passes: Callable[["StorageVolumeRef"], bool]
+
+
+# Automatic selection's order. The transport log shows each probe's result under its name.
+# Each probe reads this module's names when it runs. Patching them steers it.
+_PROBES = (
+    _Probe(
+        "shm",
+        TransportType.SharedMemory,
+        lambda ref: SHM_ENABLED and is_local_to_volume(ref),
+    ),
+    _Probe(
+        "torch_distributed",
+        TransportType.TorchDistributed,
+        lambda ref: torch_transport_available(),
+    ),
+    _Probe("nixl", TransportType.NIXL, lambda ref: nixl_available()),
+    _Probe(
+        "uniflow", TransportType.TorchComms, lambda ref: torchcomms_uniflow_available()
+    ),
+    _Probe(
+        "tc_rdma", TransportType.TorchComms, lambda ref: torchcomms_rdma_available()
+    ),
+    _Probe(
+        "monarch_rdma",
+        TransportType.MonarchRDMA,
+        lambda ref: _backend_transport_available(TransportType.MonarchRDMA),
+    ),
+    _Probe("gloo", TransportType.Gloo, lambda ref: gloo_available()),
+)
+
+
+def _probes_for(storage_volume_ref: "StorageVolumeRef") -> list[_Probe]:
+    transports = storage_volume_ref.transports
+    return [p for p in _PROBES if transports is None or p.transport in transports]
+
+
 def get_available_transport(storage_volume_ref: "StorageVolumeRef") -> TransportType:
     """Determine the best available transport type for the given storage volume.
 
     Prefers SharedMemory for same-host transfers, then explicitly enabled
     torch.distributed and NIXL transports, TorchComms, MonarchRDMA, and Gloo,
-    before falling back to MonarchRPC.
+    before falling back to MonarchRPC. Only a reference's own ``transports`` are probed when set.
     """
-    # Prefer SharedMemory for same-host transfers
-    if SHM_ENABLED and is_local_to_volume(storage_volume_ref):
-        return TransportType.SharedMemory
-
-    if torch_transport_available():
-        return TransportType.TorchDistributed
-
-    if nixl_available():
-        return TransportType.NIXL
-
-    # Fall back to RDMA if available (prefer TorchComms over Monarch RDMA)
-    if torchcomms_uniflow_available() or torchcomms_rdma_available():
-        return TransportType.TorchComms
-    elif _backend_transport_available(TransportType.MonarchRDMA):
-        return TransportType.MonarchRDMA
-    elif gloo_available():
-        return TransportType.Gloo
-
+    for probe in _probes_for(storage_volume_ref):
+        if probe.passes(storage_volume_ref):
+            return probe.transport
     return TransportType.MonarchRPC
 
 
 def _log_transport_resolution(
     storage_volume_ref: "StorageVolumeRef", transport_type: TransportType
 ) -> None:
+    # The same probes with shared memory's column last.
+    probes = sorted(
+        _probes_for(storage_volume_ref),
+        key=lambda probe: probe.transport is TransportType.SharedMemory,
+    )
     logger.info(
-        "[ts-transport] resolved=%s (torch_distributed=%s, nixl=%s, uniflow=%s, tc_rdma=%s, monarch_rdma=%s, gloo=%s, shm=%s)",
+        "[ts-transport] resolved=%s (%s)",
         transport_type.name,
-        torch_transport_available(),
-        nixl_available(),
-        torchcomms_uniflow_available(),
-        torchcomms_rdma_available(),
-        _backend_transport_available(TransportType.MonarchRDMA),
-        gloo_available(),
-        SHM_ENABLED and is_local_to_volume(storage_volume_ref),
+        ", ".join(f"{p.name}={p.passes(storage_volume_ref)}" for p in probes),
     )
 
 

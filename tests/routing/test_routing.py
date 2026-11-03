@@ -13,8 +13,8 @@ import torch
 from torch.distributed.tensor import DTensor
 from torchstore.state_dict_utils import get_state_dict, put_state_dict
 
-from . import utils
-from .utils import MakeClients, shard
+from . import routed_sync_data as data, utils
+from .utils import MakeClients
 
 pytestmark = pytest.mark.timeout(120)
 
@@ -29,7 +29,7 @@ async def test_multi_source_fetch_assembles_into_allocated_and_inplace_tensors(
     """Assemble two publisher shards for allocated and caller-owned outputs."""
     # 1. Represent each publisher's local rows as a DTensor shard.
     publisher_tensors = [
-        shard(torch.arange(16).view(4, 4), 0, rank, 2) for rank in range(2)
+        data.shard(torch.arange(16).view(4, 4), 0, rank, 2) for rank in range(2)
     ]
     destination = torch.full((4, 4), -1)
     clients = await make_clients(
@@ -99,7 +99,7 @@ async def test_identical_mapping_entries_from_dtensor_shards_are_merged(
     make_clients: MakeClients,
 ) -> None:
     """Accept the same FQN-to-path entry from every shard of one DTensor."""
-    publisher_tensors = [shard(torch.arange(4), 0, rank, 2) for rank in range(2)]
+    publisher_tensors = [data.shard(torch.arange(4), 0, rank, 2) for rank in range(2)]
     destination = {"w": torch.full((4,), -1)}
     clients = await make_clients(
         publishers={
@@ -308,39 +308,6 @@ async def test_non_strict_reads_plan_and_fetch_one_subset_per_call(
     requester._control_plane.get_layouts.assert_called_once_with("model")
 
 
-# Shard dim of each tensor on two publishers, or None for a whole copy on each.
-# Column shards of out.weight are strided in every requester's buffer, so reads
-# copy them in rather than writing in place.
-_PUBLISHER_DIMS = {"proj.weight": 0, "norm.weight": None, "out.weight": 1}
-
-
-def _weights(round_: int) -> dict[str, torch.Tensor]:
-    """Whole tensors published in one round, with every value new each round."""
-    proj = torch.arange(24, dtype=torch.float32).view(4, 6) / 7 + round_
-    return {
-        "proj.weight": proj.to(torch.bfloat16),
-        "norm.weight": torch.arange(6, dtype=torch.float32) / 3 - round_,
-        "out.weight": torch.arange(24, dtype=torch.float32).view(4, 6) / 5 + 2 * round_,
-    }
-
-
-def _place(
-    tensors: dict[str, torch.Tensor],
-    dims: dict[str, int | None],
-    rank: int,
-    num_ranks: int,
-) -> dict[str, torch.Tensor]:
-    """Hold each tensor as one rank of a mesh would."""
-    return {
-        name: (
-            tensor.clone()
-            if dims[name] is None
-            else shard(tensor, dims[name], rank, num_ranks)
-        )
-        for name, tensor in tensors.items()
-    }
-
-
 def _locals(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """The rank-local part of each tensor."""
     return {
@@ -350,12 +317,7 @@ def _locals(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 @pytest.mark.parametrize(
-    ("num_ranks", "dims"),
-    [
-        (1, {"proj.weight": None, "norm.weight": None, "out.weight": None}),
-        (2, {"proj.weight": 1, "norm.weight": 0, "out.weight": 0}),
-    ],
-    ids=["whole", "resharded"],
+    ("num_ranks", "dims"), data.REQUESTERS, ids=["whole", "resharded"]
 )
 @pytest.mark.asyncio
 async def test_reads_refill_requester_buffers_every_round(
@@ -364,14 +326,16 @@ async def test_reads_refill_requester_buffers_every_round(
     """Refill caller-owned buffers each round, sharded unlike the publishers."""
     published = [
         {
-            f"publisher/{rank}": _place(_weights(round_), _PUBLISHER_DIMS, rank, 2)
-            for rank in range(2)
+            f"publisher/{rank}": data.place(
+                data.weights(round_), data.PUBLISHER_DIMS, rank, data.PUBLISHER_RANKS
+            )
+            for rank in range(data.PUBLISHER_RANKS)
         }
         for round_ in range(2)
     ]
-    zeros = {name: torch.zeros_like(tensor) for name, tensor in _weights(0).items()}
+    zeros = {name: torch.zeros_like(t) for name, t in data.weights(0).items()}
     destinations = {
-        f"requester/0/{rank}": _place(zeros, dims, rank, num_ranks)
+        f"requester/0/{rank}": data.place(zeros, dims, rank, num_ranks)
         for rank in range(num_ranks)
     }
     clients = await make_clients(publishers=published[0], requesters=destinations)
@@ -385,7 +349,7 @@ async def test_reads_refill_requester_buffers_every_round(
             {name: _locals(destination) for name, destination in destinations.items()},
             {
                 f"requester/0/{rank}": _locals(
-                    _place(_weights(round_), dims, rank, num_ranks)
+                    data.place(data.weights(round_), dims, rank, num_ranks)
                 )
                 for rank in range(num_ranks)
             },

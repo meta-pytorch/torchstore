@@ -17,6 +17,7 @@ import logging
 import pickle
 import re
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -424,8 +425,10 @@ def test_selection_reads_the_rdma_modules_probe_and_buffer_when_it_runs(
         TransportType.MonarchRDMA,
         _REGISTERED_ON_LOAD[TransportType.MonarchRDMA],
     )
-    unset = SimpleNamespace(default_transport_type=TransportType.Unset)
-    forced = SimpleNamespace(default_transport_type=TransportType.MonarchRDMA)
+    unset = SimpleNamespace(default_transport_type=TransportType.Unset, transports=None)
+    forced = SimpleNamespace(
+        default_transport_type=TransportType.MonarchRDMA, transports=None
+    )
     for usable, chosen in (
         (True, TransportType.MonarchRDMA),
         (False, TransportType.Gloo),
@@ -443,8 +446,10 @@ def test_selection_takes_monarch_rdma_only_once_registered_and_usable(
 ):
     """Pick Monarch RDMA for an unset transport only while it is registered and usable."""
     caplog.set_level(logging.INFO, logger="torchstore.transport")
-    unset = SimpleNamespace(default_transport_type=TransportType.Unset)
-    forced = SimpleNamespace(default_transport_type=TransportType.MonarchRDMA)
+    unset = SimpleNamespace(default_transport_type=TransportType.Unset, transports=None)
+    forced = SimpleNamespace(
+        default_transport_type=TransportType.MonarchRDMA, transports=None
+    )
     with pytest.raises(RuntimeError, match="Monarch RDMA transport is not registered"):
         transport.create_transport_buffer(forced)
     assert transport.get_available_transport(unset) is TransportType.Gloo
@@ -476,8 +481,16 @@ def test_selection_prefers_torchcomms_to_a_usable_monarch_rdma(
     transport.register_backend_transport(
         TransportType.MonarchRDMA, MonarchRDMATransportBuffer, lambda: True
     )
-    unset = SimpleNamespace(default_transport_type=TransportType.Unset)
+    unset = SimpleNamespace(default_transport_type=TransportType.Unset, transports=None)
     assert transport.get_available_transport(unset) is TransportType.TorchComms
+
+
+def test_selection_and_the_transport_log_need_a_references_transports(selection):
+    """Raise AttributeError for a stand-in reference without ``transports``, as the README says."""
+    for transport_type in (TransportType.Unset, TransportType.Gloo):
+        stand_in: Any = SimpleNamespace(default_transport_type=transport_type)
+        with pytest.raises(AttributeError, match="'transports'"):
+            transport.create_transport_buffer(stand_in)
 
 
 def test_registry_takes_only_transports_selection_has_a_place_for(selection):
