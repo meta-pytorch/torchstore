@@ -2322,6 +2322,9 @@ async def test_each_call_logs_one_timing_line(
         f"get_layouts key={key}",
     ]
     assert decoded_after == [len(timed) - 1]
+    # LatencyTracker logs through the root logger, not a "torchstore" one.
+    loggers = {r.name for r in caplog.records if _TIMING_LINE.search(r.getMessage())}
+    assert loggers == {"root"}
 
 
 @pytest.mark.asyncio

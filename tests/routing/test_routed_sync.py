@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import uuid
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import monarch.actor as monarch_actor
 import pytest
 import torch
 import torchstore as ts
+import torchstore.api as store_api
 from monarch.actor import Actor, concurrent_endpoint, current_rank, this_host
 from torchstore.transport import TransportType
 
@@ -187,7 +189,8 @@ async def test_routed_weight_sync_across_actor_meshes(
             # Each rank got its own copy of the address, equal to the driver's.
             for point, received in result.items():
                 assert received == forwarded, point
-        for round_ in range(_ROUNDS):
+
+        async def sync_round(round_: int) -> None:
             # Each read follows the push, as one that starts first can miss the mapping.
             await publishers.push.call(round_)
             pulled = await requesters.pull.call()
@@ -197,6 +200,19 @@ async def test_routed_weight_sync_across_actor_meshes(
                 rtol=0,
                 atol=0,
             )
+
+        for round_ in range(_ROUNDS):
+            await sync_round(round_)
+        if isinstance(address, ServiceAddress):
+            server = store_api._owned_service_map[store_name]._server
+            assert server is not None
+            # With the driver's coordinator and TCPStore stopped, the planned key syncs
+            # from the volumes alone.
+            await ts.shutdown(store_name)
+            for port in (address.port, server.address.port):
+                with pytest.raises(ConnectionRefusedError):
+                    socket.create_connection(("127.0.0.1", port)).close()
+            await sync_round(_ROUNDS)
 
     try:
         await asyncio.wait_for(sync(), _DEADLINE_S)
