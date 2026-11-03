@@ -10,13 +10,13 @@ import asyncio
 import logging
 import re
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torchstore as ts
 import torchstore.api as store_api
 from torchstore import RankRole
-from torchstore.client import ClientType, LocalClient
+from torchstore.client import ClientType
 from torchstore.monarch.coordinator import MonarchControlPlane
 from torchstore.routing.client import RoutingClient
 
@@ -211,11 +211,13 @@ def test_standard_initialize_spawns_volumes_on_the_callers_mesh(backend) -> None
 def test_standard_initialize_reuses_the_controller_volume(backend) -> None:
     """Find the one controller volume through the backend instead of spawning volumes."""
     controller = backend.controller.return_value = _controller()
-    strategy = ts.ControllerStorageVolumes()
 
-    asyncio.run(ts.initialize(strategy=strategy, store_name="singleton"))
+    asyncio.run(ts.initialize(store_name="singleton"))
 
-    backend.controller_volume.assert_awaited_once_with(strategy.get_volume_id)
+    backend.controller.assert_awaited_once_with("singleton")
+    backend.controller_volume.assert_awaited_once_with(
+        ts.ControllerStorageVolumes.get_volume_id
+    )
     backend.spawn_volumes.assert_not_awaited()
     assert (
         controller.init.call.await_args.kwargs["storage_volumes"]
@@ -223,20 +225,24 @@ def test_standard_initialize_reuses_the_controller_volume(backend) -> None:
     )
 
 
-def test_standard_client_and_shutdown_find_the_stores_own_controller(backend) -> None:
-    """Look each store's controller up by its own name for ``client`` and ``shutdown``."""
+def test_standard_client_finds_the_stores_own_controller(backend, monkeypatch) -> None:
+    """Look the store's controller up by its own name and build the client on it."""
+    monkeypatch.setattr(store_api, "_local_clent_map", {})
     strategy = object()
     controller = backend.controller.return_value = _controller(strategy)
 
-    async def run() -> LocalClient:
-        try:
-            return await ts.client("named-store")
-        finally:
-            await ts.shutdown("named-store")
+    client = asyncio.run(ts.client("named-store"))
 
-    client = asyncio.run(run())
-
-    assert backend.controller.await_args_list == [call("named-store")] * 2
+    backend.controller.assert_awaited_once_with("named-store")
     assert client.strategy is strategy
     backend.directory.assert_called_once_with(controller)
+
+
+def test_standard_shutdown_finds_the_stores_own_controller(backend) -> None:
+    """Look the store's controller up by its own name and tear it down."""
+    controller = backend.controller.return_value = _controller()
+
+    asyncio.run(ts.shutdown("named-store"))
+
+    backend.controller.assert_awaited_once_with("named-store")
     controller.teardown.call.assert_awaited_once_with()
