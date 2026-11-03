@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import traceback
+import tracemalloc
 import types
 import weakref
 from collections.abc import Callable, Iterator
@@ -56,7 +57,7 @@ from torchstore.carrier import (
     RemoteError,
     StaleAddressError,
 )
-from torchstore.carrier.codec import Hello, Kind, Reject
+from torchstore.carrier.codec import Hello, Kind, Reject, Welcome
 
 pytestmark = pytest.mark.timeout(120)
 
@@ -105,7 +106,7 @@ assert decoded.dtype == torch.bfloat16 and torch.equal(decoded, tensor), decoded
 
 
 _CYCLE_CHILD = """
-import gc, sys
+import gc, pickle, sys
 
 sys.path.insert(0, sys.argv[1])
 import torch
@@ -116,7 +117,14 @@ class Cycle:
     pass
 
 
-body, buffers = codec.dumps(torch.ones(1 << 16))
+data = bytes(range(256)) * 256
+payloads = {
+    "tensor": lambda: torch.ones(1 << 16),
+    "memoryview": lambda: memoryview(data),
+    "memoryview-slice": lambda: ("put", ("key", memoryview(data)[8:]), {}),
+    "pickle-buffer-over-a-slice": lambda: pickle.PickleBuffer(memoryview(data)[8:]),
+}
+body, buffers = codec.dumps(payloads[sys.argv[2]]())
 # Like a failed send's frames and chunk lists, made after the buffers they hold.
 cycle = Cycle()
 cycle.self, cycle.chunks = cycle, [body, *buffers]
@@ -647,10 +655,10 @@ def _shrunk(storage: torch.UntypedStorage, nbytes: int) -> Iterator[None]:
     storage.resize_(full)
 
 
-def _run_child(script: str) -> None:
-    """Run ``script`` in a child process that imports this tree, and fail unless it exits with status 0."""
+def _run_child(script: str, *args: str) -> None:
+    """Run ``script`` with ``args`` in a child process that imports this tree, and fail unless it exits with status 0."""
     child = subprocess.run(
-        [sys.executable, "-c", script, _ROOT],
+        [sys.executable, "-c", script, _ROOT, *args],
         capture_output=True,
         text=True,
         timeout=100,
@@ -1372,11 +1380,85 @@ def test_sparse_tensors_decode_on_cpu_under_a_default_device() -> None:
 
 
 def test_other_pickle_buffers_stay_in_band() -> None:
-    """Keep pickle buffers that are not the codec's in the body, so every buffer is a tensor."""
+    """Keep pickle buffers over mutable memory in the body. Only tensors and bytes leave it."""
     blob = _Blob(b"\x00\x01\x02")
     assert len(codec.dumps([blob, torch.ones(2)])[1]) == 1
     decoded_blob, decoded_tensor = _round_trip([blob, torch.ones(2)])
     assert decoded_blob.data == blob.data and torch.equal(decoded_tensor, torch.ones(2))
+
+
+def test_a_pickle_buffer_over_bytes_travels_out_of_band_uncopied() -> None:
+    """Send a ``PickleBuffer`` over ``bytes`` as that object's own buffer, read-only on arrival."""
+    payload = bytes(range(256)) * 4
+    _, buffers = codec.dumps(pickle.PickleBuffer(payload))
+    assert len(buffers) == 1 and buffers[0].obj is payload and buffers[0].readonly
+    decoded = _round_trip(pickle.PickleBuffer(payload))
+    assert isinstance(decoded, memoryview) and decoded.readonly
+    assert bytes(decoded) == payload
+
+
+def test_a_read_only_pickle_buffer_over_mutable_memory_stays_in_band() -> None:
+    """Keep a read-only ``PickleBuffer`` over a ``bytearray`` in the body: only ``bytes`` skip the reply copy."""
+    data = bytearray(b"abc")
+    body, buffers = codec.dumps(pickle.PickleBuffer(memoryview(data).toreadonly()))
+    assert buffers == []
+    data[:] = b"xyz"
+    assert bytes(codec.loads(body)) == b"abc"
+
+
+def test_read_only_memoryviews_travel_out_of_band_only_over_bytes() -> None:
+    """Send a read-only ``memoryview``, as a ``PickleBuffer`` arrives, out of band only over a whole ``bytes``."""
+    payload = bytes(range(256))
+    received = _round_trip(pickle.PickleBuffer(payload))
+    views = [
+        (memoryview(payload), 1),
+        (memoryview(payload)[1:3], 0),
+        (received, 0),
+        (memoryview(bytearray(payload)).toreadonly(), 0),
+    ]
+    for view, count in views:
+        assert len(codec.dumps(view)[1]) == count
+        decoded = _round_trip({"view": view})["view"]
+        assert isinstance(decoded, memoryview) and bytes(decoded) == bytes(view)
+    # A pickle buffer over a slice of bytes stays in the body too.
+    assert codec.dumps(pickle.PickleBuffer(memoryview(payload)[1:3]))[1] == []
+
+
+def test_a_body_unpickles_from_a_memoryview_in_every_protocol() -> None:
+    """Unpickle a body handed over as a memoryview, as large ones arrive, whatever pickle protocol made it."""
+    obj = {"blob": b"x" * 100_000, "lines": "a\nb" * 3_000, "items": list(range(5_000))}
+    for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+        body = pickle.dumps(obj, protocol)
+        assert codec.loads(memoryview(body)) == obj == codec.loads(body)
+        view = codec.byte_view(torch.frombuffer(bytearray(body), dtype=torch.uint8))
+        assert codec.loads(view) == obj
+
+
+def test_a_memoryview_body_is_never_copied_whole() -> None:
+    """Unpickle a large memoryview body into its objects alone, with no copy of the whole body first."""
+    payload = b"x" * (16 << 20)
+    body = memoryview(pickle.dumps(payload, protocol=5))
+    tracemalloc.start()
+    try:
+        assert codec.loads(body) == payload
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < len(payload) + (4 << 20), peak
+
+
+def test_memoryviews_with_another_format_or_shape_are_refused() -> None:
+    """Refuse a ``memoryview`` that is writable, not contiguous or of another format or shape with pickle's own error."""
+    data = bytes(16)
+    for view in (
+        memoryview(data).cast("d"),
+        memoryview(data).cast("i", (2, 2)),
+        memoryview(data).cast("B", (4, 4)),
+        memoryview(bytearray(data)),
+        memoryview(data)[::2],
+    ):
+        with pytest.raises(TypeError, match="cannot pickle '?memoryview"):
+            codec.dumps(view)
 
 
 def test_plain_objects_round_trip() -> None:
@@ -1784,9 +1866,13 @@ def test_round_trips_without_numpy() -> None:
     _run_child(_NO_NUMPY_CHILD)
 
 
-def test_collecting_a_cycle_that_holds_frame_buffers_is_safe() -> None:
+@pytest.mark.parametrize(
+    "payload",
+    ["tensor", "memoryview", "memoryview-slice", "pickle-buffer-over-a-slice"],
+)
+def test_collecting_a_cycle_that_holds_frame_buffers_is_safe(payload: str) -> None:
     """Collect a garbage cycle that holds a frame's buffers, which must not crash Python 3.10."""
-    _run_child(_CYCLE_CHILD)
+    _run_child(_CYCLE_CHILD, payload)
 
 
 @pytest.mark.filterwarnings("ignore::UserWarning")
@@ -2602,6 +2688,16 @@ def test_handshake_bodies_are_json() -> None:
             record.version = 2  # type: ignore[misc]
     future = {**fields, "peer": "host-b:7", "version": 2, "added_later": True}
     assert Hello.from_json(json.dumps(future)).version == 2
+
+
+def test_a_welcome_carries_the_servers_window() -> None:
+    """Send a hello's fields and the server's window in a welcome, which a hello alone does not make."""
+    welcome = Welcome("store/nonce", "publisher/0", "9f2c", "host-b:7", window=63)
+    assert json.loads(welcome.to_json())["window"] == 63
+    assert Welcome.from_json(welcome.to_json()) == welcome
+    hello = Hello("store/nonce", "publisher/0", "9f2c", "host-b:7")
+    with pytest.raises(CarrierProtocolError, match="^not a Welcome object: KeyError"):
+        Welcome.from_json(hello.to_json())
 
 
 def test_carrier_address_round_trips_through_json() -> None:

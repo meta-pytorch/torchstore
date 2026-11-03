@@ -6,12 +6,14 @@
 
 import math
 import time
+import uuid
 from logging import getLogger
 
 import pytest
 import torch
 import torchstore as ts
 from monarch.actor import Actor, endpoint
+from torchstore.carrier import CarrierClient, CarrierServer, close_all
 from torchstore.logging import init_logging
 from torchstore.monarch.rdma import monarch_rdma_transport_available
 from torchstore.strategy import HostStrategy
@@ -123,6 +125,30 @@ async def test_large_tensors():
         # TODO: Investigate monarch bug with proc_mesh.stop()
         # await actor._proc_mesh.stop()
         await ts.shutdown()
+
+
+class _Echo:
+    def echo(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(900)
+async def test_carrier_echoes_a_tensor_over_4_gib() -> None:
+    """Echo a tensor over 4 GiB through the carrier, whose buffer lengths are 64-bit."""
+    tensor = torch.randint(0, 256, ((4 << 30) + 4097,), dtype=torch.uint8)
+    server = await CarrierServer.serve(
+        _Echo(), ["echo"], service="large", scope=f"large/{uuid.uuid4().hex}"
+    )
+    try:
+        start = time.perf_counter()
+        echoed = await CarrierClient(server.address).call("echo", tensor)
+        logger.info(
+            f"Carrier echo of {tensor.nbytes} bytes took {time.perf_counter() - start:.2f} s"
+        )
+        assert echoed.shape == tensor.shape and torch.equal(echoed, tensor)
+    finally:
+        await close_all()
 
 
 if __name__ == "__main__":
