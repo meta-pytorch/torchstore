@@ -12,8 +12,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from torchstore.controller import ObjectType, StorageInfo
-from torchstore.directory import VolumeDirectory
+from torchstore.directory import ObjectType, StorageInfo, VolumeDirectory
 from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import same_slice_geometry
 from ._model import LocalRouteTable, RankRole

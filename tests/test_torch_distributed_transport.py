@@ -26,7 +26,7 @@ from torch.distributed._transport import (
     register_transport,
     Transport,
 )
-from torchstore.storage_volume import InMemoryStore
+from torchstore.storage import InMemoryStore
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.torch_distributed import (
     TorchDistributedTransportBuffer,

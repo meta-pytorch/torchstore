@@ -13,15 +13,24 @@ import socket
 import tempfile
 import unittest
 import uuid
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import cloudpickle
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torchstore as ts
 import torchstore.api as _api
+import torchstore.monarch.spmd as monarch_spmd
+from torchstore.monarch.controller import Controller
+from torchstore.monarch.spmd import _SPMDSession
+
+from .backend_stub import install_backend_stub
 
 _WORLD_SIZE = 2
 _MASTER_ADDR = "127.0.0.1"
@@ -262,6 +271,18 @@ def _run_spmd_scenario(
         ]
 
 
+def _two_host_env(*, rank: int) -> ts.spmd.SPMDEnv:
+    """An SPMD environment of two hosts with two ranks each, as seen by ``rank``."""
+    return ts.spmd.SPMDEnv(
+        rank=rank,
+        local_rank=rank % 2,
+        world_size=4,
+        local_world_size=2,
+        master_addr=_MASTER_ADDR,
+        master_port=0,
+    )
+
+
 class SPMDEnvTest(unittest.TestCase):
     def _env_vars(self, **overrides: str | int | None) -> dict[str, str]:
         env_vars: dict[str, str] = {
@@ -340,8 +361,9 @@ class SPMDInitializeTest(unittest.IsolatedAsyncioTestCase):
         job.state.side_effect = RuntimeError("attach failed")
 
         with (
-            patch("torchstore.spmd.TCPStore"),
-            patch("torchstore.spmd.StoreJob.from_store", return_value=job),
+            patch.dict(os.environ),
+            patch("torchstore.monarch.spmd.TCPStore"),
+            patch("torchstore.monarch.spmd.StoreJob.from_store", return_value=job),
         ):
             with self.assertRaisesRegex(RuntimeError, "attach failed"):
                 await ts.initialize_spmd(
@@ -352,6 +374,452 @@ class SPMDInitializeTest(unittest.IsolatedAsyncioTestCase):
 
         job.kill.assert_called_once_with()
         self.assertNotIn(store_name, _api._spmd_state_map)
+
+    async def test_a_failing_cleanup_logs_under_the_spmd_logger(self) -> None:
+        """Log a cleanup that raises after a failed attach, under ``torchstore.spmd`` as before."""
+        job = MagicMock()
+        job.state.side_effect = RuntimeError("attach failed")
+        job.kill.side_effect = RuntimeError("kill failed")
+
+        with (
+            patch.dict(os.environ),
+            patch("torchstore.monarch.spmd.TCPStore"),
+            patch("torchstore.monarch.spmd.StoreJob.from_store", return_value=job),
+            self.assertLogs("torchstore.spmd", level="WARNING") as logs,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "attach failed"):
+                await ts.initialize_spmd(
+                    strategy=ts.HostStrategy(),
+                    store_name=f"cleanup_failure_{uuid.uuid4().hex[:8]}",
+                    env=_two_host_env(rank=0),
+                )
+
+        self.assertEqual(
+            [(record.name, record.getMessage()) for record in logs.records],
+            [
+                (
+                    "torchstore.spmd",
+                    "torchstore.spmd: job cleanup after init failure raised",
+                )
+            ],
+        )
+
+    async def test_initialize_refuses_a_strategy_before_reaching_the_backend(
+        self,
+    ) -> None:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            backend = install_backend_stub(monkeypatch)
+            with self.assertRaisesRegex(RuntimeError, "explicit HostStrategy"):
+                await ts.initialize_spmd(strategy=ts.TorchStoreStrategy())
+        backend.initialize_spmd.assert_not_awaited()
+
+    async def test_initialize_hands_the_backend_the_rest(self) -> None:
+        env = ts.spmd.SPMDEnv(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            local_world_size=1,
+            master_addr=_MASTER_ADDR,
+            master_port=0,
+        )
+        strategy = ts.HostStrategy()
+        with (
+            pytest.MonkeyPatch.context() as monkeypatch,
+            patch.dict(_api._spmd_state_map),
+        ):
+            backend = install_backend_stub(monkeypatch)
+            await ts.initialize_spmd(
+                strategy=strategy,
+                store_name="store",
+                env=env,
+                rendezvous_timeout=timedelta(seconds=7),
+                transport="tcp",
+                monarch_port=7,
+                configure_job=print,
+            )
+            registered = _api._spmd_state_map["store"]
+        backend.initialize_spmd.assert_awaited_once_with(
+            strategy,
+            "store",
+            env=env,
+            rendezvous_timeout=timedelta(seconds=7),
+            transport="tcp",
+            monarch_port=7,
+            configure_job=print,
+        )
+        self.assertIs(registered, backend.initialize_spmd.return_value)
+
+    async def test_initialize_refuses_a_running_monarch_context(self) -> None:
+        running = SimpleNamespace(_context=SimpleNamespace(get=lambda: object()))
+        with (
+            patch.dict(os.environ),
+            patch.object(monarch_spmd, "actor_mesh", running),
+            patch("torchstore.monarch.spmd.TCPStore") as tcp_store,
+            patch("torchstore.monarch.spmd.StoreJob.from_store", return_value=None),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "requires a fresh Monarch context"
+            ):
+                await ts.initialize_spmd(
+                    strategy=ts.HostStrategy(), env=_two_host_env(rank=1)
+                )
+        tcp_store.assert_not_called()
+
+    async def _bootstrap_rank_zero(
+        self, strategy: ts.TorchStoreStrategy
+    ) -> tuple[Any, AsyncMock, str]:
+        """Bootstrap rank 0 of two hosts with stand-ins, returning its host mesh and initialize."""
+        store_name = f"configure_{uuid.uuid4().hex[:8]}"
+        job = MagicMock()
+        host_mesh = getattr(job.state.return_value, f"torchstore_{store_name}")
+        controller = SimpleNamespace(store=store_name)
+        configure_job = MagicMock()
+        initialize = AsyncMock()
+        lookup = AsyncMock(return_value=controller)
+        with (
+            patch.dict(os.environ),
+            patch("torchstore.monarch.spmd.TCPStore") as tcp_store,
+            patch("torchstore.monarch.spmd.StoreJob.from_store", return_value=job),
+            patch("torchstore.monarch.spmd.get_or_spawn_controller", lookup),
+            patch.object(_api, "initialize", initialize),
+            patch.dict(_api._spmd_state_map),
+        ):
+            await ts.initialize_spmd(
+                strategy=strategy,
+                store_name=store_name,
+                env=_two_host_env(rank=0),
+                configure_job=configure_job,
+            )
+            session = _api._spmd_state_map[store_name]
+        tcp_store.assert_called_once_with(
+            _MASTER_ADDR, 0, 4, is_master=True, timeout=timedelta(seconds=120)
+        )
+        configure_job.assert_called_once_with(job)
+        lookup.assert_awaited_once_with(store_name, Controller)
+        self.assertIs(session.controller, controller)
+        # Rank 0 broadcasts the controller handle to the other ranks.
+        tcp_store.return_value.set.assert_called_once()
+        key, value = tcp_store.return_value.set.call_args.args
+        self.assertEqual(key, f"torchstore/spmd/{store_name}/controller")
+        self.assertEqual(cloudpickle.loads(value), controller)
+        return host_mesh, initialize, store_name
+
+    async def test_rank_zero_spawns_a_volume_per_host_for_host_strategy(self) -> None:
+        strategy = ts.HostStrategy()
+        host_mesh, initialize, store_name = await self._bootstrap_rank_zero(strategy)
+        host_mesh.spawn_procs.assert_called_once_with(name=f"{store_name}_spmd")
+        initialize.assert_awaited_once_with(
+            num_storage_volumes=2,
+            strategy=strategy,
+            store_name=store_name,
+            mesh=host_mesh.spawn_procs.return_value,
+        )
+
+    async def test_rank_zero_spawns_a_volume_per_rank_for_local_rank_strategy(
+        self,
+    ) -> None:
+        strategy = ts.LocalRankStrategy()
+        host_mesh, initialize, store_name = await self._bootstrap_rank_zero(strategy)
+        host_mesh.spawn_procs.assert_called_once_with(
+            per_host={"gpus": 2}, name=f"{store_name}_spmd"
+        )
+        initialize.assert_awaited_once_with(
+            num_storage_volumes=4,
+            strategy=strategy,
+            store_name=store_name,
+            mesh=host_mesh.spawn_procs.return_value,
+        )
+
+    async def test_other_ranks_load_the_broadcast_controller_without_a_job(
+        self,
+    ) -> None:
+        store_name = f"peer_{uuid.uuid4().hex[:8]}"
+        controller = SimpleNamespace(store=store_name)
+        configure_job = MagicMock()
+        initialize = AsyncMock()
+        with (
+            patch.dict(os.environ),
+            patch("torchstore.monarch.spmd.TCPStore") as tcp_store,
+            patch("torchstore.monarch.spmd.StoreJob.from_store", return_value=None),
+            patch.object(_api, "initialize", initialize),
+            patch.dict(_api._spmd_state_map),
+        ):
+            tcp_store.return_value.get.return_value = cloudpickle.dumps(controller)
+            await ts.initialize_spmd(
+                strategy=ts.HostStrategy(),
+                store_name=store_name,
+                env=_two_host_env(rank=1),
+                configure_job=configure_job,
+            )
+            session = _api._spmd_state_map[store_name]
+        configure_job.assert_not_called()
+        initialize.assert_not_awaited()
+        tcp_store.return_value.get.assert_called_once_with(
+            f"torchstore/spmd/{store_name}/controller"
+        )
+        self.assertEqual(session.controller, controller)
+        self.assertFalse(session.is_primary)
+
+    async def test_initialize_reads_the_environment_and_forwards_each_setting(
+        self,
+    ) -> None:
+        """Read the topology from the environment, then hand each setting to the rendezvous and job."""
+        store_name = f"env_{uuid.uuid4().hex[:8]}"
+        topology = {
+            "RANK": "1",
+            "LOCAL_RANK": "1",
+            "WORLD_SIZE": "4",
+            "LOCAL_WORLD_SIZE": "2",
+            "MASTER_ADDR": _MASTER_ADDR,
+            "MASTER_PORT": "29512",
+        }
+        timeout = timedelta(seconds=7)
+        with (
+            patch.dict(os.environ, topology),
+            patch("torchstore.monarch.spmd.TCPStore") as tcp_store,
+            patch(
+                "torchstore.monarch.spmd.StoreJob.from_store", return_value=None
+            ) as from_store,
+            patch.dict(_api._spmd_state_map),
+        ):
+            os.environ.pop("TORCHSTORE_HOSTNAME", None)
+            tcp_store.return_value.get.return_value = cloudpickle.dumps(store_name)
+            await ts.initialize_spmd(
+                strategy=ts.HostStrategy(),
+                store_name=store_name,
+                rendezvous_timeout=timeout,
+                transport="tcp",
+                monarch_port=7,
+            )
+            hostname = os.environ.get("TORCHSTORE_HOSTNAME")
+        tcp_store.assert_called_once_with(
+            _MASTER_ADDR, 29512, 4, is_master=False, timeout=timeout
+        )
+        from_store.assert_called_once_with(
+            tcp_store.return_value,
+            monarch_port=7,
+            name=f"torchstore_{store_name}",
+            transport="tcp",
+            rank=1,
+            local_rank=1,
+            world_size=4,
+            local_world_size=2,
+        )
+        self.assertEqual(hostname, socket.gethostname())
+
+    async def test_a_failure_after_the_attach_shuts_the_host_mesh_down(self) -> None:
+        """Kill the job and shut the attached host mesh down when the store fails to start."""
+        store_name = f"start_failure_{uuid.uuid4().hex[:8]}"
+        job = MagicMock()
+        host_mesh = getattr(job.state.return_value, f"torchstore_{store_name}")
+        host_mesh.shutdown = AsyncMock()
+        with (
+            patch.dict(os.environ),
+            patch("torchstore.monarch.spmd.TCPStore"),
+            patch("torchstore.monarch.spmd.StoreJob.from_store", return_value=job),
+            patch.object(
+                _api, "initialize", AsyncMock(side_effect=RuntimeError("start failed"))
+            ),
+            patch.dict(_api._spmd_state_map),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "start failed"):
+                await ts.initialize_spmd(
+                    strategy=ts.HostStrategy(),
+                    store_name=store_name,
+                    env=_two_host_env(rank=0),
+                )
+            self.assertNotIn(store_name, _api._spmd_state_map)
+        job.kill.assert_called_once_with()
+        host_mesh.shutdown.assert_awaited_once_with()
+
+    @unittest.skipUnless(
+        hasattr(monarch_spmd, "_store_job_import_error"),
+        "this Monarch has StoreJob",
+    )
+    def test_the_store_job_stand_in_raises(self) -> None:
+        """Raise where Monarch lacks ``StoreJob``, so no rank mistakes itself for a peer."""
+        with self.assertRaisesRegex(RuntimeError, r"StoreJob\.from_store\(\) is not"):
+            monarch_spmd.StoreJob.from_store()
+
+    async def _shut_down_a_session(self, error: Exception | None) -> None:
+        store_name = f"session_{uuid.uuid4().hex[:8]}"
+        cached_during_teardown = []
+        registered_during_teardown = []
+
+        async def teardown() -> None:
+            cached_during_teardown.append(store_name in _api._local_clent_map)
+            registered_during_teardown.append(store_name in _api._spmd_state_map)
+            if error is not None:
+                raise error
+
+        session = SimpleNamespace(shutdown=AsyncMock(side_effect=teardown))
+        with (
+            pytest.MonkeyPatch.context() as monkeypatch,
+            patch.dict(_api._spmd_state_map, {store_name: session}),
+            patch.dict(_api._local_clent_map, {store_name: MagicMock()}),
+        ):
+            backend = install_backend_stub(monkeypatch)
+            if error is None:
+                await ts.shutdown(store_name)
+            else:
+                with self.assertRaisesRegex(RuntimeError, "teardown failed"):
+                    await ts.shutdown(store_name)
+            self.assertNotIn(store_name, _api._spmd_state_map)
+            self.assertNotIn(store_name, _api._local_clent_map)
+        session.shutdown.assert_awaited_once_with()
+        # Shutdown leaves an SPMD store's teardown to its session and looks up no controller.
+        backend.controller.assert_not_awaited()
+        self.assertEqual(cached_during_teardown, [True])
+        self.assertEqual(registered_during_teardown, [False])
+
+    async def test_shutdown_drops_an_spmd_session_then_its_client(self) -> None:
+        """Drop the session first, then the client once the session's teardown returns."""
+        await self._shut_down_a_session(None)
+
+    async def test_shutdown_drops_the_client_when_the_teardown_fails(self) -> None:
+        await self._shut_down_a_session(RuntimeError("teardown failed"))
+
+    async def test_session_tears_the_store_down_once(self) -> None:
+        """Tear the store, the job and the host mesh down once, and tell the peers it went well."""
+        controller = SimpleNamespace(teardown=SimpleNamespace(call=AsyncMock()))
+        rendezvous = MagicMock()
+        job = MagicMock()
+        host_mesh = SimpleNamespace(shutdown=AsyncMock())
+        session = _SPMDSession(
+            rendezvous=rendezvous,
+            controller=controller,
+            store_name="once",
+            job=job,
+            host_mesh=host_mesh,
+            is_primary=True,
+        )
+        await session.shutdown()
+        await session.shutdown()
+        controller.teardown.call.assert_awaited_once_with()
+        rendezvous.set.assert_called_once_with("torchstore/spmd/once/shutdown", "ok")
+        job.kill.assert_called_once_with()
+        host_mesh.shutdown.assert_awaited_once_with()
+
+    async def test_session_does_not_retry_a_failed_teardown(self) -> None:
+        error = RuntimeError("teardown failed")
+        teardown = AsyncMock(side_effect=error)
+        rendezvous = MagicMock()
+        session = _SPMDSession(
+            rendezvous=rendezvous,
+            controller=SimpleNamespace(teardown=SimpleNamespace(call=teardown)),
+            store_name="retry",
+            job=None,
+            host_mesh=None,
+            is_primary=True,
+        )
+        with self.assertRaisesRegex(RuntimeError, "teardown failed"):
+            await session.shutdown()
+        await session.shutdown()
+        teardown.assert_awaited_once_with()
+        rendezvous.set.assert_called_once_with(
+            "torchstore/spmd/retry/shutdown", repr(error)
+        )
+
+    async def test_session_runs_every_step_and_raises_the_first_failure(self) -> None:
+        """Run each step after an earlier one fails, raise the first failure and run no step twice."""
+        steps = ("teardown", "set", "kill", "mesh")
+        for failing in [(step,) for step in steps] + [("teardown", "mesh")]:
+            with self.subTest(failing=failing):
+                errors = {step: RuntimeError(f"{step} failed") for step in failing}
+                teardown = AsyncMock(side_effect=errors.get("teardown"))
+                rendezvous = MagicMock()
+                rendezvous.set.side_effect = errors.get("set")
+                job = MagicMock()
+                job.kill.side_effect = errors.get("kill")
+                host_mesh = SimpleNamespace(
+                    shutdown=AsyncMock(side_effect=errors.get("mesh"))
+                )
+                session = _SPMDSession(
+                    rendezvous=rendezvous,
+                    controller=SimpleNamespace(teardown=SimpleNamespace(call=teardown)),
+                    store_name="steps",
+                    job=job,
+                    host_mesh=host_mesh,
+                    is_primary=True,
+                )
+                with self.assertRaises(RuntimeError) as raised:
+                    await session.shutdown()
+                await session.shutdown()
+                self.assertIs(raised.exception, errors[failing[0]])
+                teardown.assert_awaited_once_with()
+                rendezvous.set.assert_called_once()
+                job.kill.assert_called_once_with()
+                host_mesh.shutdown.assert_awaited_once_with()
+
+    async def test_a_peer_session_reports_a_rendezvous_that_fails(self) -> None:
+        session, rendezvous, _ = self._peer_session(b"ok")
+        rendezvous.get.side_effect = TimeoutError("no answer")
+        with self.assertRaisesRegex(
+            RuntimeError, "Timed out waiting for TorchStore shutdown"
+        ) as raised:
+            await session.shutdown()
+        self.assertIs(raised.exception.__cause__, rendezvous.get.side_effect)
+
+    async def test_a_failing_host_mesh_cleanup_logs_and_keeps_the_init_failure(
+        self,
+    ) -> None:
+        """Log a host mesh cleanup that raises after a failed start, and raise the start's failure."""
+        store_name = f"mesh_cleanup_{uuid.uuid4().hex[:8]}"
+        job = MagicMock()
+        host_mesh = getattr(job.state.return_value, f"torchstore_{store_name}")
+        host_mesh.shutdown = AsyncMock(side_effect=RuntimeError("mesh failed"))
+        with (
+            patch.dict(os.environ),
+            patch("torchstore.monarch.spmd.TCPStore"),
+            patch("torchstore.monarch.spmd.StoreJob.from_store", return_value=job),
+            patch.object(
+                _api, "initialize", AsyncMock(side_effect=RuntimeError("start failed"))
+            ),
+            patch.dict(_api._spmd_state_map),
+            self.assertLogs("torchstore.spmd", level="WARNING") as logs,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "start failed"):
+                await ts.initialize_spmd(
+                    strategy=ts.HostStrategy(),
+                    store_name=store_name,
+                    env=_two_host_env(rank=0),
+                )
+        job.kill.assert_called_once_with()
+        self.assertEqual(
+            [record.getMessage() for record in logs.records],
+            ["torchstore.spmd: host mesh cleanup after init failure raised"],
+        )
+
+    def _peer_session(self, status: bytes) -> tuple[_SPMDSession, MagicMock, AsyncMock]:
+        """A session on another rank, whose rendezvous answers rank 0's ``status``."""
+        rendezvous = MagicMock()
+        rendezvous.get.return_value = status
+        teardown = AsyncMock()
+        session = _SPMDSession(
+            rendezvous=rendezvous,
+            controller=SimpleNamespace(teardown=SimpleNamespace(call=teardown)),
+            store_name="peer",
+            job=None,
+            host_mesh=None,
+            is_primary=False,
+        )
+        return session, rendezvous, teardown
+
+    async def test_a_peer_session_leaves_the_teardown_to_rank_zero(self) -> None:
+        """Wait for rank 0's outcome and return on ``ok``, tearing nothing down itself."""
+        session, rendezvous, teardown = self._peer_session(b"ok")
+        await session.shutdown()
+        rendezvous.get.assert_called_once_with("torchstore/spmd/peer/shutdown")
+        rendezvous.set.assert_not_called()
+        teardown.assert_not_awaited()
+
+    async def test_a_peer_session_raises_rank_zeros_failure(self) -> None:
+        session, _, teardown = self._peer_session(b"RuntimeError('boom')")
+        with self.assertRaisesRegex(
+            RuntimeError, r"shutdown failure - 'peer': RuntimeError\('boom'\)"
+        ):
+            await session.shutdown()
+        teardown.assert_not_awaited()
 
 
 @unittest.skipUnless(
