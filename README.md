@@ -472,7 +472,10 @@ await ts.client(store_name="weights", role=ts.RankRole.REQUESTER, group=group)
 ```
 
 Initialize each routing store once per job unless you start it over as described below.
-TorchStore does not check this on any plane.
+TorchStore checks this only for some repeats on the coordinator service. While a store's
+service runs, the process that started it refuses any routing `ts.initialize` of the store
+before spawning volumes. Any process refuses a plane dialed from a service's address once
+the volumes spawned. It does so even after that service stopped.
 Every process keeps its cached client for a store, and on a bring-your-own plane its
 record of that plane (passed or dialed), until its own `ts.shutdown` for the store. A
 routing `ts.initialize` of the store also drops the client cached in the process that
