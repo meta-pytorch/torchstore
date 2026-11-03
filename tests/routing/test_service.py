@@ -544,17 +544,15 @@ def _service_child(children: _Children, grace_s: float = 1.0) -> _ChildService:
 
 @pytest.mark.asyncio
 async def test_address_pickles_compares_by_value_and_hides_its_nonce() -> None:
-    """Round-trip the address by value, show it as host:port, and keep the nonce out of logs."""
-    cloudpickle = pytest.importorskip("cloudpickle")
+    """Round-trip the address by value, show it as host:port, and keep the nonce out of logs.
+
+    The driver's handle, a handle dialed from the address and the service refuse to pickle.
+    """
     async with _served(publishers=None) as served:
         address = served.service.address
-        for dumps, loads in (
-            (pickle.dumps, pickle.loads),
-            (cloudpickle.dumps, cloudpickle.loads),
-        ):
-            copy = loads(dumps(address))
-            assert type(copy) is ServiceAddress
-            assert copy == address and hash(copy) == hash(address)
+        copy = pickle.loads(pickle.dumps(address))
+        assert type(copy) is ServiceAddress
+        assert copy == address and hash(copy) == hash(address)
         assert dataclasses.replace(address, nonce=uuid.uuid4().hex) != address
         assert isinstance(address, ts.ControlPlaneAddress)
         assert str(address) == f"{_LOCALHOST}:{address.port}"
@@ -562,9 +560,20 @@ async def test_address_pickles_compares_by_value_and_hides_its_nonce() -> None:
         assert address.nonce not in repr(address)
         with pytest.raises(dataclasses.FrozenInstanceError):
             address.nonce = "stale"  # type: ignore[misc]
-        for live in (served.driver, served.service):
-            with pytest.raises(TypeError, match="pass its address"):
+        for live in (served.driver, await served.connect(), served.service):
+            # Its own class refuses, not a service that a handle holds.
+            refusal = f"^{type(live).__name__} cannot be pickled: pass its address$"
+            with pytest.raises(TypeError, match=refusal):
                 pickle.dumps(live)
+
+
+def test_address_round_trips_through_cloudpickle() -> None:
+    """Round-trip the address by value through cloudpickle, as Monarch's actor calls do."""
+    cloudpickle = pytest.importorskip("cloudpickle")
+    address = ServiceAddress(_store_name(), _LOCALHOST, 1, uuid.uuid4().hex)
+    copy = cloudpickle.loads(cloudpickle.dumps(address))
+    assert type(copy) is ServiceAddress
+    assert copy == address and hash(copy) == hash(address)
 
 
 @pytest.mark.asyncio

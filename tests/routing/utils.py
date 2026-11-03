@@ -41,7 +41,6 @@ from torchstore.routing.layout_registry import LayoutRegistry
 from torchstore.routing.service import ServiceControlPlane
 from torchstore.strategy import _installed_volume_host
 from torchstore.transport import TransportType
-from torchstore.transport.types import TensorSlice
 
 from .tcpstore_fixtures import _initialize_service
 
@@ -106,24 +105,6 @@ class _FaultLog:
 
 
 _fault_log = _FaultLog()
-
-
-def tensor_slice(
-    offsets: tuple[int, ...],
-    local_shape: tuple[int, ...],
-    *,
-    global_shape: tuple[int, ...] = (8, 6),
-    coordinates: tuple[int, ...] = (),
-    mesh_shape: tuple[int, ...] = (),
-) -> TensorSlice:
-    """Build tensor-slice metadata with empty placement by default."""
-    return TensorSlice(
-        offsets=offsets,
-        coordinates=coordinates,
-        global_shape=global_shape,
-        local_shape=local_shape,
-        mesh_shape=mesh_shape,
-    )
 
 
 @pytest_asyncio.fixture(params=["monarch", "service"])

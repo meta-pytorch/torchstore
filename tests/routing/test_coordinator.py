@@ -41,8 +41,9 @@ from torchstore.transport import TransportType
 
 from ..volume_meshes import VolumeMesh
 from .file_store_control_plane import FileStoreControlPlane
+from .slices import tensor_slice
 from .tcpstore_fixtures import service_store
-from .utils import registry_store, tensor_slice
+from .utils import registry_store
 
 pytestmark = pytest.mark.timeout(60)
 

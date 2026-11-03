@@ -15,7 +15,7 @@ from torchstore.routing.directory import RoutingDirectory
 from torchstore.routing.plan import RoutingPlan
 from torchstore.transport.types import Request
 
-from .utils import tensor_slice
+from .slices import tensor_slice
 
 
 def _routing_plan(namespace: str = "model", rank: str = "requester") -> RoutingPlan:
