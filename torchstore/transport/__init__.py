@@ -69,8 +69,8 @@ def register_backend_transport(
 ) -> None:
     """Build ``buffer(ref)`` for ``transport_type``, which selection offers where ``available()``.
 
-    ``torchstore.monarch.rdma`` registers Monarch RDMA when it loads. Raises ``ValueError``
-    for a type that selection has no place for.
+    Internal to TorchStore and subject to change: ``torchstore.monarch.rdma`` registers Monarch
+    RDMA when it loads. Raises ``ValueError`` for a type that selection has no place for.
     """
     if transport_type not in _BACKEND_TRANSPORT_TYPES:
         raise ValueError(
