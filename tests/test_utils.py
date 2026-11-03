@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
 from logging import getLogger
 
 import pytest
@@ -15,7 +16,10 @@ from torchstore.utils import (
     get_slice_numel,
     same_slice_geometry,
     slice_covers,
+    spawn_actors,
 )
+
+from .backend_stub import install_backend_stub
 
 logger = getLogger(__name__)
 
@@ -269,3 +273,11 @@ def test_slice_covers_uses_global_geometry() -> None:
 
     assert slice_covers(outer, inner)
     assert not slice_covers(inner, outer)
+
+
+def test_spawn_actors_spawns_through_the_backend(monkeypatch):
+    """Hand every argument of ``spawn_actors`` to the Monarch backend."""
+    backend = install_backend_stub(monkeypatch)
+    backend.spawn_actors.return_value = "actors"
+    assert asyncio.run(spawn_actors(2, object, "name", "mesh", flag=True)) == "actors"
+    backend.spawn_actors.assert_awaited_once_with(2, object, "name", "mesh", flag=True)

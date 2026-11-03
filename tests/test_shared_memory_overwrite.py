@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from torchstore.storage_volume import InMemoryStore
+from torchstore.storage import InMemoryStore
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.shared_memory import (
     SharedMemoryCache,

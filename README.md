@@ -152,6 +152,138 @@ if __name__ == "__main__":
 
 ```
 
+### Importing TorchStore and Monarch
+
+`import torchstore` loads no Monarch module. TorchStore's Monarch backend loads Monarch
+on the first call that goes through it, such as `ts.initialize`, `ts.initialize_spmd` or
+a process's first `ts.client`, which data calls such as `ts.put` make. Volumes of
+`LocalRankStrategy` and of routing stores load it as they start, to read their rank, and
+so does direct weight sync's RDMA registration. A worker that builds a `LocalClient` from
+a controller it was handed loads Monarch when it unpickles the controller, but not the
+backend.
+
+Monarch reads its `HYPERACTOR_*` settings when it loads, and others such as `MONARCH_*`
+and `OTEL_PYTHON_CONTEXT`. So in a process that has not imported Monarch yet, settings you
+set after importing TorchStore apply too. Monarch also sets `HYPERACTOR_EXECUTION_ID`
+when it loads, so start child processes that must share it after that first call. On
+ROCm, torchmonarch 0.7.0 preloads Triton's library when it loads to keep Triton from
+crashing, which works only before Triton loads, so there import Monarch first.
+
+If `HYPERACTOR_CODEC_MAX_FRAME_LENGTH` is unset, importing TorchStore exports
+`910737418240` for it. A process that loads Monarch afterwards reads that limit. In one
+that imported Monarch first, the first TorchStore call that loads TorchStore's Monarch
+backend, such as `ts.initialize` or `ts.client`, hands Monarch that limit through
+`monarch.config.configure`, unless Monarch holds a limit other than its own, the variable
+no longer holds TorchStore's value, or the value it held when Monarch loaded outranks
+`configure`. Processes that never load the backend keep the limit Monarch started with,
+such as one that only hosts `HostStrategy` volumes, or one that builds a `LocalClient`
+from a controller it was handed and registers no direct RDMA buffer, while
+`LocalRankStrategy` and routing store volumes load it as they start. Where this process's
+own import exported the default and it is in effect, the backend's load, not the import,
+logs TorchStore's warning about it through the `torchstore` logger. A process that
+inherited or preset the value logs nothing. The import no longer creates that logger, so a
+logging configuration run after the import still lets the warning through.
+
+Connections Monarch opened before that call keep the limit they started with, so a process
+that imported Monarch first makes that call before it spawns or calls actors, or sets the
+variable before importing Monarch. A driver that imported Monarch first and passes
+`ts.initialize(mesh=...)` has spawned that mesh by then, so it sets the variable instead.
+
+Set the variable before importing either one, in every process that loads TorchStore,
+those on other hosts included, to choose the limit yourself, Monarch's own (`10737418240`
+in torchmonarch 0.6.0 and 0.7.0) included. Otherwise a process whose own import exported
+the default raises Monarch's own limit to it once it loads the backend, even one its
+parent pushed. The processes a driver starts afterwards get the driver's limit only where
+their environment lacks the variable, since one they inherit outranks what the driver
+pushes. A Monarch `configured()` block in which a process that imported Monarch first
+makes that call restores Monarch's own limit when it exits.
+`monarch.config.configure(codec_max_frame_length=...)` also chooses a limit other than
+Monarch's own, but only in a process that imports Monarch first, since the variable
+outranks it once Monarch reads it. TorchStore reads Monarch's config and then configures
+it, and Monarch offers no way to do both at once, so configure Monarch from no other thread
+while the call that loads the backend runs.
+
+Monarch shuts down at exit through exit hooks, one registered when it loads and one at its
+first use outside an actor, such as `this_host()`, `current_rank()` or TorchStore's first
+call that starts actors, as `ts.initialize` does. Exit hooks run in reverse order of
+registration, so register one that calls TorchStore after `ts.initialize` returns. In a
+process that loads Monarch before exit, a hook registered before Monarch loads (such as
+right after `import torchstore`) runs after Monarch's shutdown. Its TorchStore calls then
+raise pyo3's `PanicException`, which derives from `BaseException` and so escapes
+`except Exception`. A hook that makes the process's first TorchStore call loads Monarch
+during exit instead. Python runs no exit hook registered that late. Monarch then never
+shuts down at exit and the hook's calls work as on main.
+
+Monarch code that core modules held now lives under `torchstore.monarch`, such as the
+controller, storage volume and routing coordinator modules, Monarch RDMA and
+`torchstore.spmd`'s bootstrap. Its log records keep the logger names they had, such as
+`torchstore.routing.coordinator`, and the old module paths, such as
+`torchstore.storage_volume`, still re-export every name the old modules defined except
+the coordinator's `_Layouts` and `_LAYOUT_REGISTRATION_TIMEOUT_S`, which moved to
+`torchstore.routing.layout_registry`. Code that used those modules changes in four ways:
+
+- Import each name from the module that defines it, or a Monarch name from Monarch, but
+  `InMemoryStore` and `StorageImpl` from `torchstore.storage_volume`, which loads Monarch.
+  The module that now defines them is internal. The old paths no longer offer names their
+  modules only imported, such as `spawn_actors` and Monarch's `Actor` and `endpoint` on
+  `torchstore.storage_volume`. `torchstore.api`, `torchstore.spmd`, `torchstore.strategy`,
+  `torchstore.transport` and `torchstore.utils` no longer offer the names that went with
+  their Monarch code, such as `torchstore.api`'s actor classes and `torchstore.spmd`'s
+  bootstrap. A star import of `torchstore.controller`, `torchstore.storage_volume` or
+  `torchstore.transport.monarch_rdma` now gives only the names in its `__all__`
+- Patch a moved name in the module whose code reads it, such as
+  `torchstore.monarch.rdma.monarch_rdma_available` instead of
+  `torchstore.transport.monarch_rdma.monarch_rdma_available`, since a patch through an
+  old path no longer reaches that code. Each volume's store and host name now come from
+  `torchstore.storage`, which is internal and may change, so set `TORCHSTORE_HOSTNAME` to
+  choose the host name, and treat a patch of `torchstore.storage.InMemoryStore` or
+  `torchstore.storage.get_local_hostname` as a patch of internals. Patching an attribute
+  of a moved class, such as a method of `InMemoryStore`, still works through any path
+  that offers the class
+- `import torchstore` no longer loads the old paths or `torchstore.storage_utils`.
+  TorchStore's Monarch backend loads them when it loads, so before that, or in a process
+  that never loads it, import a module, as in `import torchstore.transport.monarch_rdma`,
+  before reading it as an attribute
+- `StorageVolume` now subclasses `StorageVolumeCore`, which is internal, and shadows the
+  core's methods with its endpoints. `InMemoryStore` and `StorageImpl` now name
+  `torchstore.storage` as their `__module__` and in their repr and pickles. Older
+  TorchStore versions cannot load those pickles. Importing the volume module or its old
+  path also loads `torchstore.storage`
+
+`typing.get_type_hints` on `ts.initialize` and `ts.initialize_spmd` needs `ProcMesh` from
+`monarch.actor` and `StoreJob` from `torchstore.monarch.spmd` in `localns`, since their
+annotations name these only for type checkers.
+
+Monarch RDMA joins transport selection once `torchstore.monarch.rdma` has loaded, which
+happens wherever a storage volume handle loads, such as when the Monarch backend loads or
+a worker unpickles a controller. Selection then looks up `monarch_rdma_transport_available`
+and `MonarchRDMATransportBuffer` in that module each time it runs, so patch them there.
+
+Because Monarch and TorchStore's Monarch modules now load later, these things that happened
+at `import torchstore` happen then instead:
+
+- A `logging.config.dictConfig` or `fileConfig` run in between no longer disables the
+  loggers of TorchStore's Monarch modules, so their records reach your handlers. Monarch's
+  job loggers, such as `monarch._src.job.job`, get Monarch's own level, stderr handler and
+  `propagate=False` when the backend loads them, which replaces a level or `propagate` you
+  set on them before that, so configure them after it
+- TorchStore's Monarch backend binds `monarch.actor.get_or_spawn_controller` and
+  `current_rank` when it loads. It takes `monarch.rdma.RDMABuffer` from
+  `torchstore.monarch.rdma`, which binds it as that module loads. That happens with the
+  backend or earlier through an old path, the storage volume module or an unpickled
+  handle. A patch of one of these names that is active at its binding stays bound after
+  the patch ends. A patch made afterwards does not reach the backend
+- Monarch's import-time warning filters, such as showing its RDMA fallback warning once,
+  now take precedence over filters you set for those warnings after `import torchstore`,
+  and a `warnings.catch_warnings` block around the call that loads Monarch drops them when
+  it exits. Set such filters after that call
+- The RDMA fallback warning that direct weight sync's registration raises now names
+  `torchstore.monarch.backend` as its module, so a filter on module
+  `torchstore.direct_weight_sync` must name `torchstore.monarch.backend` instead
+- Monarch's import runs on the first call's thread, so that call blocks its event loop
+  while Monarch imports, where `import torchstore` took that time on main. To keep that
+  pause out of a running loop, `import torchstore.monarch.backend` before starting it
+
 ### SPMD Usage (torchrun / torchx)
 
 If your job is launched with `torchrun` or `torchx` rather than from inside a
@@ -316,6 +448,345 @@ await ts.get_state_dict("policy", user_state_dict=model.state_dict(), direct_rdm
 `transfer_dtype` can cast weights for transfer (e.g. float32 master weights
 transferred as bfloat16).
 
+## Routing Control Planes
+
+Routing stores (`client_type=ts.ClientType.ROUTING`) sync state dicts from a publisher
+mesh, such as RL trainers, to requester meshes, such as generators: publishers register
+their layouts and requesters plan their reads from them. Ranks share the publisher set,
+the strategy and these layouts through a control plane, by default `"monarch"`, which
+spawns TorchStore's routing coordinator as a Monarch actor:
+
+```python
+# Driver: spawns a storage volume on each trainer rank, then sets up the control plane
+await ts.initialize(
+    mesh=trainer_mesh,
+    strategy=ts.TorchStoreStrategy(),
+    client_type=ts.ClientType.ROUTING,
+    store_name="weights",
+    control_plane="monarch",  # the default
+)
+# Each trainer rank, before its state-dict calls
+await ts.client(store_name="weights", role=ts.RankRole.PUBLISHER)
+# Each generator rank, before its state-dict calls (group is its mesh's index)
+await ts.client(store_name="weights", role=ts.RankRole.REQUESTER, group=group)
+```
+
+Initialize each routing store once per job unless you start it over as described below.
+TorchStore checks this only for some repeats on the `"service"` plane (below).
+Every process keeps its cached client for a store, and on a bring-your-own plane its
+record of that plane (passed or dialed), until its own `ts.shutdown` for the store. A
+routing `ts.initialize` of the store also drops the client cached in the process that
+calls it, and replaces that process's record with the plane it initializes, or drops the
+record on `"monarch"`. A forked child drops each record of a plane dialed through an
+address, with that plane's client, so the child passes the address again.
+`ts.reset_client` drops only the client, so the next `ts.client`, which passes the rank's
+role (and group) again, reuses the recorded plane. To start a store over:
+
+- On the `"monarch"` plane, call `ts.initialize` again, which makes the coordinator drop
+  the publishers, strategy and layouts it held and drops a client cached in the calling
+  process. Then call `ts.reset_client` in every rank, and `ts.client` with its role (and
+  group) before its next state-dict call, which otherwise looks the store up as a
+  standard store and raises `AttributeError`
+- On `"service"`, call `ts.shutdown` in the driver and in every rank that made a client of
+  the store, then `ts.initialize` again, and pass the address it returns to each rank's
+  next `ts.client`
+- On a bring-your-own plane, call `ts.shutdown` in the driver and in every rank that made a
+  client of the store, then `ts.initialize` with a plane holding fresh state, and pass that
+  plane or its address to each rank's next `ts.client`
+
+A `ts.shutdown` of a service or bring-your-own store in a process that never made a client
+or record of it, never shut it down before and did not inherit its record across fork
+looks the name up as a standard store. Unless a Monarch actor already holds the name, that
+spawns a standard controller under it, which a later `"monarch"` routing `ts.initialize` of
+the name finds in place of its coordinator and then fails with a `TypeError`.
+
+Give standard and routing stores different names on every plane, since a process keeps
+one client per store name. In one process, whether from one event loop or from several
+threads, never overlap a `ts.initialize` or `ts.shutdown` with another call for its store,
+nor a first `ts.client` given `address` or `control_plane` with another `ts.client` for
+the store. The exception is concurrent first `ts.client` calls through one address on one
+event loop, which share its first connection and that connection's client, or a new client
+on it when a `ts.reset_client` drops that client in between. Concurrent data calls still
+work as before, and concurrent role-less first clients for one store share one client.
+
+Make no routing `ts.client` or state-dict call in the driver on either plane. Outside an
+actor every routing client gets rank 0 of its mesh, so a driver would publish as
+`publisher/0` and write into that rank's volume.
+
+`ts.initialize` and each new routing client log one INFO selection line naming the
+control plane, its address, store, rank and pid, such as
+`routing control_plane=monarch address=- store=weights rank=publisher/0 pid=1234`.
+The `"monarch"` plane also logs one INFO line per call with its duration, such as
+`routing control_plane=monarch init took 0.0042s`. A process gets a logging handler from
+`import torchstore` only when that import exported `HYPERACTOR_CODEC_MAX_FRAME_LENGTH`.
+Ranks in Monarch actors that inherit the variable, as local ones spawned after the
+driver's import do, start with none, so call `ts.init_logging()` in each rank before its first
+`ts.client` to see these lines, and in the driver too when a launcher sets that variable.
+
+On the `"monarch"` plane, `ts.shutdown` cannot shut down a routing store: it looks the
+name up as a standard store's controller and raises `AttributeError`. The store's
+routing coordinator runs in the driver's process and keeps the strategy and every layout
+it collected until that process exits or the next `ts.initialize` starts it over. This
+is a known limitation, so skip `ts.shutdown` for a routing store on that plane and stop
+its meshes when the job is done.
+
+A routing store's volumes outlive `ts.shutdown` on every control plane and, unlike a
+standard store's, keep every tensor published to them until `mesh` stops. Each
+`ts.initialize` spawns a new volume on every rank of `mesh` beside the old ones, so stop
+`mesh`, or use a new one, before you initialize a routing store on it again. Publish
+each state dict under one key on every push: routing clients cannot delete, so each new
+key adds tensors to the volumes, layouts to the plane and routes to every rank for good.
+A key's layout is fixed at its first push, so keep its names, shapes, sharding and dtypes
+on every push. Routed reads neither wait for a push nor detect one, so start each pull
+after every publisher's `put_state_dict` for that push has returned, and the next push
+after every pull of the key has returned.
+
+A requester's routed `get_state_dict` that passes entries a publisher has and no earlier
+call through its client planned turns off automatic garbage collection for the whole
+process while it plans their routes, a few seconds for a whole state dict at 512
+publishers, and then turns it back on if it was on. A strict call that passes only
+entries no publisher has also turns it off and back on before it raises `KeyError`. In a
+call with `strict=False`, entries no publisher has stay unplanned without turning it off.
+A client built after `ts.reset_client` plans its entries again.
+When such calls overlap in two threads, the one that turned collection off turns it back
+on as it finishes, even while the other still plans. Other threads see collection off in
+that window, and a `gc.disable()` they call meanwhile is undone when the window closes.
+So a guard that restores the collection state it found, such as vLLM's CUDA-graph
+capture, can see collection resume, run automatic collections inside it, and then leave
+it off for the rest of the process. Keep such syncs out of that work, since turning
+collection back on afterwards cannot undo collections that ran inside it. A process that
+exits while another thread plans skips Python's collection before teardown, so let
+planning finish first.
+Importing TorchStore also registers an at-fork hook that turns collection on in a child
+forked while a plan that found collection on runs in any thread, after freezing
+everything the child inherited. That holds even where other code turned collection back
+on before the fork. Until the child calls `gc.unfreeze()`, its collections skip what it
+inherited, even through `gc.collect()`, and `gc.get_objects()` and `gc.get_referrers()`
+leave those objects out. So a `subprocess` `preexec_fn` that runs in it finds collection
+on but finalizes none of the garbage cycles the parent left, and a leak hunt or reference
+walk in such a child calls `gc.unfreeze()` first.
+The coordinator service pauses collection the same way while it decodes layouts: in the
+driver's process for each layout a publisher registers, at times the publishers choose,
+and in a requester's process for each reply. Keep code that turns collection off and later
+restores what it found, as vLLM does around CUDA graph capture, from overlapping these
+windows. Begun inside one that closes before it ends, it finds collection off and leaves
+it off for good, and a window begun before it that closes inside it turns collection back
+on early.
+
+### Coordinator Service
+
+With `control_plane="service"`, the driver's process serves the routing coordinator over
+TorchStore's own request/reply layer, beside a TCPStore through which ranks find it. No
+Monarch coordinator actor is spawned or looked up, and only routing stores take this
+value. `ts.initialize` then returns a `ts.ControlPlaneAddress`, and each rank below passes
+it to `ts.client`:
+
+```python
+# Driver: the call above with control_plane="service"
+address = await ts.initialize(
+    mesh=trainer_mesh,
+    strategy=ts.TorchStoreStrategy(),
+    client_type=ts.ClientType.ROUTING,
+    store_name="weights",
+    control_plane="service",
+)
+# Each trainer rank, given the address as an argument of its actor endpoint
+await ts.client(store_name="weights", role=ts.RankRole.PUBLISHER, address=address)
+# Each generator rank, given it the same way
+await ts.client(
+    store_name="weights", role=ts.RankRole.REQUESTER, group=group, address=address
+)
+```
+
+`"monarch"` returns None, which `ts.client` takes as no address. So code that forwards
+what `ts.initialize` returned, and calls `ts.shutdown` only for a result that is not None,
+switches between `"monarch"` and `"service"` with the `control_plane` argument alone when
+every rank reaches the driver's host and the strategy reaches every rank through Python's
+`pickle` (both below). To start the store over it then
+follows the list above for each plane: for a result that is not None it calls
+`ts.shutdown` on the driver and on every rank with a client, and for None it calls
+`ts.reset_client` in every rank before each rank's next `ts.client`. Actor calls can carry
+the address since it is a frozen dataclass that pickles. It names the store and prints as
+the `host:port` of the driver's selection line
+`routing control_plane=service address=trainer-0:43521 store=weights rank=- pid=1234`.
+A rank's first `ts.client` connects to it and logs the same address, and later clients
+in its process reuse that connection. The snippet's ranks run in actors outside the
+driver's process, and one whose first `ts.client` omits `address=` gets Monarch's
+coordinator for that name instead. That fails with `init has not run`, serves the layouts
+that an earlier `"monarch"` store of that name left in that coordinator (above), or reaches
+the standard controller that a client-less process's `ts.shutdown` spawned (above). The
+`"service"` plane also logs one INFO timing line per call in the process that makes it
+(such as the driver's `routing control_plane=service init took 0.0042s`) through the root
+logger rather than the `torchstore` loggers of the lines above.
+
+Ranks dial the host that `TORCHSTORE_TCPSTORE_HOST` names in the driver's environment
+when `ts.initialize` runs, else the driver's hostname, so set it to a name or address at
+which every rank reaches the driver. They dial two ports there, both picked by the
+operating system: the TCPStore's, which the address holds, and the coordinator's, which
+they read from the TCPStore. Like TCPStore, the service has no authentication. Both
+servers listen on every interface. The coordinator unpickles every request on a
+connection whose JSON hello it accepted, and that hello checks only values that any
+TCPStore client can read. Each rank also unpickles the strategy it reads from the
+TCPStore and every reply of the coordinator whose address it reads there, and any
+TCPStore client can overwrite both. So choose `"service"` only on a trusted network.
+The TCPStore keys a store's name goes into stay under its 8KiB key limit only for a name
+of up to about 8,100 UTF-8 bytes. `ts.initialize` refuses a longer one with `ValueError`
+only after it spawns volumes on `mesh` and starts the TCPStore and the coordinator. It
+closes both servers before it raises but leaves the volumes running on `mesh`.
+
+Volumes stay Monarch actors on `mesh`, each rank's id still comes from Monarch's
+`current_rank()`, and the strategy, which holds the volumes' Monarch handles, reaches
+ranks through the TCPStore pickled with Python's `pickle`. So this plane still needs
+`torchmonarch`, and each rank's first `ts.client` must run in an actor's context, as the
+next section explains. Each publisher compresses its layout with zlib before it sends
+it, and a requester gets every publisher's layout for a key in one reply. The
+`"monarch"` plane sends layouts uncompressed.
+
+In the driver's process, a store whose service runs refuses another routing
+`ts.initialize` (on any plane and before spawning anything) until that process's
+`ts.shutdown` for the store. Elsewhere (and in the driver once that service stopped) a
+routing `ts.initialize` given a plane dialed from a service's address raises because only the
+driver's own handle initializes it. It raises only after spawning volumes on `mesh`, which
+keeps them until it stops. Another process can still start a second service under the same
+name, and a standard `ts.initialize` of that name runs as well. Start such a store over as
+the list above says.
+
+On the driver, `ts.shutdown` stops the coordinator, giving calls already running 5 s, and
+then the TCPStore. Ranks' calls to the service then fail naming its `host:port`, though
+keys whose layouts a rank already registered or fetched keep syncing from the volumes. On
+a rank, `ts.shutdown` closes the connection the rank made and drops its client.
+
+This plane's TCPStore client and request/reply layer register exit hooks of their own when
+they load, at the driver's `ts.initialize` and when a rank unpickles the address. Exit hooks
+run in reverse order so register one that calls TorchStore on this plane after that: in
+the driver after `ts.initialize` returns (as for Monarch's hooks above) and in a rank
+after it unpickles the address. Importing `monarch.actor` first covers neither.
+
+### Bring Your Own Control Plane
+
+To run this coordination on your own service, subclass `ts.ControlPlane`:
+
+```python
+from collections.abc import Collection, Mapping
+
+import torchstore as ts
+
+
+class MyControlPlane(ts.ControlPlane):
+    kind = "mine"  # its name in log lines (the class name if unset)
+
+    async def init(
+        self, publishers: Collection[str], strategy: ts.TorchStoreStrategy
+    ) -> None:
+        """Fix the publisher set and the volume-resolution strategy."""
+        ...
+
+    async def register_layout(
+        self, rank: str, key: str, registrations: Mapping[str, ts.KeyRegistration]
+    ) -> None:
+        """Record one publisher's layout. Idempotent per rank, never blocks."""
+        ...
+
+    async def get_layouts(self, key: str) -> ts.Registrations:
+        """Every publisher layout for ``key``. Blocks until the set is complete."""
+        ...
+
+    async def strategy(self) -> ts.TorchStoreStrategy:
+        """Return a strategy that resolves the registered publishers' volumes."""
+        ...
+
+    async def close(self) -> None:
+        """Optional: release the connection of a plane an address's connect() returned."""
+        ...
+```
+
+Your plane must keep these rules:
+
+- `ts.initialize` calls `init` once, on the driver's instance. Until then, make
+  `register_layout`, `get_layouts` and `strategy` raise on every instance, but let `close`
+  release what the plane holds, since TorchStore closes planes dialed before `init`
+- Give each `ts.initialize` plane state that no earlier run wrote, such as a new
+  directory or key prefix: TorchStore never clears a plane, so leftover state would hand
+  ranks an earlier run's layouts or volumes
+- A rank's first layout per key wins. Registering a rank outside the publisher set raises
+- `get_layouts` keys each publisher's layout by its rank exactly as `register_layout`
+  received it
+- Put `init has not run`, `not a publisher rank` or `missing publishers: [...]` in the
+  matching error's message, since callers match errors by these texts
+- TorchStore calls the skeleton's methods, and an address's `connect()`, with no timeout,
+  so give each call a deadline of your own past which it raises. `get_layouts`, which
+  waits for every publisher (Monarch's coordinator waits 300 s), raises naming the
+  missing ones
+- `strategy()` returns, on every rank, the strategy `init` received or a copy of it. It
+  holds the store's Monarch volume handles, which can be pickled
+- Unpickling can run arbitrary code, so keep anything you pickle where only the job's
+  ranks can write
+- TorchStore may call your plane from any thread or event loop, and a child forked after
+  you passed the plane in keeps using it, so hold no loop-bound state and keep the plane
+  working after fork. Each store needs its own instance
+- Keep the skeleton's parameter names: TorchStore passes `init` and `register_layout`
+  their arguments by keyword
+- TorchStore may close a plane that `connect()` returned while calls on any thread or
+  event loop, the caller's own included, are still in flight, so make those calls fail
+  rather than hang
+- Return a `ts.TorchStoreStrategy` or a subclass of it from `strategy()`: a requester's first
+  routed get calls a private method that a stand-in strategy lacks
+
+The driver passes an instance to
+`ts.initialize(..., client_type=ts.ClientType.ROUTING, control_plane=plane)`. Each rank
+passes `ts.client(role=..., control_plane=...)` its own instance on the same service, or
+passes `address=` a `ts.ControlPlaneAddress` from the driver: a frozen dataclass subclass
+whose `store_name` names the store, whose async `connect()` returns a connected plane and
+whose `__str__` names the address in log lines without whitespace, such as `host:port`.
+Equal addresses count as one, as the dataclass compares them, so an actor call's copy
+reuses the connection. `ts.client` raises `TypeError` for an address class that the
+dataclass decorator skipped, or processed with `eq=False` without an `__eq__` of its own,
+since a class that inherits its base's `__eq__` compares only the base's fields. Pass a
+rank's instance once: later `ts.client` calls in the process return the cached client,
+which refuses any other instance, even a copy an actor call delivers. That cache holds
+one client per store and process whatever its role, so give each process at most one
+routing rank per store.
+
+TorchStore closes each plane `connect()` returned, through its async `close()`, when
+`ts.shutdown` releases this process's record of the store (its volumes stay, as above),
+when a later selection replaces that record, or when the `ts.client` call that dialed it
+fails before recording it or finds that another call recorded the same address first. If
+that call is cancelled, or fails with an error that is no `Exception`, TorchStore starts
+the close without waiting for it. A call cancelled after it recorded the plane, while the
+connection it replaced closes, keeps the plane recorded until a shutdown or selection
+closes it, and a call whose coroutine is closed while the dialed plane's `strategy()`
+runs closes nothing, which leaves that plane open. Return a new plane from each
+`connect()`, one whose `close()` leaves the others working. A `connect()` that returns
+something other than a `ts.ControlPlane` makes that `ts.client` raise `TypeError`.
+TorchStore closes a plane `connect()` returned even when you pass it back in as
+`control_plane=`, and never closes another plane you passed in. Close that one yourself
+only after this process's `ts.shutdown` for the store, since `ts.reset_client` keeps it
+recorded for the next `ts.client`.
+
+`ts.shutdown` raises any error from the `close()` it runs, `RuntimeError` if that close
+ends cancelled or in `GeneratorExit`, or `TimeoutError` after 5s, leaving the close running
+on the event loop. A failed close whose caller is cancelled, even in the loop step the
+close fails in, is logged, as is every failed close that other calls start, unless it ends
+cancelled with no call left waiting for it. Give each blocking call inside `close()` a
+timeout of its own.
+
+Only the coordination is yours: `ts.initialize` still spawns the store's volumes as
+Monarch actors on `mesh` and installs them in the strategy, and `ts.client` takes each
+rank's id from Monarch's `current_rank()`, which follows the actor's context, not the
+process. So make each rank's first `ts.client` call in an endpoint called on all of `mesh`
+or of a requester mesh, since a call through a slice gets the rank's position in that
+slice, or in an `asyncio.to_thread` call that endpoint makes, which copies the context.
+A bring-your-own control plane therefore needs `torchmonarch`.
+
+The contract tests' own bring-your-own plane, a worked example over a local directory
+rather than a plane to deploy, is
+[`tests/routing/file_store_control_plane.py`](tests/routing/file_store_control_plane.py).
+It passes the same contract tests as Monarch's coordinator
+([`tests/routing/test_coordinator.py`](tests/routing/test_coordinator.py)), which also
+call `get_layouts` with a keyword-only `timeout_s` to bound each wait, and
+[`tests/routing/test_routed_sync.py`](tests/routing/test_routed_sync.py) syncs weights
+through it.
+
 ## Transport Backends
 
 TorchStore automatically selects the best available transport for each transfer. No
@@ -324,8 +795,8 @@ configuration is needed — the selection happens at runtime:
 | Priority | Transport | When used |
 |----------|-----------|-----------|
 | 1 | **POSIX Shared Memory** | Client and storage volume are on the same host |
-| 2 | **Monarch RDMA** | Cross-host, `monarch.rdma` available |
-| 3 | **TorchComms RDMA** | Cross-host, `torchcomms` installed |
+| 2 | **TorchComms RDMA** | Cross-host, RDMA supported by Uniflow or `torchcomms`, `USE_TORCHCOMMS` and `USE_TORCHCOMMS_RDMA` unset or `1` |
+| 3 | **Monarch RDMA** | Cross-host, ibverbs available to `monarch.rdma`, `TORCHSTORE_RDMA_ENABLED` unset or `1`, `torchstore.monarch.rdma` loaded |
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
 
@@ -346,18 +817,69 @@ strategy = ts.LocalRankStrategy(default_transport_type=TransportType.Gloo)
 await ts.initialize(num_storage_volumes=N, strategy=strategy)
 ```
 
-A custom transport subclasses `torchstore.transport.buffers.TransportBuffer`. Clients
-pickle each buffer to its storage volume, and the base class's `__getstate__` sets
-`storage_volume_ref` to None in that copy, in the reply and in copies made with the
-`copy` module, so volume-side code reads its `ctx` argument and the fields the client set.
-A subclass hook extends `super().__getstate__()`, a copy of the instance dict. Where a
-class after `TransportBuffer` in the subclass's method resolution order defines its own
-hook, such as a mixin listed after the transport class, the base hook starts from that
-hook's state instead, copying a dict and passing anything else through unchanged, handle
-included. A subclass that keeps fields in `__slots__` adds them there and restores them in
-its own `__setstate__`. Otherwise slot fields that no hook of the subclass returns are
-lost in copies, and a `__setstate__` that unpacks the base hook's state as Python's
-(dict, slots) pair fails.
+Each transfer logs its transport at INFO on the `torchstore.transport` logger as
+`[ts-transport] resolved=<transport> (<probe>=<result>, ...)`. Its probes reach the record
+as one argument: read the line with `record.getMessage()` rather than `record.args`.
+Selection probes every transport where a volume reference's `transports` attribute is None
+and otherwise only the ones it names. A stand-in reference therefore needs `transports=None`.
+
+Because TorchStore selects only its built-in transports, the rules below are for a transport
+added to TorchStore and for buffer subclasses that code builds itself, all of which
+subclass `torchstore.transport.buffers.TransportBuffer`. Clients pickle each buffer to its
+storage volume, and the base class's `__getstate__` sets `storage_volume_ref` to None in
+that copy, in the reply and in copies that pickle or the `copy` module makes through that
+hook. So volume-side code reads its `ctx` argument and the fields the client set, and a
+buffer forwarded to another process can no longer put or get: build each buffer in the
+process that uses it. A class in the method resolution order with its own `__reduce__`,
+`__reduce_ex__`, `__copy__` or `__deepcopy__` can bypass that hook and keep the handle in
+its copies. A subclass hook extends `super().__getstate__()`, a copy of the instance dict.
+Where a class between `TransportBuffer` and `object` in the subclass's method resolution
+order defines its own hook, such as a mixin listed after the transport class, the base hook
+starts from that hook's state instead. Either way it copies a dict state as an `OrderedDict`
+or `defaultdict` when it is one and as a plain dict otherwise, and it passes anything else
+through unchanged with the handle. A copied `defaultdict` keeps its default factory and
+pickles only if pickle can carry that factory. Give such a state a module-level factory in
+place of a lambda or have the hook return a plain dict. A subclass that keeps fields in
+`__slots__` adds them there and restores them in its own `__setstate__`. Otherwise slot
+fields that no hook of the subclass returns are lost in copies, and a `__setstate__` that
+unpacks the base hook's state as Python's (dict, slots) pair fails.
+
+A put or get that fails raises its own error even when its transport's cleanup
+fails afterward, and logs that cleanup failure at WARNING. On Monarch's backend
+an error a storage volume raises reaches the caller as an `ActorError`, which is
+neither a `RuntimeError` nor a `KeyError`. For example, once a Gloo timeout has
+closed a connection to a volume, a later Gloo put over it raises the volume's
+`ActorError` where earlier versions raised the client's `RuntimeError`, so code
+that catches `RuntimeError` around such puts should catch `ActorError` too.
+
+A process keeps one Gloo connection per volume ID, for the live client that opened
+it. Tensor puts and gets through another client of that volume ID in the process
+raise `GlooPairInUseError`, a `RuntimeError` from `torchstore.transport.gloo`, while
+object puts and gets still work. On Monarch's backend such a client is one made after
+`ts.reset_client()` while the first is still referenced, or a second store's client
+where both stores use one volume ID as every store on `ControllerStorageVolumes` does.
+Earlier versions failed such tensor transfers with `KeyError` or a Gloo timeout. Once
+nothing refers to the first client, errors kept from its calls included, the next
+tensor transfer connects anew. On Monarch's backend a client also counts as live while
+one of its Gloo transfers still waits, as a get's receive that a failed call left behind
+does until the Gloo timeout (`TORCHSTORE_GLOO_INIT_TIMEOUT`, 120s by default). A tensor
+transfer to a volume served over the carrier whose handshake, put or get call fails
+drops its connection instead and another client may then connect anew. A get that fails
+at its metadata lookup keeps its connection. On Monarch's backend the volume keeps its
+end of the connection that a new one replaced until it resets, as at `ts.shutdown()`.
+
+A storage volume gives up connecting to a client whose TCPStore stops answering
+after 4 Gloo timeouts and 10s more and raises `TimeoutError`, where earlier versions
+waited with no bound. Importing TorchStore registers an exit hook that then refuses
+new connections in that process's volumes and waits up to 5s for those still being
+made, and a fork hook. A connection still being made after that wait can abort the
+process if it returns while the interpreter finalizes, where earlier versions waited
+for it at exit with no bound.
+
+Every process must list the same number of interfaces in `GLOO_SOCKET_IFNAME`,
+as torch requires. Gloo transfers spread over those interfaces, so with
+`TORCH_GLOO_LAZY_INIT=1` a mismatch that earlier versions tolerated now times out
+transfers and can make Gloo abort a process.
 
 ## Testing
 
