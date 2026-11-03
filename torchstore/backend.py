@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The runtime that hosts a store's actors, and how core modules reach it.
+"""The runtimes that host a store's actors and services, and how core modules reach them.
 
 Internal to TorchStore and subject to change.
 """
@@ -15,17 +15,24 @@ import importlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from datetime import timedelta
-from typing import Any, TYPE_CHECKING
+from typing import Any, Literal, overload, TYPE_CHECKING
 
 if TYPE_CHECKING:
     import torch
 
     from torchstore.directory import VolumeDirectory
-    from torchstore.routing.control_plane import ControlPlane
+    from torchstore.routing.control_plane import ControlPlane, ControlPlaneAddress
+    from torchstore.routing.service import CoordinatorService
     from torchstore.spmd import SPMDEnv
     from torchstore.strategy import TorchStoreStrategy
 
-__all__ = ["Backend", "get_backend"]
+__all__ = [
+    "Backend",
+    "ServiceBackend",
+    "get_backend",
+    "loaded_backend",
+    "register_backend",
+]
 
 
 class Backend(ABC):
@@ -121,28 +128,96 @@ class Backend(ABC):
         """
 
 
-# The module and class of each backend, loaded on first use. No other core code names them.
-_BACKENDS = {"monarch": ("torchstore.monarch.backend", "MonarchBackend")}
+class ServiceBackend(ABC):
+    """Serves routing stores' coordinators over the carrier, beside a TCPStore rendezvous.
 
-# Each backend loaded so far, by name. Tests install stand-ins here.
-_backends: dict[str, Backend] = {}
+    Its modules register exit and fork hooks when they load, so it loads with the first call
+    that needs it, or when unpickling one of its addresses imports it.
+    """
+
+    @abstractmethod
+    async def start_coordinator(self, store_name: str) -> CoordinatorService:
+        """Start a coordinator service for routing store ``store_name`` in this process."""
+
+    @abstractmethod
+    def service_address(self, control_plane: object) -> ControlPlaneAddress | None:
+        """Return the address of the service ``control_plane`` is a handle to, else None."""
 
 
-def get_backend(name: str, /) -> Backend:
+# The module of each backend, which registers it as it loads. No other core code names them.
+_BACKENDS = {
+    "monarch": "torchstore.monarch.backend",
+    "service": "torchstore.routing.service",
+}
+
+# By name, what each module registered as it loaded or a stand-in a test installed. A name whose stand-in
+# came before its module loaded drops out once that stand-in goes.
+_backends: dict[str, Backend | ServiceBackend] = {}
+# What each module registered, which stands again once a stand-in installed before it goes.
+_registered: dict[str, Backend | ServiceBackend] = {}
+
+
+@overload
+def get_backend(name: Literal["monarch"], /) -> Backend:
+    ...
+
+
+@overload
+def get_backend(name: Literal["service"], /) -> ServiceBackend:
+    ...
+
+
+@overload
+def get_backend(name: str, /) -> Backend | ServiceBackend:
+    ...
+
+
+def get_backend(name: str, /) -> Backend | ServiceBackend:
     """Return backend ``name``, importing its module on the first call.
 
-    Concurrent first calls may each build one and the last stays cached. Raises ``ValueError``
+    Concurrent first calls return the one backend its module registers. Raises ``ValueError``
     for an unknown name, and ``ModuleNotFoundError`` naming the missing module, such as
     ``monarch`` from the torchmonarch package, if its runtime is not installed.
     """
-    backend = _backends.get(name)
+    backend = loaded_backend(name)
     if backend is not None:
         return backend
     if name not in _BACKENDS:
         raise ValueError(
             f"unknown backend {name!r}, expected one of {sorted(_BACKENDS)}"
         )
-    module_name, class_name = _BACKENDS[name]
-    backend = getattr(importlib.import_module(module_name), class_name)()
-    _backends[name] = backend
-    return backend
+    importlib.import_module(_BACKENDS[name])
+    return _backends[name]
+
+
+@overload
+def loaded_backend(name: Literal["monarch"]) -> Backend | None:
+    ...
+
+
+@overload
+def loaded_backend(name: Literal["service"]) -> ServiceBackend | None:
+    ...
+
+
+@overload
+def loaded_backend(name: str) -> Backend | ServiceBackend | None:
+    ...
+
+
+def loaded_backend(name: str) -> Backend | ServiceBackend | None:
+    """Return a test's stand-in for ``name``, else what its module registered, else None, importing nothing.
+
+    A module still loading, even in another thread, has not registered yet.
+    """
+    backend = _backends.get(name)
+    return _registered.get(name) if backend is None else backend
+
+
+def register_backend(name: str, backend: Backend | ServiceBackend) -> None:
+    """Record ``backend`` as ``name`` unless an earlier call did. Its module calls this as it loads, however that happens.
+
+    A stand-in installed first stays, and the first registration stands again once the stand-in goes, also after a reload.
+    """
+    first = _registered.setdefault(name, backend)
+    _backends.setdefault(name, first)
