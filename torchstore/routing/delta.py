@@ -409,7 +409,7 @@ async def get_state_dict_delta(
 
     Args:
         strict: Raise on keys that no publisher has, instead of leaving them
-            unchanged.
+            unchanged. Tensors without local elements are skipped.
     """
     if not isinstance(store, RoutingClient):
         raise TypeError("state dict deltas require a routing client")

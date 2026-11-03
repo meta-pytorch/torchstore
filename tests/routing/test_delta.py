@@ -253,6 +253,36 @@ async def test_delta_sync_middle_dim_shards_of_a_nested_state_dict(
             )
 
 
+@pytest.mark.parametrize("keys", [("w", "b"), ("w",)])
+@pytest.mark.asyncio
+async def test_delta_sync_skips_empty_local_shards(keys: tuple[str, ...]) -> None:
+    """Requester 1's shard of ``w`` is empty; strict must not reject it."""
+    values = {"w": torch.randn(1, 6), "b": torch.randn(4, 6)}
+    values = {key: values[key] for key in keys}
+    destinations = {
+        rank: {
+            key: _distribute(torch.zeros(value.shape), (2,), [Shard(0)], rank)
+            for key, value in values.items()
+        }
+        for rank in range(2)
+    }
+    clients = await routing_clients(
+        publishers={"publisher/0": {}},
+        requesters={f"requester/{rank}": {} for rank in range(2)},
+    )
+    delta = StateDictDelta(values, max_fraction=0.5)
+    for version in range(2):
+        state_dict = {key: value + version for key, value in values.items()}
+        await put_state_dict_delta(clients["publisher/0"], delta, state_dict, "model")
+        for rank, destination in destinations.items():
+            await get_state_dict_delta(
+                clients[f"requester/{rank}"], "model", destination
+            )
+            for key, value in state_dict.items():
+                expected = _distribute(value, (2,), [Shard(0)], rank)
+                assert torch.equal(destination[key].to_local(), expected.to_local())
+
+
 @pytest.mark.parametrize(
     "device",
     [
