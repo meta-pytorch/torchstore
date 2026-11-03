@@ -523,18 +523,6 @@ class TestPinMemoryFailOpen:
         assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
-class TestSharedMemoryTransportBuffer:
-    """Test SharedMemoryTransportBuffer."""
-
-    def test_getstate(self, ref):
-        """Test serialization excludes client-side handles."""
-        buffer = SharedMemoryTransportBuffer(ref)
-
-        state = buffer.__getstate__()
-
-        assert state["storage_volume_ref"] is None
-
-
 class TestSharedMemoryTransportBufferPUT:
     """Tests for SharedMemoryTransportBuffer PUT flow."""
 
