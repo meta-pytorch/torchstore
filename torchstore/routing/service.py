@@ -599,7 +599,7 @@ class CoordinatorService:
     async def _init(
         self, publishers: Collection[str], strategy: TorchStoreStrategy
     ) -> None:
-        """Set up the registry, then write publishers, strategy, coordinator and ``ready``."""
+        """Set up the registry, then write publishers, strategy, coordinator, a key per publisher and ``ready``."""
         if os.getpid() != self._pid:
             raise self._error(
                 "this coordinator service was inherited across fork: only the process"
@@ -610,14 +610,21 @@ class CoordinatorService:
         # Close clears both, and no handle exists until start has served the coordinator.
         if rendezvous is None:
             raise self._error("this coordinator service is closed")
+        # Before the registry: a publish the TCPStore would refuse then leaves init to a later call.
+        try:
+            prepared = rendezvous.prepare_publish(
+                publishers,
+                strategy,
+                coordinator=cast(CarrierServer, server).address.to_json(),
+            )
+        except ValueError as error:
+            raise ValueError(
+                _named(self.address, f"cannot publish: {error}")
+            ) from error
         # The one registry call off the dispatcher loop: init only sets attributes,
         # and no client reaches the registry before ``ready``.
         await self._adapter.init(publishers, strategy)
-        await rendezvous.publish(
-            publishers,
-            strategy,
-            coordinator=cast(CarrierServer, server).address.to_json(),
-        )
+        await rendezvous.publish_prepared(prepared)
 
 
 def _start_thread(target: Callable[[], object]) -> None:

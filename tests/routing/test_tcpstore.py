@@ -605,9 +605,10 @@ async def test_publish_writes_ready_last_and_read_reads_it_first(monkeypatch) ->
 
             return call
 
-        # No set or multi_set: they return before the server applies them.
+        # No set: publish writes values by compare_set and only the publisher keys by multi_set.
+        names = ("compare_set", "check", "multi_get", "multi_set")
         rendezvous._prefixed = types.SimpleNamespace(  # type: ignore[assignment]
-            **{name: recorded(name) for name in ("compare_set", "check", "multi_get")}
+            **{name: recorded(name) for name in names}
         )
         monkeypatch.setattr(tcpstore, "_run_with_deadline", record)
         monkeypatch.setattr(tcpstore, "_decode_strategy", record_decode)
@@ -618,14 +619,19 @@ async def test_publish_writes_ready_last_and_read_reads_it_first(monkeypatch) ->
         assert await other._check([tcpstore._READY], _deadline())
 
     ready, rest = [tcpstore._READY], [tcpstore._PUBLISHERS, tcpstore._STRATEGY]
+    members = [tcpstore._member_key(rank) for rank in sorted(_PUBLISHER_RANKS)]
     assert calls == [
-        *[("compare_set", key) for key in (*rest, tcpstore._READY)],
+        *[("compare_set", key) for key in rest],
+        ("multi_set", members),
+        ("compare_set", tcpstore._READY),
         ("check", ready),
         ("multi_get", ready),
         ("check", rest),
         ("multi_get", rest),
     ]
-    assert deadlines == [deadlines[0]] * 3 + [deadlines[3]] * 4, deadlines
+    # One native call per value, one for this test's few publisher keys, and one for ready.
+    writes = len(rest) + 1 + 1
+    assert deadlines == [deadlines[0]] * writes + [deadlines[writes]] * 4, deadlines
     assert decoded_on == [threading.get_ident()]
 
 
@@ -676,7 +682,10 @@ class _ModuleStrategy(ts.TorchStoreStrategy):
 
 @pytest.mark.asyncio
 async def test_keys_sit_under_the_store_name_and_nonce() -> None:
-    """Pin the wire keys and values under torchstore/routing/{store_name}/{nonce}."""
+    """Pin the publishers, strategy and ready keys and values under torchstore/routing/{store_name}/{nonce}.
+
+    The publishers' own keys have a case of their own.
+    """
     published = _ModuleStrategy(TransportType.MonarchRPC)
     store_name = _store_name()
     async with _served(store_name=store_name) as rendezvous:
@@ -694,7 +703,7 @@ async def test_keys_sit_under_the_store_name_and_nonce() -> None:
     assert encoded == json.dumps(sorted(ranks)).encode()
     assert strategy == tcpstore._encode_strategy(published)
     assert type(decoded) is _ModuleStrategy
-    assert ready == b"1"
+    assert ready == b"2"
 
 
 @pytest.mark.asyncio
@@ -744,7 +753,7 @@ async def test_reads_fail_fast_before_publish_and_under_a_stale_nonce() -> None:
 @pytest.mark.parametrize(
     ("ready", "error", "strategy_error"),
     [
-        (b"2", "schema version b'2'", "schema version b'2'"),
+        (b"1", "schema version b'1'", "schema version b'1'"),
         (
             tcpstore._SCHEMA_VERSION + b"0",
             f"schema version {tcpstore._SCHEMA_VERSION + b'0'!r}",

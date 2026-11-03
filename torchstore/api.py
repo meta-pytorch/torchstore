@@ -371,7 +371,9 @@ async def initialize(
         TypeError: If control_plane is neither a string nor a ``ControlPlane``.
         ValueError: If control_plane is a string other than ``"monarch"`` or
             ``"service"``, anything but ``"monarch"`` for a standard store, or an
-            instance that serves another store.
+            instance that serves another store. On ``"service"`` also for a
+            ``store_name`` too long for the TCPStore keys it publishes (over about
+            8,100 UTF-8 bytes).
 
     Example:
         >>> import torchstore as ts
