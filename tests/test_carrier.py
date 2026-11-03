@@ -1086,18 +1086,18 @@ async def test_a_request_left_unread_past_its_deadline_never_runs(
     Timed from its header's read, it got its whole deadline again once the reader went on.
     """
     server = await _serve(target)
-    # Accepted sockets take this receive buffer, which holds both frames while the reader is stopped. A default one
-    # holds no 4 MiB plug.
-    server._listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 << 20)
-    plug, _ = codec.dumps(("echo", (b"plug" * (1 << 20),), {}))
+    plug, _ = codec.dumps(("echo", (b"plug" * 1024,), {}))
     stale, _ = codec.dumps(("echo", ("stale",), {}))
     with _raw_connection(server.address) as sock:
         _send_frame(sock, Kind.HELLO, body=_hello(server.address))
         assert _handshake_reply(sock)[0] == Kind.WELCOME
+        [conn] = server._connections
+        received = conn.reader.received
         await server._set_reading(False)
-        # Its reader takes one receive of the plug, then stops at the gate partway through it.
+        # Its reader, parked past the gate, takes one receive of the plug, so its next receive waits at the gate and
+        # the stale request stays unread in the kernel.
         _send_frame(sock, Kind.REQUEST, 1, deadline_us=60_000_000, body=plug)
-        await _until(lambda: _unsent_bytes(sock) == 0)
+        await _until(lambda: conn.reader.received > received)
         sent = time.monotonic()
         _send_frame(sock, Kind.REQUEST, 2, deadline_us=500_000, body=stale)
         await _until(lambda: time.monotonic() > sent + 0.6 and _unsent_bytes(sock) == 0)
@@ -1111,7 +1111,7 @@ async def test_a_request_left_unread_past_its_deadline_never_runs(
     assert answers[1][0] == Kind.REPLY
     kind, body = answers[2]
     assert kind == Kind.ERROR and type(codec.decode_error(body)) is CallTimeoutError
-    assert target.calls == [b"plug" * (1 << 20)] and server.stats()["expired"] == 1
+    assert target.calls == [b"plug" * 1024] and server.stats()["expired"] == 1
 
 
 @pytest.mark.asyncio
@@ -1275,6 +1275,9 @@ async def test_a_held_call_is_released_at_a_turn_once_what_came_with_it_is_read(
     monkeypatch.setattr(runtime.CarrierServer, "_enqueue", recorded_enqueue)
     monkeypatch.setattr(runtime.CarrierServer, "_unhold", recorded_unhold)
     server = await _serve(target)
+    # Accepted sockets take this receive buffer, which holds the long frame while the I/O thread waits. Some kernels,
+    # such as those of CI's runners, give a default buffer too small a window for it.
+    server._listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 << 20)
     call, _ = codec.dumps(("echo", ("first",), {}))
     middle = [torch.ones(1) for _ in range(4 * runtime._BUFFER_TURN)]
     body, buffers = codec.dumps(("echo", (middle,), {}))
@@ -5115,10 +5118,18 @@ async def test_a_coroutine_run_on_a_stopping_loop_is_waited_for_only_while_it_ca
     loop_thread = runtime._LoopThread("torchstore-carrier test-run-on")
     # Its task is destroyed pending with the loop, which this handler takes instead of asyncio's logger.
     loop_thread.loop.set_exception_handler(lambda loop, context: None)
-    stuck = threading.Event()
-    loop_thread.loop.call_soon_threadsafe(stuck.wait, 30)
+    entered, stuck = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        entered.set()
+        stuck.wait(30)
+
+    loop_thread.loop.call_soon_threadsafe(hold)
     before, after = asyncio.sleep(0), asyncio.sleep(0)
     try:
+        # A coroutine posted before the loop thread is inside hold can join hold's turn. Its first step then shares
+        # the stop's turn and runs.
+        await _until(entered.is_set)
         waiting = asyncio.ensure_future(runtime._run_on(loop_thread.loop, before, 3600))
         # One turn of this loop lets that run post its coroutine ahead of the stop.
         await asyncio.sleep(0)
