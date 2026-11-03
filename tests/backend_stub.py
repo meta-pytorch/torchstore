@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import create_autospec, MagicMock
 
 import pytest
 import torchstore.backend as backend_module
@@ -16,8 +16,11 @@ from torchstore.backend import Backend
 
 
 def install_backend_stub(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
-    """Make ``get_backend("monarch")`` return a mock ``Backend`` at rank 0 for one test."""
-    stub = MagicMock(spec=Backend)
+    """Make ``get_backend("monarch")`` return a mock ``Backend`` at rank 0 for one test.
+
+    Each call is checked against the signature ``Backend`` declares.
+    """
+    stub = create_autospec(Backend, instance=True)
     stub.rank.return_value = 0
     monkeypatch.setitem(backend_module._backends, "monarch", stub)
     return stub

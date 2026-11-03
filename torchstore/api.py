@@ -44,14 +44,14 @@ _spmd_state_map: dict[str, "_SPMDSession"] = {}
 
 
 class _SelectedControlPlane(NamedTuple):
-    """A routing control plane other than Monarch's, and the address it came from."""
+    """A routing control plane passed in or dialed, and the address it came from."""
 
     control_plane: ControlPlane
     address: ControlPlaneAddress | None
 
 
 # Control planes this process initialized, was given or connected to. It survives
-# reset_client, and stores on Monarch's coordinator never enter it.
+# reset_client, and stores selected with control_plane="monarch" never enter it.
 _control_plane_map: dict[str, _SelectedControlPlane] = {}
 
 # Held while initialize, client and shutdown update the record together with the client
@@ -318,9 +318,10 @@ async def initialize(
         client_type: Client implementation to initialize. Routing clients lazily
             exchange state-dict layouts and construct routes.
         control_plane: Where a routing store's ranks share publishers and layouts.
-            ``"monarch"`` spawns the routing coordinator actor. A ``ControlPlane``
-            instance, which serves only this store, is initialized here instead for
-            later clients in this process. Log lines name it by ``kind`` or class name.
+            ``"monarch"`` spawns the routing coordinator actor, which ``client`` then
+            finds with no ``control_plane``. A ``ControlPlane`` instance, which serves
+            only this store, is initialized here instead for later clients in this
+            process. Log lines name it by ``kind`` or class name.
 
     Raises:
         RuntimeError: If num_storage_volumes > 1 but no strategy is provided.
@@ -507,8 +508,9 @@ def _after_fork_in_child(lock: threading.Lock) -> None:
             _forked_stores[store_name] = selected.address
 
 
-# Hold the lock across fork, so a child never copies a half-made update. Each hook takes or
-# frees the lock it was registered with, so a reload that registers them again uses two.
+# Hold the lock across fork so a child copies no half-made update unless a signal handler raises
+# while the before hook waits. Each hook takes or frees the lock it was registered with so a
+# reload that registers them again uses two.
 os.register_at_fork(
     before=_selection_lock.acquire,
     after_in_parent=_selection_lock.release,
@@ -537,8 +539,8 @@ async def client(
     Returns a cached LocalClient instance that provides the interface for put/get operations.
     Never overlap it with an ``initialize`` or ``shutdown`` call for the same store in this
     process, nor a first call with ``address`` or ``control_plane`` with another ``client``
-    call for the store, unless both pass one address: those share one connection, and its
-    client unless ``reset_client`` drops it in between.
+    call for the store unless both pass one address and neither passes ``control_plane``:
+    those share one connection, and its client unless ``reset_client`` drops it in between.
 
     Args:
         store_name (str): Name of the store to get a client for. Defaults to DEFAULT_TORCHSTORE_NAME.
@@ -553,9 +555,10 @@ async def client(
             clients in this process reuse its connection, through this address or an
             equal one, until ``shutdown`` or another selection replaces and closes it.
             A forked child dials its own.
-        control_plane: A routing store's own control plane, which serves only that
-            store and needs ``role``. It wins over ``address``, then this process's record
-            (kept across ``reset_client``), then the Monarch lookup. A cached client
+        control_plane: A routing store's own control plane instance, which serves only
+            that store and needs ``role``. It wins over ``address``, then this process's
+            record (kept across ``reset_client``), then the Monarch lookup, which needs no
+            argument: unlike ``initialize`` this takes no ``"monarch"``. A cached client
             refuses other instances, even a copy that an actor call delivers.
 
     Returns:
@@ -568,7 +571,8 @@ async def client(
         ValueError: If address or control_plane comes without role, the address
             names another store, control_plane (else address) differs from the cached
             client's, control_plane serves another store, or the first client of a
-            store with a recorded or shut down control plane has no role.
+            store with a recorded control plane, or one shut down here with no SPMD
+            session of its name, has no role.
         RuntimeError: In a forked child, if a call without address or control_plane
             needs a store whose connection the fork dropped.
 
@@ -740,7 +744,7 @@ def _record_client(
     closing = None
     cached = _local_clent_map.get(store_name)
     if selected is recorded:
-        # A racing call that also reused the record built its client first.
+        # A racing call built its client first, on the record or on a plane it was given.
         if cached is not None:
             return cached, selected, None, False
     else:
