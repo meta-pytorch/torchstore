@@ -6,12 +6,16 @@
 
 """The Monarch backend, which ``torchstore.backend.get_backend("monarch")`` returns."""
 
+import os
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
 import torch
 from monarch.actor import current_rank, get_or_spawn_controller
+from monarch.config import configure, get_global_config
+
+import torchstore
 
 # The old module paths, so code that reads one as an attribute once this backend loads, such
 # as ``ts.transport.monarch_rdma``, finds it.
@@ -32,6 +36,37 @@ from torchstore.spmd import SPMDEnv
 from torchstore.strategy import TorchStoreStrategy
 
 __all__ = ["MonarchBackend"]
+
+# Monarch's own frame limit, in torchmonarch 0.6.0 and 0.7.0.
+_MONARCH_FRAME_LENGTH = 10737418240
+
+
+def _apply_frame_length_default() -> None:
+    """Give Monarch the default this process's import exported, and log it once in effect.
+
+    Acts only while the variable still holds the export. A Monarch that loaded first gets it
+    only over its own limit, which its config cannot tell from a limit configured to that
+    value, so other limits stay. The log follows Monarch's config read after ``configure``.
+    """
+    exported = str(torchstore._FRAME_LENGTH)
+    if not torchstore._exported_frame_length:
+        return
+    if os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH") != exported:
+        return
+    if get_global_config()["codec_max_frame_length"] == _MONARCH_FRAME_LENGTH:
+        configure(codec_max_frame_length=torchstore._FRAME_LENGTH)
+    if get_global_config()["codec_max_frame_length"] == torchstore._FRAME_LENGTH:
+        torchstore.logger.warning(
+            "Warning: setting HYPERACTOR_CODEC_MAX_FRAME_LENGTH since this needs to be set"
+            " to enable large RPC calls via Monarch"
+        )
+
+
+# A reload of this module keeps the flag and so skips the step. An import after the module
+# left sys.modules starts without the flag and runs it again.
+if not globals().get("_frame_length_default_applied", False):
+    _frame_length_default_applied = True
+    _apply_frame_length_default()
 
 
 class MonarchBackend(Backend):

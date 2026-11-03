@@ -8,12 +8,14 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +28,16 @@ _ROOT = str(Path(importlib.util.find_spec("torchstore").origin).parents[1])
 _FRAME_LENGTH_DEFAULT = 910737418240
 # A launcher's own frame length, which importing TorchStore keeps.
 _PRESET_FRAME_LENGTH = "1234567890"
+# Level, logger and message of the warning the Monarch backend logs when it loads.
+_FRAME_WARNING = [
+    "WARNING",
+    "torchstore",
+    "Warning: setting HYPERACTOR_CODEC_MAX_FRAME_LENGTH since this needs to be set"
+    " to enable large RPC calls via Monarch",
+]
 # Children import like a fresh process, without the frame length that this process's own
-# TorchStore import exported.
-_UNSET_IN_CHILDREN = ("HYPERACTOR_CODEC_MAX_FRAME_LENGTH",)
+# TorchStore import exported, and log warnings whatever level this process runs at.
+_UNSET_IN_CHILDREN = ("HYPERACTOR_CODEC_MAX_FRAME_LENGTH", "TORCHSTORE_LOG_LEVEL")
 # Modules that fail to load without Monarch. Every other module, the Monarch RDMA ones
 # included, must load without it.
 _NEEDS_MONARCH = {
@@ -111,10 +120,9 @@ with open(out, "w") as f:
 _INSTALLED_CHILD = """
 import importlib, json, os, sys
 
-root, out, targets = sys.argv[1:]
+root, out, target = sys.argv[1:]
 sys.path.insert(0, root)
-for target in targets.split(","):
-    importlib.import_module(target)
+importlib.import_module(target)
 report = {
     "modules": sorted(name for name in sys.modules if name.split(".")[0] == "monarch"),
     "env": os.environ.get("HYPERACTOR_CODEC_MAX_FRAME_LENGTH"),
@@ -218,6 +226,128 @@ with open(out, "w") as f:
     json.dump({"rdma": transport.TransportType.MonarchRDMA in transport._backend_transports}, f)
 """
 
+# A handler the children below add to the root logger, recording each frame-length warning.
+_FRAME_WARNINGS = """
+import logging
+
+frame_warnings = []
+
+
+class FrameWarnings(logging.Handler):
+    def emit(self, record):
+        if "HYPERACTOR_CODEC_MAX_FRAME_LENGTH" in record.getMessage():
+            frame_warnings.append([record.levelname, record.name, record.getMessage()])
+"""
+
+_BACKEND_CHILD = (
+    _FRAME_WARNINGS
+    + """
+import json, sys
+
+root, out = sys.argv[1:]
+sys.path.insert(0, root)
+logging.getLogger().addHandler(FrameWarnings())
+import torchstore
+
+report = {"at_import": list(frame_warnings)}
+import torchstore.monarch.backend
+from torchstore.backend import get_backend
+
+report["at_backend_import"] = list(frame_warnings)
+get_backend("monarch")
+report["after_backend"] = list(frame_warnings)
+with open(out, "w") as f:
+    json.dump(report, f)
+"""
+)
+
+_LOGGING_CHILD = """
+import json, logging, sys
+
+root, out = sys.argv[1:]
+sys.path.insert(0, root)
+import torchstore
+
+stdout = [h for h in logging.getLogger().handlers if getattr(h, "stream", None) is sys.stdout]
+report = {
+    "logger": getattr(torchstore, "logger", None) is logging.getLogger("torchstore"),
+    "stdout_handlers": len(stdout),
+}
+try:
+    torchstore.not_a_name
+except AttributeError as error:
+    report["unknown"] = str(error)
+with open(out, "w") as f:
+    json.dump(report, f)
+"""
+
+_MONARCH_FIRST_CHILD = """
+import json, os, sys
+
+root, out, configured, set_after = sys.argv[1:]
+sys.path.insert(0, root)
+from monarch.config import configure, get_global_config
+
+if configured:
+    configure(codec_max_frame_length=int(configured))
+import torchstore
+
+if set_after:
+    os.environ["HYPERACTOR_CODEC_MAX_FRAME_LENGTH"] = set_after
+report = {"before": get_global_config()["codec_max_frame_length"]}
+import torchstore.monarch.backend as monarch_backend
+
+report["after"] = get_global_config()["codec_max_frame_length"]
+report["own"] = monarch_backend._MONARCH_FRAME_LENGTH
+with open(out, "w") as f:
+    json.dump(report, f)
+"""
+
+# The common order: import at the top, configure logging in main(), then the first call.
+_DICTCONFIG_CHILD = (
+    _FRAME_WARNINGS
+    + """
+import json, logging.config, sys
+
+root, out = sys.argv[1:]
+sys.path.insert(0, root)
+import torchstore
+
+logging.config.dictConfig({"version": 1})
+logging.getLogger().addHandler(FrameWarnings())
+import torchstore.monarch.backend
+
+with open(out, "w") as f:
+    json.dump({"logged": frame_warnings}, f)
+"""
+)
+
+_RELOAD_CHILD = (
+    _FRAME_WARNINGS
+    + """
+import importlib, json, sys
+
+root, out, reloaded = sys.argv[1:]
+sys.path.insert(0, root)
+logging.getLogger().addHandler(FrameWarnings())
+from monarch.config import get_global_config
+import torchstore
+
+if reloaded == "package":
+    importlib.reload(torchstore)
+import torchstore.monarch.backend as monarch_backend
+
+if reloaded == "backend":
+    importlib.reload(monarch_backend)
+report = {
+    "warnings": len(frame_warnings),
+    "limit": get_global_config()["codec_max_frame_length"],
+}
+with open(out, "w") as f:
+    json.dump(report, f)
+"""
+)
+
 _monarch_installed = pytest.mark.skipif(
     importlib.util.find_spec("monarch") is None, reason="Monarch is not installed"
 )
@@ -253,11 +383,11 @@ def blocked(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
 
 @pytest.fixture(scope="module")
 def installed(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
-    """One child per import order, keyed by its comma-joined modules, and one preset."""
+    """One child per module it imports, keyed by that module, and one that presets the variable."""
     root = tmp_path_factory.mktemp("installed")
     reports = {
-        targets: _run_child(_INSTALLED_CHILD, root / f"{targets}.json", targets)
-        for targets in ("torchstore", "monarch", "monarch,torchstore")
+        target: _run_child(_INSTALLED_CHILD, root / f"{target}.json", target)
+        for target in ("torchstore", "monarch")
     }
     preset = {"HYPERACTOR_CODEC_MAX_FRAME_LENGTH": _PRESET_FRAME_LENGTH}
     reports["preset"] = _run_child(
@@ -320,11 +450,30 @@ def test_monarch_loaded_after_torchstore_reads_the_exported_frame_length(
 
 
 @_monarch_installed
-def test_monarch_loaded_before_torchstore_keeps_its_own_frame_length(installed) -> None:
-    """Export the default for later processes while a Monarch loaded first keeps its own."""
-    first = installed["monarch,torchstore"]
-    assert first["env"] == str(_FRAME_LENGTH_DEFAULT)
-    assert first["frame_length"] == installed["monarch"]["frame_length"]
+@pytest.mark.parametrize(
+    ("configured", "set_after", "before", "after"),
+    [
+        ("", "", "own", _FRAME_LENGTH_DEFAULT),
+        ("1234567890", "", 1234567890, 1234567890),
+        ("20000000000", "", 20000000000, 20000000000),
+        ("", _PRESET_FRAME_LENGTH, "own", "own"),
+    ],
+    ids=["unset", "configured-below", "configured-above", "set-after-torchstore"],
+)
+def test_monarch_loaded_before_torchstore_gets_the_default_once_the_backend_loads(
+    tmp_path: Path, installed, configured, set_after, before, after
+) -> None:
+    """Give a Monarch loaded first the default when the backend loads, unless a limit was chosen.
+
+    A limit configured to Monarch's own is replaced too, since Monarch's config cannot tell it
+    from Monarch's default, and a variable set after the import leaves Monarch's own limit.
+    """
+    args = (configured, set_after)
+    report = _run_child(_MONARCH_FIRST_CHILD, tmp_path / "report.json", *args)
+    own = installed["monarch"]["frame_length"]
+    assert report["own"] == own
+    assert report["before"] == (own if before == "own" else before)
+    assert report["after"] == (own if after == "own" else after)
 
 
 @_monarch_installed
@@ -363,3 +512,105 @@ def test_a_child_forked_after_the_import_can_use_torchstore(tmp_path: Path) -> N
     Main loaded Monarch at the import, and such a child's first call hung.
     """
     assert _run_child(_FORK_CHILD, tmp_path / "report.json") == {"got": [0, 1, 2, 3]}
+
+
+@pytest.mark.parametrize(
+    ("frame_length", "stdout_handlers"),
+    [(None, 1), (_PRESET_FRAME_LENGTH, 0)],
+    ids=["exported", "preset"],
+)
+def test_import_keeps_the_package_logger_and_sets_up_logging_only_when_it_exports(
+    tmp_path: Path, frame_length: str | None, stdout_handlers: int
+) -> None:
+    """Define ``torchstore.logger`` on every import, refuse other unknown names, and add a stdout handler only on export."""
+    extra_env = None
+    if frame_length is not None:
+        extra_env = {"HYPERACTOR_CODEC_MAX_FRAME_LENGTH": frame_length}
+    report = _run_child(_LOGGING_CHILD, tmp_path / "report.json", extra_env=extra_env)
+    assert report == {
+        "logger": True,
+        "stdout_handlers": stdout_handlers,
+        "unknown": "module 'torchstore' has no attribute 'not_a_name'",
+    }
+
+
+def _read_by_type_checkers(statements: list[ast.stmt]) -> Iterator[ast.stmt]:
+    """Each module-level statement in a block a type checker may read: all but ``TYPE_CHECKING``'s else."""
+    for node in statements:
+        yield node
+        if isinstance(node, ast.If):
+            yield from _read_by_type_checkers(node.body)
+            if ast.unparse(node.test) != "TYPE_CHECKING":
+                yield from _read_by_type_checkers(node.orelse)
+        elif isinstance(node, (ast.Try, ast.With)):
+            for block in (node.body, getattr(node, "orelse", [])):
+                yield from _read_by_type_checkers(block)
+            yield from _read_by_type_checkers(getattr(node, "finalbody", []))
+            for handler in getattr(node, "handlers", []):
+                yield from _read_by_type_checkers(handler.body)
+
+
+def test_type_checkers_see_the_package_logger_but_no_module_getattr() -> None:
+    """Show type checkers ``logger``'s type and hide the module ``__getattr__`` that accepts any name.
+
+    A ``__getattr__`` defined or assigned in any block they may read counts.
+    """
+    tree = ast.parse(Path(_ROOT, "torchstore", "__init__.py").read_text())
+    seen = list(_read_by_type_checkers(tree.body))
+    getattrs = [
+        ast.unparse(n)
+        for n in seen
+        if (isinstance(n, ast.FunctionDef) and n.name == "__getattr__")
+        or (
+            isinstance(n, (ast.Assign, ast.AnnAssign))
+            and "__getattr__"
+            in {
+                t.id
+                for t in (n.targets if isinstance(n, ast.Assign) else [n.target])
+                if isinstance(t, ast.Name)
+            }
+        )
+    ]
+    declared = [ast.unparse(n) for n in seen if isinstance(n, ast.AnnAssign)]
+    assert (getattrs, declared) == ([], ["logger: Logger"])
+
+
+@_monarch_installed
+@pytest.mark.parametrize(
+    "frame_length",
+    [None, str(_FRAME_LENGTH_DEFAULT)],
+    ids=["exported", "inherited"],
+)
+def test_frame_length_warning_logs_once_the_backend_module_loads(
+    tmp_path: Path, frame_length: str | None
+) -> None:
+    """Log the warning once, as the Monarch backend's module loads, if this import exported."""
+    extra_env = None
+    if frame_length is not None:
+        extra_env = {"HYPERACTOR_CODEC_MAX_FRAME_LENGTH": frame_length}
+    report = _run_child(_BACKEND_CHILD, tmp_path / "report.json", extra_env=extra_env)
+    logged = [] if frame_length else [_FRAME_WARNING]
+    assert report == {
+        "at_import": [],
+        "at_backend_import": logged,
+        "after_backend": logged,
+    }
+
+
+@_monarch_installed
+def test_frame_length_warning_survives_a_logging_config_run_after_the_import(
+    tmp_path: Path,
+) -> None:
+    """Log the warning through a logger that a dictConfig run between import and backend keeps."""
+    report = _run_child(_DICTCONFIG_CHILD, tmp_path / "report.json")
+    assert report == {"logged": [_FRAME_WARNING]}
+
+
+@_monarch_installed
+@pytest.mark.parametrize("reloaded", ["package", "backend"])
+def test_frame_length_default_survives_a_reload_with_one_warning(
+    tmp_path: Path, reloaded: str
+) -> None:
+    """Warn once and leave a Monarch loaded first at the default, after a package or backend reload."""
+    report = _run_child(_RELOAD_CHILD, tmp_path / "report.json", reloaded)
+    assert report == {"warnings": 1, "limit": _FRAME_LENGTH_DEFAULT}

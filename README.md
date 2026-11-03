@@ -170,10 +170,38 @@ ROCm, torchmonarch 0.7.0 preloads Triton's library when it loads to keep Triton 
 crashing, which works only before Triton loads, so there import Monarch first.
 
 If `HYPERACTOR_CODEC_MAX_FRAME_LENGTH` is unset, importing TorchStore exports
-`910737418240` for it. A process that loads Monarch afterwards uses that limit, which
-also outranks `monarch.config.configure(codec_max_frame_length=...)`, while one that
-imported Monarch first keeps Monarch's own limit. Set the variable before importing
-either one to choose the limit yourself.
+`910737418240` for it. A process that loads Monarch afterwards reads that limit. In one
+that imported Monarch first, the first TorchStore call that loads TorchStore's Monarch
+backend, such as `ts.initialize` or `ts.client`, hands Monarch that limit through
+`monarch.config.configure`, unless Monarch holds a limit other than its own, the variable
+no longer holds TorchStore's value, or the value it held when Monarch loaded outranks
+`configure`. Processes that never load the backend keep the limit Monarch started with,
+such as one that only hosts `HostStrategy` volumes, or one that builds a `LocalClient`
+from a controller it was handed and registers no direct RDMA buffer, while
+`LocalRankStrategy` and routing store volumes load it as they start. Where this process's
+own import exported the default and it is in effect, the backend's load, not the import,
+logs TorchStore's warning about it through the `torchstore` logger. A process that
+inherited or preset the value logs nothing. The import no longer creates that logger, so a
+logging configuration run after the import still lets the warning through.
+
+Connections Monarch opened before that call keep the limit they started with, so a process
+that imported Monarch first makes that call before it spawns or calls actors, or sets the
+variable before importing Monarch. A driver that imported Monarch first and passes
+`ts.initialize(mesh=...)` has spawned that mesh by then, so it sets the variable instead.
+
+Set the variable before importing either one, in every process that loads TorchStore,
+those on other hosts included, to choose the limit yourself, Monarch's own (`10737418240`
+in torchmonarch 0.6.0 and 0.7.0) included. Otherwise a process whose own import exported
+the default raises Monarch's own limit to it once it loads the backend, even one its
+parent pushed. The processes a driver starts afterwards get the driver's limit only where
+their environment lacks the variable, since one they inherit outranks what the driver
+pushes. A Monarch `configured()` block in which a process that imported Monarch first
+makes that call restores Monarch's own limit when it exits.
+`monarch.config.configure(codec_max_frame_length=...)` also chooses a limit other than
+Monarch's own, but only in a process that imports Monarch first, since the variable
+outranks it once Monarch reads it. TorchStore reads Monarch's config and then configures
+it, and Monarch offers no way to do both at once, so configure Monarch from no other thread
+while the call that loads the backend runs.
 
 Monarch shuts down at exit through exit hooks, one registered when it loads and one at its
 first use outside an actor, such as `this_host()`, `current_rank()` or TorchStore's first
