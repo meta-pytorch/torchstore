@@ -4,7 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""A process-wide pause of automatic cyclic garbage collection around allocation-heavy work."""
+"""A process-wide pause of automatic cyclic garbage collection around allocation-heavy work.
+
+Overlapping calls in other threads can end a pause early.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ _resuming: set[object] = set()
 
 
 def call_gc_paused(fn: Callable[..., _T], /, *args: object) -> _T:
-    """Call ``fn(*args)`` with automatic cyclic collection paused for every thread.
+    """Call ``fn(*args)`` with automatic collection paused for every thread until a call that found it on returns.
 
     A call that found collection enabled enables it as it returns, also on a raise or an interrupt, even
     inside another thread's call or a pause begun meanwhile, which may later restore it to off. No call
@@ -46,7 +49,8 @@ def call_gc_paused(fn: Callable[..., _T], /, *args: object) -> _T:
 
 def _after_fork_in_child() -> None:
     # Calls running in other threads never return in a forked child, so any open one resumes there,
-    # freezing what the parent held first so that no collection in the child finalizes it.
+    # freezing what the parent held first so that no collection in the child finalizes it. That also
+    # hides those objects from gc.get_objects() and gc.get_referrers() until gc.unfreeze().
     if _resuming:
         _resuming.clear()
         gc.freeze()
