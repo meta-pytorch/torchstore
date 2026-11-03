@@ -33,6 +33,8 @@ requesters keep the older data.
 
 from __future__ import annotations
 
+import functools
+import itertools
 import logging
 import math
 import os
@@ -44,8 +46,10 @@ from typing import Any
 import torch
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import _StridedShard
 
+from torchstore.direct_weight_sync import _request_to_slice
 from torchstore.state_dict_utils import (
     _state_dict_storage_key,
     _wire_dtype,
@@ -121,11 +125,24 @@ def _shard_grid(value: torch.Tensor) -> tuple[tuple[int, ...], tuple[int, ...]]:
     coordinate = mesh.get_coordinate()
     assert coordinate is not None, "rank is not part of the DTensor mesh"
     for placement in value.placements:
-        # The row only needs a unique coordinate. Elements are mapped through
-        # the box the full put registers, which is exact for _StridedShard when
-        # each rank holds one contiguous box, as FSDP over TP does.
         if not isinstance(placement, (Replicate, Shard, _StridedShard)):
             raise ValueError(f"unsupported placement {placement} for a delta")
+    # Elements are mapped through the box the full put registers, which is
+    # only exact for _StridedShard if each rank holds one contiguous box, as
+    # with FSDP over TP.
+    for dim in {
+        p.dim % value.ndim for p in value.placements if isinstance(p, _StridedShard)
+    }:
+        chain = tuple(
+            (mesh.size(axis), getattr(p, "split_factor", None))
+            for axis, p in enumerate(value.placements)
+            if isinstance(p, (Shard, _StridedShard)) and p.dim % value.ndim == dim
+        )
+        if not _one_box_per_rank(value.shape[dim], chain):
+            raise ValueError(
+                f"placements {value.placements} do not give each rank one "
+                f"contiguous box of dim {dim}"
+            )
     axes = [
         axis for axis, p in enumerate(value.placements) if not isinstance(p, Replicate)
     ]
@@ -133,6 +150,40 @@ def _shard_grid(value: torch.Tensor) -> tuple[tuple[int, ...], tuple[int, ...]]:
         tuple(coordinate[axis] for axis in axes),
         tuple(mesh.size(axis) for axis in axes),
     )
+
+
+@functools.cache
+def _one_box_per_rank(size: int, chain: tuple[tuple[int, int | None], ...]) -> bool:
+    """Whether sharding a dim of ``size`` gives every rank the box DTensor reports.
+
+    ``chain`` holds (mesh axis size, split factor or None for ``Shard``) of each
+    mesh axis sharding the dim, in mesh order. Splits ``arange(size)`` as
+    ``distribute_tensor`` does, for every coordinate, so all ranks agree.
+    """
+    placements = [
+        Shard(0)
+        if split_factor is None
+        else _StridedShard(0, split_factor=split_factor)
+        for _num_chunks, split_factor in chain
+    ]
+    mesh_shape = tuple(num_chunks for num_chunks, _split_factor in chain)
+    for coordinate in itertools.product(*(range(n) for n in mesh_shape)):
+        local = torch.arange(size)
+        for placement, num_chunks, index in zip(placements, mesh_shape, coordinate):
+            shards, _pad = placement._split_tensor(
+                local, num_chunks, with_padding=False
+            )
+            local = shards[index]
+        shape, offsets = _compute_local_shape_and_global_offset(
+            (size,),
+            mesh_shape=mesh_shape,
+            my_coordinate=list(coordinate),
+            placements=placements,
+        )
+        expected = torch.arange(offsets[0], offsets[0] + shape[0])
+        if not torch.equal(local, expected):
+            return False
+    return True
 
 
 @dataclass
@@ -159,8 +210,9 @@ class StateDictDelta:
     Args:
         state_dict: Template with the same keys, shapes, placements and devices
             as every put version.
-        max_fraction: Fraction of a shard's elements that fit in its row. A
-            version changing more elements sends the full tensor instead.
+        max_fraction: Fraction of a shard's elements that fit in its row,
+            based on the average shard size. A version changing more elements
+            sends the full tensor instead.
             Rows are fixed size, so a get reads about
             ``max_fraction * (itemsize + 4) / itemsize`` of the bytes of the
             publisher shards it overlaps, and at least 8 elements plus a
@@ -358,16 +410,23 @@ _routes: weakref.WeakKeyDictionary[
 
 
 async def get_state_dict_delta(
-    store: RoutingClient, key: str, user_state_dict: dict[str, Any]
+    store: RoutingClient,
+    key: str,
+    user_state_dict: dict[str, Any],
+    *,
+    strict: bool = True,
 ) -> dict[str, Any]:
     """Update ``user_state_dict`` from the previous to the latest version in place.
 
     Tensors are fetched in full unless they hold what the previous call on
     this client wrote to them: pass the same destination tensors every call,
     and write them only through this function. Writes that bypass autograd's
-    version counter (``.data``, numpy, DLPack) are not detected. Keys that no
-    publisher has are left unchanged. Call after the first
-    :func:`put_state_dict_delta` of ``key`` completed.
+    version counter (``.data``, numpy, DLPack) are not detected. Call after
+    the first :func:`put_state_dict_delta` of ``key`` completed.
+
+    Args:
+        strict: Raise on keys that no publisher has, instead of leaving them
+            unchanged.
     """
     if not isinstance(store, RoutingClient):
         raise TypeError("state dict deltas require a routing client")
@@ -378,7 +437,7 @@ async def get_state_dict_delta(
                 f"{flat_key!r} is an inference tensor, whose writes cannot be "
                 "detected; allocate destinations outside inference mode"
             )
-    routes = await _plan(store, key, flattened)
+    routes = await _plan(store, key, flattened, strict)
     if not routes:
         return user_state_dict
 
@@ -424,7 +483,7 @@ def _local(value: torch.Tensor) -> torch.Tensor:
 
 
 async def _plan(
-    store: RoutingClient, key: str, flattened: Mapping[str, Any]
+    store: RoutingClient, key: str, flattened: Mapping[str, Any], strict: bool
 ) -> dict[str, _Route]:
     """Routes for ``flattened``, planning keys seen for the first time."""
     routes = _routes.setdefault(store, {}).setdefault(key, {})
@@ -434,15 +493,39 @@ async def _plan(
         publishers = await store._publisher_registrations(key)
         delta_publishers = await store._publisher_registrations(delta_key)
         new_routes = {}
-        registrations = {}
         for flat_key in new_keys:
             route = _route(
                 key, flat_key, flattened[flat_key], publishers, delta_publishers
             )
-            if route is None:
-                continue
-            new_routes[flat_key] = route
+            if route is not None:
+                new_routes[flat_key] = route
+            elif strict and flattened[flat_key].numel() > 0:
+                raise KeyError(f"no publisher has {flat_key!r} of {key!r}")
+        # Plan the full reads first: each row is read from the replica that
+        # serves its shard's full read, as replicas differ after a failed put.
+        await store.get_layouts(
+            {flat_key: flattened[flat_key] for flat_key in new_routes}, key
+        )
+        planned = store._routing_directory.routes.keys
+        registrations = {}
+        row_publishers: dict[str, dict[str, KeyRegistration]] = {}
+        for flat_key, route in new_routes.items():
             storage_key = _state_dict_storage_key(delta_key, flat_key)
+            full_route = planned[_state_dict_storage_key(key, flat_key)].route
+            assert full_route is not None
+            sources = {
+                _row_coordinate(delta_publishers[transfer.source][storage_key]): (
+                    transfer.source
+                )
+                for transfer in full_route.transfers
+            }
+            for rank, rank_registrations in delta_publishers.items():
+                row = rank_registrations.get(storage_key)
+                if row is None:
+                    continue
+                # Rows outside the own slice are fetched but never applied.
+                if sources.get(_row_coordinate(row), rank) == rank:
+                    row_publishers.setdefault(rank, {})[storage_key] = row
             row_global = _row_global_shape(storage_key, delta_publishers)
             last_row = tuple(
                 max(coordinate[axis] for coordinate in route.shards) + 1
@@ -463,10 +546,16 @@ async def _plan(
                 dtype=torch.uint8,
             )
         if registrations:
-            store._install_requester_plan(delta_key, registrations)
+            store._install_requester_plan(
+                delta_key, registrations, publishers=row_publishers
+            )
         # Only after the plan is installed, so a failed plan is retried.
         routes.update(new_routes)
     return {flat_key: routes[flat_key] for flat_key in flattened if flat_key in routes}
+
+
+def _row_coordinate(row: KeyRegistration) -> tuple[int, ...]:
+    return tuple(row.tensor_slice.offsets[:-1])
 
 
 def _row_global_shape(
@@ -486,8 +575,6 @@ def _route(
     delta_publishers: Mapping[str, Mapping[str, KeyRegistration]],
 ) -> _Route | None:
     """Plan one flat key, or None if no publisher has it or it is empty."""
-    from torchstore.direct_weight_sync import _request_to_slice
-
     storage_key = _state_dict_storage_key(key, flat_key)
     delta_storage_key = _state_dict_storage_key(_delta_key(key), flat_key)
     if not isinstance(value, torch.Tensor):
@@ -505,6 +592,11 @@ def _route(
         full = registrations.get(storage_key)
         if full is None:
             continue
+        if full.tensor_slice.global_shape != destination_slice.global_shape:
+            raise ValueError(
+                f"{flat_key!r} has global shape {destination_slice.global_shape}, "
+                f"but publisher {rank} put {full.tensor_slice.global_shape}"
+            )
         wire_dtype = full.dtype
         if get_slice_intersection(full.tensor_slice, destination_slice) is None:
             continue
@@ -514,7 +606,7 @@ def _route(
                 f"publisher {rank} put {storage_key!r} without a delta row; put "
                 "every version with put_state_dict_delta"
             )
-        shards[tuple(row.tensor_slice.offsets[:-1])] = full.tensor_slice
+        shards[_row_coordinate(row)] = full.tensor_slice
     if wire_dtype is None or not shards:
         return None
     num_axes = len(next(iter(shards)))

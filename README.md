@@ -318,9 +318,10 @@ transferred as bfloat16).
 
 #### Delta State Dict Sync
 
-With a routing client, publishers can also send only the elements that changed
-since the previous version. Requesters apply them in place and read tensors in
-full when their changes do not fit or they missed a version.
+With a routing client, publishers can also put the elements that changed since
+the previous version, next to the full state dict. Requesters read and apply
+only those in place, and read tensors in full when their changes do not fit or
+they missed a version.
 
 ```python
 # Learner: build once, then put every version with put_state_dict_delta.
@@ -332,7 +333,8 @@ await ts.get_state_dict_delta("policy", user_state_dict=buffers)
 ```
 
 Each get reads about `max_fraction * (itemsize + 4) / itemsize` of the bytes of
-the publisher shards overlapping its tensors. The publisher keeps a copy of the
+the publisher shards overlapping its tensors, and at least 8 elements plus a
+24-byte header per shard. The publisher keeps a copy of the
 previous version in the wire dtype in host memory and compares against it on
 every put, on the tensors' device. Puts and gets of one key must not overlap. A
 restarted publisher must use the same template and `max_fraction`.

@@ -143,7 +143,7 @@ async def test_delta_sync_matches_latest_version(
             ),
             "bias": torch.zeros(4, dtype=torch.bfloat16),
             "step": torch.tensor(-1),
-            # No publisher has it, so it is left unchanged.
+            # No publisher has it, so strict=False leaves it unchanged.
             "local_only": torch.full((2,), -1.0),
         }
         for rank in range(num_requesters)
@@ -176,12 +176,14 @@ async def test_delta_sync_matches_latest_version(
             if replica == 1 and version == 2:
                 reads.append(None)
                 continue
-            result = await get_state_dict_delta(client, "model", destination)
+            result = await get_state_dict_delta(
+                client, "model", destination, strict=False
+            )
             reads.append(full_reads.pop(client, set()))
             assert result is destination
             if replica == 1:
                 # Already at the latest version: nothing to read or change.
-                await get_state_dict_delta(client, "model", destination)
+                await get_state_dict_delta(client, "model", destination, strict=False)
                 assert client not in full_reads
             expected = _distribute(
                 versions[version].bfloat16(),
@@ -208,11 +210,28 @@ async def test_delta_sync_matches_latest_version(
             assert reads == [everything, set(), None, everything]
 
 
-def test_stage_encodes_changed_elements_and_overflow() -> None:
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("chunk_numel", [1 << 24, 5])
+def test_stage_encodes_changed_elements_and_overflow(
+    device: str, chunk_numel: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Rows hold the changed values and indices, and -1 once they do not fit."""
-    weight = torch.zeros(16)
+    monkeypatch.setattr(delta_module, "_CHUNK_NUMEL", chunk_numel)
+    weight = torch.zeros(16, device=device)
     delta = StateDictDelta({"w": weight}, max_fraction=0.5)
     [entry] = delta._entries.values()
+    assert entry.packed.is_pinned() == (device != "cpu")
     assert entry.capacity == 8
     count, version, epoch = entry.packed[:24].view(torch.int64)
 
@@ -221,7 +240,7 @@ def test_stage_encodes_changed_elements_and_overflow() -> None:
     assert version.item() == 1
     assert epoch.item() == delta._epoch
 
-    weight[[2, 9]] = torch.tensor([1.0, -2.0])
+    weight[[2, 9]] = torch.tensor([1.0, -2.0], device=device)
     delta._stage({"w": weight})
     assert count.item() == 2
     values = entry.packed[24 : 24 + 8 * 4].view(torch.float32)[:2]
@@ -392,7 +411,7 @@ async def test_delta_sync_retries_failed_plan(
 
     install = requester._install_requester_plan
 
-    def fail_once(key, registrations):
+    def fail_once(key, registrations, **kwargs):
         monkeypatch.setattr(requester, "_install_requester_plan", install)
         raise RuntimeError("injected")
 
@@ -426,3 +445,78 @@ def test_stage_rejects_unsupported_placements() -> None:
     )
     with pytest.raises(ValueError, match="unsupported placement"):
         StateDictDelta({"w": partial}, max_fraction=0.5)
+
+
+@pytest.mark.asyncio
+async def test_delta_sync_reads_rows_from_the_full_read_replica() -> None:
+    """After a failed put to one replica, rows come from the replica read in full.
+
+    Applying the other replica's rows to that base would corrupt the destination.
+    """
+    keys = [f"w{index}" for index in range(8)]
+    clients = await routing_clients(
+        publishers={f"publisher/{rank}": {} for rank in range(2)},
+        requesters={"requester/0": {}},
+    )
+    requester = clients["requester/0"]
+    weights = {flat_key: torch.randn(_SHAPE) for flat_key in keys}
+
+    def state_dict(rank: int) -> dict[str, torch.Tensor]:
+        return {
+            flat_key: _distribute(weight, (2,), [Replicate()], rank)
+            for flat_key, weight in weights.items()
+        }
+
+    async def publish(ranks: Sequence[int]) -> None:
+        for rank in ranks:
+            await put_state_dict_delta(
+                clients[f"publisher/{rank}"], deltas[rank], state_dict(rank), "model"
+            )
+
+    deltas = {
+        rank: StateDictDelta(state_dict(rank), max_fraction=0.5) for rank in range(2)
+    }
+    destination = {flat_key: torch.zeros(_SHAPE) for flat_key in keys}
+    await publish([0, 1])
+    for version in (1, 2):
+        for weight in weights.values():
+            weight[version, version] += 1
+        # The put to replica 1 fails once, so it keeps the previous version.
+        await publish([0] if version == 1 else [0, 1])
+        await get_state_dict_delta(requester, "model", destination)
+    for flat_key in keys:
+        assert torch.equal(destination[flat_key], weights[flat_key]), flat_key
+
+
+@pytest.mark.asyncio
+async def test_delta_sync_rejects_missing_keys_and_shape_mismatches() -> None:
+    clients = await routing_clients(
+        publishers={"publisher/0": {}}, requesters={"requester/0": {}}
+    )
+    requester = clients["requester/0"]
+    weight = torch.randn(_SHAPE)
+    delta = StateDictDelta({"w": weight}, max_fraction=0.5)
+    await put_state_dict_delta(clients["publisher/0"], delta, {"w": weight}, "model")
+    with pytest.raises(KeyError, match="no publisher has 'other'"):
+        await get_state_dict_delta(
+            requester, "model", {"w": torch.zeros(_SHAPE), "other": torch.zeros(2)}
+        )
+    with pytest.raises(ValueError, match="global shape"):
+        await get_state_dict_delta(requester, "model", {"w": torch.zeros(4, 6)})
+
+
+@pytest.mark.parametrize(
+    "rows, mesh_shape, placements",
+    [
+        # Rank 0 holds rows 0-1 and 4-5.
+        (8, (2,), [_StridedShard(0, split_factor=2)]),
+        # FSDP over TP rows with uneven shards.
+        (13, (3, 2), [_StridedShard(0, split_factor=2), Shard(0)]),
+    ],
+)
+def test_stage_rejects_strided_shards_without_one_box_per_rank(
+    rows: int, mesh_shape: tuple[int, ...], placements: list[Placement]
+) -> None:
+    weight = _distribute(torch.zeros(rows, 6), mesh_shape, placements, rank=0)
+    with pytest.raises(ValueError, match="one contiguous box"):
+        StateDictDelta({"w": weight}, max_fraction=0.5)

@@ -163,12 +163,19 @@ class RoutingClient(LocalClient):
         return publishers
 
     def _install_requester_plan(
-        self, key: str, registrations: Mapping[str, KeyRegistration]
+        self,
+        key: str,
+        registrations: Mapping[str, KeyRegistration],
+        *,
+        publishers: Registrations | None = None,
     ) -> None:
         """Plan and install routes for storage keys of ``key`` not yet planned.
 
-        Requires ``_publisher_registrations(key)`` to have run.
+        Plans against ``publishers``, by default the layouts fetched by
+        ``_publisher_registrations(key)``, which must have run.
         """
+        if publishers is None:
+            publishers = self._publisher_layouts[key]
         # Plan against only these keys' publisher entries so each incremental get
         # costs its own subset, not the whole state dict.
         publishers = {
@@ -177,9 +184,7 @@ class RoutingClient(LocalClient):
                 for name in registrations
                 if name in publisher_registrations
             }
-            for publisher, publisher_registrations in self._publisher_layouts[
-                key
-            ].items()
+            for publisher, publisher_registrations in publishers.items()
         }
         rank = self._routing_directory.rank
         self._routing_directory.install(

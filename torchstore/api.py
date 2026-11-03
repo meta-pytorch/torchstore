@@ -558,6 +558,8 @@ async def get_state_dict_delta(
     key: str,
     user_state_dict: dict[str, Any],
     store_name: str = DEFAULT_TORCHSTORE_NAME,
+    *,
+    strict: bool = True,
 ) -> dict[str, Any]:
     """Update ``user_state_dict`` in place to the latest version of ``key``.
 
@@ -570,9 +572,13 @@ async def get_state_dict_delta(
         key (str): Unique identifier of the state_dict.
         user_state_dict (dict): Destination tensors, as written by the previous call.
         store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+        strict (bool): Raise on keys that no publisher has, instead of leaving
+            them unchanged. Defaults to True.
 
     Returns:
         dict: ``user_state_dict``.
     """
     cl = await client(store_name)
-    return await torchstore.routing.delta.get_state_dict_delta(cl, key, user_state_dict)
+    return await torchstore.routing.delta.get_state_dict_delta(
+        cl, key, user_state_dict, strict=strict
+    )
