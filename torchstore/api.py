@@ -1054,6 +1054,11 @@ async def get_state_dict(
 ) -> dict[str, Any]:
     """Retrieve a PyTorch model state_dict from the distributed store.
 
+    A routing requester's call that passes entries no earlier call through its client planned, unless
+    ``strict=False`` and no publisher has them, turns automatic garbage collection off for the whole process
+    while it plans, then back on if it was on, which can undo a change another thread makes meanwhile. A
+    call in another thread that turned it off first turns it back on as it finishes, maybe mid-plan.
+
     Args:
         key (str): Unique identifier of the state_dict to retrieve.
         user_state_dict (dict, optional): Pre-existing state_dict to merge with.
