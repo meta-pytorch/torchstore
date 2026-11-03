@@ -653,15 +653,24 @@ of up to about 8,100 UTF-8 bytes. `ts.initialize` refuses a longer one with `Val
 only after it starts the TCPStore and the coordinator, which it closes before it raises.
 
 Each publisher's first `ts.client` serves its storage volume in its own process and
-registers the volume's record in the TCPStore, where requesters find every volume, so
-`ts.initialize` spawns no volume and reads only the size of `mesh`. The TCPStore holds the
-strategy as versioned JSON naming its transport, so `ts.initialize` first refuses anything
-but a plain `ts.TorchStoreStrategy` over `SharedMemory`, `Gloo`, `MonarchRPC` or none
-chosen. A rank that passes no `rank=` takes its id from Monarch's `current_rank()`, so its
-first `ts.client` must run in an actor's context, as the bring-your-own section explains.
-The next section starts ranks without Monarch. Each publisher compresses its layout with
-zlib before it sends it, and a requester gets every publisher's layout for a key in one
-reply. The `"monarch"` plane sends layouts uncompressed.
+registers the volume's record in the TCPStore, so `ts.initialize` spawns no volume and
+reads only the size of `mesh`. The coordinator reads the records from the TCPStore while
+the publishers register and fetches each at most once. Its layout replies return the
+records it holds, and a requester reads a record from the TCPStore only when a reply lacks
+it. A key's first reply waits for those reads, which end at most 30s after every publisher
+has registered a layout. The driver logs how many records its replies carry in one INFO
+line once the reads are done, or in a WARNING if a read failed or no thread could make
+them. Neither line comes from a close that stops the reads first or from an exit that cuts
+them short. A driver's exit still waits up to 5s for a store call those reads make.
+Run one TorchStore version in the driver and every rank: a rank's first call refuses a
+driver that runs an earlier TorchStore. The TCPStore holds the strategy as versioned JSON
+naming its transport, so `ts.initialize` first refuses anything but a plain
+`ts.TorchStoreStrategy` over `SharedMemory`, `Gloo`, `MonarchRPC` or none chosen. A rank
+that passes no `rank=` takes its id from Monarch's `current_rank()`, so its first
+`ts.client` must run in an actor's context, as the bring-your-own section explains. The
+next section starts ranks without Monarch. Each publisher compresses its layout with zlib
+before it sends it, and a requester gets every publisher's layout for a key in one reply.
+The `"monarch"` plane sends layouts uncompressed.
 
 Requesters reach each volume over `SharedMemory` on its host, else over `Gloo`, else inside
 the call (`MonarchRPC`), and a plain `ts.TorchStoreStrategy()` picks among them in that
@@ -677,7 +686,9 @@ the same name, and a standard `ts.initialize` of that name runs as well. Start s
 over as the list above says.
 
 On the driver, `ts.shutdown` stops the coordinator, giving calls already running 5 s, and
-then the TCPStore. Ranks' calls to the service then fail naming its `host:port`, though
+then the TCPStore. A lookup still waiting for the coordinator's reads of the records fails
+as that grace ends. A store call those reads still make then keeps the TCPStore answering
+until it returns. Ranks' calls to the service then fail naming its `host:port`, though
 keys whose layouts a rank already registered or fetched keep syncing from the volumes
 while their publishers serve them. On a rank, `ts.shutdown` drops its client, closes its
 clients' volume handles and the connection the rank made, and on a publisher first stops

@@ -612,7 +612,7 @@ async def test_keys_sit_under_the_store_name_and_nonce() -> None:
     assert type(decoded) is ts.TorchStoreStrategy
     assert decoded.default_transport_type is TransportType.Unset
     assert _installed_volume_host(decoded) is None
-    assert ready == b"3"
+    assert ready == b"4"
 
 
 @pytest.mark.parametrize("transport_type", list(TransportType), ids=str)
@@ -1441,7 +1441,7 @@ _EXIT_HOOKS = (
         "    try:\n"
         "        print(name, asyncio.run(handle._check(['k'], time.monotonic() + 30)), flush=True)\n"
         "    except RuntimeError as error:\n"
-        "        print(name, error, flush=True)\n"
+        "        print(name, type(error).__name__, error, flush=True)\n"
         "atexit.register(call_at_exit, 'before:')\n"
     )
     + _IMPORT_ALONE
@@ -1469,7 +1469,7 @@ def test_an_exit_hook_registered_after_the_module_loads_can_still_call() -> None
     assert child.returncode == 0, child.stderr[-2000:]
     after, before = child.stdout.splitlines()[-2:]
     assert after == "after: False", child.stdout
-    refused = r"before: check\(\['k'\]\) on TCPStore 127\.0\.0\.1:\d+ was not started: exiting"
+    refused = r"before: ExitingError check\(\['k'\]\) on TCPStore 127\.0\.0\.1:\d+ was not started: exiting"
     assert re.fullmatch(refused, before), child.stdout
 
 
@@ -1515,7 +1515,7 @@ async def test_exit_drain_shares_one_budget_then_refuses_calls(
     assert returned.name not in warnings[0]
     aborts = "a c10d call that returns during finalization aborts the process before Python 3.14"
     assert aborts in warnings[0]
-    with pytest.raises(RuntimeError, match="was not started: exiting"):
+    with pytest.raises(tcpstore.ExitingError, match="was not started: exiting"):
         await tcpstore._Lane().run(
             tcpstore._NativeCall(lambda: None), _deadline(), "call"
         )
@@ -1576,13 +1576,38 @@ async def test_a_call_waiting_for_its_turn_at_exit_never_starts(
             release.set()
         assert await first is False
         with pytest.raises(
-            RuntimeError, match=re.escape(f"{what} was not started: exiting")
+            tcpstore.ExitingError, match=re.escape(f"{what} was not started: exiting")
         ):
             await second
     assert not ran
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1 and "held on TCPStore" in warnings[0], warnings
     assert "queued" not in warnings[0]
+
+
+class _StartsAtItsSecondJoin(threading.Thread):
+    """A thread still unstarted at its first join (as one listed while its start is under way) that starts at its second."""
+
+    def __init__(self) -> None:
+        super().__init__(target=lambda: None, name="starts at its second join")
+        self.joins = 0
+
+    def join(self, timeout: float | None = None) -> None:
+        self.joins += 1
+        if self.joins == 2:
+            self.start()
+        super().join(timeout)
+
+
+def test_the_native_call_join_waits_out_a_start_under_way_until_its_deadline() -> None:
+    """Join a thread again once a join refused it as unstarted and give up on one never started at the deadline."""
+    starting = _StartsAtItsSecondJoin()
+    tcpstore_fixtures._join_started([starting], 30)
+    assert starting.joins == 2 and starting.ident is not None
+    assert not starting.is_alive()
+    never = threading.Thread(target=lambda: None)
+    tcpstore_fixtures._join_started([never], 0)
+    assert never.ident is None
 
 
 @pytest.mark.asyncio

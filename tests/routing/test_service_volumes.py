@@ -37,6 +37,7 @@ import torchstore.utils as store_utils
 from torchstore import carrier_volumes
 from torchstore.carrier import (
     CarrierAddress,
+    CarrierError,
     close_all,
     PeerLostError,
     runtime,
@@ -51,7 +52,7 @@ from torchstore.carrier_volumes import (
     VolumeProxy,
 )
 from torchstore.client import LocalClient
-from torchstore.routing import tcpstore
+from torchstore.routing import service as service_module, tcpstore
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.service import (
@@ -2285,18 +2286,24 @@ async def test_a_sync_after_the_driver_dies_still_completes_bitwise(
         await store_api._shutdown_selected(store_name)
 
 
-@pytest.mark.parametrize("how", ["closed", "stopped"])
-@pytest.mark.asyncio
-async def test_a_tcpstore_lost_before_the_records_load_fails_the_first_get_unwrapped(
+async def _close_tcpstore(driver: subprocess.Popen[bytes]) -> None:
+    _command(driver, "stop-tcpstore")
+    assert await asyncio.to_thread(_reply, driver) == {"stopped": True}
+
+
+async def _stop_driver(driver: subprocess.Popen[bytes]) -> None:
+    driver.send_signal(signal.SIGSTOP)
+    await _until(lambda: _stopped(driver))
+
+
+@contextlib.asynccontextmanager
+async def _losing_the_tcpstore(
     children: _Children,
     monkeypatch: pytest.MonkeyPatch,
     rank_client: _RankClient,
-    how: str,
-) -> None:
-    """Raise a record read's error naming host:port from the first get, after its layouts arrived.
-
-    A closed TCPStore fails it at EOF, and one that stops answering at the TCPStore deadline.
-    """
+    lose: Callable[[subprocess.Popen[bytes]], Coroutine[Any, Any, None]],
+) -> AsyncIterator[tuple[_Requester, ServiceAddress]]:
+    """A requester of a one-publisher store, whose first get loses the TCPStore by ``lose`` once its layouts arrive."""
     monkeypatch.setattr(tcpstore, "_DEFAULT_TIMEOUT_S", 2)
     store_name = _store_name()
     driver, address = await asyncio.to_thread(
@@ -2311,31 +2318,79 @@ async def test_a_tcpstore_lost_before_the_records_load_fails_the_first_get_unwra
         )
         assert isinstance(requester, RoutingClient)
         handle = requester._control_plane
+        assert isinstance(handle, ServiceControlPlane)
         get_layouts = handle.get_layouts
 
         async def layouts_then_lose_the_tcpstore(key: str, **kwargs: Any) -> Any:
             layouts = await get_layouts(key, **kwargs)
-            if how == "closed":
-                _command(driver, "stop-tcpstore")
-                assert await asyncio.to_thread(_reply, driver) == {"stopped": True}
-            else:
-                driver.send_signal(signal.SIGSTOP)
-                await _until(lambda: _stopped(driver))
+            await lose(driver)
             return layouts
 
         monkeypatch.setattr(handle, "get_layouts", layouts_then_lose_the_tcpstore)
-        start = time.monotonic()
-        lost = ConnectionError if how == "closed" else TimeoutError
-        with pytest.raises(lost, match=re.escape(str(address))):
-            await _Requester(0, 0, requester).get()
-        elapsed = time.monotonic() - start
-        if how == "closed":
-            assert elapsed < 5
-        else:
-            assert 1.9 < elapsed < 7
+        yield _Requester(0, 0, requester), address
     finally:
-        driver.send_signal(signal.SIGCONT)
-        await store_api._shutdown_selected(store_name)
+
+        async def resume() -> None:
+            driver.send_signal(signal.SIGCONT)
+
+        await _close_each(
+            [resume, lambda: store_api._shutdown_selected(store_name)],
+            sys.exc_info()[1] is not None,
+        )
+
+
+@pytest.mark.parametrize("how", ["closed", "stopped"])
+@pytest.mark.asyncio
+async def test_a_tcpstore_lost_after_a_reply_without_records_fails_the_first_get_unwrapped(
+    children: _Children,
+    monkeypatch: pytest.MonkeyPatch,
+    rank_client: _RankClient,
+    how: str,
+) -> None:
+    """Raise a record read's own error naming host:port (not the coordinator's) from a get whose reply lacked records.
+
+    A closed TCPStore fails it at EOF and one that stops answering at the 2s TCPStore deadline this case sets.
+    """
+    split = service_module._split_reply
+    # Replies reach the requester without records, as after the coordinator's read failed.
+    monkeypatch.setattr(
+        service_module,
+        "_split_reply",
+        lambda address, data: (split(address, data)[0], {}),
+    )
+    lose = _close_tcpstore if how == "closed" else _stop_driver
+    async with _losing_the_tcpstore(children, monkeypatch, rank_client, lose) as (
+        reader,
+        address,
+    ):
+        lost = ConnectionError if how == "closed" else TimeoutError
+        with pytest.raises(lost, match=re.escape(str(address))) as raised:
+            await reader.get()
+    error = str(raised.value)
+    assert not isinstance(raised.value, CarrierError), raised.value
+    assert "coordinator call failed" not in error, raised.value
+    if how == "closed":
+        assert " failed: Failed to recv" in error, raised.value
+    else:
+        # What was left of the case's 2s deadline as the stalled store call started.
+        left = re.search(r" did not finish within (\d+\.\d) s", error)
+        assert left is not None and float(left.group(1)) <= 2.0, raised.value
+
+
+@pytest.mark.asyncio
+async def test_a_get_whose_reply_carried_records_syncs_after_the_tcpstore_closes(
+    children: _Children,
+    monkeypatch: pytest.MonkeyPatch,
+    rank_client: _RankClient,
+) -> None:
+    """Sync bitwise from a first get whose reply carried the records, though the TCPStore closed after its layouts.
+
+    That get reads no volume record from the TCPStore.
+    """
+    async with _losing_the_tcpstore(
+        children, monkeypatch, rank_client, _close_tcpstore
+    ) as (reader, _):
+        reader.check(0, await reader.get())
 
 
 @pytest.mark.asyncio

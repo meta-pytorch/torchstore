@@ -18,11 +18,21 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+)
+from concurrent import futures
 from typing import Any, cast
 
 import pytest
 import torchstore as ts
+from torchstore.carrier import wait_future
 from torchstore.routing import tcpstore
 from torchstore.routing.service import (
     CoordinatorService,
@@ -54,6 +64,78 @@ class _Mesh:
         return self._size
 
 
+class _Reads:
+    """A coordinator's TCPStore connection holding ``held`` records, recording each read's ids and bound.
+
+    A read numbered in ``holds`` waits for ``release``, one in ``fails`` raises ``failure`` (else ConnectionError) and
+    each read moves ``clock`` on by ``_READ_S``. A hold that waits 30s unreleased lands in ``unreleased``.
+    """
+
+    def __init__(
+        self,
+        held: Mapping[str, bytes] | None = None,
+        *,
+        holds: Iterable[int] = (),
+        fails: Iterable[int] = (),
+        failure: Exception | None = None,
+        clock: _Clock | None = None,
+    ) -> None:
+        self.address = TCPStoreAddress(_LOCALHOST, 1, "reads", "nonce")
+        self.held = dict(held or {})
+        self.reads: list[list[str]] = []
+        self.bounds: list[float] = []
+        self.cancelled: list[int] = []
+        self.unreleased: list[int] = []
+        self._holds: dict[int, futures.Future[None]] = {
+            n: futures.Future() for n in holds
+        }
+        self._fails = set(fails)
+        self._failure = failure
+        self._clock = clock
+
+    def release(self, n: int) -> None:
+        self._holds[n].set_result(None)
+
+    def unreleased_holds(self) -> list[int]:
+        """The holds that ``release`` has not released."""
+        return sorted(n for n, hold in self._holds.items() if not hold.done())
+
+    async def existing_volume_records(
+        self, volume_ids: Collection[str], /, *, timeout_s: float
+    ) -> dict[str, bytes]:
+        n = len(self.reads)
+        found = {i: self.held[i] for i in volume_ids if i in self.held}
+        self.bounds.append(timeout_s)
+        self.reads.append(list(volume_ids))
+        try:
+            if n in self._holds and not await wait_future(self._holds[n], 30):
+                self.unreleased.append(n)
+        except asyncio.CancelledError:
+            self.cancelled.append(n)
+            raise
+        if self._clock is not None:
+            self._clock.now += _READ_S
+        if n in self._fails:
+            raise self._failure or ConnectionError("TCPStore unreachable")
+        return found
+
+
+_READ_S = 1.5
+
+
+class _Clock:
+    """The service module's ``time``, whose ``monotonic`` returns ``now``."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
 def _store_name() -> str:
     return f"tcpstore-test-{uuid.uuid4()}"
 
@@ -74,11 +156,25 @@ def _native_calls(name: str = "") -> list[threading.Thread]:
 _earlier_calls: set[threading.Thread] = set()
 
 
+def _join_started(threads: Iterable[threading.Thread], timeout_s: float) -> None:
+    """Join each thread for up to ``timeout_s`` and first wait out a ``start`` that another thread has under way."""
+    for thread in threads:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                thread.join(timeout=max(deadline - time.monotonic(), 0))
+                break
+            except RuntimeError:
+                # Listed before its start() returned: the records passes start such calls.
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.001)
+
+
 def _join_native_calls() -> None:
     """Let this test's native calls finish, so none outlives the test."""
     mine = set(_native_calls()) - _earlier_calls
-    for thread in mine:
-        thread.join(timeout=60)
+    _join_started(mine, 60)
     alive = [thread for thread in mine if thread.is_alive()]
     assert not alive, "native TCPStore calls outlived the test"
 

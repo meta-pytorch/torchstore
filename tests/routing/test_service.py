@@ -33,7 +33,7 @@ import weakref
 import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, cast, NoReturn
 
 import pytest
 import torch
@@ -63,7 +63,7 @@ from torchstore.transport import TransportType
 from torchstore.transport.types import TensorSlice
 
 from ..test_carrier import _Children
-from .tcpstore_fixtures import _close_each
+from .tcpstore_fixtures import _close_each, _join_started, _Reads
 
 pytestmark = [
     pytest.mark.timeout(120),
@@ -163,7 +163,14 @@ handle = asyncio.run(service.address.connect())
 # The handle's TCPStore connection and the served TCPStore's end of it.
 dropped = [(fd, inode) for fd, inode in socket_inodes().items() if fd not in before]
 assert dropped, "connect opened no socket"
+asyncio.run(handle.register_volume("publisher/0", b"record"))
 asyncio.run(handle.register_layout("publisher/0", "model", {}))
+# The handle holds the record its reply carried.
+assert asyncio.run(handle.get_layouts("model", timeout_s=0)) == {"publisher/0": {}}
+assert handle._records == {"publisher/0": b"record"}, handle._records
+# The service holds that reply and a part no lookup has encoded yet, which the fork hook drops in a child.
+asyncio.run(handle.register_layout("publisher/0", "unread", {}))
+assert service._adapter._encoded and service._adapter._parts["unread"], "the service holds no reply or part"
 # A lookup in flight on its own thread, which waits until the parent registers its layout.
 looked_up = {}
 looking = threading.Thread(
@@ -189,7 +196,9 @@ held, release = threading.Event(), threading.Event()
 
 
 def hold():
-    with handle._lock, driver._lock, service._lock:
+    records = service._adapter._records
+    # A parent thread may hold the records' lock or their section future's lock at a fork.
+    with handle._lock, driver._lock, service._lock, records._lock, records._section._condition:
         held.set()
         release.wait(30)
 
@@ -208,10 +217,15 @@ if pid == 0:
             assert socket_inodes().get(fd) != inode, f"the fork hook kept the handle's fd {fd}"
         # Its close must not touch the parent's call, whose future a parent thread may lock.
         assert not handle._stops, "the fork hook kept the parent's call in flight"
+        adapter = service._adapter
+        assert not adapter._parts and not adapter._encoded, "the fork hook kept the parent's parts or replies"
+        # The handle keeps the record a reply carried before the fork.
+        assert handle._records == {"publisher/0": b"record"}, handle._records
         # The inherited client calls the coordinator with no TCPStore connection, which a read dials again.
         assert asyncio.run(handle.get_layouts("model", timeout_s=0)) == {"publisher/0": {}}
         assert handle._rendezvous is None, "a call through the inherited client dialed the TCPStore"
         assert type(asyncio.run(handle.strategy())).__name__ == "TorchStoreStrategy"
+        assert asyncio.run(handle.volume_records(["publisher/0"])) == {"publisher/0": b"record"}
         # The service stays the parent's: only the parent inits or connects through it.
         calls = (
             (
@@ -230,6 +244,7 @@ if pid == 0:
         # Closing what the child inherited leaves the parent's connections and servers.
         for inherited in (handle, driver, service):
             asyncio.run(inherited.close())
+        assert not service._adapter.registry._layouts, "the child's close kept the layouts"
         os._exit(0)
     except BaseException:
         traceback.print_exc()
@@ -286,9 +301,11 @@ def _part(name: str) -> tuple[bytes, int]:
     return _raw_part(data), len(data)
 
 
-def _layouts(key: str) -> dict[str, dict[str, KeyRegistration]]:
+def _layouts(
+    key: str, publishers: Collection[str] = _PUBLISHERS
+) -> dict[str, dict[str, KeyRegistration]]:
     """What a lookup of ``key`` returns once every publisher registered its layout."""
-    return {rank: _layout(f"{key}/{rank}") for rank in _PUBLISHERS}
+    return {rank: _layout(f"{key}/{rank}") for rank in publishers}
 
 
 def _llama3_70b_layout(rank: int) -> dict[str, KeyRegistration]:
@@ -519,8 +536,7 @@ def _joins_its_native_calls() -> Iterator[None]:
     earlier = _native_calls()
     yield
     mine = _native_calls() - earlier
-    for thread in mine:
-        thread.join(timeout=30)
+    _join_started(mine, 30)
     alive = [thread.name for thread in mine if thread.is_alive()]
     assert not alive, f"native TCPStore calls outlived the test: {alive}"
     assert not tcpstore._live_calls - earlier, "finished calls stayed registered"
@@ -801,13 +817,17 @@ async def test_a_failed_read_is_not_cached() -> None:
     [
         (tcpstore._SCHEMA_VERSION, "marked ready without a coordinator"),
         (b"1", "schema version b'1'"),
+        (b"3", "schema version b'3'"),
     ],
-    ids=["no_coordinator", "other_schema"],
+    ids=["no_coordinator", "other_schema", "replies_without_records"],
 )
 async def test_a_store_without_a_coordinator_under_this_schema_fails_fast(
     ready: bytes, error: str
 ) -> None:
-    """Fail a first layout call at once, making no client, under another schema or with no coordinator key."""
+    """Fail a first layout call at once, making no client, under another schema or with no coordinator key.
+
+    Schema 3 stores come from drivers whose coordinator replies carry no volume records.
+    """
     store_name = _store_name()
     rendezvous = await TCPStoreRendezvous.serve(store_name, host=_LOCALHOST)
     try:
@@ -907,12 +927,15 @@ async def test_complete_layouts_are_pickled_once_and_sent_from_one_buffer(
     The waiting lookups' reply joins the parts kept as each rank registered, then drops them.
     """
     encoded: list[Any] = []
+    returned: list[bytes] = []
     encode = service_module._encode_layouts
-    monkeypatch.setattr(
-        service_module,
-        "_encode_layouts",
-        lambda layouts: encoded.append(layouts) or encode(layouts),
-    )
+
+    def encoding(layouts: Any, **kw: Any) -> bytes:
+        encoded.append(layouts)
+        returned.append(encode(layouts, **kw))
+        return returned[-1]
+
+    monkeypatch.setattr(service_module, "_encode_layouts", encoding)
     sent: list[list[Any]] = []
     copy_mutable = runtime._copy_mutable
 
@@ -946,7 +969,8 @@ async def test_complete_layouts_are_pickled_once_and_sent_from_one_buffer(
     replies = [objects for objects in sent if objects]
     assert len(replies) == 6
     assert all(objects == [cached] and objects[0] is cached for objects in replies)
-    assert type(cached) is bytes
+    # The coordinator sends the encoder's own buffer, not a copy made to append the records.
+    assert type(cached) is bytes and cached is returned[0]
 
 
 @pytest.mark.asyncio
@@ -962,7 +986,7 @@ async def test_each_layout_is_pickled_as_it_registers_and_lookups_only_join_them
     monkeypatch.setattr(
         service_module,
         "_encode_layouts",
-        lambda layouts: encoded.append(dict(layouts)) or encode(layouts),
+        lambda layouts, **kw: encoded.append(dict(layouts)) or encode(layouts, **kw),
     )
     key = _key()
     async with _served() as served:
@@ -997,10 +1021,11 @@ async def test_a_lookup_drops_only_its_own_keys_parts() -> None:
 
 
 class _WatchedPickle:
-    """The service module's ``pickle``, recording what each ``loads`` gets and collection's state as a reply dumps."""
+    """The service module's ``pickle``, recording what each ``loads`` gets and collection's state at each load and reply dump."""
 
     def __init__(self, seen: list[tuple[str, bool]]) -> None:
         self.loaded: list[Any] = []
+        self._seen = seen
 
         class Pickler(pickle.Pickler):
             def dump(self, obj: Any) -> None:
@@ -1013,6 +1038,7 @@ class _WatchedPickle:
         return getattr(pickle, name)
 
     def loads(self, data: Any, /) -> Any:
+        self._seen.append(("unpickled", gc.isenabled()))
         self.loaded.append(data)
         return pickle.loads(data)
 
@@ -1027,7 +1053,9 @@ async def test_a_reply_holds_parts_that_join_into_one_stream_naming_no_global(
     size its publisher sent. A client loads each part from a view of the one buffer it inflated, never a copy.
     """
     key = _key()
-    adapter = service_module._CoordinatorAdapter(layout_registry.LayoutRegistry())
+    adapter = service_module._CoordinatorAdapter(
+        layout_registry.LayoutRegistry(), cast(Any, _Reads())
+    )
     await adapter.init(_PUBLISHERS, _strategy())
     layouts = _layouts(key)
     parts = {rank: service_module._compress_part(layouts[rank]) for rank in layouts}
@@ -1077,7 +1105,9 @@ async def test_a_client_inflates_a_reply_once_then_loads_its_parts_in_one_pause_
     frame run. Other threads may run there too, and the decode-window case checks that the parts load inside the pause.
     """
     key = _key()
-    adapter = service_module._CoordinatorAdapter(layout_registry.LayoutRegistry())
+    adapter = service_module._CoordinatorAdapter(
+        layout_registry.LayoutRegistry(), cast(Any, _Reads())
+    )
     await adapter.init(_PUBLISHERS, _strategy())
     for rank in _PUBLISHERS:
         await adapter.register_layout(rank, key, *_part(f"{key}/{rank}"))
@@ -1479,8 +1509,9 @@ async def test_decodes_run_with_collection_paused_and_nothing_else_does(
 ) -> None:
     """Pause collection only while the service loads a layout and a client loads a reply's layouts.
 
-    A publisher's pickle, each inflate, the registry's calls and the reply's dump run with it enabled. A client
-    inflates a reply of two parts once, before the one pause in which it loads them.
+    A publisher's pickle, each inflate, the registry's calls, the reply's dump and the client's loads of the reply's
+    records and of its table of parts run with it enabled. A client inflates a reply of two parts once, before the
+    one pause in which it loads them.
     """
     seen: list[tuple[str, bool]] = []
     monkeypatch.setattr(_GcSeen, "seen", seen)
@@ -1520,6 +1551,7 @@ async def test_decodes_run_with_collection_paused_and_nothing_else_does(
         ("pickled", True),  # the publisher pickles its layout, which becomes its part
         ("decompressed", True),  # the service decodes it for the registry
         ("pause", True),
+        ("unpickled", False),
         ("loaded", False),
         ("register_layout", True),
     ]
@@ -1528,9 +1560,14 @@ async def test_decodes_run_with_collection_paused_and_nothing_else_does(
         *registration,
         ("get_layouts", True),
         ("dumped", True),  # the reply, from the parts
-        ("decompressed", True),  # the client's one inflate of the reply's stream
+        ("decompressed", True),  # the client's decode of the reply's records
+        ("unpickled", True),
+        ("unpickled", True),  # then of its table of parts
+        ("decompressed", True),  # then its one inflate of the layouts' stream
         ("pause", True),
+        ("unpickled", False),
         ("loaded", False),
+        ("unpickled", False),
         ("loaded", False),
     ]
 
@@ -1554,14 +1591,17 @@ async def test_a_part_inflates_with_a_byte_to_spare_and_a_reply_into_exactly_its
         handle = await served.connect()
         await _register(handle, key)
         assert await handle.get_layouts(key, timeout_s=0) == layouts
-    assert bufsizes == [*(size + 1 for size in sizes), sum(sizes)]
+    # The reply's volume records inflate first, with zlib's default buffer.
+    assert bufsizes == [*(size + 1 for size in sizes), None, sum(sizes)]
 
 
 @pytest.mark.asyncio
 async def test_a_publishers_size_beyond_what_its_part_can_inflate_to_fails_its_registration() -> None:
     """Refuse a size that is not an int or asks for more than deflate's largest ratio, before any inflate."""
     key = _key()
-    adapter = service_module._CoordinatorAdapter(layout_registry.LayoutRegistry())
+    adapter = service_module._CoordinatorAdapter(
+        layout_registry.LayoutRegistry(), cast(Any, _Reads())
+    )
     await adapter.init(_PUBLISHERS, _strategy())
     part, size = _part(f"{key}/publisher/0")
     for wrong in (-1, 1033 * len(part), 1.5, "12", True):
@@ -1572,22 +1612,27 @@ async def test_a_publishers_size_beyond_what_its_part_can_inflate_to_fails_its_r
 
 
 @pytest.mark.asyncio
-async def test_a_key_answers_again_after_a_failed_encode_or_dropped_parts(
+async def test_a_key_answers_again_after_a_failed_encode_from_its_kept_parts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Answer a key from its kept parts after its reply's encode raised once, and once they are dropped from its layouts."""
+    """Answer a key from its kept parts after its reply's encode raised once.
+
+    Dropping the encodings also drops the store's records here so a later lookup waits for records reads.
+    """
     key = _key()
-    adapter = service_module._CoordinatorAdapter(layout_registry.LayoutRegistry())
+    adapter = service_module._CoordinatorAdapter(
+        layout_registry.LayoutRegistry(), cast(Any, _Reads())
+    )
     await adapter.init(_PUBLISHERS, _strategy())
     for rank in _PUBLISHERS:
         await adapter.register_layout(rank, key, *_part(f"{key}/{rank}"))
     encode, failures = service_module._encode_layouts, [MemoryError()]
     compress, compressed = service_module._compress_part, []
 
-    def failing_once(parts: Any) -> bytes:
+    def failing_once(parts: Any, **kwargs: Any) -> bytes:
         if failures:
             raise failures.pop()
-        return encode(parts)
+        return encode(parts, **kwargs)
 
     def compressing(layout: Any) -> tuple[bytes, int]:
         compressed.append(layout)
@@ -1599,9 +1644,6 @@ async def test_a_key_answers_again_after_a_failed_encode_or_dropped_parts(
         await adapter.get_layouts(key, 0)
     reply = bytes(await adapter.get_layouts(key, 0))
     assert service_module._decode_layouts(reply) == _layouts(key) and compressed == []
-    adapter.drop_encodings()
-    assert bytes(await adapter.get_layouts(key, 0)) == reply
-    assert compressed == list(_layouts(key).values())
 
 
 @pytest.mark.asyncio
@@ -2280,7 +2322,7 @@ async def test_a_cancelled_close_that_cannot_start_a_thread_keeps_the_layouts(
     monkeypatch.setattr(service_module, "_CLOSE_GRACE_S", 30)
     monkeypatch.setitem(_HELD, "held", (threading.Event(), threading.Event()))
 
-    def no_thread(target: Callable[[], object]) -> NoReturn:
+    def no_thread(name: str, target: Callable[[], object]) -> NoReturn:
         raise RuntimeError("can't start new thread")
 
     monkeypatch.setattr(service_module, "_start_thread", no_thread)
@@ -2845,10 +2887,11 @@ async def test_a_coordinator_key_naming_another_servers_scope_is_stale_once(
 
 @pytest.mark.asyncio
 async def test_the_coordinator_takes_only_its_nonce_scope_and_its_two_layout_calls() -> None:
-    """Refuse a hello without this start's nonce, and a peer's ``init``, ``drop_encodings`` or ``drop_layouts``.
+    """Refuse a hello without this start's nonce, and a peer's ``init`` or any other adapter method.
 
     The nonce keeps out clients of other starts, not attackers, as the network is trusted. Served, ``drop_layouts``
-    would drop every layout, ``drop_encodings`` every part and reply, and an early ``init`` would fix the publishers.
+    would drop every layout, ``drop_encodings`` every part and reply, ``stop_reading`` the records of later replies,
+    and an early ``init`` would fix the publishers.
     """
     key = _key()
     async with _served() as served:
@@ -2868,6 +2911,7 @@ async def test_the_coordinator_takes_only_its_nonce_scope_and_its_two_layout_cal
                 ("init", (["intruder"], None)),
                 ("drop_encodings", ()),
                 ("drop_layouts", ()),
+                ("stop_reading", ()),
             ):
                 with pytest.raises(
                     AttributeError, match=f"has no endpoint {endpoint!r}$"
