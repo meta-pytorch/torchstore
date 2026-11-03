@@ -13,7 +13,6 @@ import collections
 import contextlib
 import dataclasses
 import gc
-import io
 import json
 import logging
 import math
@@ -28,10 +27,10 @@ import subprocess
 import sys
 import threading
 import time
-import tracemalloc
 import types
 import uuid
 import weakref
+import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
 from pathlib import Path
 from typing import Any, cast, NoReturn
@@ -273,14 +272,57 @@ def _layout(name: str) -> dict[str, KeyRegistration]:
     return {name: KeyRegistration(tensor_slice, dtype=torch.float32)}
 
 
-def _pickled(name: str) -> bytes:
-    """``_layout(name)`` as a publisher sends it to the coordinator."""
-    return pickle.dumps(_layout(name), protocol=5)
+def _raw_part(data: bytes, level: int = service_module._PART_ZLIB_LEVEL) -> bytes:
+    """``data`` deflated raw at ``level`` up to a sync flush, as a publisher ends its part."""
+    compressor = zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS)
+    return compressor.compress(data) + compressor.flush(zlib.Z_SYNC_FLUSH)
+
+
+def _part(name: str) -> tuple[bytes, int]:
+    """``_layout(name)`` as a publisher sends it to the coordinator: its compressed pickle and the pickle's size."""
+    data = pickle.dumps(_layout(name), protocol=5)
+    return _raw_part(data), len(data)
 
 
 def _layouts(key: str) -> dict[str, dict[str, KeyRegistration]]:
     """What a lookup of ``key`` returns once every publisher registered its layout."""
     return {rank: _layout(f"{key}/{rank}") for rank in _PUBLISHERS}
+
+
+def _llama3_70b_layout(rank: int) -> dict[str, KeyRegistration]:
+    """One of 64 FSDP ranks' layouts of TorchTitan's Llama 3 70B, as TitanRL registers its state dict.
+
+    Parameters are bfloat16 under ``model_state_dict``, wqkv and w13 fused, all evenly sharded.
+    """
+    world = 64
+    shapes: list[tuple[str, tuple[int, ...], int]] = [
+        ("tok_embeddings.weight", (128256, 8192), 0)
+    ]
+    for layer in range(80):
+        prefix = f"layers.{layer}."
+        shapes += [
+            (f"{prefix}attention.qkv_linear.wqkv.weight", (10240, 8192), 0),
+            (f"{prefix}attention.wo.weight", (8192, 8192), 0),
+            (f"{prefix}feed_forward.w13.weight", (2, 28672, 8192), 1),
+            (f"{prefix}feed_forward.w2.weight", (8192, 28672), 0),
+            (f"{prefix}attention_norm.weight", (8192,), 0),
+            (f"{prefix}ffn_norm.weight", (8192,), 0),
+        ]
+    shapes += [("norm.weight", (8192,), 0), ("lm_head.weight", (128256, 8192), 0)]
+    # A device mesh hands every DTensor the same coordinate tuple.
+    coordinate = (rank,)
+    layout = {}
+    for name, shape, dim in shapes:
+        local, offsets = list(shape), [0] * len(shape)
+        local[dim] = shape[dim] // world
+        offsets[dim] = local[dim] * rank
+        tensor_slice = TensorSlice(
+            tuple(offsets), coordinate, torch.Size(shape), torch.Size(local), (world,)
+        )
+        layout[f"model_state_dict/{name}"] = KeyRegistration(
+            tensor_slice, dtype=torch.bfloat16
+        )
+    return layout
 
 
 async def _register(handle: ServiceControlPlane, key: str, *ranks: str) -> None:
@@ -845,7 +887,7 @@ async def test_complete_layouts_are_pickled_once_and_sent_from_one_buffer(
         later = await requesters[0].get_layouts(key, timeout_s=0)
         assert later == _layouts(key) and len(encoded) == 1
         parts = encoded[0].values()
-        assert all(type(part) is service_module._PickledLayout for part in parts)
+        assert all(type(part) is bytes and type(size) is int for part, size in parts)
         assert key not in served.service._adapter._parts
         later["publisher/0"] = {}
         del later["publisher/1"]
@@ -861,17 +903,10 @@ async def test_complete_layouts_are_pickled_once_and_sent_from_one_buffer(
 async def test_each_layout_is_pickled_as_it_registers_and_lookups_only_join_them(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep each rank's first layout as its publisher pickled it, and encode replies from those parts."""
-    pickled: list[str] = []
+    """Keep each rank's first layout as the compressed bytes its publisher sent, and join replies from them.
 
-    class Recording(service_module._PickledLayout):
-        __slots__ = ()
-
-        def __init__(self, data: bytes) -> None:
-            pickled.extend(pickle.loads(data))
-            super().__init__(data)
-
-    monkeypatch.setattr(service_module, "_PickledLayout", Recording)
+    The registry decodes the same first layouts, which later registrations change in neither.
+    """
     encoded: list[dict[str, Any]] = []
     encode = service_module._encode_layouts
     monkeypatch.setattr(
@@ -891,9 +926,9 @@ async def test_each_layout_is_pickled_as_it_registers_and_lookups_only_join_them
         assert await handle.get_layouts(key, timeout_s=0) == _layouts(key)
         adapter = served.service._adapter
         assert key not in adapter._parts and type(adapter._encoded[key]) is bytes
-    assert pickled == [f"{key}/{rank}" for rank in _PUBLISHERS]
+        assert adapter.registry._layouts[key].publishers == _layouts(key)
     assert len(encoded) == 1 and list(encoded[0]) == list(_PUBLISHERS)
-    assert all(type(part) is Recording for part in encoded[0].values())
+    assert encoded[0] == {rank: _part(f"{key}/{rank}") for rank in _PUBLISHERS}
 
 
 @pytest.mark.asyncio
@@ -911,105 +946,145 @@ async def test_a_lookup_drops_only_its_own_keys_parts() -> None:
         assert await handle.get_layouts(other, timeout_s=0) == _layouts(other)
 
 
-@pytest.mark.asyncio
-async def test_a_reply_names_only_pickle_loads_which_loads_each_parts_own_bytes() -> None:
-    """Load each part through the standard library's C ``pickle.loads`` of that part's bytes.
+class _WatchedPickle:
+    """The service module's ``pickle``, recording what each ``loads`` gets and collection's state as a reply dumps."""
 
-    Readers keep plain ``pickle.loads``, and each part's unpickler is freed as that part loads.
+    def __init__(self, seen: list[tuple[str, bool]]) -> None:
+        self.loaded: list[Any] = []
+
+        class Pickler(pickle.Pickler):
+            def dump(self, obj: Any) -> None:
+                seen.append(("dumped", gc.isenabled()))
+                super().dump(obj)
+
+        self.Pickler = Pickler
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(pickle, name)
+
+    def loads(self, data: Any, /) -> Any:
+        self.loaded.append(data)
+        return pickle.loads(data)
+
+
+@pytest.mark.asyncio
+async def test_a_reply_holds_parts_that_join_into_one_stream_naming_no_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Send the parts as publishers sent them, which join into one raw deflate stream, in a reply with no memo or global.
+
+    Plain ``pickle.loads`` runs no function on it, and it lists each rank with its pickle's own size, whatever
+    size its publisher sent. A client loads each part from a view of the one buffer it inflated, never a copy.
     """
     key = _key()
     adapter = service_module._CoordinatorAdapter(layout_registry.LayoutRegistry())
     await adapter.init(_PUBLISHERS, _strategy())
-    for rank in _PUBLISHERS:
-        await adapter.register_layout(rank, key, _pickled(f"{key}/{rank}"))
-    parts = [part.data for part in adapter._parts[key].values()]
-    named: list[tuple[str, str]] = []
-    loaded: list[bytes] = []
-
-    class Recording(pickle.Unpickler):
-        def find_class(self, module_name: str, global_name: str) -> Any:
-            named.append((module_name, global_name))
-            found = super().find_class(module_name, global_name)
-            return lambda data: loaded.append(data) or found(data)
-
-    reply = await adapter.get_layouts(key, 0)
-    assert Recording(io.BytesIO(reply)).load() == _layouts(key)
-    assert set(named) == {("_pickle", "loads")}
-    assert len(parts) == len(_PUBLISHERS) and loaded == parts
-
-
-@pytest.mark.asyncio
-async def test_a_reply_has_no_memo_so_readers_free_each_parts_bytes() -> None:
-    """Join a reply with no memo, so a reader frees each part's bytes as that part loads.
-
-    A rank's layout without a part is pickled as one, and loads like the others.
-    """
-    key = _key()
-    adapter = service_module._CoordinatorAdapter(layout_registry.LayoutRegistry())
-    await adapter.init(_PUBLISHERS, _strategy())
-    for rank in _PUBLISHERS:
-        await adapter.register_layout(rank, key, _pickled(f"{key}/{rank}"))
-    del adapter._parts[key]["publisher/1"]
+    layouts = _layouts(key)
+    parts = {rank: service_module._compress_part(layouts[rank]) for rank in layouts}
+    for rank, (part, size) in parts.items():
+        # publisher/1's size, below its pickle's, only makes its inflate grow and copy its buffer.
+        await adapter.register_layout(
+            rank, key, part, size if rank == "publisher/0" else 1
+        )
     reply = bytes(await adapter.get_layouts(key, 0))
     ops = {op.name for op, _, _ in pickletools.genops(reply)}
     assert not ops & {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}
-    named: list[tuple[str, str]] = []
+    assert not ops & {"GLOBAL", "STACK_GLOBAL", "INST", "OBJ", "REDUCE", "NEWOBJ"}
+    ranks, sizes, sent = pickle.loads(reply)
+    assert (ranks, sizes, sent) == (
+        list(_PUBLISHERS),
+        [size for _, size in parts.values()],
+        [part for part, _ in parts.values()],
+    )
+    # The reply's own parts, then the empty last block that ends the stream.
+    pickled = [pickle.dumps(layouts[rank], protocol=5) for rank in _PUBLISHERS]
+    joined = b"".join([*sent, b"\x03\x00"])
+    assert zlib.decompress(joined, -zlib.MAX_WBITS) == b"".join(pickled)
+    watched = _WatchedPickle([])
+    monkeypatch.setattr(service_module, "pickle", watched)
+    inflated: list[bytes] = []
+    inflate = service_module._inflate
 
-    class Recording(pickle.Unpickler):
-        def find_class(self, module_name: str, global_name: str) -> Any:
-            named.append((module_name, global_name))
-            return super().find_class(module_name, global_name)
+    def recording(stream: bytes, size: int) -> bytes:
+        inflated.append(inflate(stream, size))
+        return inflated[-1]
 
-    assert Recording(io.BytesIO(reply)).load() == _layouts(key)
-    # Named once per rank, as no memo holds it for the next.
-    assert named == len(_PUBLISHERS) * [("_pickle", "loads")]
+    monkeypatch.setattr(service_module, "_inflate", recording)
+    assert service_module._decode_layouts(reply) == layouts
+    _, *views = watched.loaded
+    [buffer] = inflated
+    assert len(views) == 2
+    assert all(type(view) is memoryview and view.obj is buffer for view in views)
 
 
 @pytest.mark.asyncio
-async def test_a_readers_decode_holds_no_second_copy_of_the_reply() -> None:
-    """Decode a reply from the read-only view the carrier delivers without copying it whole on Python's heap.
+async def test_a_client_inflates_a_reply_once_then_loads_its_parts_in_one_pause_of_c(
+    collecting: None,
+) -> None:
+    """Inflate a reply's stream once with collection on, then pause collection once and call only ``gc.enable`` inside.
 
-    tracemalloc sees Python's allocations, where a copy of the reply's bytes would land.
+    ``dict`` takes each part's ``pickle.loads`` through ``map`` in C. So only the two ends of ``call_gc_paused``'s own
+    frame run. Other threads may run there too, and the decode-window case checks that the parts load inside the pause.
     """
-    publishers = [f"publisher/{rank}" for rank in range(64)]
     key = _key()
     adapter = service_module._CoordinatorAdapter(layout_registry.LayoutRegistry())
-    await adapter.init(publishers, _strategy())
-    for rank in publishers:
-        layout = {f"{key}/{rank}/{i}": _layout("w")["w"] for i in range(500)}
-        await adapter.register_layout(rank, key, pickle.dumps(layout, protocol=5))
-    reply = memoryview(bytes(await adapter.get_layouts(key, 0))).toreadonly()
-    tracemalloc.start()
+    await adapter.init(_PUBLISHERS, _strategy())
+    for rank in _PUBLISHERS:
+        await adapter.register_layout(rank, key, *_part(f"{key}/{rank}"))
+    reply = bytes(await adapter.get_layouts(key, 0))
+    # Each Python function and each C function that Python code calls, with whether collection was on.
+    called: list[tuple[str, bool]] = []
+
+    def profile(frame: types.FrameType, event: str, arg: Any) -> None:
+        if event == "call":
+            called.append((frame.f_code.co_name, gc.isenabled()))
+        elif event == "c_call":
+            called.append((getattr(arg, "__name__", ""), gc.isenabled()))
+
+    previous = sys.getprofile()
+    sys.setprofile(profile)
     try:
         decoded = service_module._decode_layouts(reply)
-        kept, peak = tracemalloc.get_traced_memory()
     finally:
-        tracemalloc.stop()
-    assert sorted(decoded) == sorted(publishers)
-    assert peak - kept < reply.nbytes / 2, (peak - kept, reply.nbytes)
+        sys.setprofile(previous)
+    assert decoded == _layouts(key)
+    # Within the one pause no Python function runs, and of C calls made from Python code only its own gc.enable.
+    assert [name for name, on in called if not on] == ["enable"], called
+    assert [
+        on for name, on in called if name in ("disable", "decompress", "loads")
+    ] == [
+        True,  # the reply's own load
+        True,  # its stream's one inflate
+        True,  # the pause
+    ], called
 
 
-@pytest.mark.asyncio
-async def test_a_lookup_decodes_the_carriers_view_of_its_reply_without_copying_it_whole() -> None:
-    """Decode a lookup's reply from the view the carrier delivers, holding no second copy of it on Python's heap."""
-    publishers = [f"publisher/{rank}" for rank in range(64)]
-    key = _key()
-    async with _served(publishers=publishers) as served:
-        handle = await served.connect()
-        for rank in publishers:
-            layout = {f"{key}/{rank}/{i}": _layout("w")["w"] for i in range(500)}
-            await handle.register_layout(rank, key, layout)
-        # The first lookup encodes the reply, so the measured one only sends and decodes it.
-        await handle.get_layouts(key, timeout_s=0)
-        size = len(served.service._adapter._encoded[key])
-        tracemalloc.start()
+def test_a_decode_builds_its_dict_before_collection_resumes(collecting: None) -> None:
+    """Build a decode's dict inside its pause so that no collection over its loaded layouts runs before it returns."""
+    layouts = {"publisher/0": _llama3_70b_layout(0)}
+    parts = {
+        rank: service_module._compress_part(layout) for rank, layout in layouts.items()
+    }
+    reply = service_module._encode_layouts(parts)
+    started: list[int] = []
+
+    def watch(phase: str, info: dict[str, int]) -> None:
+        if phase == "start":
+            started.append(info["generation"])
+
+    # From empty counts and with no settrace tracer (such as coverage's) whose own allocations would set it off.
+    tracer = sys.gettrace()
+    sys.settrace(None)
+    try:
+        gc.collect()
+        gc.callbacks.append(watch)
         try:
-            decoded = await handle.get_layouts(key, timeout_s=0)
-            kept, peak = tracemalloc.get_traced_memory()
+            decoded = service_module._decode_layouts(reply)
         finally:
-            tracemalloc.stop()
-    assert sorted(decoded) == sorted(publishers)
-    assert peak - kept < size / 2, (peak - kept, size)
+            gc.callbacks.remove(watch)
+    finally:
+        sys.settrace(tracer)
+    assert started == [] and decoded == layouts
 
 
 def _fail_to_load() -> NoReturn:
@@ -1044,12 +1119,67 @@ async def test_a_layout_that_does_not_pickle_or_load_fails_only_its_registration
             await handle.register_layout("publisher", key, unloadable)
         # The service's own call, whose error keeps the frames of the window it raised in.
         adapter = served.service._adapter
-        with pytest.raises(pickle.UnpicklingError) as raised:
-            await adapter.register_layout("publisher", key, b"not a pickle")
+        part = _raw_part(b"not a pickle")
+        with pytest.raises(pickle.UnpicklingError, match="^invalid load key") as raised:
+            await adapter.register_layout("publisher", key, part, 12)
         assert gc.isenabled(), raised
         await handle.register_layout("publisher", key, _layout(key))
         assert served.server.stats()["calls"] == calls + 2
         assert await handle.get_layouts(key, timeout_s=0) == {"publisher": _layout(key)}
+
+
+@pytest.mark.asyncio
+async def test_a_part_that_does_not_decompress_fails_only_its_registration() -> None:
+    """Fail a registration whose part does not decompress, as a plain pickle does, with zlib's error.
+
+    It raises in the service and across the carrier, and a part ended by a last block fails too. Nothing reaches the
+    registry, and other ranks' parts stay.
+    """
+    key = _key()
+    plain = pickle.dumps(_layout(f"{key}/publisher/0"), protocol=5)
+    async with _served() as served:
+        handle = await served.connect()
+        await _register(handle, key, "publisher/1")
+        adapter = served.service._adapter
+        with pytest.raises(zlib.error, match="invalid stored block lengths$"):
+            await adapter.register_layout("publisher/0", key, plain, len(plain))
+        with pytest.raises(zlib.error, match="invalid stored block lengths$"):
+            await handle._call("register_layout", "publisher/0", key, plain, len(plain))
+        # Ended by its own last block, it would end every reader's joined stream there.
+        finishing = zlib.compressobj(8, zlib.DEFLATED, -zlib.MAX_WBITS)
+        final = finishing.compress(plain) + finishing.flush()
+        with pytest.raises(ValueError, match="must end with a sync flush$"):
+            await adapter.register_layout("publisher/0", key, final, len(plain))
+        assert list(adapter._parts[key]) == ["publisher/1"]
+        assert list(adapter.registry._layouts[key].publishers) == ["publisher/1"]
+
+
+@pytest.mark.asyncio
+async def test_llama_3_70b_layouts_round_trip_in_a_sixteenth_of_their_bytes() -> None:
+    """Register and look up two of 64 FSDP ranks' Llama 3 70B layouts in a reply under 1/16 of their pickles.
+
+    The registry decodes every publisher's layout unchanged, and so does the client.
+    """
+    layouts = {f"publisher/{rank}": _llama3_70b_layout(rank) for rank in range(2)}
+    key = _key()
+    async with _served(publishers=list(layouts)) as served:
+        handle = await served.connect()
+        for rank, layout in layouts.items():
+            await handle.register_layout(rank, key, layout)
+        adapter = served.service._adapter
+        # Level 8's bytes. Levels 1 to 7 give others that also pass the size bound below, and level 9
+        # gives these same bytes more slowly, so no byte check tells it from level 8.
+        pickled = {
+            rank: pickle.dumps(layout, protocol=5) for rank, layout in layouts.items()
+        }
+        assert adapter._parts[key] == {
+            rank: (_raw_part(data, 8), len(data)) for rank, data in pickled.items()
+        }
+        assert await handle.get_layouts(key, timeout_s=0) == layouts
+        assert adapter.registry._layouts[key].publishers == layouts
+        reply = adapter._encoded[key]
+    pickled = sum(len(pickle.dumps(layout, protocol=5)) for layout in layouts.values())
+    assert len(reply) * 16 < pickled, (len(reply), pickled)
 
 
 @pytest.mark.asyncio
@@ -1064,7 +1194,7 @@ async def test_a_key_with_a_reply_still_refuses_a_nonpublisher_and_an_unloadable
             await handle.register_layout("requester", key, _layout(key))
         with pytest.raises(pickle.UnpicklingError, match="^invalid load key"):
             await served.service._adapter.register_layout(
-                "publisher/0", key, b"not a pickle"
+                "publisher/0", key, _raw_part(b"not a pickle"), 12
             )
 
 
@@ -1278,27 +1408,44 @@ def _gc_seen_loaded() -> _GcSeen:
     return _GcSeen()
 
 
+class _WatchedZlib:
+    """The service module's ``zlib``, recording each decompress's buffer and whether collection is enabled."""
+
+    bufsizes: list[object] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(zlib, name)
+
+    @staticmethod
+    def decompress(*args: Any, **kwargs: Any) -> bytes:
+        _WatchedZlib.bufsizes.append(kwargs.get("bufsize"))
+        _GcSeen.seen.append(("decompressed", gc.isenabled()))
+        return zlib.decompress(*args, **kwargs)
+
+
 @pytest.mark.asyncio
 async def test_decodes_run_with_collection_paused_and_nothing_else_does(
     collecting: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pause collection only while the service decodes a layout and a client decodes a reply.
+    """Pause collection only while the service loads a layout and a client loads a reply's layouts.
 
-    A publisher's pickle, the registry's calls and the reply's join run with it enabled.
+    A publisher's pickle, each inflate, the registry's calls and the reply's dump run with it enabled. A client
+    inflates a reply of two parts once, before the one pause in which it loads them.
     """
     seen: list[tuple[str, bool]] = []
     monkeypatch.setattr(_GcSeen, "seen", seen)
+    monkeypatch.setattr(_WatchedZlib, "bufsizes", [])
+    paused = service_module.call_gc_paused
 
-    class Watched(service_module._PickledLayout):
-        __slots__ = ()
+    def pausing(fn: Callable[..., Any], *args: Any) -> Any:
+        seen.append(("pause", gc.isenabled()))
+        return paused(fn, *args)
 
-        def __reduce__(self) -> tuple[Any, ...]:
-            seen.append(("joined", gc.isenabled()))
-            return super().__reduce__()
-
-    monkeypatch.setattr(service_module, "_PickledLayout", Watched)
+    monkeypatch.setattr(service_module, "call_gc_paused", pausing)
+    monkeypatch.setattr(service_module, "pickle", _WatchedPickle(seen))
+    monkeypatch.setattr(service_module, "zlib", _WatchedZlib())
     key = _key()
-    async with _served(publishers={"publisher"}) as served:
+    async with _served() as served:
         registry = served.service._adapter.registry
 
         def watching(name: str) -> Callable[..., Awaitable[Any]]:
@@ -1313,19 +1460,98 @@ async def test_decodes_run_with_collection_paused_and_nothing_else_does(
         for name in ("register_layout", "get_layouts"):
             monkeypatch.setattr(registry, name, watching(name))
         handle = await served.connect()
-        entry: Any = _GcSeen()
-        await handle.register_layout("publisher", key, {"entry": entry})
+        for rank in _PUBLISHERS:
+            entry: Any = _GcSeen()
+            await handle.register_layout(rank, key, {"entry": entry})
         reply = await handle.get_layouts(key, timeout_s=0)
-        assert type(reply["publisher"]["entry"]) is _GcSeen
+        assert [type(layout["entry"]) for layout in reply.values()] == [_GcSeen] * 2
         assert gc.isenabled()
-    assert seen == [
+    registration = [
         ("pickled", True),  # the publisher pickles its layout, which becomes its part
-        ("loaded", False),  # the service decodes it for the registry
+        ("decompressed", True),  # the service decodes it for the registry
+        ("pause", True),
+        ("loaded", False),
         ("register_layout", True),
-        ("get_layouts", True),
-        ("joined", True),  # the reply, from the parts
-        ("loaded", False),  # the client's decode of the reply
     ]
+    assert seen == [
+        *registration,
+        *registration,
+        ("get_layouts", True),
+        ("dumped", True),  # the reply, from the parts
+        ("decompressed", True),  # the client's one inflate of the reply's stream
+        ("pause", True),
+        ("loaded", False),
+        ("loaded", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_part_inflates_with_a_byte_to_spare_and_a_reply_into_exactly_its_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inflate a part into a buffer with a byte to spare and a reply's stream into one of exactly its pickles' size.
+
+    Each publisher sends its pickle's size, which sets its part's buffer in the service.
+    """
+    bufsizes: list[object] = []
+    monkeypatch.setattr(_WatchedZlib, "bufsizes", bufsizes)
+    monkeypatch.setattr(_GcSeen, "seen", [])
+    monkeypatch.setattr(service_module, "zlib", _WatchedZlib())
+    key = _key()
+    layouts = _layouts(key)
+    sizes = [len(pickle.dumps(layout, protocol=5)) for layout in layouts.values()]
+    async with _served() as served:
+        handle = await served.connect()
+        await _register(handle, key)
+        assert await handle.get_layouts(key, timeout_s=0) == layouts
+    assert bufsizes == [*(size + 1 for size in sizes), sum(sizes)]
+
+
+@pytest.mark.asyncio
+async def test_a_publishers_size_beyond_what_its_part_can_inflate_to_fails_its_registration() -> None:
+    """Refuse a size that is not an int or asks for more than deflate's largest ratio, before any inflate."""
+    key = _key()
+    adapter = service_module._CoordinatorAdapter(layout_registry.LayoutRegistry())
+    await adapter.init(_PUBLISHERS, _strategy())
+    part, size = _part(f"{key}/publisher/0")
+    for wrong in (-1, 1033 * len(part), 1.5, "12", True):
+        with pytest.raises(ValueError, match="cannot inflate to"):
+            await adapter.register_layout("publisher/0", key, part, wrong)
+    await adapter.register_layout("publisher/0", key, part, size)
+    assert list(adapter.registry._layouts[key].publishers) == ["publisher/0"]
+
+
+@pytest.mark.asyncio
+async def test_a_key_answers_again_after_a_failed_encode_or_dropped_parts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Answer a key from its kept parts after its reply's encode raised once, and once they are dropped from its layouts."""
+    key = _key()
+    adapter = service_module._CoordinatorAdapter(layout_registry.LayoutRegistry())
+    await adapter.init(_PUBLISHERS, _strategy())
+    for rank in _PUBLISHERS:
+        await adapter.register_layout(rank, key, *_part(f"{key}/{rank}"))
+    encode, failures = service_module._encode_layouts, [MemoryError()]
+    compress, compressed = service_module._compress_part, []
+
+    def failing_once(parts: Any) -> bytes:
+        if failures:
+            raise failures.pop()
+        return encode(parts)
+
+    def compressing(layout: Any) -> tuple[bytes, int]:
+        compressed.append(layout)
+        return compress(layout)
+
+    monkeypatch.setattr(service_module, "_encode_layouts", failing_once)
+    monkeypatch.setattr(service_module, "_compress_part", compressing)
+    with pytest.raises(MemoryError):
+        await adapter.get_layouts(key, 0)
+    reply = bytes(await adapter.get_layouts(key, 0))
+    assert service_module._decode_layouts(reply) == _layouts(key) and compressed == []
+    adapter.drop_encodings()
+    assert bytes(await adapter.get_layouts(key, 0)) == reply
+    assert compressed == list(_layouts(key).values())
 
 
 @pytest.mark.asyncio
@@ -1340,8 +1566,11 @@ async def test_a_reply_that_fails_to_decode_resumes_collection_as_it_raises(
     async with _served(publishers={"publisher"}) as served:
         handle = await served.connect()
         await handle.register_layout("publisher", key, _layout(key))
-        served.service._adapter._parts[key]["publisher"].data = b"not a pickle"
-        with pytest.raises(pickle.UnpicklingError) as raised:
+        served.service._adapter._parts[key]["publisher"] = (
+            _raw_part(b"not a pickle"),
+            12,
+        )
+        with pytest.raises(pickle.UnpicklingError, match="^invalid load key") as raised:
             await handle.get_layouts(key, timeout_s=0)
         # The held error keeps its frames, and with them any window they left open.
         assert gc.isenabled(), raised
