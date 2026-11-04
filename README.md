@@ -329,6 +329,11 @@ configuration is needed — the selection happens at runtime:
 | 4 | **Gloo** | Cross-host fallback via collective transport |
 | 5 | **Monarch RPC** | Universal fallback, always available |
 
+The Gloo transport's client creates a TCPStore on port 0 for each storage volume it
+pairs with. The kernel picks the store's port from the host's ephemeral range
+(`net.ipv4.ip_local_port_range` on Linux) and the volume connects to the port the
+store reports.
+
 Setting `TORCHSTORE_TORCH_TRANSPORT_BACKEND` to a backend listed by
 `torch.distributed._transport.available_transports()` (e.g. `nixl`) enables the
 torch.distributed transport, preferred after shared memory and over NIXL. Requires
