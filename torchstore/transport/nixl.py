@@ -269,6 +269,15 @@ class NixlTransportBuffer(TransportBuffer):
     @override
     async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Allocate RDMA memory for put (transport already set up)."""
+        # Validate the whole batch before registering any source buffers.
+        for request in requests:
+            tensor = request.tensor_val
+            if not request.is_object and tensor is not None:
+                if tensor.is_conj() or tensor.is_neg():
+                    raise ValueError(
+                        "NIXL sources cannot have conjugate or negative view bits; "
+                        "materialize with tensor.resolve_conj().resolve_neg() first."
+                    )
         self._contexts = []
         for request in requests:
             if request.is_object:
@@ -286,10 +295,6 @@ class NixlTransportBuffer(TransportBuffer):
                     request.key,
                 )
                 tensor = tensor.cpu().contiguous()
-            if tensor.is_conj() or tensor.is_neg():
-                tensor = tensor.clone(memory_format=torch.contiguous_format)
-                if tensor.is_cuda:
-                    torch.cuda.current_stream(tensor.device).synchronize()
             self._contexts.append(self._register_client_tensor(tensor))
         self._publish_client_metadata()
 
@@ -496,19 +501,23 @@ class NixlTransportBuffer(TransportBuffer):
                 request_context.shape,
                 must_be_contiguous=False,
             )
+            if data.is_conj() or data.is_neg():
+                raise ValueError(
+                    "NIXL sources cannot have conjugate or negative view bits; "
+                    "materialize with tensor.resolve_conj().resolve_neg() first."
+                )
             # Empty tensors have no bytes to move or NIXL descriptors to transfer.
             if data.numel() == 0:
                 continue
             assert request_context.remote_descriptors is not None
-            if data.is_contiguous() and not data.is_conj() and not data.is_neg():
+            if data.is_contiguous():
                 transfers.append((request, data, request_context.remote_descriptors))
             elif data.device.type == "cpu":
                 staged.append((request, data, request_context.remote_descriptors))
             else:
-                data = data.clone(memory_format=torch.contiguous_format)
-                # NIXL reads raw bytes without waiting on PyTorch's copy stream.
-                torch.cuda.current_stream(data.device).synchronize()
-                transfers.append((request, data, request_context.remote_descriptors))
+                transfers.append(
+                    (request, data.contiguous(), request_context.remote_descriptors)
+                )
 
         tasks = [
             asyncio.create_task(
