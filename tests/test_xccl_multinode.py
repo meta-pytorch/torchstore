@@ -123,6 +123,14 @@ def test_xccl_cross_node_pull():
 
 
 @requires_8_ranks
+@pytest.mark.xfail(
+    # Only clients (ranks 4-7) receive the corrupt transfers; volumes always pass.
+    os.environ.get("CCL_SYCL_BROADCAST_SCALEOUT_THRESHOLD") != "0"
+    and _rank is not None
+    and int(_rank) >= 4,
+    reason="uxlfoundation/oneCCL#222; CCL_SYCL_BROADCAST_SCALEOUT_THRESHOLD=0 avoids it",
+    strict=True,
+)
 def test_xccl_pull_after_intra_node_collective():
     """The same pull after the volumes ran a collective on an intra-node group.
 
