@@ -6,18 +6,16 @@
 
 # pyre-unsafe
 import asyncio
-import os
 from functools import partial
 
 import torch
 import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint, shutdown_context, this_host
+from torchstore.utils import accelerator, set_visible_devices
 
 # Run the example : python example/torchstore_rl.py
 
-
-def set_cuda_visible_devices(devices: str) -> None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = devices
+ACCEL = accelerator()
 
 
 class Learner(Actor):
@@ -50,7 +48,7 @@ class Learner(Actor):
 
 class Generator(Actor):
     def __init__(self):
-        self.model = torch.nn.Linear(4, 4, bias=False, device="cuda")
+        self.model = torch.nn.Linear(4, 4, bias=False, device=ACCEL)
         self.index = current_rank()["gpus"]
 
     @endpoint
@@ -62,7 +60,7 @@ class Generator(Actor):
 
     @endpoint
     async def generate(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        inputs = inputs.to("cuda")
+        inputs = inputs.to(ACCEL)
         logits = self.model(inputs)
         reward = torch.sum(logits)
         return logits, reward
@@ -80,11 +78,11 @@ async def main():
     # TODO: Show weights re-sharding usecase.
     learner_mesh = this_host().spawn_procs(
         per_host={"gpus": num_learners},
-        bootstrap=partial(set_cuda_visible_devices, "0"),
+        bootstrap=partial(set_visible_devices, "0"),
     )
     gen_mesh = this_host().spawn_procs(
         per_host={"gpus": num_generators},
-        bootstrap=partial(set_cuda_visible_devices, "1"),
+        bootstrap=partial(set_visible_devices, "1"),
     )
 
     await ts.initialize()
@@ -92,13 +90,11 @@ async def main():
     learner = learner_mesh.spawn("learner", Learner)
     generators = gen_mesh.spawn("generator", Generator)
 
-    logits, reward = await generators.generate.call_one(
-        torch.randn(4, 4, device="cuda")
-    )
+    logits, reward = await generators.generate.call_one(torch.randn(4, 4, device=ACCEL))
     for _ in range(3):
         await learner.step.call_one(logits, reward)
         logits, reward = await generators.generate.call_one(
-            torch.randn(4, 4, device="cuda")
+            torch.randn(4, 4, device=ACCEL)
         )
         await generators.update_weights.call_one()
 

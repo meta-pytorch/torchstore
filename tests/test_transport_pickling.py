@@ -41,6 +41,7 @@ EXPECTED_BUFFERS = {
     "TorchCommsRdmaTransportBuffer",
     "TorchCommsTransportBuffer",
     "TorchDistributedTransportBuffer",
+    "XcclTransportBuffer",
 }
 
 CACHED_BYTES = 8 * 1024 * 1024
@@ -139,6 +140,13 @@ _RESET_ON_PICKLE = {
         "_pending": lambda: ("process-local", None),
         "_endpoint": lambda: ("process-local", None),
         "_keys": lambda: (["process-local"], []),
+    },
+    "XcclTransportBuffer": {
+        **{
+            name: lambda: ("process-local", None)
+            for name in ("_tcp_store", "_pg_task", "_send_task", "_recv_task")
+        },
+        "_batch_metas": lambda: (["process-local"], []),
     },
 }
 
