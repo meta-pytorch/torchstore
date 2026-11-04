@@ -212,8 +212,7 @@ class GlooTransportBuffer(TransportBuffer):
 
     def __getstate__(self) -> dict[str, Any]:
         """Serialize state, excluding non-serializable fields."""
-        state = self.__dict__.copy()
-        state["storage_volume_ref"] = None
+        state = super().__getstate__()
         state["_tcp_store"] = None
         state["_pg_task"] = None
         state["_send_task"] = None

@@ -132,8 +132,7 @@ class TorchCommsRdmaTransportBuffer(TransportBuffer):
 
     def __getstate__(self) -> dict[str, Any]:
         """Serialize the state of the buffer, excluding non-serializable components."""
-        state = self.__dict__.copy()
-        state["storage_volume_ref"] = None
+        state = super().__getstate__()
         state["_transports"] = {}
         return state
 

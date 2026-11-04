@@ -16,7 +16,7 @@ from torchstore.client import ClientType, LocalClient
 from torchstore.controller import Controller, ControllerDirectory
 from torchstore.routing._model import RankRole
 from torchstore.routing.client import RoutingClient
-from torchstore.routing.coordinator import RoutingCoordinator
+from torchstore.routing.coordinator import MonarchControlPlane, RoutingCoordinator
 from torchstore.storage_volume import StorageVolume
 from torchstore.strategy import ControllerStorageVolumes, TorchStoreStrategy
 from torchstore.transport.types import TensorSlice
@@ -132,7 +132,7 @@ async def _initialize_routing(
     publishers = {f"{namespace}/{rank}" for rank in range(mesh.size())}
 
     coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
-    await coordinator.init.call_one(
+    await MonarchControlPlane(coordinator).init(
         publishers=publishers,
         strategy=strategy,
     )
@@ -211,11 +211,12 @@ async def client(
     if role is not None:
         role = RankRole(role)
         coordinator = await get_or_spawn_controller(store_name, RoutingCoordinator)
+        control_plane = MonarchControlPlane(coordinator)
         local_client = RoutingClient(
             _routing_volume_id(_routing_namespace(role, group)),
             role,
-            coordinator,
-            await coordinator.strategy.call_one(),
+            control_plane,
+            await control_plane.strategy(),
         )
     else:
         controller = await _controller(store_name)
@@ -449,6 +450,8 @@ async def put_state_dict(
     store_name: str = DEFAULT_TORCHSTORE_NAME,
     direct_rdma: bool = False,
     transfer_dtype: "torch.dtype | None" = None,
+    *,
+    preserve_dtype_keys: frozenset[str] = frozenset(),
 ) -> None:
     """Store a PyTorch model state_dict in the distributed store.
 
@@ -467,7 +470,15 @@ async def put_state_dict(
         transfer_dtype (torch.dtype, optional): If set, cast floating-point
             weights to this dtype for transfer. Allows the source to keep
             higher-precision master weights (e.g. float32) while transferring
-            in a lower precision (e.g. bfloat16).
+            in a lower precision (e.g. bfloat16). Without ``direct_rdma``,
+            SharedMemory casts while copying into StorageVolume memory and
+            other transports cast each dispatched batch, so tensors must not
+            change until the put returns.
+        preserve_dtype_keys (frozenset[str]): Flattened state-dict keys (e.g.
+            buffers) that keep their dtype when ``transfer_dtype`` is set.
+            Ignored unless ``transfer_dtype`` is set; then raises
+            ``ValueError`` if a key is missing, and ``NotImplementedError``
+            with ``direct_rdma=True``.
 
     Example:
         >>> model = torch.nn.Linear(10, 5)
@@ -480,6 +491,7 @@ async def put_state_dict(
         key=key,
         direct_rdma=direct_rdma,
         transfer_dtype=transfer_dtype,
+        preserve_dtype_keys=preserve_dtype_keys,
     )
 
 
