@@ -13,6 +13,9 @@ between the registered byte views. That keeps the batching orchestration
 without an ibverbs backend.
 """
 
+import pickle
+import threading
+
 import pytest
 import torch
 import torchstore.transport.monarch_rdma as monarch_rdma
@@ -22,15 +25,30 @@ from torchstore.transport.types import Request
 
 
 class FakeRDMABuffer:
-    """Stand-in for ``monarch.rdma.RDMABuffer`` wrapping a byte view."""
+    """Stand-in for ``monarch.rdma.RDMABuffer`` wrapping a byte view.
+
+    A pickled copy is the same buffer, as a real one still names the same memory.
+    """
+
+    # The test's buffers by key, so that unpickling finds the original.
+    registry: dict[int, "FakeRDMABuffer"] = {}
 
     def __init__(self, byte_view: torch.Tensor) -> None:
         # The fake action reads/writes this view to emulate a transfer.
         self.mem = byte_view
         self.dropped = False
+        self.key = len(FakeRDMABuffer.registry)
+        FakeRDMABuffer.registry[self.key] = self
+
+    def __reduce__(self) -> tuple:
+        return _registered_buffer, (self.key,)
 
     async def drop(self) -> None:
         self.dropped = True
+
+
+def _registered_buffer(key: int) -> FakeRDMABuffer:
+    return FakeRDMABuffer.registry[key]
 
 
 class FakeRDMAAction:
@@ -80,15 +98,17 @@ class MockStorageVolumeRef:
         self.volume_id = "test_volume"
         self.volume = MockVolume(metas or [])
         self.transport_context = TransportContext()
+        # Pickle refuses it, so a buffer copy that kept this handle could not be sent.
+        self.lock = threading.Lock()
 
 
 @pytest.fixture(autouse=True)
 def fake_rdma(monkeypatch):
     """Patch the module's RDMA primitives with in-process fakes."""
-    FakeRDMAAction.instances = []
+    monkeypatch.setattr(FakeRDMABuffer, "registry", {})
+    monkeypatch.setattr(FakeRDMAAction, "instances", [])
     monkeypatch.setattr(monarch_rdma, "RDMABuffer", FakeRDMABuffer)
     monkeypatch.setattr(monarch_rdma, "RDMAAction", FakeRDMAAction)
-    yield
 
 
 @pytest.fixture
@@ -106,6 +126,20 @@ def ctx():
 def _sv_entries_for_put(requests):
     """Mimic InMemoryStore.put: pair each request with no existing object."""
     return [(r.meta_only(), None) for r in requests]
+
+
+def _volume_copy(buffer):
+    """The pickled copy of ``buffer`` that a call hands its storage volume."""
+    return pickle.loads(pickle.dumps(buffer))
+
+
+async def _serve_get(buffer, entries, requests):
+    """Run the volume's get on a pickled copy and hand the client a pickled reply."""
+    volume_copy = _volume_copy(buffer)
+    await volume_copy.handle_get_request(TransportContext(), entries)
+    return await buffer._handle_storage_volume_response(
+        requests, _volume_copy(volume_copy)
+    )
 
 
 class TestMonarchRDMABatchPut:
@@ -136,7 +170,7 @@ class TestMonarchRDMABatchPut:
         requests = [Request.from_tensor("k1", t1), Request.from_tensor("k2", t2)]
         await buffer._pre_put_hook(requests)
 
-        results = await buffer.handle_put_request(
+        results = await _volume_copy(buffer).handle_put_request(
             TransportContext(), _sv_entries_for_put(requests)
         )
 
@@ -159,7 +193,7 @@ class TestMonarchRDMABatchPut:
         ]
         await buffer._pre_put_hook(requests)
 
-        results = await buffer.handle_put_request(
+        results = await _volume_copy(buffer).handle_put_request(
             TransportContext(), _sv_entries_for_put(requests)
         )
 
@@ -174,7 +208,7 @@ class TestMonarchRDMABatchPut:
         requests = [Request.from_objects("k0", 1), Request.from_objects("k1", 2)]
         await buffer._pre_put_hook(requests)
 
-        results = await buffer.handle_put_request(
+        results = await _volume_copy(buffer).handle_put_request(
             TransportContext(), _sv_entries_for_put(requests)
         )
 
@@ -188,7 +222,7 @@ class TestMonarchRDMABatchPut:
 
         put_buffer = MonarchRDMATransportBuffer(ref)
         await put_buffer._pre_put_hook(requests)
-        put_results = await put_buffer.handle_put_request(
+        put_results = await _volume_copy(put_buffer).handle_put_request(
             TransportContext(), _sv_entries_for_put(requests)
         )
 
@@ -197,11 +231,8 @@ class TestMonarchRDMABatchPut:
         )
         get_requests = [Request.from_any("empty", None)]
         await get_buffer._pre_get_hook(get_requests)
-        await get_buffer.handle_get_request(
-            TransportContext(), [(get_requests[0], tensor)]
-        )
-        get_results = await get_buffer._handle_storage_volume_response(
-            get_requests, get_buffer
+        get_results = await _serve_get(
+            get_buffer, [(get_requests[0], tensor)], get_requests
         )
 
         assert put_results[0].shape == get_results[0].shape == tensor.shape
@@ -225,10 +256,9 @@ class TestMonarchRDMABatchGet:
         await buffer._pre_get_hook(requests)
 
         stored1, stored2 = torch.randn(4, 4), torch.randn(8)
-        await buffer.handle_get_request(
-            TransportContext(), [(requests[0], stored1), (requests[1], stored2)]
+        results = await _serve_get(
+            buffer, [(requests[0], stored1), (requests[1], stored2)], requests
         )
-        results = await buffer._handle_storage_volume_response(requests, buffer)
 
         assert len(FakeRDMAAction.instances) == 1
         assert len(FakeRDMAAction.instances[0].ops) == 2
@@ -250,8 +280,7 @@ class TestMonarchRDMABatchGet:
         assert buffer._contexts[0].shape == torch.Size([5])
 
         stored = torch.randn(5)
-        await buffer.handle_get_request(TransportContext(), [(requests[0], stored)])
-        results = await buffer._handle_storage_volume_response(requests, buffer)
+        results = await _serve_get(buffer, [(requests[0], stored)], requests)
 
         assert torch.equal(results[0], stored)
 
@@ -269,11 +298,11 @@ class TestMonarchRDMABatchGet:
             RuntimeError, match="Missing remote RDMA buffer for nonempty tensor"
         ):
             if operation == "put":
-                await buffer.handle_put_request(
+                await _volume_copy(buffer).handle_put_request(
                     TransportContext(), [(request.meta_only(), None)]
                 )
             else:
-                await buffer.handle_get_request(
+                await _volume_copy(buffer).handle_get_request(
                     TransportContext(), [(request.meta_only(), tensor)]
                 )
 
@@ -292,10 +321,9 @@ class TestMonarchRDMABatchGet:
 
         stored = torch.randn(4)
         obj = {"payload": [1, 2, 3]}
-        await buffer.handle_get_request(
-            TransportContext(), [(requests[0], stored), (requests[1], obj)]
+        results = await _serve_get(
+            buffer, [(requests[0], stored), (requests[1], obj)], requests
         )
-        results = await buffer._handle_storage_volume_response(requests, buffer)
 
         assert torch.equal(results[0], stored)
         assert results[1] == obj
