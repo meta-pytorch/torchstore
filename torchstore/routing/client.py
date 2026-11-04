@@ -12,17 +12,23 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
+from torch.distributed.checkpoint._nested_dict import flatten_state_dict
 from torch.distributed.tensor import DTensor
 
 from torchstore.client import LocalClient
 from torchstore.logging import LatencyTracker
-from torchstore.state_dict_utils import _state_dict_storage_metadata, DELIM, MAPPING
+from torchstore.state_dict_utils import (
+    _state_dict_storage_key,
+    _state_dict_storage_metadata,
+    DELIM,
+    MAPPING,
+)
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
 from torchstore.transport.types import Request
 from torchstore.utils import same_slice_geometry
 from ._model import KeyRegistration, RankRole
-from .coordinator import RoutingCoordinator
+from .control_plane import ControlPlane
 from .directory import RoutingDirectory
 from .plan import RoutingPlan
 
@@ -36,15 +42,24 @@ class RoutingClient(LocalClient):
         self,
         rank: str,
         role: RankRole,
-        coordinator: RoutingCoordinator,
+        control_plane: ControlPlane,
         strategy: TorchStoreStrategy,
     ) -> None:
+        if not isinstance(control_plane, ControlPlane):
+            raise TypeError(
+                "control_plane must be a ControlPlane. Wrap a RoutingCoordinator actor "
+                f"as MonarchControlPlane(coordinator), got {control_plane!r}"
+            )
         directory = RoutingDirectory(rank)
         super().__init__(directory, strategy)
         self._routing_directory = directory
         self._role = role
-        self._coordinator = coordinator
+        self._control_plane = control_plane
         self._registered_layouts: set[str] = set()
+        # Requester: state dict key -> publisher layouts and storage keys planned so
+        # far, so later gets can plan keys earlier gets did not pass.
+        self._publisher_layouts: dict[str, Any] = {}
+        self._requested_keys: dict[str, set[str]] = {}
 
     @torch.no_grad()
     async def register_layout(
@@ -72,7 +87,7 @@ class RoutingClient(LocalClient):
         }
         rank = self._routing_directory.rank
         self._routing_directory.install(RoutingPlan.for_publisher(rank, registrations))
-        await self._coordinator.register_layout.call_one(
+        await self._control_plane.register_layout(
             rank=rank,
             key=key,
             registrations=registrations,
@@ -87,18 +102,46 @@ class RoutingClient(LocalClient):
         *,
         strict: bool = True,
     ) -> None:
-        """Fetch publisher layouts and install one requester plan."""
-        if key in self._registered_layouts:
-            return
+        """Fetch publisher layouts and plan the keys of ``state_dict`` not yet planned.
+
+        Each get may pass a different subset of the state dict, e.g. one group of
+        parameters at a time; each key is planned the first time it is passed.
+        """
         if self._role != RankRole.REQUESTER:
             raise RuntimeError("only requester clients get layouts")
         if state_dict is None:
+            if key in self._registered_layouts:
+                return
             raise ValueError(
                 "user_state_dict is required for the first routed get_state_dict"
             )
 
-        publishers = await self._coordinator.get_layouts.call_one(key=key)
-        slices, dtypes, _mapping = _state_dict_storage_metadata(state_dict, key)
+        requested = self._requested_keys.setdefault(key, set())
+        flattened, _mapping = flatten_state_dict(dict(state_dict))
+        new_state_dict = {
+            flat_key: value
+            for flat_key, value in flattened.items()
+            if _state_dict_storage_key(key, flat_key) not in requested
+        }
+        if not new_state_dict:
+            return
+
+        publishers = self._publisher_layouts.get(key)
+        if publishers is None:
+            publishers = await self._control_plane.get_layouts(key)
+            self._publisher_layouts[key] = publishers
+        slices, dtypes, _mapping = _state_dict_storage_metadata(new_state_dict, key)
+        new_keys = set(slices)
+        # Plan against only these keys' publisher entries so each incremental get
+        # costs its own subset, not the whole state dict.
+        publishers = {
+            publisher: {
+                name: publisher_registrations[name]
+                for name in new_keys
+                if name in publisher_registrations
+            }
+            for publisher, publisher_registrations in publishers.items()
+        }
         if not strict:
             published_keys = {
                 name
@@ -119,11 +162,21 @@ class RoutingClient(LocalClient):
         self._routing_directory.install(
             RoutingPlan.for_requester(rank, registrations, publishers)
         )
+        # Unpublished keys stay unplanned so a strict get still rejects them.
+        requested.update(slices)
         self._registered_layouts.add(key)
 
     @torch.no_grad()
-    async def put_batch(self, entries: dict[str, torch.Tensor | Any]) -> None:
-        """Put batches to the one volume this rank publishes through."""
+    async def put_batch(
+        self,
+        entries: dict[str, torch.Tensor | Any],
+        *,
+        transfer_dtypes: Mapping[str, torch.dtype] | None = None,
+    ) -> None:
+        """Put batches to the one volume this rank publishes through.
+
+        See LocalClient.put_batch for ``transfer_dtypes``.
+        """
         assert (
             isinstance(entries, dict) and entries
         ), "put_batch requires a non-empty dict"
@@ -134,6 +187,7 @@ class RoutingClient(LocalClient):
         for key, value in entries.items():
             if isinstance(value, (torch.Tensor, DTensor)):
                 request = Request.from_any(key, value)
+                request.transfer_dtype = (transfer_dtypes or {}).get(key)
                 self._match_plan(request)
             else:
                 request = Request.from_objects(key, value)
