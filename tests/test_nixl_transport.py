@@ -378,62 +378,56 @@ async def test_get_writes_storage_tensor_into_client_destination(ref, ctx):
     ids=["transpose", "strided", "conjugate", "negative", "conjugate_negative"],
 )
 @pytest.mark.parametrize("requires_grad", [False, True])
+@pytest.mark.parametrize("explicit_copy", [False, True])
 @pytest.mark.asyncio
-async def test_get_preserves_destination_view(make_view, requires_grad, ref, ctx):
+async def test_get_rejects_unsupported_destinations(
+    make_view, requires_grad, explicit_copy, ref, ctx
+):
     backing = torch.full(
         (4, 8), 17 + 19j, dtype=torch.complex64, requires_grad=requires_grad
     )
+    original = backing.detach().clone()
     destination = make_view(backing)
-    expected = backing.detach().clone()
+    ordinary = torch.zeros(destination.shape, dtype=destination.dtype)
+    receive = torch.empty_like(ordinary) if explicit_copy else destination
+    requests = [
+        Request.from_tensor("valid", ordinary),
+        Request.from_tensor("view", receive),
+    ]
+    client_buffer = NixlTransportBuffer(ref)
+
+    if not explicit_copy:
+        with pytest.raises(ValueError, match="NIXL destinations must be contiguous"):
+            await client_buffer._pre_get_hook(requests)
+        assert all(
+            not agent.register_memory.called and not agent.initialized
+            for agent in FakeNixlAgent.instances
+        )
+        assert torch.count_nonzero(ordinary) == 0
+        assert torch.equal(backing, original)
+        return
+
+    await client_buffer._pre_get_hook(requests)
+    assert client_buffer._contexts[1].tensor is receive
+    remote_buffer = _storage_volume_copy(client_buffer)
     stored = (
         torch.arange(destination.numel()).reshape(destination.shape).to(torch.complex64)
         + 3j
     )
-    make_view(expected).copy_(stored)
-    request = Request.from_tensor("weight", destination)
-    client_buffer = NixlTransportBuffer(ref)
-
-    await client_buffer._pre_get_hook([request])
-    staging = client_buffer._contexts[0].tensor
-    assert staging is not destination
-    assert staging.is_contiguous() and not staging.is_conj() and not staging.is_neg()
-    storage_volume_buffer = _storage_volume_copy(client_buffer)
-    await storage_volume_buffer.handle_get_request(ctx, [(request.meta_only(), stored)])
-    assert torch.all(backing == 17 + 19j)
-    results = await client_buffer._handle_storage_volume_response(
-        [request], storage_volume_buffer
+    await remote_buffer.handle_get_request(
+        ctx, [(request.meta_only(), stored) for request in requests]
     )
-
-    assert results[0] is destination
-    assert destination.requires_grad == requires_grad
+    results = await client_buffer._handle_storage_volume_response(
+        requests, remote_buffer
+    )
+    assert results[1] is receive
+    assert torch.equal(backing, original)
+    # Copy-back and its autograd policy are explicitly the caller's responsibility.
+    with torch.no_grad():
+        destination.copy_(results[1])
+    make_view(original).copy_(stored)
     assert torch.equal(destination, stored)
-    assert torch.equal(backing, expected)
-    await client_buffer.drop()
-    assert client_buffer._contexts == []
-
-
-@pytest.mark.asyncio
-async def test_failed_get_does_not_copy_staging_into_destination(ref, ctx):
-    backing = torch.full((3, 8), -1.0)
-    destination = backing[:, ::2]
-    request = Request.from_tensor("weight", destination)
-    client_buffer = NixlTransportBuffer(ref)
-
-    async def get(buffer, requests):
-        remote_buffer = _storage_volume_copy(buffer)
-        await remote_buffer.handle_get_request(ctx, [(requests[0], torch.ones(3, 4))])
-        raise RuntimeError("response failed")
-
-    ref.volume.get = SimpleNamespace(call_one=AsyncMock(side_effect=get))
-    with pytest.raises(RuntimeError, match="response failed"):
-        await client_buffer.get_from_storage_volume([request])
-
-    assert torch.all(backing == -1)
-    assert client_buffer._contexts == []
-    # The fake's call history otherwise retains the registered staging storage.
-    ref.transport_context.get(NixlAgentCache).agent.register_memory.reset_mock()
-    gc.collect()
-    assert ref.transport_context.get(NixlAgentCache)._registrations == {}
+    assert torch.equal(backing, original)
 
 
 @pytest.mark.asyncio
