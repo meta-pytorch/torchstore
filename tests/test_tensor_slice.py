@@ -377,8 +377,11 @@ async def test_dtensor_fetch_slice():
     Test DTensor slice optimization by storing a DTensor across multiple volumes
     and requesting slices that test both cross-volume and single-volume scenarios.
 
-    It checks the values and shapes of a slice that spans both volumes and of a
-    slice inside one volume, not which volumes a get contacts.
+    This test validates that the slice optimization:
+    1. Only fetches from relevant storage volumes when requesting slices
+    2. Works correctly for slices that span multiple volumes
+    3. Works correctly for slices contained within a single volume
+    4. Maintains correctness while providing performance benefits
     """
     import tempfile
 
