@@ -17,6 +17,7 @@ from torchstore.routing._model import KeyRegistration, RankRole, Registrations
 from torchstore.routing.client import RoutingClient
 from torchstore.routing.control_plane import ControlPlane
 from torchstore.transport import TransportType
+from torchstore.transport.types import TensorSlice
 
 from .utils import registered_clients
 
@@ -165,3 +166,61 @@ async def test_a_failed_layout_exchange_is_retried_on_the_next_sync() -> None:
     assert route is not None
     [transfer] = route.transfers
     assert transfer.source == "publisher/0"
+
+
+@pytest.mark.asyncio
+async def test_get_state_dict_layout_lists_each_published_slice_once() -> None:
+    """Strip the key prefix, collapse replicas and sort slices by offsets."""
+    control_plane, publisher, requester = _in_memory_clients()
+    with pytest.raises(RuntimeError, match="only requester"):
+        await publisher.get_state_dict_layout("model")
+
+    def registration(offset: int, coordinate: int) -> KeyRegistration:
+        return KeyRegistration(
+            TensorSlice(
+                offsets=(offset, 0),
+                coordinates=(coordinate,),
+                global_shape=(4, 3),
+                local_shape=(2, 3),
+                mesh_shape=(4,),
+            ),
+            dtype=torch.bfloat16,
+        )
+
+    # Ranks 0 and 2 replicate the second half; rank 1 holds the first half.
+    for rank, offset in enumerate((2, 0, 2)):
+        await control_plane.register_layout(
+            f"publisher/{rank}", "model", {"model/w": registration(offset, rank)}
+        )
+
+    layout = await requester.get_state_dict_layout("model")
+    assert [tensor_slice.offsets for tensor_slice in layout["w"]] == [(0, 0), (2, 0)]
+    assert layout.keys() == {"w"}
+    # Mutating the result does not change the cached layout.
+    layout["w"][0].offsets = (1, 0)
+    layout = await requester.get_state_dict_layout("model")
+    assert [tensor_slice.offsets for tensor_slice in layout["w"]] == [(0, 0), (2, 0)]
+    assert control_plane.calls["get_layouts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_state_dict_layout_rejects_inconsistent_publishers() -> None:
+    """Publishers must agree on the global shape and dtype of a key."""
+    control_plane, _publisher, requester = _in_memory_clients()
+    for rank, (global_shape, dtype) in enumerate(
+        [((4,), torch.float32), ((4,), torch.bfloat16)]
+    ):
+        tensor_slice = TensorSlice(
+            offsets=(rank * 2,),
+            coordinates=(rank,),
+            global_shape=global_shape,
+            local_shape=(2,),
+            mesh_shape=(2,),
+        )
+        await control_plane.register_layout(
+            f"publisher/{rank}",
+            "model",
+            {"model/w": KeyRegistration(tensor_slice, dtype=dtype)},
+        )
+    with pytest.raises(ValueError, match="inconsistent dtype"):
+        await requester.get_state_dict_layout("model")

@@ -16,6 +16,7 @@ from torchstore.api import (
     get,
     get_batch,
     get_state_dict,
+    get_state_dict_layout,
     initialize,
     keys,
     put,
@@ -68,6 +69,7 @@ __all__ = [
     "ControllerStorageVolumes",
     "put_state_dict",
     "get_state_dict",
+    "get_state_dict_layout",
     "reset_client",
     "spmd",
 ]
