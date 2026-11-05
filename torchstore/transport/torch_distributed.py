@@ -449,14 +449,17 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         )
 
     def _synchronize_streams(self) -> None:
-        """Wait for queued kernels on client tensors; DMA ignores CUDA streams."""
+        """Wait for queued kernels on client tensors; DMA ignores device streams."""
+        accelerator = torch.accelerator.current_accelerator()
         devices = {
             context.tensor.device
             for context in self._contexts
-            if context.tensor is not None and context.tensor.is_cuda
+            if context.tensor is not None
+            and accelerator is not None
+            and context.tensor.device.type == accelerator.type
         }
         for device in devices:
-            torch.cuda.current_stream(device).synchronize()
+            torch.accelerator.current_stream(device).synchronize()
 
     def _expose_contexts(self, endpoint: _Endpoint) -> bool:
         """Register context tensors; False if a descriptor conflicts."""

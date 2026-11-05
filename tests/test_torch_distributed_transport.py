@@ -849,3 +849,52 @@ async def test_real_backend_roundtrip(backend_name, device, probe, caplog):
         volume.store.reset()
     # Unregister and close failures are only logged.
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+class _RecordingStream:
+    def __init__(self, synced: list, device: torch.device) -> None:
+        self._synced = synced
+        self._device = device
+
+    def synchronize(self) -> None:
+        self._synced.append(self._device)
+
+
+def _fake_accelerator(monkeypatch, device_type: str) -> list:
+    """Make device_type the current accelerator and record the streams synchronized on it."""
+    synced: list = []
+    monkeypatch.setattr(
+        torch.accelerator, "current_accelerator", lambda: torch.device(device_type)
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_stream",
+        lambda device=None: _RecordingStream(synced, device),
+    )
+    return synced
+
+
+def test_synchronize_streams_covers_any_accelerator(monkeypatch):
+    # `meta` stands in for a non-CUDA accelerator such as XPU: its tensors are synced, CPU tensors are not.
+    synced = _fake_accelerator(monkeypatch, "meta")
+    buffer = TorchDistributedTransportBuffer.__new__(TorchDistributedTransportBuffer)
+    buffer._contexts = [
+        SimpleNamespace(tensor=torch.empty(4, device="meta")),
+        SimpleNamespace(tensor=torch.empty(4)),
+        SimpleNamespace(tensor=None),
+    ]
+    buffer._synchronize_streams()
+    assert synced == [torch.device("meta")]
+
+
+def test_transfer_dtype_cast_syncs_any_accelerator(monkeypatch):
+    from torchstore.transport.buffers import _apply_transfer_dtypes
+
+    synced = _fake_accelerator(monkeypatch, "meta")
+    requests = [
+        Request(tensor_val=torch.empty(4, device="meta"), transfer_dtype=torch.float16),
+        Request(tensor_val=torch.empty(4), transfer_dtype=torch.float16),
+    ]
+    cast = _apply_transfer_dtypes(requests)
+    assert [r.tensor_val.dtype for r in cast] == [torch.float16, torch.float16]
+    assert synced == [torch.device("meta")]
