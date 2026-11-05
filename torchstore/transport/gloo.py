@@ -11,7 +11,6 @@ from datetime import timedelta
 from logging import getLogger
 from typing import Any, TYPE_CHECKING
 
-import portpicker
 import torch
 from torch.distributed import ProcessGroup, ProcessGroupGloo, Store, TCPStore
 
@@ -176,25 +175,25 @@ class GlooTransportBuffer(TransportBuffer):
         """
         volume_id = self.storage_volume_ref.volume_id
 
-        # Generate unique store key and find free port
         self.store_key = f"torchstore_gloo_{str(uuid.uuid4())[:8]}"
         self.master_addr = _get_hostname()
-        self.master_port = portpicker.pick_unused_port()
 
         logger.info(
             f"Initiating gloo handshake with StorageVolume:[{volume_id}] "
-            f"using TCPStore at {self.master_addr}:{self.master_port}"
+            f"using TCPStore at {self.master_addr}"
         )
 
         # Create TCPStore as master (non-blocking with wait_for_workers=False)
+        # Port 0 has the kernel pick a free port during the bind so no other socket can take it first.
         self._tcp_store = TCPStore(
             host_name=self.master_addr,
-            port=self.master_port,
+            port=0,
             world_size=2,
             is_master=True,
             timeout=timedelta(seconds=TORCHSTORE_GLOO_INIT_TIMEOUT),
             wait_for_workers=False,
         )
+        self.master_port = self._tcp_store.port
 
         # Start PG creation in background so it runs concurrently with handshake RPC
         tcp_store = self._tcp_store
