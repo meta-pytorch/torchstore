@@ -36,11 +36,7 @@ def _client(volume_id: str) -> GlooTransportBuffer:
 async def test_two_handshakes_pair_through_the_ports_their_stores_bound(
     monkeypatch, request
 ):
-    """Another socket binds the port each client store asks for just before that store binds.
-
-    A store that asks for port 0 loses nothing to it. Each volume half gets its own store's
-    bound port and receives its own tensor.
-    """
+    """Another socket binds the port each client store asks for just before that store binds."""
     real_store = gloo.TCPStore
 
     def store_after_another_bind(**kwargs):
