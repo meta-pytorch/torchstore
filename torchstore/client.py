@@ -5,6 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
+import hashlib
+import os
 from collections import defaultdict
 from collections.abc import Mapping
 from enum import Enum
@@ -22,6 +24,7 @@ from torchstore.transport import create_transport_buffer, Request, TensorSlice
 from torchstore.utils import (
     assemble_tensor,
     get_destination_view,
+    get_local_hostname,
     get_slice_intersection,
     tensors_overlap_in_memory,
 )
@@ -54,6 +57,13 @@ class LocalClient:
         self._directory = directory
         self._controller = controller
         self.strategy: TorchStoreStrategy = strategy
+        # Use SHA-256 because the salted hash() would change the offset on every run.
+        identity = [get_local_hostname()] + [
+            os.environ.get(name, "")
+            for name in ("RANK", "LOCAL_RANK", "CUDA_VISIBLE_DEVICES")
+        ]
+        digest = hashlib.sha256(b"\0".join(map(os.fsencode, identity))).digest()
+        self._fetch_offset = int.from_bytes(digest[:4], "big")
 
     async def register_layout(
         self,
@@ -313,7 +323,9 @@ class LocalClient:
                         self._expand_tensor_slices(request, storage_info, use_inplace)
                     )
 
-        return dict(volume_requests), whole_keys
+        # A volume the get reads nothing from drops out and so takes no start and no empty fetch.
+        # Batch transports such as NIXL would send that fetch as an RPC.
+        return {vid: reqs for vid, reqs in volume_requests.items() if reqs}, whole_keys
 
     def _expand_tensor_slices(
         self,
@@ -360,11 +372,23 @@ class LocalClient:
             )
             return list(zip(sub_requests, results, strict=True))
 
-        per_volume = await asyncio.gather(
-            *[_fetch_one(vid, reqs) for vid, reqs in volume_requests.items()]
+        # Each client starts at its offset into the sorted volumes and so clients that read the same volumes
+        # and whose offsets differ modulo their count send their first requests to different volumes.
+        try:
+            order = sorted(volume_requests)
+        except TypeError:
+            # Ids that do not order (such as a mix of int and str) sort by repr. Clients agree on
+            # that order when each id has its own repr and it is the same in every process.
+            order = sorted(volume_requests, key=repr)
+        start = self._fetch_offset % len(order) if order else 0
+        order = order[start:] + order[:start]
+        results = await asyncio.gather(
+            *[_fetch_one(vid, volume_requests[vid]) for vid in order]
         )
-        # Flatten list-of-lists into a single list of (sub_request, result) pairs
-        return [pair for pairs in per_volume for pair in pairs]
+        per_volume = dict(zip(order, results))
+        # Grouped by volume in volume_requests order so plain gets assemble the same from any start.
+        # In-place copies can still depend on the start since the copy a transport writes last wins.
+        return [pair for vid in volume_requests for pair in per_volume[vid]]
 
     def _assemble_results(
         self,
