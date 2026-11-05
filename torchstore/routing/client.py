@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
@@ -25,7 +26,7 @@ from torchstore.state_dict_utils import (
 )
 from torchstore.strategy import TorchStoreStrategy
 from torchstore.transport import create_transport_buffer
-from torchstore.transport.types import Request
+from torchstore.transport.types import Request, TensorSlice
 from torchstore.utils import same_slice_geometry
 from ._model import KeyRegistration, RankRole
 from .control_plane import ControlPlane
@@ -165,6 +166,49 @@ class RoutingClient(LocalClient):
         # Unpublished keys stay unplanned so a strict get still rejects them.
         requested.update(slices)
         self._registered_layouts.add(key)
+
+    async def get_state_dict_layout(self, key: str) -> dict[str, list[TensorSlice]]:
+        """Every published slice of each flat key of state dict ``key``.
+
+        Replicas of a slice are listed once; only ``offsets``, ``local_shape``
+        and ``global_shape`` identify a slice. Blocks until every publisher has
+        registered ``key``, failing after 300 seconds; the result is cached for
+        the client's lifetime. Other fields come from an arbitrary replica.
+        """
+        if self._role != RankRole.REQUESTER:
+            raise RuntimeError("only requester clients get layouts")
+        publishers = self._publisher_layouts.get(key)
+        if publishers is None:
+            publishers = await self._control_plane.get_layouts(key)
+            self._publisher_layouts[key] = publishers
+        prefix = f"{key}{DELIM}"
+        layout: dict[str, dict[tuple, TensorSlice]] = {}
+        dtypes: dict[str, torch.dtype] = {}
+        global_shapes: dict[str, tuple[int, ...]] = {}
+        for registrations in publishers.values():
+            for storage_key, registration in registrations.items():
+                flat_key = storage_key.removeprefix(prefix)
+                tensor_slice = registration.tensor_slice
+                global_shape = tuple(tensor_slice.global_shape)
+                if global_shapes.setdefault(flat_key, global_shape) != global_shape:
+                    raise ValueError(f"inconsistent global shape for key {flat_key!r}")
+                if (
+                    dtypes.setdefault(flat_key, registration.dtype)
+                    != registration.dtype
+                ):
+                    raise ValueError(f"inconsistent dtype for key {flat_key!r}")
+                geometry = (
+                    tuple(tensor_slice.offsets),
+                    tuple(tensor_slice.local_shape),
+                )
+                layout.setdefault(flat_key, {}).setdefault(geometry, tensor_slice)
+        # Copies, so callers cannot change the cached layouts routes plan from.
+        return {
+            flat_key: [
+                dataclasses.replace(slices[geometry]) for geometry in sorted(slices)
+            ]
+            for flat_key, slices in layout.items()
+        }
 
     @torch.no_grad()
     async def put_batch(

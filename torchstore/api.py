@@ -525,3 +525,30 @@ async def get_state_dict(
     return await torchstore.state_dict_utils.get_state_dict(
         cl, key, user_state_dict, strict, direct_rdma=direct_rdma
     )
+
+
+async def get_state_dict_layout(
+    key: str, store_name: str = DEFAULT_TORCHSTORE_NAME
+) -> dict[str, list[TensorSlice]]:
+    """Return every published slice of each flat key of a routed state dict.
+
+    Lets a requester see how publishers shard a state dict, e.g. to read
+    metadata the publishers put per shard. Replicas of a slice are listed
+    once. Blocks until every publisher has registered ``key``, failing after
+    300 seconds. The result is cached for the client's lifetime.
+
+    Args:
+        key (str): Key the publishers passed to ``put_state_dict``.
+        store_name (str): Name of the store to use. Defaults to DEFAULT_TORCHSTORE_NAME.
+
+    Returns:
+        dict: flat key -> published slices, sorted by offsets.
+
+    Raises:
+        TypeError: If the store client is not a routing client.
+        RuntimeError: If the client is not a requester.
+    """
+    cl = await client(store_name)
+    if not isinstance(cl, RoutingClient):
+        raise TypeError("get_state_dict_layout requires a routing client")
+    return await cl.get_state_dict_layout(key)
