@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
+from torchstore.client import LocalClient
+from torchstore.directory import VolumeDirectory
 from torchstore.state_dict_utils import (
     _state_dict_storage_metadata,
     get_state_dict,
@@ -64,6 +67,37 @@ def test_strict_state_dict_mismatch() -> None:
                 user_state_dict={"other": torch.empty(1)},
             )
         )
+
+
+@pytest.mark.parametrize("subsets", [False, True], ids=["standard", "subset"])
+def test_non_strict_state_dict_reads_follow_client_capability(
+    monkeypatch: pytest.MonkeyPatch, subsets: bool
+) -> None:
+    """Non-strict staged reads honor the client capability."""
+    client = LocalClient(directory=Mock(spec=VolumeDirectory), strategy=None)
+    if subsets:
+        monkeypatch.setattr(client, "fetches_state_dict_subsets", True)
+    stored = {
+        "model/first": torch.tensor([2.0, 3.0], dtype=torch.float32),
+        "model/second": torch.tensor([5.0, 7.0], dtype=torch.float32),
+    }
+    monkeypatch.setattr(
+        client,
+        "get",
+        AsyncMock(return_value={"first": ("first",), "second": ("second",)}),
+    )
+    monkeypatch.setattr(
+        client,
+        "get_batch",
+        AsyncMock(side_effect=lambda entries: {key: stored[key] for key in entries}),
+    )
+    result = asyncio.run(
+        get_state_dict(client, "model", {"first": torch.zeros(2)}, strict=False)
+    )
+    expected_keys = {"first"} if subsets else {"first", "second"}
+    assert set(result) == expected_keys
+    for name in expected_keys:
+        torch.testing.assert_close(result[name], stored[f"model/{name}"])
 
 
 def test_put_state_dict_rejects_unknown_preserve_dtype_keys() -> None:

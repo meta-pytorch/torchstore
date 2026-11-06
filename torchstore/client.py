@@ -37,12 +37,12 @@ class ClientType(str, Enum):
 
 
 class LocalClient:
-    """Client-side interface for TorchStore operations.
-
-    LocalClient runs in the user's process and coordinates with remote StorageVolumes
-    via TransportBuffers. It handles put/get operations by selecting appropriate storage
-    volumes through the configured strategy and managing data transport.
+    """Coordinate remote volume put/get through transport buffers and a strategy in the user's process.
+    ``fetches_state_dict_subsets`` is a bool for non-strict destination reads with ``direct_rdma=False``.
     """
+
+    # True restricts fetched keys to the destination. False keeps every stored state dict key.
+    fetches_state_dict_subsets: bool = False
 
     def __init__(
         self,

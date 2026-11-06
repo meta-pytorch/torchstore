@@ -208,16 +208,8 @@ async def put_state_dict(
 async def get_state_dict(
     store, key, user_state_dict: dict | None = None, strict=True, direct_rdma=False
 ):
-    """Retrieve a state dict from TorchStore.
-
-    When ``direct_rdma=False`` (default), each parameter is fetched from
-    a StorageVolume via the normal two-hop transport path.
-
-    When ``direct_rdma=True``, RDMA handles are fetched from TorchStore
-    (first call only, cached afterwards) and weights are pulled directly
-    from the source's GPU memory via one-sided RDMA reads.
-    ``user_state_dict`` must be provided in this mode so the destination
-    tensors are available for in-place writes.
+    """Fetch by two-hop volumes. One-sided GPU RDMA needs ``user_state_dict`` for in-place writes and caches handles on first use.
+    Non-strict reads with ``direct_rdma=False`` and a destination require bool ``store.fetches_state_dict_subsets``.
     """
     tracker = LatencyTracker(
         f"get_state_dict[{key}]/{'rdma' if direct_rdma else 'cpu_staged'}",
@@ -257,9 +249,7 @@ async def get_state_dict(
         )
 
     flattened_keys = list(fetched_mapping.keys())
-    from torchstore.routing.client import RoutingClient
-
-    if not strict and user_state_dict is not None and isinstance(store, RoutingClient):
+    if not strict and user_state_dict is not None and store.fetches_state_dict_subsets:
         # A routed read may pass one subset of the state dict per call; fetch only
         # that subset rather than every key planned by earlier calls.
         flattened_keys = [
