@@ -44,11 +44,20 @@ from torchstore.transport.buffers import TransportBuffer, TransportCache
 from torchstore.transport.types import Request
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Iterable
+
+    from torch.distributed import Work
     from torch.distributed._transport import Memory, RemoteBuffer, Transport
 
     from torchstore.logging import LatencyTracker
     from torchstore.strategy import StorageVolumeRef
     from torchstore.transport.buffers import TransportContext
+
+    _TransportAPI = tuple[
+        Callable[[], tuple[str, ...]],
+        Callable[[str], Transport],
+        Callable[[Iterable[Work]], Awaitable[None]],
+    ]
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +77,17 @@ _MAX_EXPOSED = 16384
 _RegistrationKey = tuple[int, int, str]
 
 
+def _load_transport_api() -> _TransportAPI:
+    """Import the functions required by the torch transport."""
+    from torch.distributed._transport import (
+        available_transports,
+        new_transport,
+        wait_all,
+    )
+
+    return available_transports, new_transport, wait_all
+
+
 @cache
 def torch_transport_available() -> bool:
     """Return whether the selected torch.distributed transport backend works.
@@ -78,7 +98,7 @@ def torch_transport_available() -> bool:
     if not ENV_TORCHSTORE_TORCH_TRANSPORT_BACKEND:
         return False
     try:
-        from torch.distributed._transport import available_transports, new_transport
+        available_transports, new_transport, _ = _load_transport_api()
     except ImportError:
         return False
     if ENV_TORCHSTORE_TORCH_TRANSPORT_BACKEND not in available_transports():
@@ -185,8 +205,7 @@ class _Endpoint:
         self, read: bool, transfers: list[tuple[torch.Tensor, RemoteBuffer]]
     ) -> None:
         """Run transfers and wait until all of them finished."""
-        from torch.distributed._transport import wait_all
-
+        _, _, wait_all = _load_transport_api()
         keys, works = [], []
         self.active += 1
         try:
@@ -384,8 +403,7 @@ class TorchDistributedTransportBuffer(TransportBuffer):
 
     @override
     async def _pre_handshake(self) -> None:
-        from torch.distributed._transport import new_transport
-
+        _, new_transport, _ = _load_transport_api()
         self._pending = _Endpoint(new_transport(self._backend))
         self._endpoint_id = self._pending.id
         self._client_url = self._pending.transport.bind()
@@ -397,8 +415,7 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         ctx: TransportContext,
         entries: list[tuple[Request, Any]],
     ) -> list[Any]:
-        from torch.distributed._transport import new_transport
-
+        _, new_transport, _ = _load_transport_api()
         assert self._client_id is not None and self._endpoint_id is not None
         assert self._client_url is not None
         cache = ctx.get(TorchTransportCache)
