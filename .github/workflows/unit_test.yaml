@@ -3,6 +3,8 @@ name: Unit Test
 on:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '17 8 * * *'
 
 concurrency:
   group: unit-test-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_number || github.ref }}
@@ -44,11 +46,10 @@ jobs:
         # TorchStore RDMA will not run on CPU-only machines
         # resharding tests runs for too long.
         # test_large_tensors.py can OOM.
+        env:
+          TORCHSTORE_RESHARDING_FILTER: ${{ github.event_name == 'pull_request' && 'Gloo or test_1d_resharding' || '' }}
         run: |
-          TORCHSTORE_RDMA_ENABLED=0 \
-          USE_TORCHCOMMS_RDMA=0 \
-          pytest tests/test_resharding_basic.py \
-            --cov=. --cov-report=xml -vv -s
+          TORCHSTORE_RDMA_ENABLED=0 USE_TORCHCOMMS_RDMA=0 pytest tests/test_resharding_basic.py -k "$TORCHSTORE_RESHARDING_FILTER" --cov=. --cov-report=xml -vv -s
       - name: Run remaining tests with coverage
         # TorchStore RDMA will not run on CPU-only machines
         # resharding tests runs for too long.
