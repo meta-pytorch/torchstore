@@ -11,8 +11,11 @@ import logging
 import pickle
 import sys
 import uuid
+from collections.abc import Awaitable, Iterable
 from dataclasses import dataclass
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import cast, NoReturn
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -356,6 +359,15 @@ def _finish(transport):
         work.get_future().set_result([])
 
 
+async def _release_pending(transport: FakeTransport, *tasks: Awaitable[object]) -> None:
+    """Release unfinished fake work and consume owned task outcomes."""
+    for work, *_ in transport.pending:
+        future = work.get_future()
+        if not future.done():
+            future.set_result([])
+    await _bounded(asyncio.gather(*tasks, return_exceptions=True))
+
+
 @pytest.mark.parametrize("name", ["", "does-not-exist", "torchstore-unsupported"])
 def test_unavailable_backend(probe, name):
     probe.setattr(td_transport, "ENV_TORCHSTORE_TORCH_TRANSPORT_BACKEND", name)
@@ -663,21 +675,42 @@ async def test_connect_failure_closes_both_sides(ref, monkeypatch, failing_conne
 
 
 @pytest.mark.asyncio
-async def test_failed_submission_drains_submitted_transfers(ref, monkeypatch):
+async def test_failed_submission_drains_submitted_transfers(
+    ref: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
     await _put(ref, [Request.from_tensor("w", torch.zeros(4))])
     old_client = _client_endpoint(ref)
     (old_volume,) = _volume_endpoints(ref).values()
-    reads = []
-    read = old_volume.transport.read
+    transport = old_volume.transport
+    assert isinstance(transport, FakeTransport)
+    read = transport.read
+    submitted: list[Work] = []
+    observed: list[Work] = []
+    draining = asyncio.Event()
+    available, factory, wait_all = td_transport._load_transport_api()
 
-    def flaky_read(*args, **kwargs):
-        reads.append(None)
-        if len(reads) == 2:
+    def flaky_read(
+        local_buffer: FakeMemory, remote_buffer: FakeRemoteBuffer, *, async_op: bool
+    ) -> FakeWork:
+        if submitted:
             raise RuntimeError("submission failed")
-        return read(*args, **kwargs)
+        work = read(local_buffer, remote_buffer, async_op=async_op)
+        submitted.append(work)
+        return work
 
-    monkeypatch.setattr(old_volume.transport, "read", flaky_read)
-    FakeTransport.hang = True
+    async def observed_wait_all(works: Iterable[Work]) -> None:
+        batch = list(works)
+        observed.extend(batch)
+        draining.set()
+        await wait_all(batch)
+
+    monkeypatch.setattr(transport, "read", flaky_read)
+    monkeypatch.setattr(
+        td_transport,
+        "_load_transport_api",
+        lambda: (available, factory, observed_wait_all),
+    )
+    monkeypatch.setattr(FakeTransport, "hang", True)
     task = asyncio.create_task(
         _put(
             ref,
@@ -687,16 +720,20 @@ async def test_failed_submission_drains_submitted_transfers(ref, monkeypatch):
             ],
         )
     )
-    await _until(lambda: old_volume.transport.pending)
-    assert not task.done()
+    try:
+        await _bounded(draining.wait())
+        (only,) = submitted
+        assert observed == [only]
+        assert old_volume.active == 1
+        assert not task.done()
+        _finish(transport)
+        with pytest.raises(RuntimeError, match="submission failed"):
+            await _bounded(task)
+        assert old_client.transport.closed
+    finally:
+        await _release_pending(transport, task, *ref.volume.tasks)
 
-    # Both sides keep memory registered until the submitted read finishes.
-    _finish(old_volume.transport)
-    with pytest.raises(RuntimeError, match="submission failed"):
-        await _bounded(task)
-    assert old_client.transport.closed
-
-    FakeTransport.hang = False
+    monkeypatch.setattr(FakeTransport, "hang", False)
     await _put(ref, [Request.from_tensor("a", torch.ones(4))])
     assert old_volume.transport.closed
     assert ref.volume.handshakes == 2
@@ -849,3 +886,56 @@ async def test_real_backend_roundtrip(backend_name, device, probe, caplog):
         volume.store.reset()
     # Unregister and close failures are only logged.
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize(
+    "missing", ["module", "available_transports", "new_transport", "wait_all"]
+)
+def test_reprobe_rejects_an_unavailable_api(
+    backend: None, probe: pytest.MonkeyPatch, missing: str
+) -> None:
+    module_name = "torch.distributed._transport"
+    if missing == "module":
+        modules = cast(dict[str, ModuleType | None], sys.modules)
+        probe.setitem(modules, module_name, None)
+    else:
+        probe.delattr(sys.modules[module_name], missing)
+    td_transport.torch_transport_available.cache_clear()
+    assert td_transport.torch_transport_available() is False
+
+
+@pytest.mark.asyncio
+async def test_loader_failure_precedes_transfer_effects(
+    ref: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _put(ref, [Request.from_tensor("w", torch.zeros(4))])
+    client = _client_endpoint(ref)
+    (endpoint,) = _volume_endpoints(ref).values()
+    transport = endpoint.transport
+    assert isinstance(transport, FakeTransport)
+    key, memory = client.register(torch.zeros(4))
+    remote = memory.to_remote_buffer()
+    register = Mock(spec=transport.register_memory, wraps=transport.register_memory)
+    monkeypatch.setattr(transport, "register_memory", register)
+
+    def unavailable() -> NoReturn:
+        raise ImportError("transport API unavailable")
+
+    monkeypatch.setattr(td_transport, "_load_transport_api", unavailable)
+    monkeypatch.setattr(FakeTransport, "hang", True)
+    task = asyncio.create_task(endpoint.transfer(True, [(torch.ones(4), remote)]))
+    try:
+        with pytest.raises(ImportError, match="transport API unavailable"):
+            await _bounded(asyncio.shield(task))
+        register.assert_not_called()
+        assert endpoint.active == 0
+        assert not endpoint._registrations
+        assert not transport.pending
+    finally:
+        try:
+            await _release_pending(transport, task, *ref.volume.tasks)
+        finally:
+            endpoint.unregister(list(endpoint._registrations))
+            if endpoint.active:
+                endpoint.release()
+            client.unregister([key])
