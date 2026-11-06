@@ -38,6 +38,8 @@ __all__ = ["RoutingClient"]
 class RoutingClient(LocalClient):
     """A ``LocalClient`` backed by a rank-local precomputed directory."""
 
+    fetches_state_dict_subsets = True
+
     def __init__(
         self,
         rank: str,
