@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import Any, TYPE_CHECKING, TypeVar
@@ -13,6 +14,8 @@ import torch
 
 from torchstore.logging import LatencyTracker
 from torchstore.transport.types import Request
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from torchstore.strategy import StorageVolumeRef
@@ -56,10 +59,14 @@ class TransportContext:
         return self._caches[cache_type]  # type: ignore[return-value]
 
     def clear(self) -> None:
-        """Clear all caches."""
-        for cache in self._caches.values():
-            cache.clear()
+        """Clear all caches, logging failures so the rest are still cleared."""
+        caches = list(self._caches.values())
         self._caches.clear()
+        for cache in caches:
+            try:
+                cache.clear()
+            except Exception:
+                logger.exception("Failed to clear %s", type(cache).__name__)
 
     def delete(self, keys: str | Iterable[str]) -> None:
         """Delete cache entries associated with one or more TorchStore keys."""
@@ -98,7 +105,7 @@ class TransportBuffer:
     `_put_requests(requests)`:
     1. Runs `perform_handshake(...)` if `requires_handshake(requests)` returns True
     2. Calls `_pre_put_hook(requests)` [CLIENT] - allocate local buffers, prepare data
-    3. Sends to StorageVolume via `volume.put.call()`
+    3. Sends to StorageVolume via `_call_volume_put(meta_requests)`
     4. Client calls `drop()` [CLIENT] - cleanup resources (e.g., deregister RDMA memory)
 
     Lifecycle: GET Operation
@@ -157,6 +164,8 @@ class TransportBuffer:
     - `perform_handshake`: Override for multi-step handshakes; default is one RPC
     - `_pre_put_hook`: Custom buffer allocation for puts
     - `_pre_get_hook`: Custom buffer allocation for gets (may need metadata fetch)
+    - `_call_volume_put`: Custom handling of the put RPC (e.g. cancellation); must still
+      make the call, and `drop()` runs afterwards even if it raises
     - `_call_volume_get`: Custom handling of the get RPC (e.g. cancellation)
     - `recv_handshake`: StorageVolume side of the default handshake
     - `drop`: Resource cleanup (especially important for RDMA buffers)
@@ -250,7 +259,7 @@ class TransportBuffer:
             await self._pre_put_hook(requests)
             l.track_step("_pre_put_hook")
 
-            await self.storage_volume_ref.volume.put.call(self, meta_requests)
+            await self._call_volume_put(meta_requests)
             l.track_step("volume.put.call")
 
             # Success-only hook: transports can promote staged state here,
@@ -293,6 +302,9 @@ class TransportBuffer:
             l.track_step("drop")
             l.track_e2e()
         return response
+
+    async def _call_volume_put(self, meta_requests: list[Request]) -> None:
+        await self.storage_volume_ref.volume.put.call(self, meta_requests)
 
     async def _call_volume_get(self, meta_requests: list[Request]) -> "TransportBuffer":
         return await self.storage_volume_ref.volume.get.call_one(self, meta_requests)
