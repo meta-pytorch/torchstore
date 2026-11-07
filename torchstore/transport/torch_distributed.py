@@ -15,7 +15,7 @@ Transfers cannot be cancelled, so the volume always waits for submitted
 transfers to finish before returning, even when its handler is cancelled. A
 cancelled request keeps its tensors alive until the volume answers. The volume
 may still read or overwrite them until then, so don't use or resize
-(``resize_``) them before it answers. Meanwhile registering memory overlapping a
+(``resize_``) them before it answers. Meanwhile registering tensors overlapping a
 cancelled get's destinations through the same ``TransportContext`` raises until
 it is cleared; other contexts are not checked. If the volume call itself is
 cancelled (e.g. at event loop shutdown), the tensors are leaked, overlapping
@@ -28,12 +28,19 @@ Limitations:
 - Memory stays registered (pinned) until every storage using it is freed, so
   only new tensors pay registration, e.g. get results without a destination.
   Freed memory stays registered until the next request or delete through
-  the same ``TransportContext``.
+  the same ``TransportContext``. Endpoints register whole storages, so a view
+  pins its entire storage and peers may access all of it. Registration runs
+  on the event loop, its cost scales with the storage size, and failing to
+  pin (e.g. over the memlock limit) fails the request.
 - Each get stages its non-contiguous CPU values through up to two buffers of
   at most ``TORCHSTORE_STAGING_BUFFER_BYTES``, registered during the get.
 - Do not move a registered storage's memory (``resize_``, ``share_memory_``):
   its old memory stays registered (pinned) until the storage is freed or the
   ``TransportContext`` is cleared.
+- Distinct storages over overlapping memory register overlapping regions, so
+  NIXL resets the peer when alternating between them. The reset waits for
+  the peer's pending transfers on the storage volume's event loop, raising
+  ``TimeoutError`` after 30 s.
 - Volumes stay connected to every client endpoint they served until reset.
 """
 
@@ -79,6 +86,19 @@ _T = TypeVar("_T")
 _leaked: list[tuple[_Endpoint, list[torch.UntypedStorage]]] = []
 
 
+def _transport_options(backend: str) -> dict[str, Any]:
+    """``new_transport`` options; NIXL gets the NIXL transport's UCX config,
+    which whole-storage registration needs under expandable segments. Its
+    disabled registration cache makes unregistering slower (~11 ms per 32 MiB
+    staging buffer, on the storage volume's event loop) but releases freed
+    memory."""
+    if backend != "nixl":
+        return {}
+    from torchstore.transport.nixl import _BACKEND_PARAMS
+
+    return {"backend_options": dict(_BACKEND_PARAMS["UCX"])}
+
+
 @cache
 def torch_transport_available() -> bool:
     """Return whether the selected torch.distributed transport backend works.
@@ -110,6 +130,11 @@ def _view_key(tensor: torch.Tensor) -> _RegistrationKey:
     return (tensor.data_ptr(), tensor.nbytes, str(tensor.device))
 
 
+def _storage_key(tensor: torch.Tensor) -> _RegistrationKey:
+    storage = tensor.untyped_storage()
+    return (storage.data_ptr(), storage.nbytes(), str(tensor.device))
+
+
 def _overlaps(a: _RegistrationKey, b: _RegistrationKey) -> bool:
     return a[2] == b[2] and a[0] < b[0] + b[1] and b[0] < a[0] + a[1]
 
@@ -135,6 +160,10 @@ class _Registration:
     # storages resized to new memory.
     storages: list[tuple[weakref.ref[torch.UntypedStorage], int]]
     remote_buffer: RemoteBuffer | None = None
+
+    def offset(self, tensor: torch.Tensor) -> int:
+        """Byte offset of tensor in the registered memory."""
+        return tensor.data_ptr() - self.key[0]
 
     def prune(self) -> bool:
         """Drop freed or moved storages; return whether any remain."""
@@ -182,13 +211,14 @@ class _Endpoint:
                 self._unregister(registration)
 
     def register(self, tensor: torch.Tensor) -> _Registration:
-        """Register a contiguous tensor's memory."""
-        key = _view_key(tensor)
-        if any(_overlaps(key, abandoned) for abandoned in self._abandoned):
+        """Register a contiguous tensor's storage."""
+        view = _view_key(tensor)
+        if any(_overlaps(view, abandoned) for abandoned in self._abandoned):
             raise RuntimeError(
-                "torch transport memory overlaps the destination of a cancelled "
+                "torch transport tensor overlaps the destination of a cancelled "
                 "get the storage volume has not answered; use another tensor"
             )
+        key = _storage_key(tensor)
         storage = tensor.untyped_storage()
         registration = self._registrations.get(key)
         if registration is not None:
@@ -228,7 +258,8 @@ class _Endpoint:
         registration = self.register(tensor)
         if registration.remote_buffer is None:
             registration.remote_buffer = registration.memory.to_remote_buffer()
-        return registration.remote_buffer
+        offset = registration.offset(tensor)
+        return registration.remote_buffer.slice(offset, tensor.nbytes)
 
     def release(self) -> None:
         self.active -= 1
@@ -243,7 +274,7 @@ class _Endpoint:
         """Release a cancelled request once its volume call finishes.
 
         Until then the volume may still access its tensors, so ``storages``
-        stay referenced and ``register`` refuses memory overlapping ``keys``.
+        stay referenced and ``register`` refuses tensors overlapping ``keys``.
         Takes over the request's endpoint reference and clears ``storages``
         once answered. If ``call`` is cancelled, the storages, the refused keys
         and the endpoint (with all its registrations) are kept forever.
@@ -297,7 +328,10 @@ class _Endpoint:
         self.active += 1
         try:
             for tensor, remote_buffer in transfers:
-                view = self.register(tensor).memory.to_mutable_view()
+                registration = self.register(tensor)
+                view = registration.memory.to_mutable_view(
+                    registration.offset(tensor), tensor.nbytes
+                )
                 works.append(self.transport.read(view, remote_buffer, async_op=True))
         finally:
             await self._drain(works)
@@ -355,7 +389,10 @@ class _Endpoint:
         try:
             await _wait_for(events)
             for tensor, remote_buffer in transfers:
-                view = self.register(tensor).memory.to_view()
+                registration = self.register(tensor)
+                view = registration.memory.to_view(
+                    registration.offset(tensor), tensor.nbytes
+                )
                 direct.append(self.transport.write(view, remote_buffer, async_op=True))
             await stage(staged, allocate, flush, wait)
         except BaseException:
@@ -460,7 +497,7 @@ class TorchTransportCache(TransportCache):
         from torch.distributed._transport import new_transport
 
         if self.endpoint is None:
-            endpoint = _Endpoint(new_transport(backend))
+            endpoint = _Endpoint(new_transport(backend, **_transport_options(backend)))
             try:
                 self.url = endpoint.transport.bind()
             except BaseException:
@@ -487,7 +524,11 @@ class TorchTransportCache(TransportCache):
             if self._creating is None:
                 # Creating a NIXL agent takes up to ~1.6 s.
                 self._creating = asyncio.ensure_future(
-                    asyncio.to_thread(lambda: _Endpoint(new_transport(backend)))
+                    asyncio.to_thread(
+                        lambda: _Endpoint(
+                            new_transport(backend, **_transport_options(backend))
+                        )
+                    )
                 )
             creating = self._creating
             clears = self._clears
