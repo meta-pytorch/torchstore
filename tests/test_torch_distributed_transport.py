@@ -7,6 +7,7 @@
 """Tests for the torch.distributed._transport StorageVolume transport."""
 
 import asyncio
+import dataclasses
 import gc
 import logging
 import pickle
@@ -26,6 +27,7 @@ import torch
 pytest.importorskip("torch.distributed._transport")
 
 import torchstore.api as store_api
+import torchstore.transport._staging as staging
 import torchstore.transport.torch_distributed as td_transport
 from torch.distributed import Work
 from torch.distributed._transport import (
@@ -68,6 +70,13 @@ class FakeRemoteBuffer:
     metadata: int = 0
     # (device, address, length) of the registration, which the peer loads.
     region: tuple[str, int, int] = ("", 0, 0)
+
+    def slice(self, offset=None, length=None) -> "FakeRemoteBuffer":
+        offset = offset or 0
+        if length is None:
+            length = self.length - offset
+        assert 0 <= offset and offset + length <= self.length
+        return dataclasses.replace(self, address=self.address + offset, length=length)
 
     def serialize(self) -> bytes:
         return pickle.dumps(self)
@@ -389,6 +398,37 @@ async def _until(predicate):
     await _bounded(poll())
 
 
+def _awaiting(task, name):
+    """Whether task is suspended inside a coroutine function named name."""
+    coro = task.get_coro()
+    while coro is not None:
+        if getattr(coro, "cr_code", None) and coro.cr_code.co_name == name:
+            return True
+        coro = getattr(coro, "cr_await", None)
+    return False
+
+
+def _record_drains(monkeypatch):
+    """Record the works passed to each wait_all call, when it is called."""
+    import torch.distributed._transport as transport_module
+
+    drains = []
+    wait_all = transport_module.wait_all
+
+    def spy(works, **kwargs):
+        works = list(works)
+        drains.append(works)
+        return wait_all(works, **kwargs)
+
+    monkeypatch.setattr(transport_module, "wait_all", spy)
+    return drains
+
+
+def _assert_drains_unfinished(drains, transport):
+    unfinished = [w for w, _, _, _ in transport.pending if not w.get_future().done()]
+    assert unfinished and all(any(w is d for d in drains[-1]) for w in unfinished)
+
+
 async def _put(ref, requests):
     await _bounded(TorchDistributedTransportBuffer(ref).put_to_storage_volume(requests))
 
@@ -507,20 +547,41 @@ async def test_registrations_are_cached_until_tensors_are_freed(ref, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_volume_staging_tensors_are_unregistered(ref):
-    await _put(ref, [Request.from_tensor("w", torch.zeros(2, 4))])
-    # A non-contiguous slice is staged in a temporary copy.
-    tensor_slice = TensorSlice(
-        offsets=(0, 1),
-        coordinates=(1,),
-        global_shape=(2, 4),
-        local_shape=(2, 2),
-        mesh_shape=(2,),
-    )
-    await _get(ref, [Request(key="w", tensor_slice=tensor_slice)])
+async def test_put_unregisters_replaced_volume_tensors(ref):
+    # Each put replaces the stored tensor, freeing the previous one after the
+    # request; the next put unregisters it.
+    for n in (4, 8, 16):
+        await _put(ref, [Request.from_tensor("w", torch.zeros(n))])
     volume = _volume_endpoint(ref)
-    await _put(ref, [Request.from_tensor("w", torch.ones(2, 4))])
-    assert len(volume._registrations) == len(volume.transport.memories) == 1
+    assert len(volume._registrations) == len(volume.transport.memories) == 2
+
+
+@pytest.mark.asyncio
+async def test_object_only_request_unregisters_freed_volume_tensors(ref):
+    await _put(ref, [Request.from_tensor("w", torch.zeros(4))])
+    volume = _volume_endpoint(ref)
+    await _put(ref, [Request.from_objects("w", {"lr": 0.1})])
+    await _get(ref, [Request(key="w")])
+    assert not volume._registrations and not volume.transport.memories
+
+
+@pytest.mark.asyncio
+async def test_cancelled_put_waits_for_reads(ref):
+    await _put(ref, [Request.from_tensor("w", torch.zeros(4))])
+    volume = _volume_endpoint(ref)
+    FakeTransport.hang = True
+    task = asyncio.create_task(_put(ref, [Request.from_tensor("w", torch.ones(4))]))
+    await _until(lambda: volume.transport.pending)
+    volume_task = ref.volume.tasks[-1]
+    volume_task.cancel()
+    await _until(lambda: _awaiting(volume_task, "wait"))
+    assert not volume_task.done()
+    assert volume.active == 1
+
+    _finish(volume.transport)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert volume.active == 0
 
 
 @pytest.mark.asyncio
@@ -677,9 +738,612 @@ def test_request_context_state_strips_client_tensors():
     assert state.tensor is None and context.tensor is not None
 
 
+def _columns(rows: int, columns: int, start: int, width: int) -> TensorSlice:
+    return TensorSlice(
+        offsets=(0, start),
+        coordinates=(start // width,),
+        global_shape=(rows, columns),
+        local_shape=(rows, width),
+        mesh_shape=(columns // width,),
+    )
+
+
+def _record_writes(monkeypatch, transport):
+    """Record (local offset, local length, remote address) of each write."""
+    writes = []
+    write = transport.write
+
+    def spy(local_buffer, remote_buffer, **kwargs):
+        writes.append((local_buffer.offset, local_buffer.length, remote_buffer.address))
+        return write(local_buffer, remote_buffer, **kwargs)
+
+    monkeypatch.setattr(transport, "write", spy)
+    return writes
+
+
+def _record_registrations(monkeypatch, endpoint, key=lambda tensor: tensor.nbytes):
+    """Record key(tensor), by default its byte size, for each registered tensor."""
+    keys = []
+    register = endpoint.register
+
+    def spy(tensor, *args, **kwargs):
+        keys.append(key(tensor))
+        return register(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(endpoint, "register", spy)
+    return keys
+
+
+def _record_write_events(monkeypatch, transport, events):
+    """Append ("write", None) to events on each transport write."""
+    write = transport.write
+
+    def spy(*args, **kwargs):
+        events.append(("write", None))
+        return write(*args, **kwargs)
+
+    monkeypatch.setattr(transport, "write", spy)
+
+
 def _reallocate(memory):
     """A new storage over memory's bytes, as if freed memory were reallocated."""
     return torch.from_numpy(memory.numpy())
+
+
+@pytest.mark.asyncio
+async def test_get_staging_packs_pieces_at_aligned_offsets(ref, monkeypatch):
+    sources = [torch.arange(12.0).reshape(2, 6), -torch.arange(12.0).reshape(2, 6)]
+    await _put(ref, [Request.from_tensor(f"w{i}", s) for i, s in enumerate(sources)])
+    volume = _volume_endpoint(ref)
+    registered = set(volume._registrations)
+    writes = _record_writes(monkeypatch, volume.transport)
+    registrations = _record_registrations(monkeypatch, volume)
+
+    results = await _get(
+        ref,
+        [Request(key=f"w{i}", tensor_slice=_columns(2, 6, 3, 3)) for i in range(2)],
+    )
+    for result, source in zip(results, sources, strict=True):
+        assert torch.equal(result, source[:, 3:])
+    # Both 24 byte slices share one buffer, the second at a 64 byte offset.
+    assert [(offset, length) for offset, length, _ in writes] == [(0, 24), (64, 24)]
+    assert registrations == [88]
+    # Staging buffers are unregistered when the request finishes.
+    assert set(volume._registrations) == registered
+    assert len(volume.transport.memories) == len(registered)
+
+
+@pytest.mark.asyncio
+async def test_get_staging_alternates_buffers(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    source = torch.arange(96.0).reshape(8, 12)
+    await _put(ref, [Request.from_tensor("w", source)])
+    volume = _volume_endpoint(ref)
+    writes = _record_writes(monkeypatch, volume.transport)
+    registrations = _record_registrations(monkeypatch, volume)
+
+    (result,) = await _get(ref, [Request(key="w", tensor_slice=_columns(8, 12, 4, 8))])
+    assert torch.equal(result, source[:, 4:])
+    # Two rows (64 bytes) per piece, written to consecutive client ranges.
+    assert [(offset, length) for offset, length, _ in writes] == [(0, 64)] * 4
+    addresses = [address for _, _, address in writes]
+    assert addresses == [addresses[0] + 64 * i for i in range(4)]
+    # Only the two staging buffers are registered; no full copy.
+    assert registrations == [64, 64]
+
+
+@pytest.mark.parametrize(
+    "slices, expected",
+    [
+        # A 128 byte piece, then a 64 byte piece.
+        ([(6, 12, 4, 8)], [128, 64]),
+        # 128, 128 and 32 byte pieces; the first buffer holds the largest.
+        ([(9, 12, 4, 8)], [128, 128]),
+        # A 24 byte piece, then a 128 byte piece that does not fit after it.
+        ([(2, 6, 3, 3), (4, 12, 4, 8)], [24, 128]),
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_staging_sizes_buffers_to_contents(
+    ref, monkeypatch, slices, expected
+):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 128)
+    sources = [torch.arange(r * c * 1.0).reshape(r, c) for r, c, _, _ in slices]
+    await _put(ref, [Request.from_tensor(f"w{i}", s) for i, s in enumerate(sources)])
+    volume = _volume_endpoint(ref)
+    registrations = _record_registrations(monkeypatch, volume)
+
+    results = await _get(
+        ref,
+        [
+            Request(key=f"w{i}", tensor_slice=_columns(*columns))
+            for i, columns in enumerate(slices)
+        ],
+    )
+    for result, source, columns in zip(results, sources, slices, strict=True):
+        assert torch.equal(result, source[:, columns[2] :])
+    assert registrations == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.asyncio
+async def test_get_copies_cuda_values_on_device(ref, monkeypatch):
+    source = torch.arange(96.0).reshape(8, 12)
+    await _put(ref, [Request.from_tensor("w", source)])
+    ref.volume.store.kv["w"] = source.cuda()
+    volume = _volume_endpoint(ref)
+    writes = _record_writes(monkeypatch, volume.transport)
+    devices = _record_registrations(
+        monkeypatch, volume, key=lambda tensor: tensor.device.type
+    )
+
+    (result,) = await _get(ref, [Request(key="w", tensor_slice=_columns(8, 12, 4, 8))])
+    assert torch.equal(result, source[:, 4:])
+    # One write of the device copy; nothing is staged through host memory.
+    assert [(offset, length) for offset, length, _ in writes] == [(0, 256)]
+    assert devices == ["cuda"]
+
+
+# Index 1 checks the copy's device, not the current one, is synced.
+@pytest.mark.parametrize("index", [0, 1])
+@pytest.mark.asyncio
+async def test_get_syncs_cuda_copies_before_writing(ref, monkeypatch, index):
+    if torch.cuda.device_count() <= index:
+        pytest.skip(f"requires {index + 1} CUDA devices")
+    device = torch.device("cuda", index)
+    source = torch.arange(96.0).reshape(8, 12)
+    await _put(ref, [Request.from_tensor("w", source)])
+    ref.volume.store.kv["w"] = source.to(device)
+    volume = _volume_endpoint(ref)
+    events = []
+
+    def spy(kind, device):
+        off_loop = threading.current_thread() is not threading.main_thread()
+        events.append((kind, device, off_loop) if kind == "wait" else (kind, device))
+
+    _spy_stream_waits(monkeypatch, spy)
+    _record_write_events(monkeypatch, volume.transport, events)
+    contiguous = torch.Tensor.contiguous
+
+    def contiguous_spy(self, *args, **kwargs):
+        if self.is_cuda and not self.is_contiguous():
+            events.append(("copy", self.device))
+        return contiguous(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "contiguous", contiguous_spy)
+
+    (result,) = await _get(ref, [Request(key="w", tensor_slice=_columns(8, 12, 4, 8))])
+    assert torch.equal(result, source[:, 4:])
+    # The transport may read the device copy outside stream order.
+    assert events[:4] == [
+        ("copy", device),
+        ("record", device),
+        ("wait", device, True),
+        ("write", None),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.asyncio
+async def test_get_keeps_endpoint_while_waiting_for_copies(ref, monkeypatch):
+    source = torch.arange(96.0).reshape(8, 12)
+    await _put(ref, [Request.from_tensor("w", source)])
+    ref.volume.store.kv["w"] = source.cuda()
+    volume = _volume_endpoint(ref)
+    wait_for = td_transport._wait_for
+    closed = []
+
+    async def clearing_wait_for(events):
+        if events:
+            # A concurrent request resets the volume's cache meanwhile.
+            _volume_cache(ref).clear()
+            closed.append(volume.closed)
+        await wait_for(events)
+
+    monkeypatch.setattr(td_transport, "_wait_for", clearing_wait_for)
+    (result,) = await _get(ref, [Request(key="w", tensor_slice=_columns(8, 12, 4, 8))])
+    assert torch.equal(result, source[:, 4:])
+    assert closed == [False]
+    assert volume.closed
+
+
+@pytest.mark.asyncio
+async def test_get_syncs_cuda_copies_on_every_device(ref, monkeypatch):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 CUDA devices")
+    sources = [torch.arange(96.0).reshape(8, 12) + i for i in range(2)]
+    await _put(ref, [Request.from_tensor(f"w{i}", s) for i, s in enumerate(sources)])
+    for i, s in enumerate(sources):
+        ref.volume.store.kv[f"w{i}"] = s.to(f"cuda:{i}")
+    volume = _volume_endpoint(ref)
+    events = []
+    _spy_stream_waits(monkeypatch, lambda kind, device: events.append((kind, device)))
+    _record_write_events(monkeypatch, volume.transport, events)
+    results = await _get(
+        ref,
+        [Request(key=f"w{i}", tensor_slice=_columns(8, 12, 4, 8)) for i in range(2)],
+    )
+    for result, source in zip(results, sources, strict=True):
+        assert torch.equal(result, source[:, 4:])
+    waits = {d for kind, d in events[: events.index(("write", None))] if kind == "wait"}
+    assert waits == {torch.device("cuda", 0), torch.device("cuda", 1)}
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.asyncio
+async def test_get_releases_endpoint_if_waiting_for_copies_fails(
+    ref, monkeypatch, cancel
+):
+    await _put(ref, [Request.from_tensor("w", torch.zeros(4))])
+    volume = _volume_endpoint(ref)
+    wait_for = td_transport._wait_for
+    waiting = asyncio.Event()
+
+    async def failing_wait_for(events):
+        if asyncio.current_task() not in ref.volume.tasks:
+            return await wait_for(events)
+        waiting.set()
+        if cancel:
+            await asyncio.Future()
+        raise RuntimeError("synchronize failed")
+
+    monkeypatch.setattr(td_transport, "_wait_for", failing_wait_for)
+    task = asyncio.create_task(_get(ref, [Request(key="w")]))
+    await _until(waiting.is_set)
+    if cancel:
+        ref.volume.tasks[-1].cancel()
+    with pytest.raises(asyncio.CancelledError if cancel else RuntimeError):
+        await _bounded(task)
+    assert volume.active == 0
+
+
+@pytest.mark.asyncio
+async def test_get_staging_rejects_tiny_buffers(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 32)
+    await _put(ref, [Request.from_tensor("w", torch.zeros(2, 4))])
+    volume = _volume_endpoint(ref)
+    with pytest.raises(ValueError, match="at least 64"):
+        await _get(ref, [Request(key="w", tensor_slice=_columns(2, 4, 2, 2))])
+    assert volume.active == 0
+    # Contiguous gets need no staging.
+    (result,) = await _get(ref, [Request(key="w")])
+    assert torch.equal(result, torch.zeros(2, 4))
+
+
+@pytest.mark.asyncio
+async def test_cancelled_staged_get_waits_for_drain(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    await _put(ref, [Request.from_tensor("w", torch.zeros(6, 12))])
+    volume = _volume_endpoint(ref)
+    registered = set(volume._registrations)
+    FakeTransport.hang = True
+    task = asyncio.create_task(
+        _get(ref, [Request(key="w", tensor_slice=_columns(6, 12, 4, 8))])
+    )
+    # The third piece waits for the first buffer's transfer.
+    await _until(
+        lambda: len(volume.transport.pending) == 2
+        and _awaiting(ref.volume.tasks[-1], "wait")
+    )
+    volume_task = ref.volume.tasks[-1]
+    volume_task.cancel()
+    # Finishing the second buffer's transfer leaves the first in flight.
+    work, _, _, copy = volume.transport.pending[1]
+    copy()
+    work.get_future().set_result([])
+    await _until(lambda: _awaiting(volume_task, "_drain"))
+    assert not volume_task.done()
+    # Staging buffers stay registered while their transfers are in flight.
+    assert len(volume._registrations) == len(registered) + 2
+
+    _finish(volume.transport)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert volume.active == 0
+    assert len(volume.transport.pending) == 2
+    assert set(volume._registrations) == registered
+    assert len(volume.transport.memories) == len(registered)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_staged_get_keeps_cancellation_over_failed_write(
+    ref, monkeypatch
+):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    await _put(ref, [Request.from_tensor("w", torch.zeros(6, 12))])
+    volume = _volume_endpoint(ref)
+    FakeTransport.hang = True
+    task = asyncio.create_task(
+        _get(ref, [Request(key="w", tensor_slice=_columns(6, 12, 4, 8))])
+    )
+    await _until(lambda: len(volume.transport.pending) == 2)
+    volume_task = ref.volume.tasks[-1]
+    volume_task.cancel()
+    await _until(lambda: _awaiting(volume_task, "_drain"))
+
+    volume.transport.pending[0][0].get_future().set_exception(
+        RuntimeError("transfer failed")
+    )
+    _finish(volume.transport)
+    with pytest.raises(asyncio.CancelledError):
+        await _bounded(volume_task)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert volume.active == 0
+
+
+@pytest.mark.asyncio
+async def test_get_staging_fills_buffer_exactly(ref, monkeypatch):
+    # Two 64 byte slices fill one buffer.
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 128)
+    sources = [torch.arange(48.0).reshape(4, 12), -torch.arange(48.0).reshape(4, 12)]
+    await _put(ref, [Request.from_tensor(f"w{i}", s) for i, s in enumerate(sources)])
+    results = await _get(
+        ref,
+        [Request(key=f"w{i}", tensor_slice=_columns(4, 12, 4, 4)) for i in range(2)],
+    )
+    for result, source in zip(results, sources, strict=True):
+        assert torch.equal(result, source[:, 4:8])
+
+
+@pytest.mark.asyncio
+async def test_get_staging_reuses_buffer_after_its_writes_finish(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    source = torch.arange(72.0).reshape(6, 12)
+    await _put(ref, [Request.from_tensor("w", source)])
+    volume = _volume_endpoint(ref)
+    FakeTransport.hang = True
+    task = asyncio.create_task(
+        _get(ref, [Request(key="w", tensor_slice=_columns(6, 12, 4, 8))])
+    )
+    await _until(lambda: len(volume.transport.pending) == 2)
+    await _until(lambda: _awaiting(ref.volume.tasks[-1], "wait"))
+    # The third piece waits for the first buffer's write.
+    assert len(volume.transport.pending) == 2
+
+    _finish(volume.transport, 1)
+    await _until(lambda: len(volume.transport.pending) == 3)
+    _finish(volume.transport)
+    (result,) = await _bounded(task)
+    assert torch.equal(result, source[:, 4:])
+
+
+@pytest.mark.asyncio
+async def test_get_staging_with_contiguous_values(ref, monkeypatch):
+    sources = [torch.arange(8.0).reshape(2, 4), -torch.arange(8.0).reshape(2, 4)]
+    await _put(ref, [Request.from_tensor(f"w{i}", s) for i, s in enumerate(sources)])
+    volume = _volume_endpoint(ref)
+    writes = _record_writes(monkeypatch, volume.transport)
+    whole, columns = await _get(
+        ref, [Request(key="w0"), Request(key="w1", tensor_slice=_columns(2, 4, 2, 2))]
+    )
+    assert torch.equal(whole, sources[0])
+    assert torch.equal(columns, sources[1][:, 2:])
+    # The contiguous value is written whole, before the staged one.
+    assert [(offset, length) for offset, length, _ in writes] == [(0, 32), (0, 16)]
+
+
+@pytest.mark.asyncio
+async def test_get_staging_waits_for_direct_writes(ref, monkeypatch):
+    sources = [torch.arange(8.0).reshape(2, 4), -torch.arange(8.0).reshape(2, 4)]
+    await _put(ref, [Request.from_tensor(f"w{i}", s) for i, s in enumerate(sources)])
+    volume = _volume_endpoint(ref)
+    drains = _record_drains(monkeypatch)
+    FakeTransport.hang = True
+    task = asyncio.create_task(
+        _get(
+            ref,
+            [Request(key="w0"), Request(key="w1", tensor_slice=_columns(2, 4, 2, 2))],
+        )
+    )
+    await _until(lambda: len(volume.transport.pending) == 2)
+    # Finish only the staged write.
+    _, _, _, copy = volume.transport.pending[1]
+    copy()
+    volume.transport.pending[1][0].get_future().set_result([])
+    await _until(lambda: _awaiting(ref.volume.tasks[-1], "_drain"))
+    _assert_drains_unfinished(drains, volume.transport)
+    assert volume.active == 1
+    assert not task.done()
+
+    _finish(volume.transport)
+    whole, columns = await _bounded(task)
+    assert torch.equal(whole, sources[0])
+    assert torch.equal(columns, sources[1][:, 2:])
+
+
+@pytest.mark.asyncio
+async def test_get_staging_survives_endpoint_close(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    source = torch.arange(72.0).reshape(6, 12)
+    await _put(ref, [Request.from_tensor("w", source)])
+    volume = _volume_endpoint(ref)
+    FakeTransport.hang = True
+    task = asyncio.create_task(
+        _get(ref, [Request(key="w", tensor_slice=_columns(6, 12, 4, 8))])
+    )
+    await _until(lambda: len(volume.transport.pending) == 2)
+    # The endpoint closes when the request releases it, before the staging
+    # buffers are unregistered.
+    ref.volume.store.transport_context.clear()
+    assert not volume.transport.closed
+
+    FakeTransport.hang = False
+    _finish(volume.transport)
+    (result,) = await _bounded(task)
+    assert torch.equal(result, source[:, 4:])
+    assert volume.transport.closed
+
+
+@pytest.mark.asyncio
+async def test_get_staging_splits_rows_larger_than_the_buffer(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    source = torch.arange(80.0).reshape(2, 40)
+    await _put(ref, [Request.from_tensor("w", source)])
+    volume = _volume_endpoint(ref)
+    writes = _record_writes(monkeypatch, volume.transport)
+
+    (result,) = await _get(ref, [Request(key="w", tensor_slice=_columns(2, 40, 8, 32))])
+    assert torch.equal(result, source[:, 8:])
+    # Each 128 byte row is written as two 64 byte pieces.
+    addresses = [address for _, _, address in writes]
+    assert addresses == [addresses[0] + 64 * i for i in range(4)]
+
+
+@pytest.mark.asyncio
+async def test_get_staging_failed_write_fails_the_request(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    await _put(ref, [Request.from_tensor("w", torch.zeros(4, 12))])
+    volume = _volume_endpoint(ref)
+    # The second buffer's write only fails when the request drains.
+    writes = _fail_write(monkeypatch, volume.transport, 2)
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        await _get(ref, [Request(key="w", tensor_slice=_columns(4, 12, 4, 8))])
+    assert len(writes) == 2
+    assert volume.active == 0
+
+
+@pytest.mark.asyncio
+async def test_get_staging_skips_unregister_on_closed_transport(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    await _put(ref, [Request.from_tensor("w", torch.zeros(4, 12))])
+    volume = _volume_endpoint(ref)
+    # Like a failed NIXL descriptor load, which closes the backend.
+    _fail_write(
+        monkeypatch,
+        volume.transport,
+        2,
+        on_fail=lambda: setattr(volume.transport, "closed", True),
+    )
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        await _get(ref, [Request(key="w", tensor_slice=_columns(4, 12, 4, 8))])
+    assert volume.active == 0
+    # The backend fixture asserts no unregister hit the closed transport.
+
+
+@pytest.mark.asyncio
+async def test_get_staging_failed_write_stops_buffer_reuse(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    await _put(ref, [Request.from_tensor("w", torch.zeros(6, 12))])
+    volume = _volume_endpoint(ref)
+    registered = set(volume._registrations)
+    writes = _fail_write(monkeypatch, volume.transport, 1)
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        await _get(ref, [Request(key="w", tensor_slice=_columns(6, 12, 4, 8))])
+    # The third piece is not written into the failed buffer.
+    assert len(writes) == 2
+    assert volume.active == 0
+    assert set(volume._registrations) == registered
+
+
+@pytest.mark.asyncio
+async def test_get_staging_failed_submission_drains_in_flight_writes(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    await _put(ref, [Request.from_tensor("w", torch.zeros(4, 12))])
+    volume = _volume_endpoint(ref)
+    drains = _record_drains(monkeypatch)
+    registered = set(volume._registrations)
+    writes = _fail_write(monkeypatch, volume.transport, 2, submit=True)
+    FakeTransport.hang = True
+    task = asyncio.create_task(
+        _get(ref, [Request(key="w", tensor_slice=_columns(4, 12, 4, 8))])
+    )
+    await _until(lambda: len(writes) == 2)
+    await _until(lambda: _awaiting(ref.volume.tasks[-1], "_drain"))
+    _assert_drains_unfinished(drains, volume.transport)
+    # Both staging buffers stay registered until the first write drains.
+    assert not task.done()
+    assert volume.active == 1
+    assert len(volume._registrations) == len(registered) + 2
+
+    _finish(volume.transport)
+    with pytest.raises(RuntimeError, match="submission failed"):
+        await _bounded(task)
+    assert volume.active == 0
+    assert set(volume._registrations) == registered
+
+
+@pytest.mark.parametrize("rows", [6, 8])
+@pytest.mark.asyncio
+async def test_get_staging_drain_waits_for_both_buffers(ref, monkeypatch, rows):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    source = torch.arange(rows * 12.0).reshape(rows, 12)
+    await _put(ref, [Request.from_tensor("w", source)])
+    volume = _volume_endpoint(ref)
+    drains = _record_drains(monkeypatch)
+    FakeTransport.hang = True
+    task = asyncio.create_task(
+        _get(ref, [Request(key="w", tensor_slice=_columns(rows, 12, 4, 8))])
+    )
+    # One 64 byte piece per two rows, alternating buffers.
+    pieces = rows // 2
+    for submitted in range(2, pieces):
+        await _until(lambda: len(volume.transport.pending) == submitted)
+        # Free the oldest buffer so the next piece can be packed.
+        _finish(volume.transport, 1)
+    await _until(lambda: len(volume.transport.pending) == pieces)
+    # Finish the last piece while the other buffer's write is in flight.
+    work, _, _, copy = volume.transport.pending[-1]
+    copy()
+    work.get_future().set_result([])
+    await _until(lambda: _awaiting(ref.volume.tasks[-1], "_drain"))
+    _assert_drains_unfinished(drains, volume.transport)
+    assert not task.done()
+
+    _finish(volume.transport)
+    (result,) = await _bounded(task)
+    assert torch.equal(result, source[:, 4:])
+
+
+@pytest.mark.asyncio
+async def test_get_staging_failed_submission_drains_both_buffers(ref, monkeypatch):
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
+    await _put(ref, [Request.from_tensor("w", torch.zeros(6, 12))])
+    volume = _volume_endpoint(ref)
+    drains = _record_drains(monkeypatch)
+    writes = _fail_write(monkeypatch, volume.transport, 3, submit=True)
+    FakeTransport.hang = True
+    task = asyncio.create_task(
+        _get(ref, [Request(key="w", tensor_slice=_columns(6, 12, 4, 8))])
+    )
+    await _until(lambda: len(volume.transport.pending) == 2)
+    # Reusing the first buffer fails while the second buffer's write is in flight.
+    _finish(volume.transport, 1)
+    await _until(lambda: len(writes) == 3)
+    await _until(lambda: _awaiting(ref.volume.tasks[-1], "_drain"))
+    _assert_drains_unfinished(drains, volume.transport)
+    assert not task.done()
+
+    _finish(volume.transport)
+    with pytest.raises(RuntimeError, match="submission failed"):
+        await _bounded(task)
+
+
+@pytest.mark.asyncio
+async def test_get_staging_failed_submission_drains_direct_writes(ref, monkeypatch):
+    sources = [torch.arange(8.0).reshape(2, 4), -torch.arange(8.0).reshape(2, 4)]
+    await _put(ref, [Request.from_tensor(f"w{i}", s) for i, s in enumerate(sources)])
+    volume = _volume_endpoint(ref)
+    drains = _record_drains(monkeypatch)
+    writes = _fail_write(monkeypatch, volume.transport, 2, submit=True)
+    FakeTransport.hang = True
+    task = asyncio.create_task(
+        _get(
+            ref,
+            [Request(key="w0"), Request(key="w1", tensor_slice=_columns(2, 4, 2, 2))],
+        )
+    )
+    await _until(lambda: len(writes) == 2)
+    await _until(lambda: _awaiting(ref.volume.tasks[-1], "_drain"))
+    _assert_drains_unfinished(drains, volume.transport)
+    # The direct write of w0 is still in flight.
+    assert not task.done()
+    assert volume.active == 1
+
+    _finish(volume.transport)
+    with pytest.raises(RuntimeError, match="submission failed"):
+        await _bounded(task)
+    assert volume.active == 0
 
 
 def _real_backend_params():
@@ -790,6 +1454,41 @@ async def test_real_backend_two_clients_two_volumes(
             ctx.clear()
         for volume in volumes:
             volume.store.reset()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize("backend_name, device", _real_backend_params())
+@pytest.mark.asyncio
+async def test_real_backend_staged_get(backend_name, device, probe, caplog):
+    probe.setattr(td_transport, "ENV_TORCHSTORE_TORCH_TRANSPORT_BACKEND", backend_name)
+    probe.setattr(staging, "STAGING_BUFFER_BYTES", 1024)
+    probe.setitem(globals(), "_BOUND_S", 60)
+    if not td_transport.torch_transport_available():
+        pytest.skip(f"{backend_name} transport is unusable")
+    transport_context = TransportContext()
+    volume = FakeVolume()
+    ref = SimpleNamespace(
+        volume_id="test-volume", volume=volume, transport_context=transport_context
+    )
+    source = torch.randn(64, 64)
+    destination = torch.zeros(64, 32, device=device)
+    try:
+        await _put(ref, [Request.from_tensor("w", source)])
+        # Column slices of CPU values are staged; CUDA destinations get them too.
+        (result,) = await _get(
+            ref,
+            [
+                Request(
+                    key="w",
+                    tensor_val=destination,
+                    tensor_slice=_columns(64, 64, 32, 32),
+                )
+            ],
+        )
+        assert torch.equal(result.cpu(), source[:, 32:])
+    finally:
+        transport_context.clear()
+        volume.store.reset()
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
@@ -1159,6 +1858,27 @@ async def test_failed_transfer_raises_and_releases_endpoints(ref, monkeypatch):
     assert torch.equal(stored, torch.zeros(4))
 
 
+def _fail_write(monkeypatch, transport, n, submit=False, on_fail=None):
+    """Fail the ``n``th write at submission if submit, else when waited on.
+
+    on_fail runs when that write is submitted. Returns the list of writes."""
+    writes = []
+    write = transport.write
+
+    def flaky_write(*args, **kwargs):
+        writes.append(None)
+        if len(writes) != n:
+            return write(*args, **kwargs)
+        if on_fail is not None:
+            on_fail()
+        if submit:
+            raise RuntimeError("submission failed")
+        return FakeWork(error=RuntimeError("transfer failed"))
+
+    monkeypatch.setattr(transport, "write", flaky_write)
+    return writes
+
+
 def _spy_stream_waits(monkeypatch, record):
     """Call record(kind, device) when accelerator work is marked or waited for."""
     current_stream = torch.accelerator.current_stream
@@ -1294,8 +2014,8 @@ async def test_cancelled_volume_transfer_waits_for_drain(ref, monkeypatch):
     wait = asyncio.wait
 
     async def spy(*args, **kwargs):
-        # Count only the drain waits in _Endpoint.transfer, not wait_all's.
-        if sys._getframe(1).f_code is td_transport._Endpoint.transfer.__code__:
+        # Count only the drain waits in _Endpoint._drain, not wait_all's.
+        if sys._getframe(1).f_code is td_transport._Endpoint._drain.__code__:
             waits.put_nowait(None)
         return await wait(*args, **kwargs)
 
