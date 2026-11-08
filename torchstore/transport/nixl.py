@@ -133,7 +133,16 @@ _BACKEND_PARAMS = {
         # covers its whole storage.
         # RCACHE_ENABLE: UCX otherwise keeps deregistered memory registered, which
         # pins CUDA memory torch has since freed so the device cannot reuse it.
-        "engine_config": "CUDA_COPY_REG_WHOLE_ALLOC=off,RCACHE_ENABLE=n",
+        # IB_MEM_REG_OVERHEAD, IB_MEM_REG_GROWTH: UCX picks each transfer's protocol
+        # by its estimated time. With RCACHE_ENABLE=n, it adds a memory registration
+        # to every zero-copy estimate, so it copies host memory through bounce
+        # buffers instead. NIXL registers each buffer up front and passes its
+        # handle with each transfer, so no transfer registers memory. Pricing
+        # registration at 0 lets UCX pick zero-copy.
+        "engine_config": (
+            "CUDA_COPY_REG_WHOLE_ALLOC=off,RCACHE_ENABLE=n,"
+            "IB_MEM_REG_OVERHEAD=0,IB_MEM_REG_GROWTH=0"
+        ),
     },
 }
 
