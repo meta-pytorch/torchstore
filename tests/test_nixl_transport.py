@@ -358,6 +358,7 @@ async def test_get_writes_storage_tensor_into_client_destination(ref, ctx):
     request = Request.from_tensor("weight", destination)
 
     await client_buffer._pre_get_hook([request])
+    assert client_buffer._contexts[0].tensor is destination
     storage_volume_buffer = _storage_volume_copy(client_buffer)
     stored = torch.arange(8, dtype=torch.float32)
     await storage_volume_buffer.handle_get_request(ctx, [(request.meta_only(), stored)])
@@ -372,6 +373,70 @@ async def test_get_writes_storage_tensor_into_client_destination(ref, ctx):
     assert agent.release_xfer_handle.call_args_list == _expected_handle_calls(
         agent.initialized
     )
+
+
+@pytest.mark.parametrize(
+    "make_view",
+    [
+        lambda tensor: tensor[1:3, 1:7].t(),
+        lambda tensor: tensor[1:3, 1::2],
+        lambda tensor: tensor[1:3].conj(),
+        lambda tensor: torch._neg_view(tensor[1:3]),
+        lambda tensor: torch._neg_view(tensor[1:3].conj()),
+    ],
+    ids=["transpose", "strided", "conjugate", "negative", "conjugate_negative"],
+)
+@pytest.mark.parametrize("requires_grad", [False, True])
+@pytest.mark.parametrize("explicit_copy", [False, True])
+@pytest.mark.asyncio
+async def test_get_rejects_unsupported_destinations(
+    make_view, requires_grad, explicit_copy, ref, ctx
+):
+    backing = torch.full(
+        (4, 8), 17 + 19j, dtype=torch.complex64, requires_grad=requires_grad
+    )
+    original = backing.detach().clone()
+    destination = make_view(backing)
+    ordinary = torch.zeros(destination.shape, dtype=destination.dtype)
+    receive = torch.empty_like(ordinary) if explicit_copy else destination
+    requests = [
+        Request.from_tensor("valid", ordinary),
+        Request.from_tensor("view", receive),
+    ]
+    client_buffer = NixlTransportBuffer(ref)
+
+    if not explicit_copy:
+        with pytest.raises(ValueError, match="NIXL destinations must be contiguous"):
+            await client_buffer._pre_get_hook(requests)
+        assert all(
+            not agent.register_memory.called and not agent.initialized
+            for agent in FakeNixlAgent.instances
+        )
+        assert torch.count_nonzero(ordinary) == 0
+        assert torch.equal(backing, original)
+        return
+
+    await client_buffer._pre_get_hook(requests)
+    assert client_buffer._contexts[1].tensor is receive
+    remote_buffer = _storage_volume_copy(client_buffer)
+    stored = (
+        torch.arange(destination.numel()).reshape(destination.shape).to(torch.complex64)
+        + 3j
+    )
+    await remote_buffer.handle_get_request(
+        ctx, [(request.meta_only(), stored) for request in requests]
+    )
+    results = await client_buffer._handle_storage_volume_response(
+        requests, remote_buffer
+    )
+    assert results[1] is receive
+    assert torch.equal(backing, original)
+    # Copy-back and its autograd policy are explicitly the caller's responsibility.
+    with torch.no_grad():
+        destination.copy_(results[1])
+    make_view(original).copy_(stored)
+    assert torch.equal(destination, stored)
+    assert torch.equal(backing, original)
 
 
 @pytest.mark.asyncio
