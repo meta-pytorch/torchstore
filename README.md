@@ -336,20 +336,24 @@ Requires a PyTorch build whose `torch.distributed._transport` has multi-peer
 `connect` (https://github.com/pytorch/pytorch/pull/202536), descriptor reloads
 (https://github.com/pytorch/pytorch/pull/202534, not yet merged) and
 `RemoteBuffer.slice` (https://github.com/pytorch/pytorch/pull/202535).
-`TORCHSTORE_TORCH_TRANSPORT_BACKEND` is read at import time. Tensor memory stays
-registered (pinned), so transfers reusing tensors register once. It is
-unregistered once every storage using it is freed, at the next torch transport
-request or delete through the same `TransportContext`, or when that
-`TransportContext` is cleared (e.g. by `reset_client` or `shutdown`). Don't move
-a registered storage's memory (`resize_`, `share_memory_`): its old memory stays
-registered (pinned) until the storage is freed or the `TransportContext` is
-cleared. A cancelled request keeps its tensors alive until the storage volume
-answers, as the volume may still access them; don't use, modify or move
-(`resize_`, `share_memory_`) them until then. If the volume call itself is
-cancelled, they are leaked. Storage volumes stage gets of non-contiguous CPU
-values through up to two buffers of at most `TORCHSTORE_STAGING_BUFFER_BYTES`
-(default 32 MiB, read at import time, also used by the NIXL transport),
-registered for the duration of the get.
+`TORCHSTORE_TORCH_TRANSPORT_BACKEND` is read at import time. A tensor's whole
+storage stays registered (pinned), so transfers reusing tensors register once
+and peers may access any of its bytes. It is unregistered once every storage
+using its memory is freed, at the next torch transport request or delete through
+the same `TransportContext`, or when that `TransportContext` is cleared (e.g. by
+`reset_client` or `shutdown`). Registering pins the whole storage on first use;
+failing to pin (e.g. over the memlock limit) fails the request. Alternating
+between distinct storages over overlapping memory makes NIXL reset the peer,
+stalling the storage volume until that peer's pending transfers finish (`TimeoutError`
+after 30 s). Don't move a registered storage's memory (`resize_`,
+`share_memory_`): its old memory stays registered (pinned) until the storage is
+freed or the `TransportContext` is cleared. A cancelled request keeps its
+tensors alive until the storage volume answers, as the volume may still access
+them; don't use, modify or move (`resize_`, `share_memory_`) them until then. If
+the volume call itself is cancelled, they are leaked. Storage volumes stage gets
+of non-contiguous CPU values through up to two buffers of at most
+`TORCHSTORE_STAGING_BUFFER_BYTES` (default 32 MiB, read at import time, also
+used by the NIXL transport), registered for the duration of the get.
 
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:
