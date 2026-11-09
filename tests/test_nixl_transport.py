@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, call, Mock
 import pytest
 import torch
 
+import torchstore.transport._staging as staging
 import torchstore.transport.nixl as nixl_transport
 from torchstore.transport.buffers import TransportContext
 from torchstore.transport.nixl import (
@@ -1044,7 +1045,7 @@ async def _get_into_client(
 async def test_get_stages_non_contiguous_tensors_through_two_buffers(
     monkeypatch, ref, ctx
 ):
-    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", 64)
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
     # Keep transfers in flight so reusing a buffer early corrupts the data.
     FakeNixlAgent.state_sequences = {
         handle_id: [_NixlTransferStatus.PROCESSING] * 3 for handle_id in range(13)
@@ -1089,7 +1090,7 @@ async def test_get_staging_buffer_is_capped_by_batch_size(ref, ctx):
 
 @pytest.mark.asyncio
 async def test_get_staging_failure_drains_in_flight_chunks(monkeypatch, ref, ctx):
-    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", 64)
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
     FakeNixlAgent.state_sequences = {
         0: ["ERR"],
         1: [_NixlTransferStatus.PROCESSING, _NixlTransferStatus.DONE],
@@ -1128,15 +1129,15 @@ async def test_get_staging_packs_pieces_at_aligned_offsets(ref, ctx):
 
 @pytest.mark.asyncio
 async def test_get_staging_rejects_tiny_buffer(monkeypatch, ref, ctx):
-    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", 0)
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 0)
 
-    with pytest.raises(ValueError, match="TORCHSTORE_NIXL_STAGING_BUFFER_BYTES"):
+    with pytest.raises(ValueError, match="TORCHSTORE_STAGING_BUFFER_BYTES"):
         await _get_into_client(ref, ctx, [torch.arange(8).reshape(2, 4).t()])
 
 
 @pytest.mark.asyncio
 async def test_get_staging_cancel_waits_for_in_flight_transfers(monkeypatch, ref, ctx):
-    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", 64)
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
     FakeNixlAgent.force_processing = True
     stored = [torch.arange(64).reshape(8, 8)[:, 2:6], torch.arange(4)]
     get = asyncio.create_task(_get_into_client(ref, ctx, stored))
@@ -1182,7 +1183,7 @@ async def test_get_staging_cancel_waits_for_in_flight_transfers(monkeypatch, ref
 
 @pytest.mark.asyncio
 async def test_get_direct_failure_while_staging_raises(monkeypatch, ref, ctx):
-    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", 64)
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
     FakeNixlAgent.state_sequences = {0: ["ERR"]}
 
     with pytest.raises(RuntimeError, match="NIXL WRITE failed"):
@@ -1199,7 +1200,7 @@ async def test_get_direct_failure_while_staging_raises(monkeypatch, ref, ctx):
 
 @pytest.mark.asyncio
 async def test_get_staging_keeps_remote_memory_type_and_device(monkeypatch, ref, ctx):
-    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_STAGING_BUFFER_BYTES", 64)
+    monkeypatch.setattr(staging, "STAGING_BUFFER_BYTES", 64)
     stored = [torch.arange(64).reshape(8, 8)[:, 2:6]]
 
     destinations = await _get_into_client(
