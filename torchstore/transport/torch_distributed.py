@@ -6,33 +6,39 @@
 
 """StorageVolume transport backed by ``torch.distributed._transport``.
 
-Each client process keeps one connected endpoint per storage volume. The
-volume performs one-sided reads (put) and writes (get) against memory the
-client registered.
+Clients and storage volumes keep one endpoint per ``TransportContext``. A
+volume connects to a client's endpoint on the first request with tensor bytes
+and performs one-sided reads (put) and writes (get) against memory the client
+registered. The backend reloads descriptor metadata a peer re-registered.
 
 Transfers cannot be cancelled, so the volume always waits for submitted
-transfers to finish before returning, even when its handler is cancelled. As
-with the NIXL transport, a client whose request is cancelled may free memory
-the volume is still transferring.
+transfers to finish before returning, even when its handler is cancelled. A
+cancelled get keeps its destinations registered and alive until the volume
+answers. The volume may write into them until then, so don't use or resize them
+(``resize_``, ``set_``) before it answers. Meanwhile registering memory overlapping them
+through the same ``TransportContext`` raises until it is cleared; other
+contexts are not checked. If the volume call itself is cancelled (e.g. at event
+loop shutdown), they are leaked, overlapping registrations raise until the
+context is cleared and the endpoint stays open. A cancelled put does
+not wait, so don't modify its tensors until the volume could have read them;
+their registrations and staging copies may be released while the volume reads
+them, partly overwriting the stored value. Clearing the cache closes an endpoint
+once its requests finish. Endpoints are not thread-safe; use a
+``TransportContext`` from one event loop.
 
 Limitations:
 - Both sides register and unregister every tensor per request (~1.8 ms each
   with NIXL over UCX), so large state dicts pay seconds per transfer. A
   registration cache is a follow-up.
-- If re-registering a buffer changes its backend metadata, or any request
-  fails (including user errors and cancellation), the endpoint is replaced:
-  a new transport on both sides plus a handshake RPC.
-- Volumes hold a client's endpoints until that client reports them closed or
-  the volume is reset.
+- Volumes stay connected to every client endpoint they served until reset.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import os
-import uuid
+from collections import Counter
 from dataclasses import dataclass
 from functools import cache
 from typing import Any, TYPE_CHECKING
@@ -46,7 +52,6 @@ from torchstore.transport.types import Request
 if TYPE_CHECKING:
     from torch.distributed._transport import Memory, RemoteBuffer, Transport
 
-    from torchstore.logging import LatencyTracker
     from torchstore.strategy import StorageVolumeRef
     from torchstore.transport.buffers import TransportContext
 
@@ -57,13 +62,6 @@ logger = logging.getLogger(__name__)
 ENV_TORCHSTORE_TORCH_TRANSPORT_BACKEND = os.environ.get(
     "TORCHSTORE_TORCH_TRANSPORT_BACKEND", ""
 ).lower()
-
-# Endpoint (re)connections per request before giving up on descriptor
-# conflicts.
-_MAX_ENDPOINT_ATTEMPTS = 4
-# Descriptors a client endpoint exposes before it is replaced, bounding the
-# metadata both sides cache.
-_MAX_EXPOSED = 16384
 
 _RegistrationKey = tuple[int, int, str]
 
@@ -95,35 +93,42 @@ def torch_transport_available() -> bool:
     return True
 
 
-def _registration_key(tensor: torch.Tensor) -> _RegistrationKey:
+# Destinations of cancelled volume calls; the volume may still write into them.
+_leaked: list[list[torch.Tensor | None]] = []
+
+
+def _view_key(tensor: torch.Tensor) -> _RegistrationKey:
     return (tensor.data_ptr(), tensor.nbytes, str(tensor.device))
 
 
-class _Endpoint:
-    """A connected transport and its refcounted memory registrations.
+def _overlaps(a: _RegistrationKey, b: _RegistrationKey) -> bool:
+    return a[2] == b[2] and a[0] < b[0] + b[1] and b[0] < a[0] + a[1]
 
-    Registrations hold their tensors, so each request unregisters its memory
-    when it finishes. Backends alias registrations of the same byte range, so
-    concurrent requests sharing a tensor share one registration.
+
+class _Endpoint:
+    """A transport and its refcounted memory registrations.
+
+    Registrations hold their tensors. Requests unregister their memory when
+    they finish; concurrent requests sharing a tensor share one registration.
     """
 
     def __init__(self, transport: Transport) -> None:
         self.transport = transport
-        self.id = uuid.uuid4().hex
         # Requests (client) or transfer batches (volume) using the endpoint.
         self.active = 0
         self.retired = False
         self.closed = False
         self._registrations: dict[_RegistrationKey, tuple[Memory, int]] = {}
-        # Descriptors exposed to the peer. Peers may cache metadata per
-        # descriptor (NIXL rejects reloading a descriptor with new metadata),
-        # so a range re-registered with different metadata, e.g. memory freed
-        # and reallocated at the same address, needs a new endpoint. Values are
-        # digests of the serialized descriptors.
-        self._exposed: dict[_RegistrationKey, bytes] = {}
+        # Destinations of cancelled gets the volume has not answered.
+        self._abandoned: Counter[_RegistrationKey] = Counter()
 
     def register(self, tensor: torch.Tensor) -> tuple[_RegistrationKey, Memory]:
-        key = _registration_key(tensor)
+        key = _view_key(tensor)
+        if any(_overlaps(key, abandoned) for abandoned in self._abandoned):
+            raise RuntimeError(
+                "torch transport memory overlaps the destination of a cancelled "
+                "get the storage volume has not answered; use another tensor"
+            )
         memory, count = self._registrations.get(key, (None, 0))
         if memory is None:
             # NIXL cannot register 0-dim tensors; register the same bytes as 1-dim.
@@ -132,9 +137,6 @@ class _Endpoint:
         return key, memory
 
     def unregister(self, keys: list[_RegistrationKey]) -> None:
-        # Closing the transport released every registration.
-        if self.closed:
-            return
         for key in keys:
             memory, count = self._registrations.pop(key)
             if count > 1:
@@ -147,23 +149,50 @@ class _Endpoint:
                     "Failed to unregister torch transport memory", exc_info=True
                 )
 
-    def expose(self, key: _RegistrationKey, memory: Memory) -> RemoteBuffer | None:
-        """Describe registered memory for the peer; None if it conflicts."""
-        remote_buffer = memory.to_remote_buffer()
-        digest = hashlib.blake2b(remote_buffer.serialize(), digest_size=16).digest()
-        if self._exposed.setdefault(key, digest) != digest:
-            return None
-        return remote_buffer
-
-    def exposed_full(self) -> bool:
-        return len(self._exposed) >= _MAX_EXPOSED
-
     def release(self) -> None:
         self.active -= 1
         self.close_if_idle()
 
+    def release_when_answered(
+        self,
+        keys: list[_RegistrationKey],
+        tensors: list[torch.Tensor | None],
+        call: asyncio.Future[Any],
+    ) -> None:
+        """Release a cancelled get's destinations once its volume call finishes.
+
+        Takes over the registrations of ``keys`` and one ``active`` reference.
+        Until then the volume may still write into them, so ``register``
+        refuses memory overlapping them and ``tensors`` are kept alive.
+        """
+        if not call.done():
+            logger.warning(
+                "Get cancelled; keeping %d torch transport destinations "
+                "registered until the storage volume answers",
+                len(keys),
+            )
+        self._abandoned.update(keys)
+
+        def release(answer: asyncio.Future[Any]) -> None:
+            if answer.cancelled():
+                # The volume may still be writing; leak the destinations.
+                logger.warning(
+                    "Storage volume call cancelled; leaking %d torch transport "
+                    "destinations",
+                    len(keys),
+                )
+                _leaked.append(tensors)
+                return
+            answer.exception()
+            self._abandoned.subtract(keys)
+            self._abandoned = +self._abandoned
+            self.unregister(keys)
+            self.release()
+
+        call.add_done_callback(release)
+
     def retire(self) -> None:
-        """Stop handing out this endpoint; close once it is idle."""
+        """Close once idle; the cache no longer hands this endpoint out."""
         self.retired = True
         self.close_if_idle()
 
@@ -175,7 +204,6 @@ class _Endpoint:
         if self.closed:
             return
         self.closed = True
-        self._registrations.clear()
         try:
             self.transport.close()
         except Exception:
@@ -219,7 +247,8 @@ class _Endpoint:
             try:
                 await asyncio.shield(waiter)
             except asyncio.CancelledError:
-                # Keep the RPC open so the client keeps its memory registered.
+                # Keep the RPC open so a cancelled get keeps its destinations
+                # registered.
                 while not waiter.done():
                     try:
                         await asyncio.wait([waiter])
@@ -228,73 +257,123 @@ class _Endpoint:
                 raise
 
 
-class TorchTransportCache(TransportCache):
-    """Process-local endpoints.
+def _record_events(devices: set[torch.device]) -> list[torch.Event]:
+    """Mark kernels queued on ``devices``; DMA ignores streams."""
+    accelerator = torch.accelerator.current_accelerator()
+    return [
+        # Blocking events sleep instead of spinning in synchronize().
+        torch.accelerator.current_stream(device).record_event(
+            torch.Event(device, blocking=True)
+        )
+        for device in devices
+        if accelerator is not None and device.type == accelerator.type
+    ]
 
-    Clients key endpoints by storage volume ID and keep retired endpoints
-    until that volume learns they closed. Storage volumes key endpoints by
-    ``(client_id, endpoint_id)`` and close each when its client reports it
-    closed.
+
+async def _wait_for(events: list[torch.Event]) -> None:
+    """Wait for ``events`` without blocking the event loop."""
+    pending = [event for event in events if not event.query()]
+    if not pending:
+        return
+
+    def synchronize() -> None:
+        for event in pending:
+            event.synchronize()
+
+    await asyncio.to_thread(synchronize)
+
+
+def _close_created(creating: asyncio.Future[_Endpoint]) -> None:
+    if creating.cancelled() or creating.exception() is not None:
+        return
+    creating.result().close()
+
+
+class TorchTransportCache(TransportCache):
+    """A client and a storage volume endpoint per ``TransportContext``.
+
+    Clients send their endpoint's URL with each request carrying tensor bytes.
+    Storage volumes connect their endpoint to each client's URL.
     """
 
     def __init__(self) -> None:
-        self.client_id = uuid.uuid4().hex
         # Client side.
-        self.endpoints: dict[str, _Endpoint] = {}
-        # (volume_id, endpoint)
-        self.retired: list[tuple[str, _Endpoint]] = []
-        self._locks: dict[str, asyncio.Lock] = {}
+        self.endpoint: _Endpoint | None = None
+        self.url: bytes | None = None
         # Storage volume side.
-        self.peers: dict[tuple[str, str], _Endpoint] = {}
+        self.volume_endpoint: _Endpoint | None = None
+        self.peers: set[bytes] = set()
+        self._creating: asyncio.Future[_Endpoint] | None = None
+        self._clears = 0
 
-    def lock(self, volume_id: str) -> asyncio.Lock:
-        return self._locks.setdefault(volume_id, asyncio.Lock())
+    def client_endpoint(self, backend: str) -> _Endpoint:
+        from torch.distributed._transport import new_transport
 
-    def put(self, volume_id: str, endpoint: _Endpoint) -> None:
-        previous = self.endpoints.get(volume_id)
-        if previous is not None:
-            self.retire(volume_id, previous)
-        self.endpoints[volume_id] = endpoint
+        if self.endpoint is None:
+            endpoint = _Endpoint(new_transport(backend))
+            try:
+                self.url = endpoint.transport.bind()
+            except BaseException:
+                endpoint.close()
+                raise
+            self.endpoint = endpoint
+        return self.endpoint
 
-    def retire(self, volume_id: str, endpoint: _Endpoint) -> None:
-        if self.endpoints.get(volume_id) is endpoint:
-            del self.endpoints[volume_id]
-        endpoint.retire()
-        if (volume_id, endpoint) not in self.retired:
-            self.retired.append((volume_id, endpoint))
+    async def connect(self, backend: str, url: bytes) -> _Endpoint:
+        """The storage volume's endpoint, connected to a client's URL.
 
-    def closed_endpoint_ids(self, volume_id: str) -> list[str]:
-        """Closed endpoint IDs to report to a storage volume."""
-        return [e.id for v, e in self.retired if v == volume_id and e.closed]
+        Creates the endpoint once, off the actor loop, and replaces it once
+        the backend closes it (e.g. after a failed descriptor load).
+        """
+        from torch.distributed._transport import new_transport
 
-    def forget(self, volume_id: str, endpoint_ids: list[str]) -> None:
-        """Drop endpoints a storage volume has closed."""
-        self.retired = [
-            (v, e)
-            for v, e in self.retired
-            if v != volume_id or e.id not in endpoint_ids
-        ]
-
-    def close_peers(self, client_id: str, endpoint_ids: list[str]) -> None:
-        """Close volume endpoints whose client side closed."""
-        for endpoint_id in endpoint_ids:
-            endpoint = self.peers.pop((client_id, endpoint_id), None)
+        # Awaiting creation lets other requests break the endpoint; recheck.
+        while (endpoint := self.volume_endpoint) is None or (
+            self.peers and not endpoint.transport.connected()
+        ):
             if endpoint is not None:
+                logger.warning("Replacing broken torch transport endpoint")
                 endpoint.retire()
+                self.volume_endpoint = None
+                self.peers.clear()
+            if self._creating is None:
+                # Creating a NIXL agent takes up to ~1.6 s.
+                self._creating = asyncio.ensure_future(
+                    asyncio.to_thread(lambda: _Endpoint(new_transport(backend)))
+                )
+            creating = self._creating
+            clears = self._clears
+            try:
+                endpoint = await asyncio.shield(creating)
+            except Exception:
+                if self._creating is creating:
+                    self._creating = None
+                raise
+            if self._creating is creating:
+                self._creating = None
+                self.volume_endpoint = endpoint
+            elif self._clears != clears:
+                # clear() closes it.
+                raise RuntimeError("Transport cache cleared while connecting")
+        if url not in self.peers:
+            endpoint.transport.connect(url)
+            self.peers.add(url)
+        return endpoint
 
     @override
     def clear(self) -> None:
-        # Endpoints with transfers in flight close once they finish.
-        for endpoint in (
-            *self.endpoints.values(),
-            *(endpoint for _, endpoint in self.retired),
-            *self.peers.values(),
-        ):
-            endpoint.retire()
-        self.endpoints.clear()
-        self.retired.clear()
-        self._locks.clear()
+        # An endpoint with requests in flight closes once they finish.
+        for endpoint in (self.endpoint, self.volume_endpoint):
+            if endpoint is not None:
+                endpoint.retire()
+        if self._creating is not None:
+            self._creating.add_done_callback(_close_created)
+        self.endpoint = None
+        self.volume_endpoint = None
+        self.url = None
         self.peers.clear()
+        self._creating = None
+        self._clears += 1
 
 
 @dataclass
@@ -332,21 +411,14 @@ class TorchDistributedTransportBuffer(TransportBuffer):
                 "torch.distributed._transport.available_transports()."
             )
         self._backend = ENV_TORCHSTORE_TORCH_TRANSPORT_BACKEND
-        self._client_id: str | None = None
         self._client_url: bytes | None = None
-        self._endpoint_id: str | None = None
-        # Client endpoints that closed; the volume closes its side.
-        self._closed_endpoint_ids: list[str] = []
         self._contexts: list[TorchTransportRequestContext] = []
         # Client-local state, stripped from RPC state.
-        self._pending: _Endpoint | None = None
         self._endpoint: _Endpoint | None = None
         self._keys: list[_RegistrationKey] = []
-        self._succeeded = False
 
     def __getstate__(self) -> dict[str, Any]:
         state = super().__getstate__()
-        state["_pending"] = None
         state["_endpoint"] = None
         state["_keys"] = []
         return state
@@ -354,149 +426,33 @@ class TorchDistributedTransportBuffer(TransportBuffer):
     def _client_cache(self) -> TorchTransportCache:
         return self.storage_volume_ref.transport_context.get(TorchTransportCache)
 
-    def _report_closed(self) -> None:
-        cache = self._client_cache()
-        self._client_id = cache.client_id
-        self._closed_endpoint_ids = cache.closed_endpoint_ids(
-            self.storage_volume_ref.volume_id
-        )
-
-    @override
-    def requires_handshake(self, requests: list[Request]) -> bool:
-        return self.storage_volume_ref.volume_id not in self._client_cache().endpoints
-
-    @override
-    async def perform_handshake(
-        self,
-        requests: list[Request],
-        meta_requests: list[Request],
-        latency_tracker: LatencyTracker | None = None,
-    ) -> None:
-        volume_id = self.storage_volume_ref.volume_id
-        cache = self._client_cache()
-        async with cache.lock(volume_id):
-            # A concurrent request may have connected while this one waited.
-            if volume_id in cache.endpoints:
-                return
-            # recv_handshake ignores the requests; the volume would validate them
-            # against stored data.
-            await super().perform_handshake(requests, [], latency_tracker)
-
-    @override
-    async def _pre_handshake(self) -> None:
-        from torch.distributed._transport import new_transport
-
-        self._pending = _Endpoint(new_transport(self._backend))
-        self._endpoint_id = self._pending.id
-        self._client_url = self._pending.transport.bind()
-        self._report_closed()
-
-    @override
-    async def recv_handshake(
-        self,
-        ctx: TransportContext,
-        entries: list[tuple[Request, Any]],
-    ) -> list[Any]:
-        from torch.distributed._transport import new_transport
-
-        assert self._client_id is not None and self._endpoint_id is not None
-        assert self._client_url is not None
-        cache = ctx.get(TorchTransportCache)
-        cache.close_peers(self._client_id, self._closed_endpoint_ids)
-        endpoint = _Endpoint(new_transport(self._backend))
-        try:
-            url = endpoint.transport.bind()
-            endpoint.transport.connect(self._client_url)
-        except BaseException:
-            endpoint.close()
-            raise
-        cache.peers[(self._client_id, self._endpoint_id)] = endpoint
-        return [url]
-
-    @override
-    async def _post_handshake(
-        self,
-        handshake_results: list[Any],
-        requests: list[Request],
-    ) -> None:
-        assert self._pending is not None
-        (volume_url,) = handshake_results
-        self._pending.transport.connect(volume_url)
-        self._client_cache().put(self.storage_volume_ref.volume_id, self._pending)
-        self._pending = None
-
     async def _register_client_tensors(self) -> None:
-        """Expose context tensors through the current endpoint."""
-        volume_id = self.storage_volume_ref.volume_id
-        self._synchronize_streams()
-        for _ in range(_MAX_ENDPOINT_ATTEMPTS):
-            endpoint = self._client_cache().endpoints.get(volume_id)
-            if endpoint is None:
-                # A failed request retired the endpoint after our handshake.
-                await self.perform_handshake([], [])
-                continue
-            if endpoint.exposed_full() or not self._expose_contexts(endpoint):
-                await self._replace_endpoint(endpoint)
-                continue
-            endpoint.active += 1
-            self._endpoint = endpoint
-            self._endpoint_id = endpoint.id
-            self._report_closed()
-            return
-        raise RuntimeError(
-            f"Failed to register torch transport memory for volume {volume_id} "
-            f"after {_MAX_ENDPOINT_ATTEMPTS} endpoint attempts"
-        )
-
-    def _synchronize_streams(self) -> None:
-        """Wait for queued kernels on client tensors; DMA ignores CUDA streams."""
-        devices = {
-            context.tensor.device
-            for context in self._contexts
-            if context.tensor is not None and context.tensor.is_cuda
-        }
-        for device in devices:
-            torch.cuda.current_stream(device).synchronize()
-
-    def _expose_contexts(self, endpoint: _Endpoint) -> bool:
-        """Register context tensors; False if a descriptor conflicts."""
-        keys = []
-        try:
-            for context in self._contexts:
-                tensor = context.tensor
-                # Empty tensors cannot be registered and have no bytes to move.
-                if tensor is None or tensor.numel() == 0:
-                    continue
-                assert tensor.is_contiguous()
-                key, memory = endpoint.register(tensor)
-                keys.append(key)
-                context.remote_buffer = endpoint.expose(key, memory)
-                if context.remote_buffer is None:
-                    endpoint.unregister(keys)
-                    return False
-        except BaseException:
-            endpoint.unregister(keys)
-            raise
-        self._keys = keys
-        return True
-
-    async def _replace_endpoint(self, endpoint: _Endpoint) -> None:
-        """Replace an endpoint whose peer may cache stale descriptor metadata."""
-        volume_id = self.storage_volume_ref.volume_id
+        """Expose context tensors through the client endpoint."""
         cache = self._client_cache()
-        async with cache.lock(volume_id):
-            if cache.endpoints.get(volume_id) is not endpoint:
-                # Another request already replaced it.
-                return
-            logger.info(
-                "Replacing torch transport endpoint for volume %s: memory was "
-                "re-registered with new metadata or too many descriptors were "
-                "exposed",
-                volume_id,
-            )
-            # Requests still using the old endpoint keep it open.
-            cache.retire(volume_id, endpoint)
-            await super().perform_handshake([], [])
+        # Object-only requests need no endpoint.
+        if not any(c.tensor is not None and c.tensor.numel() for c in self._contexts):
+            return
+        endpoint = cache.client_endpoint(self._backend)
+        self._client_url = cache.url
+        events = _record_events(
+            {c.tensor.device for c in self._contexts if c.tensor is not None}
+        )
+        endpoint.active += 1
+        self._endpoint = endpoint
+        self._expose_contexts(endpoint)
+        # Registration overlaps queued kernels; transfers must not.
+        await _wait_for(events)
+
+    def _expose_contexts(self, endpoint: _Endpoint) -> None:
+        for context in self._contexts:
+            tensor = context.tensor
+            # Empty tensors cannot be registered and have no bytes to move.
+            if tensor is None or tensor.numel() == 0:
+                continue
+            assert tensor.is_contiguous()
+            key, memory = endpoint.register(tensor)
+            self._keys.append(key)
+            context.remote_buffer = memory.to_remote_buffer()
 
     @override
     async def _pre_put_hook(self, requests: list[Request]) -> None:
@@ -568,16 +524,11 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         read: bool,
         transfers: list[tuple[torch.Tensor, RemoteBuffer]],
     ) -> None:
-        assert self._client_id is not None
         cache = ctx.get(TorchTransportCache)
-        cache.close_peers(self._client_id, self._closed_endpoint_ids)
         if not transfers:
             return
-        endpoint = cache.peers.get((self._client_id, self._endpoint_id))
-        if endpoint is None:
-            raise RuntimeError(
-                f"No torch transport endpoint for client {self._client_id}"
-            )
+        assert self._client_url is not None
+        endpoint = await cache.connect(self._backend, self._client_url)
         await endpoint.transfer(read, transfers)
 
     @override
@@ -645,29 +596,32 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         ]
 
     @override
-    async def _post_request_success(self) -> None:
-        self._succeeded = True
-        self._client_cache().forget(
-            self.storage_volume_ref.volume_id, self._closed_endpoint_ids
-        )
+    async def _call_volume_get(self, meta_requests: list[Request]) -> TransportBuffer:
+        if self._endpoint is None:
+            return await super()._call_volume_get(meta_requests)
+        call = asyncio.ensure_future(super()._call_volume_get(meta_requests))
+        try:
+            return await asyncio.shield(call)
+        except asyncio.CancelledError:
+            # A cancelled call does not stop the volume.
+            if call.done() and not call.cancelled():
+                raise
+            endpoint, keys = self._take_endpoint()
+            assert endpoint is not None
+            # The volume may still write into the destinations; keep them
+            # registered, which holds them, until it answers.
+            tensors = [context.tensor for context in self._contexts]
+            endpoint.release_when_answered(keys, tensors, call)
+            raise
+
+    def _take_endpoint(self) -> tuple[_Endpoint | None, list[_RegistrationKey]]:
+        endpoint, keys = self._endpoint, self._keys
+        self._endpoint, self._keys = None, []
+        return endpoint, keys
 
     async def drop(self) -> None:
-        cache = self._client_cache()
-        volume_id = self.storage_volume_ref.volume_id
-        if self._pending is not None:
-            # The handshake failed; the volume may have created its side.
-            cache.retire(volume_id, self._pending)
-            self._pending = None
-
-        endpoint, succeeded = self._endpoint, self._succeeded
-        self._endpoint, self._succeeded = None, False
         self._contexts = []
-        if endpoint is None:
-            return
-        endpoint.unregister(self._keys)
-        self._keys = []
-        endpoint.release()
-        if not succeeded:
-            # The transport may be broken or the volume may have lost its
-            # side; reconnect on the next request.
-            cache.retire(volume_id, endpoint)
+        endpoint, keys = self._take_endpoint()
+        if endpoint is not None:
+            endpoint.unregister(keys)
+            endpoint.release()
