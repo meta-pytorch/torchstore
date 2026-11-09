@@ -918,7 +918,10 @@ async def test_drop_releases_every_lease_when_one_fails(ref):
 def test_agent_disables_ucx_registration_reuse(agent_cache):
     assert agent_cache.agent.config.kwargs["backends"] == []
     assert agent_cache.agent.backend_params == {
-        "UCX": {"engine_config": "CUDA_COPY_REG_WHOLE_ALLOC=off,RCACHE_ENABLE=n"}
+        "UCX": {
+            "engine_config": "CUDA_COPY_REG_WHOLE_ALLOC=off,RCACHE_ENABLE=n,"
+            "IB_MEM_REG_OVERHEAD=0,IB_MEM_REG_GROWTH=0"
+        }
     }
 
 
