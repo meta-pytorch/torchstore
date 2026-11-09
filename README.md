@@ -353,7 +353,16 @@ them; don't use, modify or move (`resize_`, `share_memory_`) them until then. If
 the volume call itself is cancelled, they are leaked. Storage volumes stage gets
 of non-contiguous CPU values through up to two buffers of at most
 `TORCHSTORE_STAGING_BUFFER_BYTES` (default 32 MiB, read at import time, also
-used by the NIXL transport), registered for the duration of the get.
+used by the NIXL transport), registered for the duration of the get. Gets write
+a non-contiguous destination (e.g. part of a resharded shard) in place when it
+has at most 64 contiguous runs. Clients fetch other parts of resharded gets into
+new tensors; other non-contiguous destinations, and those with a lazy conj or
+neg bit, are fetched into a contiguous tensor on their device and copied. A
+failed get may have partly written its destinations, and other storage volumes
+may keep writing them until they answer. Until a cancelled get is answered (or,
+if its volume call was cancelled, until the `TransportContext` is cleared),
+registering tensors overlapping its destinations (from the first to the last
+written byte) through the same `TransportContext` raises.
 
 To force a specific transport, pass `default_transport_type` when constructing a
 strategy:
