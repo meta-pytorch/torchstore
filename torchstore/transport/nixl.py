@@ -383,6 +383,15 @@ class NixlTransportBuffer(TransportBuffer):
     @override
     async def _pre_put_hook(self, requests: list[Request]) -> None:
         """Allocate RDMA memory for put (transport already set up)."""
+        # Validate the whole batch before registering any source buffers.
+        for request in requests:
+            tensor = request.tensor_val
+            if not request.is_object and tensor is not None:
+                if tensor.is_conj() or tensor.is_neg():
+                    raise ValueError(
+                        "NIXL sources cannot have conjugate or negative view bits; "
+                        "materialize with tensor.resolve_conj().resolve_neg() first."
+                    )
         self._contexts = []
         for request in requests:
             if request.is_object:
@@ -608,6 +617,11 @@ class NixlTransportBuffer(TransportBuffer):
                 request_context.shape,
                 must_be_contiguous=False,
             )
+            if data.is_conj() or data.is_neg():
+                raise ValueError(
+                    "NIXL sources cannot have conjugate or negative view bits; "
+                    "materialize with tensor.resolve_conj().resolve_neg() first."
+                )
             # Empty tensors have no bytes to move or NIXL descriptors to transfer.
             if data.numel() == 0:
                 continue
