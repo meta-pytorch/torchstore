@@ -167,8 +167,14 @@ async def shutdown(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
 
 
 def reset_client(store_name: str = DEFAULT_TORCHSTORE_NAME) -> None:
-    """Reset the cached or installed client for a given store."""
-    _local_clent_map.pop(store_name, None)
+    """Reset the cached or installed client for a given store.
+
+    Releases the client's transport resources (e.g. registered memory), so
+    don't call it while the client has requests in flight.
+    """
+    client = _local_clent_map.pop(store_name, None)
+    if client is not None:
+        client.strategy.transport_context.clear()
 
 
 async def _controller(store_name: str = DEFAULT_TORCHSTORE_NAME) -> Controller:

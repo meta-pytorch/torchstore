@@ -13,23 +13,25 @@ registered. The backend reloads descriptor metadata a peer re-registered.
 
 Transfers cannot be cancelled, so the volume always waits for submitted
 transfers to finish before returning, even when its handler is cancelled. A
-cancelled get keeps its destinations registered and alive until the volume
-answers. The volume may write into them until then, so don't use or resize them
-(``resize_``, ``set_``) before it answers. Meanwhile registering memory overlapping them
-through the same ``TransportContext`` raises until it is cleared; other
-contexts are not checked. If the volume call itself is cancelled (e.g. at event
-loop shutdown), they are leaked, overlapping registrations raise until the
-context is cleared and the endpoint stays open. A cancelled put does
-not wait, so don't modify its tensors until the volume could have read them;
-their registrations and staging copies may be released while the volume reads
-them, partly overwriting the stored value. Clearing the cache closes an endpoint
-once its requests finish. Endpoints are not thread-safe; use a
-``TransportContext`` from one event loop.
+cancelled request keeps its tensors alive until the volume answers. The volume
+may still read or overwrite them until then, so don't use or resize
+(``resize_``) them before it answers. Meanwhile registering memory overlapping a
+cancelled get's destinations through the same ``TransportContext`` raises until
+it is cleared; other contexts are not checked. If the volume call itself is
+cancelled (e.g. at event loop shutdown), the tensors are leaked, overlapping
+registrations raise until the context is cleared and the endpoint stays open
+with all its registrations.
+Clearing the cache closes an endpoint once its requests finish. Endpoints are
+not thread-safe; use a ``TransportContext`` from one event loop.
 
 Limitations:
-- Both sides register and unregister every tensor per request (~1.8 ms each
-  with NIXL over UCX), so large state dicts pay seconds per transfer. A
-  registration cache is a follow-up.
+- Memory stays registered (pinned) until every storage using it is freed, so
+  only new tensors pay registration, e.g. get results without a destination.
+  Freed memory stays registered until the next request or delete through
+  the same ``TransportContext``.
+- Do not move a registered storage's memory (``resize_``, ``share_memory_``):
+  its old memory stays registered (pinned) until the storage is freed or the
+  ``TransportContext`` is cleared.
 - Volumes stay connected to every client endpoint they served until reset.
 """
 
@@ -38,10 +40,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import weakref
 from collections import Counter
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from functools import cache
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, TypeVar
 
 import torch
 from typing_extensions import override
@@ -64,6 +68,11 @@ ENV_TORCHSTORE_TORCH_TRANSPORT_BACKEND = os.environ.get(
 ).lower()
 
 _RegistrationKey = tuple[int, int, str]
+_T = TypeVar("_T")
+
+# Endpoints and storages of cancelled volume calls; the volume may still access
+# them.
+_leaked: list[tuple[_Endpoint, list[torch.UntypedStorage]]] = []
 
 
 @cache
@@ -93,10 +102,6 @@ def torch_transport_available() -> bool:
     return True
 
 
-# Destinations of cancelled volume calls; the volume may still write into them.
-_leaked: list[list[torch.Tensor | None]] = []
-
-
 def _view_key(tensor: torch.Tensor) -> _RegistrationKey:
     return (tensor.data_ptr(), tensor.nbytes, str(tensor.device))
 
@@ -105,11 +110,45 @@ def _overlaps(a: _RegistrationKey, b: _RegistrationKey) -> bool:
     return a[2] == b[2] and a[0] < b[0] + b[1] and b[0] < a[0] + a[1]
 
 
-class _Endpoint:
-    """A transport and its refcounted memory registrations.
+def _alias(key: _RegistrationKey) -> torch.Tensor:
+    """A flat byte tensor over a key's memory that does not keep it alive.
 
-    Registrations hold their tensors. Requests unregister their memory when
-    they finish; concurrent requests sharing a tensor share one registration.
+    Uses a private torch API.
+    """
+    data_ptr, nbytes, device = key
+    storage = torch._C._construct_storage_from_data_pointer(
+        data_ptr, torch.device(device), nbytes
+    )
+    return torch.empty(0, dtype=torch.uint8, device=device).set_(storage)
+
+
+@dataclass
+class _Registration:
+    key: _RegistrationKey
+    memory: Memory
+    # (weakref, data_ptr) of storages using the memory. Distinct storages can
+    # share memory (e.g. torch.from_numpy of one array); the pointer detects
+    # storages resized to new memory.
+    storages: list[tuple[weakref.ref[torch.UntypedStorage], int]]
+    remote_buffer: RemoteBuffer | None = None
+
+    def prune(self) -> bool:
+        """Drop freed or moved storages; return whether any remain."""
+        self.storages = [
+            (ref, ptr)
+            for ref, ptr in self.storages
+            if (storage := ref()) is not None and storage.data_ptr() == ptr
+        ]
+        return bool(self.storages)
+
+
+class _Endpoint:
+    """A transport and its cached memory registrations.
+
+    Registrations alias tensor memory without owning it and last until the
+    storages using it are freed and swept or the endpoint closes, so tensors
+    transferred repeatedly (stored values, weights updated in place) register
+    once.
     """
 
     def __init__(self, transport: Transport) -> None:
@@ -118,36 +157,69 @@ class _Endpoint:
         self.active = 0
         self.retired = False
         self.closed = False
-        self._registrations: dict[_RegistrationKey, tuple[Memory, int]] = {}
+        # Also closes the transport if the endpoint is dropped uncleared.
+        self._close = weakref.finalize(self, _close_transport, transport)
+        # Closing at exit may wait for transfers a volume never finishes.
+        self._close.atexit = False
+        self._registrations: dict[_RegistrationKey, _Registration] = {}
+        # Keys of freed storages, appended by weakref callbacks. Those may run
+        # on any thread or inside a transport call, so sweep() unregisters
+        # them later.
+        self._dead: list[_RegistrationKey] = []
         # Destinations of cancelled gets the volume has not answered.
         self._abandoned: Counter[_RegistrationKey] = Counter()
 
-    def register(self, tensor: torch.Tensor) -> tuple[_RegistrationKey, Memory]:
+    def sweep(self) -> None:
+        """Unregister memory of freed storages."""
+        while self._dead:
+            registration = self._registrations.get(self._dead.pop())
+            # Other storages, or new memory at the same key, may use it.
+            if registration is not None and not registration.prune():
+                self._unregister(registration)
+
+    def register(self, tensor: torch.Tensor) -> _Registration:
+        """Register a contiguous tensor's memory."""
         key = _view_key(tensor)
         if any(_overlaps(key, abandoned) for abandoned in self._abandoned):
             raise RuntimeError(
                 "torch transport memory overlaps the destination of a cancelled "
                 "get the storage volume has not answered; use another tensor"
             )
-        memory, count = self._registrations.get(key, (None, 0))
-        if memory is None:
-            # NIXL cannot register 0-dim tensors; register the same bytes as 1-dim.
-            memory = self.transport.register_memory(tensor.reshape(-1))
-        self._registrations[key] = (memory, count + 1)
-        return key, memory
+        storage = tensor.untyped_storage()
+        registration = self._registrations.get(key)
+        if registration is not None:
+            if registration.prune():
+                if all(ref() is not storage for ref, _ in registration.storages):
+                    registration.storages.append(self._track(key, storage))
+                return registration
+            self._unregister(registration)
 
-    def unregister(self, keys: list[_RegistrationKey]) -> None:
-        for key in keys:
-            memory, count = self._registrations.pop(key)
-            if count > 1:
-                self._registrations[key] = (memory, count - 1)
-                continue
-            try:
-                self.transport.unregister_memory(memory)
-            except Exception:
-                logger.error(
-                    "Failed to unregister torch transport memory", exc_info=True
-                )
+        # Registering an alias keeps the registration from holding the tensor,
+        # and registers 0-dim tensors as 1-dim, which NIXL requires.
+        memory = self.transport.register_memory(_alias(key))
+        registration = _Registration(key, memory, [self._track(key, storage)])
+        self._registrations[key] = registration
+        return registration
+
+    def _track(
+        self, key: _RegistrationKey, storage: torch.UntypedStorage
+    ) -> tuple[weakref.ref[torch.UntypedStorage], int]:
+        dead = self._dead
+        return weakref.ref(storage, lambda _: dead.append(key)), storage.data_ptr()
+
+    def _unregister(self, registration: _Registration) -> None:
+        del self._registrations[registration.key]
+        try:
+            self.transport.unregister_memory(registration.memory)
+        except Exception:
+            logger.error("Failed to unregister torch transport memory", exc_info=True)
+
+    def expose(self, tensor: torch.Tensor) -> RemoteBuffer:
+        """Register tensor and describe it for the peer."""
+        registration = self.register(tensor)
+        if registration.remote_buffer is None:
+            registration.remote_buffer = registration.memory.to_remote_buffer()
+        return registration.remote_buffer
 
     def release(self) -> None:
         self.active -= 1
@@ -156,37 +228,38 @@ class _Endpoint:
     def release_when_answered(
         self,
         keys: list[_RegistrationKey],
-        tensors: list[torch.Tensor | None],
+        storages: list[torch.UntypedStorage],
         call: asyncio.Future[Any],
     ) -> None:
-        """Release a cancelled get's destinations once its volume call finishes.
+        """Release a cancelled request once its volume call finishes.
 
-        Takes over the registrations of ``keys`` and one ``active`` reference.
-        Until then the volume may still write into them, so ``register``
-        refuses memory overlapping them and ``tensors`` are kept alive.
+        Until then the volume may still access its tensors, so ``storages``
+        stay referenced and ``register`` refuses memory overlapping ``keys``.
+        Takes over the request's endpoint reference and clears ``storages``
+        once answered. If ``call`` is cancelled, the storages, the refused keys
+        and the endpoint (with all its registrations) are kept forever.
         """
         if not call.done():
             logger.warning(
-                "Get cancelled; keeping %d torch transport destinations "
-                "registered until the storage volume answers",
-                len(keys),
+                "Request cancelled; the storage volume may still access its "
+                "torch transport tensors until it answers"
             )
         self._abandoned.update(keys)
 
         def release(answer: asyncio.Future[Any]) -> None:
             if answer.cancelled():
-                # The volume may still be writing; leak the destinations.
+                # The volume may still access them; leak the storages and keep
+                # the endpoint open.
                 logger.warning(
-                    "Storage volume call cancelled; leaking %d torch transport "
-                    "destinations",
-                    len(keys),
+                    "Storage volume call cancelled; leaking its torch transport "
+                    "tensors and endpoint with its registrations"
                 )
-                _leaked.append(tensors)
+                _leaked.append((self, storages))
                 return
             answer.exception()
+            storages.clear()
             self._abandoned.subtract(keys)
             self._abandoned = +self._abandoned
-            self.unregister(keys)
             self.release()
 
         call.add_done_callback(release)
@@ -204,10 +277,10 @@ class _Endpoint:
         if self.closed:
             return
         self.closed = True
-        try:
-            self.transport.close()
-        except Exception:
-            logger.error("Failed to close torch transport", exc_info=True)
+        # Closing the transport releases every registration.
+        self._registrations.clear()
+        self._close.detach()
+        _close_transport(self.transport)
 
     async def transfer(
         self, read: bool, transfers: list[tuple[torch.Tensor, RemoteBuffer]]
@@ -215,12 +288,11 @@ class _Endpoint:
         """Run transfers and wait until all of them finished."""
         from torch.distributed._transport import wait_all
 
-        keys, works = [], []
+        works = []
         self.active += 1
         try:
             for tensor, remote_buffer in transfers:
-                key, memory = self.register(tensor)
-                keys.append(key)
+                memory = self.register(tensor).memory
                 if read:
                     work = self.transport.read(
                         memory.to_mutable_view(), remote_buffer, async_op=True
@@ -240,15 +312,13 @@ class _Endpoint:
                     logger.warning(
                         "torch transport transfer failed", exc_info=future.exception()
                     )
-                self.unregister(keys)
                 self.release()
 
             waiter.add_done_callback(done)
             try:
                 await asyncio.shield(waiter)
             except asyncio.CancelledError:
-                # Keep the RPC open so a cancelled get keeps its destinations
-                # registered.
+                # Keep the RPC open so the client keeps its memory alive.
                 while not waiter.done():
                     try:
                         await asyncio.wait([waiter])
@@ -268,6 +338,13 @@ def _record_events(devices: set[torch.device]) -> list[torch.Event]:
         for device in devices
         if accelerator is not None and device.type == accelerator.type
     ]
+
+
+def _close_transport(transport: Transport) -> None:
+    try:
+        transport.close()
+    except Exception:
+        logger.error("Failed to close torch transport", exc_info=True)
 
 
 async def _wait_for(events: list[torch.Event]) -> None:
@@ -328,12 +405,10 @@ class TorchTransportCache(TransportCache):
         from torch.distributed._transport import new_transport
 
         # Awaiting creation lets other requests break the endpoint; recheck.
-        while (endpoint := self.volume_endpoint) is None or (
-            self.peers and not endpoint.transport.connected()
-        ):
-            if endpoint is not None:
+        while self.volume_endpoint is None or self._volume_broken():
+            if self.volume_endpoint is not None:
                 logger.warning("Replacing broken torch transport endpoint")
-                endpoint.retire()
+                self.volume_endpoint.retire()
                 self.volume_endpoint = None
                 self.peers.clear()
             if self._creating is None:
@@ -355,10 +430,32 @@ class TorchTransportCache(TransportCache):
             elif self._clears != clears:
                 # clear() closes it.
                 raise RuntimeError("Transport cache cleared while connecting")
+        endpoint = self.volume_endpoint
         if url not in self.peers:
             endpoint.transport.connect(url)
             self.peers.add(url)
         return endpoint
+
+    def _volume_broken(self) -> bool:
+        endpoint = self.volume_endpoint
+        return (
+            endpoint is not None
+            and bool(self.peers)
+            and not endpoint.transport.connected()
+        )
+
+    def sweep(self) -> None:
+        """Unregister freed memory."""
+        if self.endpoint is not None:
+            self.endpoint.sweep()
+        # A closed backend can't unregister; connect() replaces the endpoint.
+        if self.volume_endpoint is not None and not self._volume_broken():
+            self.volume_endpoint.sweep()
+
+    @override
+    def delete(self, keys: set[str]) -> None:
+        # Deleted values may have freed registered tensors.
+        self.sweep()
 
     @override
     def clear(self) -> None:
@@ -415,11 +512,16 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         self._contexts: list[TorchTransportRequestContext] = []
         # Client-local state, stripped from RPC state.
         self._endpoint: _Endpoint | None = None
+        # Storages of request tensors, kept alive while a cancelled request's
+        # volume call may access them even if a tensor's data is reassigned.
+        self._storages: list[torch.UntypedStorage] = []
+        # Destination memory a cancelled get refuses to other requests.
         self._keys: list[_RegistrationKey] = []
 
     def __getstate__(self) -> dict[str, Any]:
         state = super().__getstate__()
         state["_endpoint"] = None
+        state["_storages"] = []
         state["_keys"] = []
         return state
 
@@ -429,6 +531,7 @@ class TorchDistributedTransportBuffer(TransportBuffer):
     async def _register_client_tensors(self) -> None:
         """Expose context tensors through the client endpoint."""
         cache = self._client_cache()
+        cache.sweep()
         # Object-only requests need no endpoint.
         if not any(c.tensor is not None and c.tensor.numel() for c in self._contexts):
             return
@@ -440,6 +543,9 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         endpoint.active += 1
         self._endpoint = endpoint
         self._expose_contexts(endpoint)
+        self._storages = [
+            c.tensor.untyped_storage() for c in self._contexts if c.tensor is not None
+        ]
         # Registration overlaps queued kernels; transfers must not.
         await _wait_for(events)
 
@@ -450,9 +556,8 @@ class TorchDistributedTransportBuffer(TransportBuffer):
             if tensor is None or tensor.numel() == 0:
                 continue
             assert tensor.is_contiguous()
-            key, memory = endpoint.register(tensor)
-            self._keys.append(key)
-            context.remote_buffer = memory.to_remote_buffer()
+            context.remote_buffer = endpoint.expose(tensor)
+            self._keys.append(_view_key(tensor))
 
     @override
     async def _pre_put_hook(self, requests: list[Request]) -> None:
@@ -526,9 +631,11 @@ class TorchDistributedTransportBuffer(TransportBuffer):
     ) -> None:
         cache = ctx.get(TorchTransportCache)
         if not transfers:
+            cache.sweep()
             return
         assert self._client_url is not None
         endpoint = await cache.connect(self._backend, self._client_url)
+        cache.sweep()
         await endpoint.transfer(read, transfers)
 
     @override
@@ -596,32 +703,41 @@ class TorchDistributedTransportBuffer(TransportBuffer):
         ]
 
     @override
+    async def _call_volume_put(self, meta_requests: list[Request]) -> None:
+        # A cancelled put keeps its sources alive, but unlike a get's
+        # destinations they may be put again meanwhile, so don't refuse them.
+        self._keys = []
+        await self._shield(super()._call_volume_put(meta_requests))
+
+    @override
     async def _call_volume_get(self, meta_requests: list[Request]) -> TransportBuffer:
-        if self._endpoint is None:
-            return await super()._call_volume_get(meta_requests)
-        call = asyncio.ensure_future(super()._call_volume_get(meta_requests))
+        return await self._shield(super()._call_volume_get(meta_requests))
+
+    async def _shield(self, coro: Awaitable[_T]) -> _T:
+        """Await a volume call; if cancelled, keep its tensors until it answers."""
+        call = asyncio.ensure_future(coro)
         try:
             return await asyncio.shield(call)
         except asyncio.CancelledError:
             # A cancelled call does not stop the volume.
             if call.done() and not call.cancelled():
                 raise
-            endpoint, keys = self._take_endpoint()
-            assert endpoint is not None
-            # The volume may still write into the destinations; keep them
-            # registered, which holds them, until it answers.
-            tensors = [context.tensor for context in self._contexts]
-            endpoint.release_when_answered(keys, tensors, call)
+            endpoint, keys, storages = self._take_endpoint()
+            if endpoint is None:
+                call.add_done_callback(lambda f: f.cancelled() or f.exception())
+            else:
+                endpoint.release_when_answered(keys, storages, call)
             raise
 
-    def _take_endpoint(self) -> tuple[_Endpoint | None, list[_RegistrationKey]]:
-        endpoint, keys = self._endpoint, self._keys
-        self._endpoint, self._keys = None, []
-        return endpoint, keys
+    def _take_endpoint(
+        self,
+    ) -> tuple[_Endpoint | None, list[_RegistrationKey], list[torch.UntypedStorage]]:
+        endpoint, keys, storages = self._endpoint, self._keys, self._storages
+        self._endpoint, self._keys, self._storages = None, [], []
+        return endpoint, keys, storages
 
     async def drop(self) -> None:
         self._contexts = []
-        endpoint, keys = self._take_endpoint()
+        endpoint, _, _ = self._take_endpoint()
         if endpoint is not None:
-            endpoint.unregister(keys)
             endpoint.release()
