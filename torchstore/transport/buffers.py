@@ -405,18 +405,19 @@ class TransportBuffer:
 def _apply_transfer_dtypes(requests: list[Request]) -> list[Request]:
     """Return requests whose tensor_val is already in its transfer dtype."""
     cast_requests = []
-    cuda_devices = set()
+    accelerator = torch.accelerator.current_accelerator()
+    devices = set()
     for request in requests:
         if request.transfer_dtype is None or request.tensor_val is None:
             cast_requests.append(request)
             continue
         tensor = request.tensor_val.to(request.transfer_dtype)
-        if tensor.is_cuda:
-            cuda_devices.add(tensor.device)
+        if accelerator is not None and tensor.device.type == accelerator.type:
+            devices.add(tensor.device)
         cast_requests.append(
             dataclasses.replace(request, tensor_val=tensor, transfer_dtype=None)
         )
-    # Transports may read the cast tensors outside CUDA stream order (e.g. RDMA).
-    for device in cuda_devices:
-        torch.cuda.current_stream(device).synchronize()
+    # Transports may read the cast tensors outside device stream order (e.g. RDMA).
+    for device in devices:
+        torch.accelerator.current_stream(device).synchronize()
     return cast_requests
