@@ -107,10 +107,11 @@ class DirectWeightSyncSource:
         Args:
             state_dict: Model state dict to register.
             rank: This process's rank.
-            transfer_dtype: If set, cast all params to this dtype for
-                transfer. A staging buffer is allocated for every param
-                so that :meth:`refresh` can re-cast from the original
-                source tensors after optimizer updates.
+            transfer_dtype: If set, cast floating-point params to this
+                dtype for transfer; other params keep their dtype. A
+                staging buffer is allocated for every param so that
+                :meth:`refresh` can re-cast from the original source
+                tensors after optimizer updates.
 
 
         Returns a dict of serializable :class:`RDMAWeightHandle` objects
@@ -128,9 +129,15 @@ class DirectWeightSyncSource:
             tensor_slice = _request_to_slice(req, param)
 
             if transfer_dtype is not None:
-                # Always stage: cast to transfer dtype for RDMA transfer.
+                # Always stage: cast floating-point params to transfer dtype
+                # for RDMA transfer, as the CPU-staged path does.
                 # refresh() will re-copy from the original source tensor.
-                buf_tensor = local_tensor.to(transfer_dtype).contiguous()
+                dtype = (
+                    transfer_dtype
+                    if local_tensor.is_floating_point()
+                    else local_tensor.dtype
+                )
+                buf_tensor = local_tensor.to(dtype).contiguous()
                 self._staging[name] = (buf_tensor, local_tensor)
                 num_staged += 1
             else:
