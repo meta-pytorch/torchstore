@@ -118,3 +118,54 @@ def test_put_state_dict_direct_rdma_rejects_preserve_dtype_keys() -> None:
                 preserve_dtype_keys=frozenset({"buffer"}),
             )
         )
+
+
+def test_get_state_dict_direct_rdma_pulls_each_key() -> None:
+    """Each key pulls its own handles, not the plan built for the first key."""
+    from torchstore.direct_weight_sync import RDMAWeightHandle
+    from torchstore.transport.types import TensorSlice
+    from torchstore.utils import to_byte_view
+
+    class Buffer:
+        def __init__(self, source: torch.Tensor) -> None:
+            self.source = source
+
+        async def read_into(self, dest: torch.Tensor) -> None:
+            dest.copy_(to_byte_view(self.source))
+
+    def handles(value: float) -> dict[str, RDMAWeightHandle]:
+        return {
+            "weight": RDMAWeightHandle(
+                rdma_buffer=Buffer(torch.full((4,), value)),
+                tensor_slice=TensorSlice(
+                    offsets=(0,),
+                    coordinates=(0,),
+                    global_shape=(4,),
+                    local_shape=(4,),
+                    mesh_shape=(1,),
+                ),
+                source_rank=0,
+            )
+        }
+
+    class Store:
+        values = {
+            "policy/num_ranks": 1,
+            "policy/rank_0": handles(1.0),
+            "reference/num_ranks": 1,
+            "reference/rank_0": handles(2.0),
+        }
+
+        async def get(self, key):
+            return self.values[key]
+
+    async def pull_both(store):
+        policy = {"weight": torch.zeros(4)}
+        reference = {"weight": torch.zeros(4)}
+        await get_state_dict(store, "policy", policy, direct_rdma=True)
+        await get_state_dict(store, "reference", reference, direct_rdma=True)
+        return policy, reference
+
+    policy, reference = asyncio.run(pull_both(Store()))
+    torch.testing.assert_close(policy["weight"], torch.full((4,), 1.0))
+    torch.testing.assert_close(reference["weight"], torch.full((4,), 2.0))
