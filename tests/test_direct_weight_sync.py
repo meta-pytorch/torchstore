@@ -306,3 +306,32 @@ async def test_transfer_dtype():
     sync2 = DirectWeightSyncDest()
     await sync2.pull({"weight": [handle]}, {"weight": dest2})
     assert torch.equal(dest2, torch.full((10, 10), 42.0, dtype=torch.bfloat16))
+
+
+async def test_transfer_dtype_keeps_integer_params(monkeypatch):
+    """transfer_dtype casts floating-point params only, as the CPU-staged path does."""
+    monkeypatch.setattr("monarch.rdma.RDMABuffer", MockRDMABuffer)
+    weight = torch.full((4,), 1.5)
+    num_batches_tracked = torch.tensor(1000, dtype=torch.int64)
+
+    source = DirectWeightSyncSource()
+    handles = source.register(
+        {"weight": weight, "num_batches_tracked": num_batches_tracked},
+        rank=0,
+        transfer_dtype=torch.bfloat16,
+    )
+
+    dest = {
+        "weight": torch.zeros(4, dtype=torch.bfloat16),
+        "num_batches_tracked": torch.tensor(0, dtype=torch.int64),
+    }
+    sync = DirectWeightSyncDest()
+    await sync.pull({name: [handle] for name, handle in handles.items()}, dest)
+
+    assert torch.equal(dest["weight"], weight.to(torch.bfloat16))
+    assert torch.equal(dest["num_batches_tracked"], num_batches_tracked)
+
+    num_batches_tracked.fill_(1001)
+    source.refresh()
+    await sync.pull({name: [handle] for name, handle in handles.items()}, dest)
+    assert torch.equal(dest["num_batches_tracked"], num_batches_tracked)
