@@ -95,7 +95,8 @@ class _DirectRDMACache:
     """Per-client cache for direct RDMA weight sync state."""
 
     source: Any = None  # DirectWeightSyncSource, lazily created
-    dest: Any = None  # DirectWeightSyncDest, lazily created
+    # key -> DirectWeightSyncDest; each caches the transfer plan for its key.
+    dests: dict = field(default_factory=dict)
     registered: set = field(default_factory=set)
     handles: dict = field(default_factory=dict)
 
@@ -353,15 +354,16 @@ async def _get_state_dict_direct_rdma(store, key, user_state_dict):
     """Fetch RDMA handles and pull weights via direct RDMA reads.
 
     First call for a given key: fetches handles from TorchStore, caches them.
-    Transfer plan is built on first pull and cached by DirectWeightSyncDest.
+    The transfer plan is built on the first pull of each key and cached by
+    that key's DirectWeightSyncDest.
     All RDMA reads are issued concurrently for maximum throughput.
     """
     from torchstore.direct_weight_sync import DirectWeightSyncDest
 
     cache = _get_rdma_cache(store)
 
-    if cache.dest is None:
-        cache.dest = DirectWeightSyncDest()
+    if key not in cache.dests:
+        cache.dests[key] = DirectWeightSyncDest()
 
     if key not in cache.handles:
         num_ranks = await store.get(f"{key}/num_ranks")
@@ -372,4 +374,4 @@ async def _get_state_dict_direct_rdma(store, key, user_state_dict):
                 all_handles[name].append(handle)
         cache.handles[key] = all_handles
 
-    await cache.dest.pull(cache.handles[key], user_state_dict)
+    await cache.dests[key].pull(cache.handles[key], user_state_dict)
