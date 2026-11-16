@@ -406,6 +406,17 @@ class NixlTransportBuffer(TransportBuffer):
     @override
     async def _pre_get_hook(self, requests: list[Request]) -> None:
         """Fetch metadata if needed and allocate RDMA buffers."""
+        # Reject the whole batch before registering any destination buffers.
+        for request in requests:
+            tensor = request.tensor_val
+            if tensor is not None and (
+                not tensor.is_contiguous() or tensor.is_conj() or tensor.is_neg()
+            ):
+                raise ValueError(
+                    "NIXL destinations must be contiguous without conjugate or "
+                    "negative view bits; receive into an ordinary contiguous "
+                    "tensor and explicitly copy into the destination instead."
+                )
         # 1. fetch metadata in a single batch, preserving order
         meta_requests = [req.meta_only() for req in requests if req.tensor_val is None]
         meta_results = (
