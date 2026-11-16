@@ -340,6 +340,7 @@ async def test_put_reads_client_tensor_into_storage_volume(ref, ctx):
 
     assert not client_buffer.requires_handshake([request])
     await client_buffer._pre_put_hook([request])
+    assert client_buffer._contexts[0].tensor is source
     assert client_buffer._client_metadata is not None
     storage_volume_buffer = _storage_volume_copy(client_buffer)
     results = await storage_volume_buffer.handle_put_request(
@@ -372,6 +373,69 @@ async def test_get_writes_storage_tensor_into_client_destination(ref, ctx):
     assert agent.release_xfer_handle.call_args_list == _expected_handle_calls(
         agent.initialized
     )
+
+
+@pytest.mark.parametrize("operation", ["put", "get"])
+@pytest.mark.parametrize("view", ["conjugate", "negative", "conjugate_negative"])
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("materialize", [False, True])
+@pytest.mark.asyncio
+async def test_transfer_rejects_lazy_sources(
+    operation, view, contiguous, materialize, ref, ctx
+):
+    backing = torch.arange(48).reshape(6, 8).to(torch.complex64) + 3j
+    original = backing.clone()
+    source = backing[1:5] if contiguous else backing[1:5, ::2]
+    if "conjugate" in view:
+        source = source.conj()
+    if "negative" in view:
+        source = torch._neg_view(source)
+    expected = source.clone()
+    if materialize:
+        source = source.resolve_conj().resolve_neg()
+    sources = [torch.ones_like(expected), source]
+    client_buffer = NixlTransportBuffer(ref)
+
+    async def transfer():
+        if operation == "put":
+            requests = [
+                Request.from_tensor(str(i), tensor) for i, tensor in enumerate(sources)
+            ]
+            await client_buffer._pre_put_hook(requests)
+            remote_buffer = _storage_volume_copy(client_buffer)
+            return await remote_buffer.handle_put_request(ctx, _put_entries(requests))
+        destinations = [torch.zeros_like(expected) for _ in sources]
+        requests = [
+            Request.from_tensor(str(i), tensor) for i, tensor in enumerate(destinations)
+        ]
+        await client_buffer._pre_get_hook(requests)
+        remote_buffer = _storage_volume_copy(client_buffer)
+        try:
+            await remote_buffer.handle_get_request(
+                ctx,
+                [
+                    (request.meta_only(), tensor)
+                    for request, tensor in zip(requests, sources)
+                ],
+            )
+        except ValueError:
+            assert all(torch.count_nonzero(tensor) == 0 for tensor in destinations)
+            raise
+        return destinations
+
+    if materialize:
+        results = await transfer()
+        assert torch.equal(results[0], sources[0])
+        assert torch.equal(results[1], expected)
+    else:
+        with pytest.raises(ValueError, match="resolve_conj.*resolve_neg"):
+            await transfer()
+        assert all(not agent.initialized for agent in FakeNixlAgent.instances)
+        if operation == "put":
+            assert all(
+                not agent.register_memory.called for agent in FakeNixlAgent.instances
+            )
+    assert torch.equal(backing, original)
 
 
 @pytest.mark.asyncio
