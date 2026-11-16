@@ -850,6 +850,36 @@ async def test_abandoned_get_releases_registration_when_volume_answers(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("already_cancelled", [False, True])
+async def test_cancelled_volume_call_keeps_destination_alive(
+    ref, monkeypatch, already_cancelled
+):
+    monkeypatch.setattr(nixl_transport, "_cancelled_volume_gets", [], raising=False)
+    monkeypatch.setattr(nixl_transport, "ENV_TORCHSTORE_NIXL_TIMEOUT_S", 0)
+    buffer = NixlTransportBuffer(ref)
+    destination = torch.zeros(4)
+    destination_ref = weakref.ref(destination)
+    buffer._contexts = [buffer._register_client_tensor(destination, cached=False)]
+    cache_ref = weakref.ref(buffer._client_cache())
+    call = asyncio.get_running_loop().create_future()
+    if already_cancelled:
+        call.cancel()
+    await buffer._wait_for_volume(call)
+    await buffer.drop()
+    call.cancel()
+    await asyncio.sleep(0)  # Run the completion callback before clearing the context.
+    ref.transport_context.clear()
+    del destination, buffer, call
+    gc.collect()
+
+    assert destination_ref() is not None
+    assert cache_ref() is not None
+    cache_ref().agent.deregister_memory.assert_not_called()
+    with pytest.raises(RuntimeError, match="has not answered"):
+        cache_ref().acquire(destination_ref())
+
+
+@pytest.mark.asyncio
 async def test_get_cancelled_before_volume_call_releases_registration(ref):
     client_buffer = NixlTransportBuffer(ref)
     destination = torch.zeros(4)
