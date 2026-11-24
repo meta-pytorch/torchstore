@@ -26,6 +26,7 @@ from typing import Any, TYPE_CHECKING
 import torch
 from typing_extensions import override
 
+from torchstore.transport import neuron_memory
 from torchstore.transport.buffers import TransportBuffer, TransportCache
 from torchstore.transport.types import Request
 
@@ -65,15 +66,21 @@ def _load_nixl_api() -> tuple[Any, Any]:
     """Import NIXL only when constructing its transport."""
     try:
         from nixl._api import nixl_agent, nixl_agent_config
-    except ImportError as error:
-        raise RuntimeError("NIXL is not installed") from error
+    except ImportError:
+        try:
+            # NIXL built from source without CUDA (e.g. for AWS Neuron + EFA).
+            from nixl_cu12._api import nixl_agent, nixl_agent_config
+        except ImportError as error:
+            raise RuntimeError("NIXL is not installed") from error
     return nixl_agent, nixl_agent_config
 
 
 @cache
 def nixl_available() -> bool:
     """Return whether the optional NIXL transport was explicitly enabled."""
-    return ENV_TORCHSTORE_NIXL_ENABLED and find_spec("nixl") is not None
+    return ENV_TORCHSTORE_NIXL_ENABLED and (
+        find_spec("nixl") is not None or find_spec("nixl_cu12") is not None
+    )
 
 
 def _aligned(nbytes: int) -> int:
@@ -122,6 +129,9 @@ def _storage_key(tensor: torch.Tensor) -> tuple[int, int]:
     storage = tensor.untyped_storage()
     return storage.data_ptr(), storage.nbytes()
 
+
+# Backends that cannot re-establish a connection to an agent they removed.
+_KEEP_CONNECTED_BACKENDS = frozenset({"LIBFABRIC"})
 
 _BACKEND_PARAMS = {
     "UCX": {
@@ -203,7 +213,7 @@ class NixlAgentCache(TransportCache):
 
         # Not kept: a tensor over the storage would keep the storage alive.
         region = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(storage)
-        descriptors = self.agent.register_memory(region, backends=[self.backend])
+        descriptors = neuron_memory.register_memory(self.agent, region, [self.backend])
         storage_ref = weakref.ref(storage, lambda _ref, _key=key: self._evict(_key))
         self._registrations[key] = _Registration(descriptors, storage_ref)
         return descriptors
@@ -233,7 +243,7 @@ class NixlAgentCache(TransportCache):
         region = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
             tensor.untyped_storage()
         )
-        descriptors = self.agent.register_memory(region, backends=[self.backend])
+        descriptors = neuron_memory.register_memory(self.agent, region, [self.backend])
         self._leases[key] = [descriptors, 1]
         return key
 
@@ -280,10 +290,30 @@ class NixlAgentCache(TransportCache):
         self.agent.deregister_memory(registration.descriptors)
         self._registrations.pop(key, None)
 
-    def add_remote_agent(self, name: str, metadata: bytes) -> str:
-        """Load new remote metadata, replacing an older copy when needed."""
+    def add_remote_agent(
+        self, name: str, metadata: bytes, partial_metadata: list[bytes] | None = None
+    ) -> str:
+        """Load new remote metadata, replacing an older copy when needed.
+
+        LIBFABRIC cannot reconnect to an agent it removed: after
+        ``remove_remote_agent`` and a reload of the same name, the peer keeps its
+        old connection and the new handshake times out. A known peer therefore
+        stays connected and only its new registrations are loaded, from the
+        partial metadata the client sends with each request.
+        """
         previous_metadata = self._remote_agents.get(name)
         if previous_metadata == metadata:
+            return name
+        if previous_metadata is not None and self.backend in _KEEP_CONNECTED_BACKENDS:
+            for partial in partial_metadata or []:
+                try:
+                    self.agent.add_remote_agent(partial)
+                except Exception as error:
+                    # NIXL refuses a memory section it already holds; partial metadata
+                    # is sent with every request, so registrations repeat.
+                    if "NOT_ALLOWED" not in f"{type(error).__name__} {error}":
+                        raise
+            self._remote_agents[name] = metadata
             return name
         if previous_metadata is not None:
             self.agent.remove_remote_agent(name)
@@ -296,6 +326,15 @@ class NixlAgentCache(TransportCache):
             )
         self._remote_agents[name] = metadata
         return remote_name
+
+    def registration_of(self, tensor: torch.Tensor) -> Any:
+        """The registration descriptors covering ``tensor``'s storage, if any."""
+        key = _storage_key(tensor)
+        registration = self._registrations.get(key)
+        if registration is not None:
+            return registration.descriptors
+        lease = self._leases.get(key)
+        return lease[0] if lease is not None else None
 
     @override
     def clear(self) -> None:
@@ -325,7 +364,11 @@ class NixlRequestContext:
 
 
 class NixlTransportBuffer(TransportBuffer):
-    """Move StorageVolume tensors with NIXL's UCX backend."""
+    """Move StorageVolume tensors with NIXL (UCX by default; LIBFABRIC for EFA).
+
+    CPU, CUDA and AWS Neuron tensors; Neuron memory is described by its runtime
+    device address (``torchstore.transport.neuron_memory``).
+    """
 
     supports_batch_puts = True
     supports_batch_gets = True
@@ -339,6 +382,9 @@ class NixlTransportBuffer(TransportBuffer):
             )
         _load_nixl_api()
         self._client_metadata: bytes | None = None
+        # Per-registration metadata without connection info, for peers that already
+        # know this agent (see NixlAgentCache.add_remote_agent).
+        self._client_partial_metadata: list[bytes] = []
         self._client_agent_name: str | None = None
         self._contexts: list[NixlRequestContext] = []
         # Storage keys of this request's CUDA destinations acquired from the cache.
@@ -370,7 +416,7 @@ class NixlTransportBuffer(TransportBuffer):
             cache.register(tensor)
         elif _storage_key(tensor) not in self._leases:
             self._leases.add(cache.acquire(tensor))
-        descriptors = cache.agent.get_xfer_descs(tensor)
+        descriptors = neuron_memory.get_xfer_descs(cache.agent, tensor)
         context.remote_descriptors = cache.agent.get_serialized_descs(descriptors)
         return context
 
@@ -379,6 +425,21 @@ class NixlTransportBuffer(TransportBuffer):
             cache = self._client_cache()
             self._client_agent_name = cache.agent.name
             self._client_metadata = cache.agent.get_agent_metadata()
+            self._client_partial_metadata = []
+            if cache.backend in _KEEP_CONNECTED_BACKENDS:
+                seen: set[int] = set()
+                for context in self._contexts:
+                    if context.tensor is None or context.remote_descriptors is None:
+                        continue
+                    descriptors = cache.registration_of(context.tensor)
+                    if descriptors is None or id(descriptors) in seen:
+                        continue
+                    seen.add(id(descriptors))
+                    self._client_partial_metadata.append(
+                        cache.agent.get_partial_agent_metadata(
+                            descriptors, False, [cache.backend]
+                        )
+                    )
 
     @override
     async def _pre_put_hook(self, requests: list[Request]) -> None:
@@ -430,6 +491,10 @@ class NixlTransportBuffer(TransportBuffer):
                 tensor = torch.empty(shape, dtype=dtype, device="cpu")
 
             self._contexts.append(
+                # CUDA memory is leased per request (FSDP reuses it in place); host
+                # and Neuron memory stay registered for the storage's lifetime. Over
+                # LIBFABRIC a peer cannot drop a section, so re-registering a range per
+                # request would leave it holding a stale one.
                 self._register_client_tensor(tensor, cached=not tensor.is_cuda)
             )
         self._publish_client_metadata()
@@ -451,7 +516,7 @@ class NixlTransportBuffer(TransportBuffer):
         try:
             for _, tensor, serialized_remote_descs in transfers:
                 cache.register(tensor)
-                tensor_local_descs = cache.agent.get_xfer_descs(tensor)
+                tensor_local_descs = neuron_memory.get_xfer_descs(cache.agent, tensor)
                 tensor_remote_descs = cache.agent.deserialize_descs(
                     serialized_remote_descs
                 )
@@ -548,7 +613,11 @@ class NixlTransportBuffer(TransportBuffer):
     def _connect_client(self, cache: NixlAgentCache) -> str:
         if self._client_agent_name is None or self._client_metadata is None:
             raise RuntimeError("NIXL request is missing client agent metadata")
-        return cache.add_remote_agent(self._client_agent_name, self._client_metadata)
+        return cache.add_remote_agent(
+            self._client_agent_name,
+            self._client_metadata,
+            self._client_partial_metadata,
+        )
 
     @override
     async def handle_put_request(
@@ -771,6 +840,7 @@ class NixlTransportBuffer(TransportBuffer):
 
     async def drop(self) -> None:
         self._client_metadata = None
+        self._client_partial_metadata = []
         self._contexts = []
         leases, self._leases = self._leases, set()
         if not leases:
