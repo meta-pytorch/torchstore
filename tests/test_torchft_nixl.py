@@ -12,8 +12,9 @@ A torchft Lighthouse and three replica processes, each on its own accelerator
 the middle of a step. The survivors keep training as two replicas; the restarted
 replica 2 rejoins, heals through ``NixlCheckpointTransport`` (model and Adam
 state), and the run ends once all three have trained together past ``STEPS``.
-Every replica must finish on the same step with bit-identical parameters, and
-replica 2 must have healed.
+Replica 1 also misses two quorums on purpose, so the same process heals twice
+from the same source. Every replica must finish on the same step with
+bit-identical parameters; replica 2 must have healed, replica 1 twice.
 
 Needs torchft, NIXL and a non-CPU accelerator with three devices; skipped
 otherwise. On Trainium: ``TORCHSTORE_NIXL_BACKEND=LIBFABRIC pytest
@@ -33,10 +34,12 @@ from pathlib import Path
 
 import pytest
 
-STEPS = 12
+STEPS = 150
 FAIL_STEP = 5
 REPLICAS = 3
 FAILING_REPLICA = 2
+LAGGING_REPLICA = 1
+LAG_STEPS = (20, 60)
 MAX_STEPS = 2000
 
 
@@ -135,9 +138,11 @@ def test_upstream_torchft_heals_a_killed_replica_over_nixl(tmp_path: Path) -> No
     results = [torch.load(tmp_path / f"replica{r}.pt") for r in range(REPLICAS)]
     steps = [r["step"] for r in results]
     assert len(set(steps)) == 1 and steps[0] >= STEPS, steps
-    # The killed replica must heal. A survivor may heal too: one still timing
-    # out on the dead peer can fall a step behind the others' new quorum.
-    assert results[FAILING_REPLICA]["healed"], [r["healed"] for r in results]
+    # The killed replica heals once; the lagging one twice, in the same process
+    # and from the same source (its NIXL metadata is already held the second time).
+    healed = [r["healed"] for r in results]
+    assert healed[FAILING_REPLICA] >= 1, healed
+    assert healed[LAGGING_REPLICA] >= 2, healed
     for other in results[1:]:
         for a, b in zip(results[0]["params"], other["params"]):
             assert torch.equal(a, b), "replicas diverged after the heal"
@@ -172,7 +177,7 @@ def _replica_main() -> None:
         p.grad = torch.zeros_like(p)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
-    healed = [False]
+    healed = [0]
 
     def state_dict() -> dict:
         return {"model": model.state_dict(), "optim": optimizer.state_dict()}
@@ -180,7 +185,7 @@ def _replica_main() -> None:
     def load_state_dict(state: dict) -> None:
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optim"])
-        healed[0] = True
+        healed[0] += 1
 
     transport = NixlCheckpointTransport(pg, timeout=timedelta(seconds=120))
     manager = Manager(
@@ -207,7 +212,14 @@ def _replica_main() -> None:
     loss_fn = nn.CrossEntropyLoss()
     # Stop once all replicas trained a step together past STEPS: the survivors
     # wait for the rejoiner instead of finishing without it.
+    lags = 0
     while manager.current_step() < MAX_STEPS:
+        if replica == LAGGING_REPLICA and lags < len(LAG_STEPS):
+            if manager.current_step() >= LAG_STEPS[lags]:
+                # Miss the next quorum (join timeout 10 s): the others commit steps
+                # without this replica, so it heals at the quorum after.
+                lags += 1
+                time.sleep(20)
         manager.start_quorum()
         step = manager.current_step()
         g = torch.Generator().manual_seed(1000 * replica + step)

@@ -484,6 +484,13 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
         self._pg = pg
         self._timeout = timeout
         self._state_dict = state_dict
+        # State memory is registered once and stays registered. Deregistering after
+        # a send and registering again gave the same addresses new keys; a receiver
+        # holding the first send's metadata then could not load the second's
+        # (NIXL_ERR_NOT_ALLOWED), and its READ failed (NIXL_ERR_NOT_FOUND).
+        self._registered: dict[tuple[str, int, int, int], int] = {}
+        self._batches: list[str] = []  # partial metadata per registration batch
+        self._loaded: set[str] = set()  # "<agent>:<batch>" metadata held here
 
     def set_state_dict(self, state_dict: Callable[[], object]) -> None:
         """In-place receive into this callable's tensors (set once the Manager exists)."""
@@ -500,24 +507,35 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
             )
         return g["store"], g["rank"], g
 
-    def _register(self, tensors: list[torch.Tensor]) -> list[Any]:
+    def _register(self, tensors: list[torch.Tensor]) -> list[int]:
+        """Register what is not registered yet; return the batches covering ``tensors``."""
         agent = self._pg._link.agent
-        regs = []
+        batches: set[int] = set()
         for mem, entries in _regions(tensors).items():
-            regs.append(
-                agent.register_memory(
-                    agent.get_reg_descs([(a, n, d, "") for a, n, d in entries], mem),
-                    backends=[_BACKEND],
-                )
+            new = []
+            for a, n, d in entries:
+                batch = self._registered.get((mem, a, n, d))
+                if batch is None:
+                    new.append((a, n, d))
+                else:
+                    batches.add(batch)
+            new = list(dict.fromkeys(new))
+            if not new:
+                continue
+            reg = agent.register_memory(
+                agent.get_reg_descs([(a, n, d, "") for a, n, d in new], mem),
+                backends=[_BACKEND],
             )
-        return regs
-
-    def _deregister(self, regs: list[Any]) -> None:
-        for reg in regs:
-            try:
-                self._pg._link.agent.deregister_memory(reg)
-            except Exception as error:
-                logger.warning("NixlCheckpointTransport: deregister failed: %s", error)
+            batch = len(self._batches)
+            self._batches.append(
+                base64.b64encode(
+                    agent.get_partial_agent_metadata(reg, False, [_BACKEND])
+                ).decode()
+            )
+            for a, n, d in new:
+                self._registered[(mem, a, n, d)] = batch
+            batches.add(batch)
+        return sorted(batches)
 
     def send_checkpoint(
         self,
@@ -532,26 +550,18 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
         meta, tensors = _prepare(state_dict, step)
         tensors = [t for t in tensors if t.nbytes > 0]
         _synchronize(self._pg._device)
-        regs = self._register(tensors)
-        try:
-            agent = self._pg._link.agent
-            info = json.dumps(
-                {
-                    "meta": base64.b64encode(pickle.dumps(meta)).decode(),
-                    "regions": [(*_region_of(t)[1], _region_of(t)[0]) for t in tensors],
-                    "md": [
-                        base64.b64encode(
-                            agent.get_partial_agent_metadata(r, False, [_BACKEND])
-                        ).decode()
-                        for r in regs
-                    ],
-                }
-            )
-            for dst in dst_ranks:
-                store.set(f"ckpt/{step}/{rank}/{dst}", info)
-            store.wait([f"ckpt/{step}/{rank}/{dst}/done" for dst in dst_ranks], timeout)
-        finally:
-            self._deregister(regs)
+        batches = self._register(tensors)
+        name = self._pg._link.name
+        info = json.dumps(
+            {
+                "meta": base64.b64encode(pickle.dumps(meta)).decode(),
+                "regions": [(*_region_of(t)[1], _region_of(t)[0]) for t in tensors],
+                "md": [[f"{name}:{b}", self._batches[b]] for b in batches],
+            }
+        )
+        for dst in dst_ranks:
+            store.set(f"ckpt/{step}/{rank}/{dst}", info)
+        store.wait([f"ckpt/{step}/{rank}/{dst}/done" for dst in dst_ranks], timeout)
         logger.info(
             "NixlCheckpointTransport: sent step %d to %s: %d tensors, %d B in %.2f s",
             step,
@@ -578,12 +588,15 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
         store.wait([key], timeout)
         info = json.loads(bytes(store.get(key)).decode())
         agent = self._pg._link.agent
-        for md in info["md"]:
+        for md_id, md in info["md"]:
+            if md_id in self._loaded:  # the source keeps it registered: still valid
+                continue
             try:
                 agent.add_remote_agent(base64.b64decode(md))
             except Exception as error:  # a section this agent already holds
                 if "NOT_ALLOWED" not in f"{type(error).__name__} {error}":
                     raise
+            self._loaded.add(md_id)
         meta = pickle.loads(base64.b64decode(info["meta"]))
         if meta.step != step:
             raise RuntimeError(
@@ -632,7 +645,7 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
             raise RuntimeError(
                 f"NixlCheckpointTransport: {len(remote)} source tensors, {len(locals_)} here"
             )
-        regs = self._register(locals_)
+        self._register(locals_)
         handles = []
         try:
             groups: dict[tuple[str, str], tuple[list, list]] = {}
@@ -661,7 +674,6 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
             _synchronize(device)
         finally:
             store.set(f"{key}/done", "1")  # release the source either way
-            self._deregister(regs)
         logger.info(
             "NixlCheckpointTransport: received step %d from %d: %d tensors, %d B in %.2f s",
             step,
