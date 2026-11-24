@@ -44,9 +44,9 @@ from __future__ import annotations
 
 import base64
 import json
-import pickle
 import logging
 import os
+import pickle
 import threading
 import time
 import uuid as _uuid
@@ -60,14 +60,18 @@ from torch.distributed.distributed_c10d import AllreduceOptions, ReduceOp, Work
 from torchstore.transport import neuron_memory
 
 try:  # upstream torchft
+    from torchft.checkpointing.pg_transport import (
+        _DTensorMeta,
+        _StateDictMeta,
+        _TensorMeta,
+    )
+    from torchft.checkpointing.transport import CheckpointTransport
     from torchft.process_group import (
         _rendezvous,
         create_store_client,
         ProcessGroupGloo,
         ReconfigureOptions,
     )
-    from torchft.checkpointing.pg_transport import _DTensorMeta, _StateDictMeta, _TensorMeta
-    from torchft.checkpointing.transport import CheckpointTransport
     from torchft.work import _DummyWork
 except ImportError as _error:  # pragma: no cover - torchft is optional for torchstore
     raise ImportError("torchstore.integrations.torchft needs torchft") from _error
@@ -75,7 +79,9 @@ except ImportError as _error:  # pragma: no cover - torchft is optional for torc
 logger = logging.getLogger(__name__)
 
 _MAX_WORLD_SIZE = int(os.environ.get("TORCHSTORE_TORCHFT_MAX_WORLD_SIZE", "4"))
-_GRAD_SLOT_BYTES = int(os.environ.get("TORCHSTORE_TORCHFT_GRAD_SLOT_BYTES", str(64 << 20)))
+_GRAD_SLOT_BYTES = int(
+    os.environ.get("TORCHSTORE_TORCHFT_GRAD_SLOT_BYTES", str(64 << 20))
+)
 _BACKEND = os.environ.get("TORCHSTORE_NIXL_BACKEND", "LIBFABRIC")
 _OP_TIMEOUT_S = float(os.environ.get("TORCHSTORE_TORCHFT_OP_TIMEOUT_S", "30"))
 _WARMUP_TIMEOUT_S = float(os.environ.get("TORCHSTORE_TORCHFT_WARMUP_TIMEOUT_S", "300"))
@@ -89,7 +95,10 @@ def _load_nixl() -> tuple[Any, Any]:
 
 
 def _synchronize(device: torch.device) -> None:
-    if neuron_memory.NEURON_DEVICE_TYPES and device.type in neuron_memory.NEURON_DEVICE_TYPES:
+    if (
+        neuron_memory.NEURON_DEVICE_TYPES
+        and device.type in neuron_memory.NEURON_DEVICE_TYPES
+    ):
         import torch_neuronx
 
         torch_neuronx.synchronize()
@@ -110,13 +119,17 @@ class _Link:
         self.name = f"torchstore-torchft-{os.getpid()}-{_uuid.uuid4().hex[:8]}"
         self.agent = nixl_agent(
             self.name,
-            nixl_agent_config(enable_prog_thread=True, enable_listen_thread=False, backends=[]),
+            nixl_agent_config(
+                enable_prog_thread=True, enable_listen_thread=False, backends=[]
+            ),
         )
         self.agent.create_backend(_BACKEND, {})
         self.agent.register_memory(
-            neuron_memory.neuron_reg_descs(self.agent, self.arena)
-            if neuron_memory.is_neuron(self.arena)
-            else self.agent.get_reg_descs(self.arena),
+            (
+                neuron_memory.neuron_reg_descs(self.agent, self.arena)
+                if neuron_memory.is_neuron(self.arena)
+                else self.agent.get_reg_descs(self.arena)
+            ),
             backends=[_BACKEND],
         )
         self.va = (
@@ -130,7 +143,11 @@ class _Link:
         self.known: set[str] = set()
         logger.info(
             "torchstore torchft: NIXL agent %s, %d B registered on %s (%d slots of %d B)",
-            self.name, total, device, 2 * max_world, slot_bytes,
+            self.name,
+            total,
+            device,
+            2 * max_world,
+            slot_bytes,
         )
 
     def slot_off(self, writer: int, parity: int) -> int:
@@ -148,7 +165,9 @@ class _Link:
 
     def connect(self, info: dict[str, Any]) -> dict[str, Any]:
         if info["slot_bytes"] != self.slot_bytes or info["max_world"] != self.max_world:
-            raise RuntimeError("NIXL peers disagree on TORCHSTORE_TORCHFT_* slot settings")
+            raise RuntimeError(
+                "NIXL peers disagree on TORCHSTORE_TORCHFT_* slot settings"
+            )
         if info["name"] not in self.known:  # never removed: see module docstring
             self.agent.add_remote_agent(base64.b64decode(info["meta"]))
             self.known.add(info["name"])
@@ -161,7 +180,9 @@ class _Link:
 
     def write(self, peer: dict[str, Any], offset: int, nbytes: int, tag: bytes) -> Any:
         local = self.agent.get_xfer_descs([(self.va, nbytes, self.dev)], self.mem)
-        remote = self.agent.get_xfer_descs([(peer["va"] + offset, nbytes, peer["dev"])], self.mem)
+        remote = self.agent.get_xfer_descs(
+            [(peer["va"] + offset, nbytes, peer["dev"])], self.mem
+        )
         handle = self.agent.initialize_xfer("WRITE", local, remote, peer["name"], tag)
         if self.agent.transfer(handle) == "ERR":
             self.agent.release_xfer_handle(handle)
@@ -194,7 +215,9 @@ class _Link:
             if retired.is_set():
                 raise RuntimeError("NIXL wait abandoned: process group reconfigured")
             if time.monotonic() > deadline:
-                raise TimeoutError(f"NIXL: {len(tags - self.seen)} notification(s) missing")
+                raise TimeoutError(
+                    f"NIXL: {len(tags - self.seen)} notification(s) missing"
+                )
             time.sleep(0.0002)
         self.seen -= tags
 
@@ -271,7 +294,9 @@ class ProcessGroupNixl(ProcessGroupGloo):
         if generation is not None:
             generation["retired"].set()
             dead = generation["tag"].encode()
-            self._link.seen = {m for m in self._link.seen if m.split(b":")[0][1:] != dead}
+            self._link.seen = {
+                m for m in self._link.seen if m.split(b":")[0][1:] != dead
+            }
 
     def abort(self, errored: bool = True) -> None:
         self._retire()
@@ -307,7 +332,9 @@ class ProcessGroupNixl(ProcessGroupGloo):
             generation["warm"] = True
         return _DummyWork(tensor)
 
-    def _allreduce(self, g: dict[str, Any], tensor: torch.Tensor, op: ReduceOp, deadline: float) -> None:
+    def _allreduce(
+        self, g: dict[str, Any], tensor: torch.Tensor, op: ReduceOp, deadline: float
+    ) -> None:
         link = self._link
         flat = tensor.reshape(-1)
         if not flat.is_contiguous():
@@ -323,17 +350,23 @@ class ProcessGroupNixl(ProcessGroupGloo):
             _synchronize(tensor.device)
             tag = f"g{g['tag']}:{seq}:".encode()
             handles = [
-                link.write(peer, link.slot_off(rank, parity), nbytes, tag + str(rank).encode())
+                link.write(
+                    peer, link.slot_off(rank, parity), nbytes, tag + str(rank).encode()
+                )
                 for peer in g["peers"].values()
             ]
             link.finish(handles, deadline)
-            link.wait({tag + str(p).encode() for p in g["peers"]}, deadline, g["retired"])
+            link.wait(
+                {tag + str(p).encode() for p in g["peers"]}, deadline, g["retired"]
+            )
             # Same rank order on every replica: bit-identical results.
             parts = [
-                link.arena[:nbytes].view(tensor.dtype)
-                if r == rank
-                else link.arena[link.slot_off(r, parity) : link.slot_off(r, parity) + nbytes].view(
-                    tensor.dtype
+                (
+                    link.arena[:nbytes].view(tensor.dtype)
+                    if r == rank
+                    else link.arena[
+                        link.slot_off(r, parity) : link.slot_off(r, parity) + nbytes
+                    ].view(tensor.dtype)
                 )
                 for r in range(world)
             ]
@@ -369,7 +402,11 @@ T = TypeVar("T")
 def _region_of(t: torch.Tensor) -> tuple[str, tuple[int, int, int]]:
     """(memory type, (address, nbytes, device id)) of a contiguous tensor."""
     if neuron_memory.is_neuron(t):
-        return "VRAM", (neuron_memory.neuron_va(t), t.nbytes, neuron_memory.neuron_device_id(t))
+        return "VRAM", (
+            neuron_memory.neuron_va(t),
+            t.nbytes,
+            neuron_memory.neuron_device_id(t),
+        )
     if t.device.type == "cuda":
         return "VRAM", (t.data_ptr(), t.nbytes, t.device.index or 0)
     return "DRAM", (t.data_ptr(), t.nbytes, 0)
@@ -417,13 +454,20 @@ def _prepare(state_dict: object, step: int) -> tuple[Any, list[torch.Tensor]]:
     for path, v in leaves:
         paths.append(path)
         if isinstance(v, DTensor):
-            non_tensor_leaves.append(_DTensorMeta(local=prep(v._local_tensor), spec=v._spec))
+            non_tensor_leaves.append(
+                _DTensorMeta(local=prep(v._local_tensor), spec=v._spec)
+            )
         elif isinstance(v, torch.Tensor):
             non_tensor_leaves.append(prep(v))
         else:
             non_tensor_leaves.append(v)
     return (
-        _StateDictMeta(step=step, treespec=treespec, paths=paths, non_tensor_leaves=non_tensor_leaves),
+        _StateDictMeta(
+            step=step,
+            treespec=treespec,
+            paths=paths,
+            non_tensor_leaves=non_tensor_leaves,
+        ),
         tensors,
     )
 
@@ -451,17 +495,21 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
     def _store_and_rank(self) -> tuple[Any, int, dict[str, Any]]:
         g = self._pg._generation
         if g is None:
-            raise RuntimeError("NixlCheckpointTransport: process group is not configured")
+            raise RuntimeError(
+                "NixlCheckpointTransport: process group is not configured"
+            )
         return g["store"], g["rank"], g
 
     def _register(self, tensors: list[torch.Tensor]) -> list[Any]:
         agent = self._pg._link.agent
         regs = []
         for mem, entries in _regions(tensors).items():
-            regs.append(agent.register_memory(
-                agent.get_reg_descs([(a, n, d, "") for a, n, d in entries], mem),
-                backends=[_BACKEND],
-            ))
+            regs.append(
+                agent.register_memory(
+                    agent.get_reg_descs([(a, n, d, "") for a, n, d in entries], mem),
+                    backends=[_BACKEND],
+                )
+            )
         return regs
 
     def _deregister(self, regs: list[Any]) -> None:
@@ -472,7 +520,11 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
                 logger.warning("NixlCheckpointTransport: deregister failed: %s", error)
 
     def send_checkpoint(
-        self, dst_ranks: list[int], step: int, state_dict: T, timeout: Optional[timedelta] = None
+        self,
+        dst_ranks: list[int],
+        step: int,
+        state_dict: T,
+        timeout: Optional[timedelta] = None,
     ) -> None:
         timeout = timeout or self._timeout
         store, rank, _ = self._store_and_rank()
@@ -483,12 +535,18 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
         regs = self._register(tensors)
         try:
             agent = self._pg._link.agent
-            info = json.dumps({
-                "meta": base64.b64encode(pickle.dumps(meta)).decode(),
-                "regions": [(*_region_of(t)[1], _region_of(t)[0]) for t in tensors],
-                "md": [base64.b64encode(agent.get_partial_agent_metadata(r, False, [_BACKEND])).decode()
-                       for r in regs],
-            })
+            info = json.dumps(
+                {
+                    "meta": base64.b64encode(pickle.dumps(meta)).decode(),
+                    "regions": [(*_region_of(t)[1], _region_of(t)[0]) for t in tensors],
+                    "md": [
+                        base64.b64encode(
+                            agent.get_partial_agent_metadata(r, False, [_BACKEND])
+                        ).decode()
+                        for r in regs
+                    ],
+                }
+            )
             for dst in dst_ranks:
                 store.set(f"ckpt/{step}/{rank}/{dst}", info)
             store.wait([f"ckpt/{step}/{rank}/{dst}/done" for dst in dst_ranks], timeout)
@@ -496,11 +554,19 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
             self._deregister(regs)
         logger.info(
             "NixlCheckpointTransport: sent step %d to %s: %d tensors, %d B in %.2f s",
-            step, dst_ranks, len(tensors), sum(t.nbytes for t in tensors), time.monotonic() - t0,
+            step,
+            dst_ranks,
+            len(tensors),
+            sum(t.nbytes for t in tensors),
+            time.monotonic() - t0,
         )
 
     def recv_checkpoint(
-        self, src_rank: int, metadata: str, step: int, timeout: Optional[timedelta] = None
+        self,
+        src_rank: int,
+        metadata: str,
+        step: int,
+        timeout: Optional[timedelta] = None,
     ) -> T:
         from torch.distributed.tensor import DTensor
         from torch.utils._pytree import tree_flatten_with_path, tree_unflatten
@@ -520,9 +586,13 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
                     raise
         meta = pickle.loads(base64.b64decode(info["meta"]))
         if meta.step != step:
-            raise RuntimeError(f"NixlCheckpointTransport: got step {meta.step}, expected {step}")
+            raise RuntimeError(
+                f"NixlCheckpointTransport: got step {meta.step}, expected {step}"
+            )
 
-        template = dict(tree_flatten_with_path(self._state_dict() if self._state_dict else {})[0])
+        template = dict(
+            tree_flatten_with_path(self._state_dict() if self._state_dict else {})[0]
+        )
         device = self._pg._device
         locals_: list[torch.Tensor] = []
         values: list[object] = []
@@ -534,19 +604,34 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
             inplace = template.get(path)
             if isinstance(inplace, DTensor):
                 inplace = inplace._local_tensor
-            if isinstance(inplace, torch.Tensor) and inplace.untyped_storage().nbytes() == local_meta.nbytes:
+            if (
+                isinstance(inplace, torch.Tensor)
+                and inplace.untyped_storage().nbytes() == local_meta.nbytes
+            ):
                 storage = _storage_bytes(inplace)
             else:
-                storage = torch.empty(local_meta.nbytes, dtype=torch.uint8, device=device)
+                storage = torch.empty(
+                    local_meta.nbytes, dtype=torch.uint8, device=device
+                )
             if local_meta.nbytes > 0:
                 locals_.append(storage)
-            t = torch.as_strided(storage.view(local_meta.dtype), size=local_meta.shape,
-                                 stride=local_meta.stride, storage_offset=local_meta.storage_offset)
-            values.append(DTensor(t, v.spec, requires_grad=False) if isinstance(v, _DTensorMeta) else t)
+            t = torch.as_strided(
+                storage.view(local_meta.dtype),
+                size=local_meta.shape,
+                stride=local_meta.stride,
+                storage_offset=local_meta.storage_offset,
+            )
+            values.append(
+                DTensor(t, v.spec, requires_grad=False)
+                if isinstance(v, _DTensorMeta)
+                else t
+            )
 
         remote = info["regions"]
         if len(remote) != len(locals_):
-            raise RuntimeError(f"NixlCheckpointTransport: {len(remote)} source tensors, {len(locals_)} here")
+            raise RuntimeError(
+                f"NixlCheckpointTransport: {len(remote)} source tensors, {len(locals_)} here"
+            )
         regs = self._register(locals_)
         handles = []
         try:
@@ -561,8 +646,12 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
             deadline = time.monotonic() + timeout.total_seconds()
             src_name = g["peers"][src_rank]["name"]
             for (lmem, rmem), (local, rem) in groups.items():
-                h = agent.initialize_xfer("READ", agent.get_xfer_descs(local, lmem),
-                                          agent.get_xfer_descs(rem, rmem), src_name)
+                h = agent.initialize_xfer(
+                    "READ",
+                    agent.get_xfer_descs(local, lmem),
+                    agent.get_xfer_descs(rem, rmem),
+                    src_name,
+                )
                 if agent.transfer(h) == "ERR":
                     agent.release_xfer_handle(h)
                     raise RuntimeError("NixlCheckpointTransport: READ ERR")
@@ -575,7 +664,11 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
             self._deregister(regs)
         logger.info(
             "NixlCheckpointTransport: received step %d from %d: %d tensors, %d B in %.2f s",
-            step, src_rank, len(locals_), sum(t.nbytes for t in locals_), time.monotonic() - t0,
+            step,
+            src_rank,
+            len(locals_),
+            sum(t.nbytes for t in locals_),
+            time.monotonic() - t0,
         )
         return tree_unflatten(values, meta.treespec)
 

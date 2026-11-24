@@ -9,7 +9,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 import torchstore.transport.nixl as nixl_transport
 from torchstore.transport import neuron_memory
 
@@ -47,7 +46,9 @@ class RecordingAgent:
 
 def neuron_tensor(nbytes=4096, index=3):
     """A duck-typed Neuron tensor: only what neuron_memory reads."""
-    return SimpleNamespace(device=SimpleNamespace(type="neuron", index=index), nbytes=nbytes)
+    return SimpleNamespace(
+        device=SimpleNamespace(type="neuron", index=index), nbytes=nbytes
+    )
 
 
 def test_neuron_tensor_registers_by_device_address(monkeypatch):
