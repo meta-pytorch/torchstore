@@ -301,7 +301,7 @@ class ProcessGroupNixl(ProcessGroupGloo):
             # (first-step compile, a rejoiner's warm-up); later ones fail fast, so a
             # dead peer costs one skipped step and a new quorum, not a hang.
             budget = _OP_TIMEOUT_S if generation.get("warm") else _WARMUP_TIMEOUT_S
-            deadline = time.monotonic() + min(budget, self._nixl_timeout.total_seconds())
+            deadline = time.monotonic() + budget  # not capped by the PG timeout
             with self._op_lock:
                 self._allreduce(generation, tensor, reduce_op, deadline)
             generation["warm"] = True
