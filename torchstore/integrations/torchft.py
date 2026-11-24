@@ -77,6 +77,8 @@ logger = logging.getLogger(__name__)
 _MAX_WORLD_SIZE = int(os.environ.get("TORCHSTORE_TORCHFT_MAX_WORLD_SIZE", "4"))
 _GRAD_SLOT_BYTES = int(os.environ.get("TORCHSTORE_TORCHFT_GRAD_SLOT_BYTES", str(64 << 20)))
 _BACKEND = os.environ.get("TORCHSTORE_NIXL_BACKEND", "LIBFABRIC")
+_OP_TIMEOUT_S = float(os.environ.get("TORCHSTORE_TORCHFT_OP_TIMEOUT_S", "30"))
+_WARMUP_TIMEOUT_S = float(os.environ.get("TORCHSTORE_TORCHFT_WARMUP_TIMEOUT_S", "300"))
 _ALIGN = 64
 
 
@@ -295,9 +297,14 @@ class ProcessGroupNixl(ProcessGroupGloo):
             raise RuntimeError("ProcessGroupNixl is not configured")
         tensor = tensors[0]
         if generation["world"] > 1:
-            deadline = time.monotonic() + self._nixl_timeout.total_seconds()
+            # The first allreduce of a generation waits for its slowest member
+            # (first-step compile, a rejoiner's warm-up); later ones fail fast, so a
+            # dead peer costs one skipped step and a new quorum, not a hang.
+            budget = _OP_TIMEOUT_S if generation.get("warm") else _WARMUP_TIMEOUT_S
+            deadline = time.monotonic() + min(budget, self._nixl_timeout.total_seconds())
             with self._op_lock:
                 self._allreduce(generation, tensor, reduce_op, deadline)
+            generation["warm"] = True
         return _DummyWork(tensor)
 
     def _allreduce(self, g: dict[str, Any], tensor: torch.Tensor, op: ReduceOp, deadline: float) -> None:
