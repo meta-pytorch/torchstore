@@ -223,6 +223,19 @@ class ProcessGroupNixl(ProcessGroupGloo):
         self._op_lock = threading.Lock()
         self._generation: Optional[dict[str, Any]] = None
 
+    def get_reconfigure_handle(self) -> str:
+        """Upstream's handle, with a store host other pods can reach.
+
+        Upstream advertises ``socket.gethostname()``; on Kubernetes that is the bare
+        pod name, which other pods cannot resolve. ``TORCHFT_ADVERTISED_HOST`` (the
+        pod IP) replaces it when set.
+        """
+        handle = json.loads(super().get_reconfigure_handle())
+        host = os.environ.get("TORCHFT_ADVERTISED_HOST")
+        if host:
+            handle["store"] = f"{host}:{handle['store'].rsplit(':', 1)[1]}"
+        return json.dumps(handle)
+
     def reconfigure(self, opts: ReconfigureOptions) -> Work:
         self._retire()
         work = super().reconfigure(opts)  # Gloo control group on the rendezvous store
