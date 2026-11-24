@@ -12,7 +12,12 @@ device- and fabric-specific pieces live here instead of in torchft:
 * ``ProcessGroupNixl``: upstream ``torchft.ProcessGroupGloo`` (the control plane)
   whose ``allreduce`` of a device tensor moves the bytes with NIXL one-sided
   WRITEs. On AWS Neuron that is LIBFABRIC (EFA) straight into HBM.
-* (``NixlCheckpointTransport``, healing: see below in this module.)
+* ``NixlCheckpointTransport``: upstream ``CheckpointTransport`` for healing. The
+  source registers its state tensors' storages and publishes their addresses
+  (plus NIXL partial metadata and upstream's pickled state-dict layout) on the
+  generation's store; the recovering replica registers its own tensors (in place
+  when given a template) and READs everything with one NIXL transfer per memory
+  type. No staging copies.
 
 Gradient allreduce: all-to-all. Each rank registers, once at construction, a send
 slot and two receive slots per possible peer (``2 * max_world_size`` slots). A
@@ -39,13 +44,14 @@ from __future__ import annotations
 
 import base64
 import json
+import pickle
 import logging
 import os
 import threading
 import time
 import uuid as _uuid
 from datetime import timedelta
-from typing import Any, Optional, Union
+from typing import Any, Callable, Generic, Optional, TypeVar, Union
 
 import torch
 from torch.distributed import PrefixStore
@@ -60,6 +66,13 @@ try:  # upstream torchft
         ProcessGroupGloo,
         ReconfigureOptions,
     )
+    from torchft.checkpointing.pg_transport import (
+        _cast_tensor,
+        _DTensorMeta,
+        _prepare_state_dict,
+        _TensorMeta,
+    )
+    from torchft.checkpointing.transport import CheckpointTransport
     from torchft.work import _DummyWork
 except ImportError as _error:  # pragma: no cover - torchft is optional for torchstore
     raise ImportError("torchstore.integrations.torchft needs torchft") from _error
@@ -239,6 +252,7 @@ class ProcessGroupNixl(ProcessGroupGloo):
             "peers": peers,
             "seq": 0,
             "retired": threading.Event(),
+            "store": store,
         }
         return work
 
@@ -332,3 +346,179 @@ def _default_device() -> torch.device:
         if torch.cuda.is_available():
             return torch.device("cuda", torch.cuda.current_device())
         return torch.device("cpu")
+
+
+T = TypeVar("T")
+
+
+def _region_of(t: torch.Tensor) -> tuple[str, tuple[int, int, int]]:
+    """(memory type, (address, nbytes, device id)) of a contiguous tensor."""
+    if neuron_memory.is_neuron(t):
+        return "VRAM", (neuron_memory.neuron_va(t), t.nbytes, neuron_memory.neuron_device_id(t))
+    if t.device.type == "cuda":
+        return "VRAM", (t.data_ptr(), t.nbytes, t.device.index or 0)
+    return "DRAM", (t.data_ptr(), t.nbytes, 0)
+
+
+def _regions(tensors: list[torch.Tensor]) -> dict[str, list[tuple[int, int, int]]]:
+    """Regions grouped by memory type (for registration)."""
+    by_type: dict[str, list[tuple[int, int, int]]] = {}
+    for t in tensors:
+        mem, entry = _region_of(t)
+        by_type.setdefault(mem, []).append(entry)
+    return by_type
+
+
+class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
+    """Heal a recovering replica by READing the source's state over NIXL."""
+
+    def __init__(
+        self,
+        pg: ProcessGroupNixl,
+        timeout: timedelta = timedelta(seconds=120),
+        state_dict: Optional[Callable[[], object]] = None,
+    ) -> None:
+        self._pg = pg
+        self._timeout = timeout
+        self._state_dict = state_dict
+
+    def set_state_dict(self, state_dict: Callable[[], object]) -> None:
+        """In-place receive into this callable's tensors (set once the Manager exists)."""
+        self._state_dict = state_dict
+
+    def metadata(self) -> str:
+        return "<torchstore-nixl>"
+
+    def _store_and_rank(self) -> tuple[Any, int, dict[str, Any]]:
+        g = self._pg._generation
+        if g is None:
+            raise RuntimeError("NixlCheckpointTransport: process group is not configured")
+        return g["store"], g["rank"], g
+
+    def _register(self, tensors: list[torch.Tensor]) -> list[Any]:
+        agent = self._pg._link.agent
+        regs = []
+        for mem, entries in _regions(tensors).items():
+            regs.append(agent.register_memory(
+                agent.get_reg_descs([(a, n, d, "") for a, n, d in entries], mem),
+                backends=[_BACKEND],
+            ))
+        return regs
+
+    def _deregister(self, regs: list[Any]) -> None:
+        for reg in regs:
+            try:
+                self._pg._link.agent.deregister_memory(reg)
+            except Exception as error:
+                logger.warning("NixlCheckpointTransport: deregister failed: %s", error)
+
+    def send_checkpoint(
+        self, dst_ranks: list[int], step: int, state_dict: T, timeout: Optional[timedelta] = None
+    ) -> None:
+        timeout = timeout or self._timeout
+        store, rank, _ = self._store_and_rank()
+        t0 = time.monotonic()
+        meta, tensors = _prepare_state_dict(state_dict, step, device=self._pg._device)
+        tensors = [t for t in tensors if t.nbytes > 0]
+        _synchronize(self._pg._device)
+        regs = self._register(tensors)
+        try:
+            agent = self._pg._link.agent
+            info = json.dumps({
+                "meta": base64.b64encode(pickle.dumps(meta)).decode(),
+                "regions": [(*_region_of(t)[1], _region_of(t)[0]) for t in tensors],
+                "md": [base64.b64encode(agent.get_partial_agent_metadata(r, False, [_BACKEND])).decode()
+                       for r in regs],
+            })
+            for dst in dst_ranks:
+                store.set(f"ckpt/{step}/{rank}/{dst}", info)
+            store.wait([f"ckpt/{step}/{rank}/{dst}/done" for dst in dst_ranks], timeout)
+        finally:
+            self._deregister(regs)
+        logger.info(
+            "NixlCheckpointTransport: sent step %d to %s: %d tensors, %d B in %.2f s",
+            step, dst_ranks, len(tensors), sum(t.nbytes for t in tensors), time.monotonic() - t0,
+        )
+
+    def recv_checkpoint(
+        self, src_rank: int, metadata: str, step: int, timeout: Optional[timedelta] = None
+    ) -> T:
+        from torch.distributed.tensor import DTensor
+        from torch.utils._pytree import tree_flatten_with_path, tree_unflatten
+
+        timeout = timeout or self._timeout
+        store, rank, g = self._store_and_rank()
+        t0 = time.monotonic()
+        key = f"ckpt/{step}/{src_rank}/{rank}"
+        store.wait([key], timeout)
+        info = json.loads(bytes(store.get(key)).decode())
+        agent = self._pg._link.agent
+        for md in info["md"]:
+            try:
+                agent.add_remote_agent(base64.b64decode(md))
+            except Exception as error:  # a section this agent already holds
+                if "NOT_ALLOWED" not in f"{type(error).__name__} {error}":
+                    raise
+        meta = pickle.loads(base64.b64decode(info["meta"]))
+        if meta.step != step:
+            raise RuntimeError(f"NixlCheckpointTransport: got step {meta.step}, expected {step}")
+
+        template = dict(tree_flatten_with_path(self._state_dict() if self._state_dict else {})[0])
+        device = self._pg._device
+        locals_: list[torch.Tensor] = []
+        values: list[object] = []
+        for path, v in zip(meta.paths, meta.non_tensor_leaves):
+            local_meta = v.local if isinstance(v, _DTensorMeta) else v
+            if not isinstance(local_meta, _TensorMeta):
+                values.append(v)
+                continue
+            inplace = template.get(path)
+            if isinstance(inplace, DTensor):
+                inplace = inplace._local_tensor
+            if isinstance(inplace, torch.Tensor) and inplace.untyped_storage().nbytes() == local_meta.nbytes:
+                storage = _cast_tensor(inplace, torch.uint8)
+            else:
+                storage = torch.empty(local_meta.nbytes, dtype=torch.uint8, device=device)
+            if local_meta.nbytes > 0:
+                locals_.append(storage)
+            t = torch.as_strided(storage.view(local_meta.dtype), size=local_meta.shape,
+                                 stride=local_meta.stride, storage_offset=local_meta.storage_offset)
+            values.append(DTensor(t, v.spec, requires_grad=False) if isinstance(v, _DTensorMeta) else t)
+
+        remote = info["regions"]
+        if len(remote) != len(locals_):
+            raise RuntimeError(f"NixlCheckpointTransport: {len(remote)} source tensors, {len(locals_)} here")
+        regs = self._register(locals_)
+        handles = []
+        try:
+            groups: dict[tuple[str, str], tuple[list, list]] = {}
+            for t, (a, n, d, rmem) in zip(locals_, remote):
+                if t.nbytes != n:
+                    raise RuntimeError("NixlCheckpointTransport: tensor size mismatch")
+                lmem, (la, ln, ld) = _region_of(t)
+                group = groups.setdefault((lmem, rmem), ([], []))
+                group[0].append((la, ln, ld))
+                group[1].append((a, n, d))
+            deadline = time.monotonic() + timeout.total_seconds()
+            src_name = g["peers"][src_rank]["name"]
+            for (lmem, rmem), (local, rem) in groups.items():
+                h = agent.initialize_xfer("READ", agent.get_xfer_descs(local, lmem),
+                                          agent.get_xfer_descs(rem, rmem), src_name)
+                if agent.transfer(h) == "ERR":
+                    agent.release_xfer_handle(h)
+                    raise RuntimeError("NixlCheckpointTransport: READ ERR")
+                handles.append(h)
+            self._pg._link.finish(handles, deadline)
+            handles = []
+            _synchronize(device)
+        finally:
+            store.set(f"{key}/done", "1")  # release the source either way
+            self._deregister(regs)
+        logger.info(
+            "NixlCheckpointTransport: received step %d from %d: %d tensors, %d B in %.2f s",
+            step, src_rank, len(locals_), sum(t.nbytes for t in locals_), time.monotonic() - t0,
+        )
+        return tree_unflatten(values, meta.treespec)
+
+    def shutdown(self, wait: bool = True) -> None:
+        pass
