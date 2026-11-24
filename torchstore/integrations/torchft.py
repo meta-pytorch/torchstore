@@ -66,12 +66,7 @@ try:  # upstream torchft
         ProcessGroupGloo,
         ReconfigureOptions,
     )
-    from torchft.checkpointing.pg_transport import (
-        _cast_tensor,
-        _DTensorMeta,
-        _prepare_state_dict,
-        _TensorMeta,
-    )
+    from torchft.checkpointing.pg_transport import _DTensorMeta, _StateDictMeta, _TensorMeta
     from torchft.checkpointing.transport import CheckpointTransport
     from torchft.work import _DummyWork
 except ImportError as _error:  # pragma: no cover - torchft is optional for torchstore
@@ -382,6 +377,50 @@ def _regions(tensors: list[torch.Tensor]) -> dict[str, list[tuple[int, int, int]
     return by_type
 
 
+def _storage_bytes(tensor: torch.Tensor) -> torch.Tensor:
+    """A uint8 tensor over ``tensor``'s whole storage.
+
+    Upstream's ``_cast_tensor`` uses ``torch.tensor(storage)``, which torch-neuronx
+    does not support ("could not determine the shape of object type ..."); a view
+    set onto the storage works on every device.
+    """
+    return torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+        tensor.untyped_storage()
+    )
+
+
+def _prepare(state_dict: object, step: int) -> tuple[Any, list[torch.Tensor]]:
+    """Upstream's ``_prepare_state_dict`` (same metadata), storages via ``_storage_bytes``."""
+    from torch.distributed.tensor import DTensor
+    from torch.utils._pytree import tree_flatten_with_path
+
+    leaves, treespec = tree_flatten_with_path(state_dict)
+    paths, non_tensor_leaves, tensors = [], [], []
+
+    def prep(t: torch.Tensor) -> Any:
+        tensors.append(_storage_bytes(t))
+        return _TensorMeta(
+            shape=t.shape,
+            dtype=t.dtype,
+            storage_offset=int(t.storage_offset()),
+            stride=t.stride(),
+            nbytes=t.untyped_storage().nbytes(),
+        )
+
+    for path, v in leaves:
+        paths.append(path)
+        if isinstance(v, DTensor):
+            non_tensor_leaves.append(_DTensorMeta(local=prep(v._local_tensor), spec=v._spec))
+        elif isinstance(v, torch.Tensor):
+            non_tensor_leaves.append(prep(v))
+        else:
+            non_tensor_leaves.append(v)
+    return (
+        _StateDictMeta(step=step, treespec=treespec, paths=paths, non_tensor_leaves=non_tensor_leaves),
+        tensors,
+    )
+
+
 class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
     """Heal a recovering replica by READing the source's state over NIXL."""
 
@@ -431,7 +470,7 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
         timeout = timeout or self._timeout
         store, rank, _ = self._store_and_rank()
         t0 = time.monotonic()
-        meta, tensors = _prepare_state_dict(state_dict, step, device=self._pg._device)
+        meta, tensors = _prepare(state_dict, step)
         tensors = [t for t in tensors if t.nbytes > 0]
         _synchronize(self._pg._device)
         regs = self._register(tensors)
@@ -489,7 +528,7 @@ class NixlCheckpointTransport(CheckpointTransport[T], Generic[T]):
             if isinstance(inplace, DTensor):
                 inplace = inplace._local_tensor
             if isinstance(inplace, torch.Tensor) and inplace.untyped_storage().nbytes() == local_meta.nbytes:
-                storage = _cast_tensor(inplace, torch.uint8)
+                storage = _storage_bytes(inplace)
             else:
                 storage = torch.empty(local_meta.nbytes, dtype=torch.uint8, device=device)
             if local_meta.nbytes > 0:
