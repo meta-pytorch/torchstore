@@ -155,6 +155,11 @@ class _Registration:
     storage_ref: weakref.ReferenceType[Any]
 
 
+# A cancelled volume call cannot prove that remote writes stopped. Keep both
+# the agent and destination allocations alive until process exit in this case.
+_cancelled_volume_gets: list[tuple[NixlAgentCache, list[torch.Tensor]]] = []
+
+
 class NixlAgentCache(TransportCache):
     """Process-local NIXL agent and reusable memory registrations."""
 
@@ -259,9 +264,9 @@ class NixlAgentCache(TransportCache):
         self._abandoned.update(keys)
 
         def release(answer: asyncio.Future[Any]) -> None:
-            del tensors[:]
             if answer.cancelled():
-                # The volume may still be writing; leak the registrations.
+                # Registrations do not own the memory the volume may still write.
+                _cancelled_volume_gets.append((self, tensors))
                 return
             answer.exception()
             self._abandoned.subtract(keys)
@@ -736,10 +741,10 @@ class NixlTransportBuffer(TransportBuffer):
         try:
             await asyncio.wait([call], timeout=ENV_TORCHSTORE_NIXL_TIMEOUT_S)
         finally:
-            if not call.done():
+            if not call.done() or call.cancelled():
                 logger.warning(
                     "NIXL get cancelled while the storage volume may still write "
-                    "into its destinations; they stay registered until it answers"
+                    "into its destinations; keeping them registered"
                 )
                 tensors = [
                     context.tensor
@@ -748,7 +753,7 @@ class NixlTransportBuffer(TransportBuffer):
                 ]
                 leases, self._leases = self._leases, set()
                 self._client_cache().release_when_answered(leases, call, tensors)
-            elif not call.cancelled():
+            else:
                 call.exception()
 
     @override
