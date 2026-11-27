@@ -15,7 +15,10 @@ defaults:
 jobs:
   unit_tests:
     if: github.repository_owner == 'meta-pytorch'
-    runs-on: linux.g5.12xlarge.nvidia.gpu
+    runs-on: mt-l-x86aavx2-45-167-a10g-4
+    container:
+      image: pytorch/almalinux-builder:cuda12.8
+      options: --gpus all
     timeout-minutes: 60
     strategy:
       matrix:
